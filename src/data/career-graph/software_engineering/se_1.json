@@ -1,0 +1,21 @@
+{
+  "role_id": "se_1",
+  "title": "Senior Software Engineer",
+  "job_family": "Software Engineering",
+  "career_level": "Mid",
+  "level_order": 3,
+  "next_roles": ["tech_lead", "engineering_manager"],
+  "parallel_roles": [],
+  "alt_paths": ["product_manager_1"],
+  "is_terminal": false,
+  "active": true,
+ "salary": {
+  "currency": "INR",
+  "min": 400000,
+  "median": 700000,
+  "max": 1000000,
+  "percentile_75": 900000,
+  "percentile_90": 1200000
+}
+}
+

@@ -1,0 +1,28 @@
+{
+  "role_id": "tech_lead",
+  "title": "Tech Lead",
+  "job_family": "Software Engineering",
+  "career_level": "Senior",
+  "level_order": 4,
+  "min_experience_years": 6,
+  "required_skills": [
+    "system_design",
+    "architecture",
+    "mentoring",
+    "ci_cd",
+    "cloud"
+  ],
+  "next_roles": ["engineering_manager"],
+  "parallel_roles": [],
+  "alt_paths": [],
+  "is_terminal": false,
+  "active": true,
+  "salary": {
+    "currency": "INR",
+    "min": 1800000,
+    "median": 2400000,
+    "max": 3200000,
+    "percentile_75": 3000000,
+    "percentile_90": 3600000
+  }
+}

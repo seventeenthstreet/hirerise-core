@@ -1,0 +1,58 @@
+# ==============================
+# 🔐 Environment & Secrets
+# ==============================
+.env
+.env.*
+!.env.example
+
+secrets/
+*.json.json
+serviceAccountKey*
+firebase-admin.json
+
+# ==============================
+# 📦 Node
+# ==============================
+node_modules/
+.npm
+.eslintcache
+.node_repl_history
+.yarn-integrity
+*.tgz
+
+# ==============================
+# 🧪 Coverage & Testing
+# ==============================
+coverage
+.nyc_output
+lib-cov
+
+# ==============================
+# 🪵 Logs
+# ==============================
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+firebase-debug.log*
+firebase-debug.*.log*
+firestore-debug.log
+
+# ==============================
+# 🔧 Build / Runtime
+# ==============================
+build/Release
+pids
+*.pid
+*.seed
+*.pid.lock
+.lock-wscript
+
+# ==============================
+# 🗂 Misc
+# ==============================
+.firebase/
+.dataconnect
+.DS_Store
+Thumbs.db

@@ -1,0 +1,28 @@
+{
+  "role_id": "engineering_manager",
+  "title": "Engineering Manager",
+  "job_family": "Software Engineering",
+  "career_level": "Manager",
+  "level_order": 5,
+  "min_experience_years": 8,
+  "required_skills": [
+    "team_management",
+    "hiring",
+    "project_ownership",
+    "system_design",
+    "stakeholder_management"
+  ],
+  "next_roles": ["director_engineering"],
+  "parallel_roles": [],
+  "alt_paths": [],
+  "is_terminal": false,
+  "active": true,
+  "salary": {
+    "currency": "INR",
+    "min": 2500000,
+    "median": 3500000,
+    "max": 5000000,
+    "percentile_75": 4500000,
+    "percentile_90": 6000000
+  }
+}

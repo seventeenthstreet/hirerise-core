@@ -1,0 +1,112 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ── Helpers ──────────────────────────────────────────────────────────────
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+
+    function isEmailVerified() {
+      return isAuthenticated() && request.auth.token.email_verified == true;
+    }
+
+    function isAdmin() {
+      return isAuthenticated() && request.auth.token.role == 'admin';
+    }
+
+    function notDeleted() {
+      return resource.data.deletedAt == null;
+    }
+
+    // ── roles/{roleId} ───────────────────────────────────────────────────────
+    // Read-only from client.
+    // Authenticated users can fetch roles (dropdown/search).
+    // All writes via Admin SDK only.
+
+    match /roles/{roleId} {
+      allow read:  if isAuthenticated();
+      allow write: if false;
+    }
+
+    // ── userProfiles/{userId} ───────────────────────────────────────────────
+    // Users can read only their own profile.
+    // All writes blocked from client SDK (backend only via Admin SDK).
+
+    match /userProfiles/{userId} {
+      allow read: if isOwner(userId);
+      allow write: if false;
+    }
+
+    // ── Resumes ───────────────────────────────────────────────────────────────
+    match /resumes/{resumeId} {
+      allow read: if isOwner(resource.data.userId) && notDeleted();
+      allow create: if isEmailVerified()
+        && request.resource.data.userId == request.auth.uid
+        && request.resource.data.keys().hasAll([
+          'userId',
+          'resumeStoragePath',
+          'mimeType',
+          'processingStatus'
+        ]);
+      allow update: if false; // backend-only via Admin SDK
+      allow delete: if false;
+    }
+
+    // ── Scores ────────────────────────────────────────────────────────────────
+    match /scores/{scoreId} {
+      allow read: if isOwner(resource.data.userId) && notDeleted();
+      allow write: if false; // backend-only
+    }
+
+    // ── Automation Jobs ───────────────────────────────────────────────────────
+    match /automationJobs/{jobId} {
+      allow read: if isOwner(resource.data.userId) && notDeleted();
+      allow write: if false; // backend-only
+    }
+
+    // ── Notifications ─────────────────────────────────────────────────────────
+    match /notifications/{notifId} {
+      allow read: if isOwner(resource.data.userId);
+      allow update: if isOwner(resource.data.userId)
+        && request.resource.data
+             .diff(resource.data)
+             .affectedKeys()
+             .hasOnly(['read']);
+      allow create, delete: if false;
+    }
+
+    // ── Conversion Events (Audit Log) ────────────────────────────────────────
+    match /conversion_events/{userId}/events/{eventId} {
+      allow read: if isOwner(userId);
+      allow write: if false; // server-only (Admin SDK)
+    }
+
+    match /conversion_events/{userId} {
+      allow read: if isOwner(userId);
+      allow write: if false; // server-only
+    }
+
+    // ── Conversion Aggregates (Intent Scores) ─────────────────────────────────
+    match /conversion_aggregates/{userId} {
+      allow read: if isOwner(userId);
+      allow write: if false; // server-only via Admin SDK
+    }
+
+    // ── Conversion Summaries (Analytics) ─────────────────────────────────────
+    match /conversion_summaries/{date} {
+      allow read: if isAdmin(); // analytics dashboard only
+      allow write: if false;    // server-only
+    }
+
+    // ── Admin Catch-All (Lowest Priority) ────────────────────────────────────
+    match /{document=**} {
+      allow read, write: if isAdmin();
+    }
+  }
+}

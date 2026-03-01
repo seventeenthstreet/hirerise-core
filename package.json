@@ -1,0 +1,63 @@
+{
+  "name": "hirerise-core",
+  "version": "1.0.0",
+  "description": "HireRise Career Intelligence Platform - Backend Core Engine",
+  "main": "src/server.js",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "nodemon --signal SIGTERM src/server.js",
+    "lint": "eslint src/**/*.js",
+    "test": "cross-env NODE_ENV=test jest --runInBand",
+    "test:watch": "cross-env NODE_ENV=test jest --watch",
+    "import:data": "node src/data-import/excelImporter.js"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.78.0",
+    "compression": "^1.7.4",
+    "cors": "^2.8.5",
+    "dotenv": "^16.3.1",
+    "express": "^4.18.2",
+    "express-rate-limit": "^7.1.5",
+    "express-validator": "^7.0.1",
+    "firebase": "^12.9.0",
+    "firebase-admin": "^11.11.1",
+    "helmet": "^7.1.0",
+    "ioredis": "^5.9.3",
+    "mammoth": "^1.11.0",
+    "morgan": "^1.10.0",
+    "multer": "^2.0.2",
+    "natural": "^6.10.4",
+    "node-cache": "^5.1.2",
+    "pdf-parse": "^1.1.1",
+    "puppeteer": "^24.37.5",
+    "redlock": "^5.0.0-beta.2",
+    "stopword": "^2.0.8",
+    "stripe": "^20.4.0",
+    "uuid": "^9.0.1",
+    "winston": "^3.11.0",
+    "xlsx": "^0.18.5"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.6",
+    "@types/node": "^25.3.1",
+    "cross-env": "^10.1.0",
+    "eslint": "^8.54.0",
+    "jest": "^29.7.0",
+    "nodemon": "^3.0.2",
+    "supertest": "^6.3.4"
+  },
+  "jest": {
+    "testEnvironment": "node",
+    "testMatch": [
+      "**/__tests__/**/*.js",
+      "**/?(*.)+(spec|test).js"
+    ],
+    "setupFilesAfterEnv": [
+      "<rootDir>/src/tests/setup.js"
+    ],
+    "clearMocks": true
+  }
+}

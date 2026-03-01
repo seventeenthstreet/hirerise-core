@@ -1,0 +1,21 @@
+{
+  "role_id": "senior_product_manager",
+  "title": "Senior Product Manager",
+  "job_family": "Product Management",
+  "career_level": "Senior",
+  "level_order": 4,
+  "next_roles": [],
+  "parallel_roles": [],
+  "alt_paths": [],
+  "is_terminal": false,
+  "active": true,
+"salary": {
+  "currency": "INR",
+  "min": 2000000,
+  "median": 3000000,
+  "max": 4500000,
+  "percentile_75": 4000000,
+  "percentile_90": 5500000
+}
+
+}
