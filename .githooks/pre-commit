@@ -1,0 +1,25 @@
+#!/bin/sh
+# Hirerise Pre-Commit Secret Scanner
+# Uses Gitleaks to prevent committing secrets
+
+echo "🔐 Running secret scan with Gitleaks..."
+
+# Check if gitleaks is installed
+if ! command -v gitleaks >/dev/null 2>&1; then
+  echo "❌ Gitleaks is not installed."
+  echo "Install it from: https://github.com/gitleaks/gitleaks"
+  exit 1
+fi
+
+# Run scan on staged files only
+gitleaks protect --staged --redact --verbose
+
+STATUS=$?
+
+if [ $STATUS -ne 0 ]; then
+  echo "❌ Secret detected. Commit blocked."
+  exit 1
+fi
+
+echo "✅ No secrets detected. Commit allowed."
+exit 0
