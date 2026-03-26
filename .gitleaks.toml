@@ -1,0 +1,19 @@
+# .gitleaks.toml
+# Gitleaks configuration for hirerise-core
+# Docs: https://github.com/gitleaks/gitleaks#configuration
+
+title = "hirerise-core gitleaks config"
+
+[extend]
+# Inherit all default rules
+useDefault = true
+
+[[allowlists]]
+description = "Test file idempotency key fixtures — not real secrets"
+paths        = ['''src/tests/phase1\.test\.js''']
+regexes      = ['''test-idempotency-key-\w+''']
+
+[[allowlists]]
+description  = "Any variable literally named test_key / testKey / mock_key in test files"
+paths        = ['''.*\.(test|spec)\.js$''']
+regexes      = ['''(test|mock|fake|dummy|stub)[_-]?(key|token|secret)[_-]?\w*''']
