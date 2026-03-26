@@ -1,49 +1,32 @@
 'use strict';
 
-/**
- * conversionEvent.repository.js
- *
- * SOLE Firestore access point for raw conversion events.
- * Uses centralized Firebase config (test-safe).
- */
-
-const { db, admin } = require('../../../config/firebase');
+const supabase = require('../../../core/supabaseClient');
 const logger = require('../utils/conversion.logger');
 const { DEDUP_WINDOW_MS } = require('../utils/eventWeights.config');
 
-const FieldValue = admin?.firestore?.FieldValue || {
-  serverTimestamp: () => new Date()
-};
-
+const TABLE = 'conversion_events';
 const MAX_METADATA_SIZE_BYTES = 10 * 1024;
 
 class ConversionEventRepository {
-  constructor() {
-    this._db = db; // ✅ Use centralized db
-    this._root = 'conversion_events';
-  }
-
-  _eventsRef(userId) {
-    return this._db
-      .collection(this._root)
-      .doc(userId)
-      .collection('events');
-  }
 
   async isDuplicate(userId, eventType, idempotencyKey) {
     if (!idempotencyKey) return false;
 
-    const windowStart = new Date(Date.now() - DEDUP_WINDOW_MS);
+    const windowStart = new Date(Date.now() - DEDUP_WINDOW_MS).toISOString();
 
     try {
-      const snap = await this._eventsRef(userId)
-        .where('idempotencyKey', '==', idempotencyKey)
-        .where('eventType', '==', eventType)
-        .where('timestamp', '>=', windowStart)
-        .limit(1)
-        .get();
+      const { data, error } = await supabase
+        .from(TABLE)
+        .select('id')
+        .eq('user_id', userId)
+        .eq('event_type', eventType)
+        .eq('idempotency_key', idempotencyKey)
+        .gte('timestamp', windowStart)
+        .limit(1);
 
-      return !snap.empty;
+      if (error) throw error;
+
+      return (data || []).length > 0;
     } catch (err) {
       logger.error('ConversionEventRepository.isDuplicate failed', {
         userId,
@@ -57,16 +40,22 @@ class ConversionEventRepository {
   async recordEvent(userId, eventType, metadata = {}, idempotencyKey = null) {
     try {
       const safeMetadata = this._sanitizeMetadata(metadata);
-      const ref = this._eventsRef(userId).doc();
 
-      await ref.set({
-        eventType,
-        metadata: safeMetadata,
-        idempotencyKey: idempotencyKey ?? null,
-        timestamp: FieldValue.serverTimestamp(),
-      });
+      const { data, error } = await supabase
+        .from(TABLE)
+        .insert({
+          user_id: userId,
+          event_type: eventType,
+          metadata: safeMetadata,
+          idempotency_key: idempotencyKey,
+          timestamp: new Date().toISOString(),
+        })
+        .select()
+        .single();
 
-      return ref.id;
+      if (error) throw error;
+
+      return data.id;
     } catch (err) {
       logger.error('ConversionEventRepository.recordEvent failed', {
         userId,
@@ -80,47 +69,50 @@ class ConversionEventRepository {
   async batchRecordEvents(userId, events) {
     if (!events?.length) return;
 
-    const BATCH_LIMIT = 500;
+    const rows = events.map(({ eventType, metadata = {}, idempotencyKey = null }) => ({
+      user_id: userId,
+      event_type: eventType,
+      metadata: this._sanitizeMetadata(metadata),
+      idempotency_key: idempotencyKey,
+      timestamp: new Date().toISOString(),
+    }));
 
-    for (let i = 0; i < events.length; i += BATCH_LIMIT) {
-      const chunk = events.slice(i, i + BATCH_LIMIT);
-      const batch = this._db.batch();
+    const { error } = await supabase
+      .from(TABLE)
+      .insert(rows);
 
-      chunk.forEach(({ eventType, metadata = {}, idempotencyKey = null }) => {
-        const ref = this._eventsRef(userId).doc();
-        batch.set(ref, {
-          eventType,
-          metadata: this._sanitizeMetadata(metadata),
-          idempotencyKey: idempotencyKey ?? null,
-          timestamp: FieldValue.serverTimestamp(),
-        });
+    if (error) {
+      logger.error('ConversionEventRepository.batchRecordEvents failed', {
+        userId,
+        error: error.message,
       });
-
-      await batch.commit();
+      throw error;
     }
   }
 
   async getUserEvents(userId) {
-    const snap = await this._eventsRef(userId)
-      .orderBy('timestamp', 'desc')
-      .get();
+    const { data, error } = await supabase
+      .from(TABLE)
+      .select('*')
+      .eq('user_id', userId)
+      .order('timestamp', { ascending: false });
 
-    return snap.docs.map((d) => ({
-      id: d.id,
-      ...d.data(),
-    }));
+    if (error) throw error;
+
+    return data || [];
   }
 
   async getRecentEvents(userId, limit = 50) {
-    const snap = await this._eventsRef(userId)
-      .orderBy('timestamp', 'desc')
-      .limit(limit)
-      .get();
+    const { data, error } = await supabase
+      .from(TABLE)
+      .select('*')
+      .eq('user_id', userId)
+      .order('timestamp', { ascending: false })
+      .limit(limit);
 
-    return snap.docs.map((d) => ({
-      id: d.id,
-      ...d.data(),
-    }));
+    if (error) throw error;
+
+    return data || [];
   }
 
   _sanitizeMetadata(metadata) {
@@ -146,3 +138,8 @@ class ConversionEventRepository {
 }
 
 module.exports = new ConversionEventRepository();
+
+
+
+
+

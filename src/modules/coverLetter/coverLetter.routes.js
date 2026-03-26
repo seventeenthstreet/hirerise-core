@@ -21,7 +21,6 @@
 const express = require('express');
 const { z }   = require('zod');
 
-const { authenticate }   = require('../../middleware/auth.middleware');
 const { AppError, ErrorCodes } = require('../../middleware/errorHandler');
 const { generate }       = require('./controllers/coverLetter.controller');
 
@@ -78,7 +77,7 @@ function requirePaidTier(req, res, next) {
 // Checks available credits before route handler runs.
 // Mirrors creditGuard.middleware.js but inline for feature isolation.
 
-const { db } = require('../../config/firebase');
+const { db } = require('../../config/supabase');
 const COVER_LETTER_CREDIT_COST = 2;
 
 async function creditGuard(req, res, next) {
@@ -131,3 +130,11 @@ router.post(
 );
 
 module.exports = router;
+
+
+
+
+
+
+
+

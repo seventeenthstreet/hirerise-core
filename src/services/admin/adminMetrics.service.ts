@@ -28,7 +28,7 @@
  *   aggregated   → read from metrics/daily/{YYYY-MM-DD} pre-aggregated docs
  */
 
-import { getFirestore, Timestamp } from 'firebase-admin/firestore';
+const { db, Timestamp } = require('../../core/supabaseDbShim');
 import { usageLogsRepository } from './usageLogs.repository';
 import { calculateCostUSD, MARGIN_THRESHOLDS, FREE_BURN_THRESHOLDS } from '../../config/pricing.config';
 import type {
@@ -146,7 +146,7 @@ async function estimateRevenueFromUsers(startDate: Date, endDate: Date): Promise
   totalRevenueUSD: number;
   paidUserCount:   number;
 }> {
-  const db   = getFirestore();
+  
   const snap = await db
     .collection('users')
     .where('tier', '!=', 'free')
@@ -316,7 +316,7 @@ class AdminMetricsService {
    */
   async getAggregatedMetrics(params: MetricsQueryParams): Promise<Partial<AdminMetricsResponse>> {
     const period = resolvePeriodWindow(params);
-    const db     = getFirestore();
+    
 
     const startStr = period.startDate.toISOString().split('T')[0];
     const endStr   = period.endDate.toISOString().split('T')[0];

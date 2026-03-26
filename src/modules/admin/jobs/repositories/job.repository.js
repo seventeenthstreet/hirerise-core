@@ -1,111 +1,118 @@
 'use strict';
 
 /**
- * job.repository.js  (v3 — hardened)
+ * job.repository.js — Job Sync Repository (Supabase)
+ * MIGRATED: Firestore 'jobs' collection → Supabase 'jobs' table
  *
- * Improvements:
- * - Sanitizes jobCode before using as document ID
- * - Defensive guard against invalid IDs
- * - Removes per-record debug logging (reduces log noise)
- * - Simplified existence check (no unnecessary data reads)
+ * SQL to create the jobs table (run in Supabase SQL Editor):
+ *
+ * CREATE TABLE IF NOT EXISTS jobs (
+ *   job_code     TEXT        PRIMARY KEY,
+ *   title        TEXT,
+ *   company      TEXT,
+ *   location     TEXT,
+ *   description  TEXT,
+ *   salary_min   BIGINT,
+ *   salary_max   BIGINT,
+ *   currency     TEXT        DEFAULT 'INR',
+ *   source_type  TEXT,
+ *   source_url   TEXT,
+ *   is_deleted   BOOLEAN     NOT NULL DEFAULT false,
+ *   created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+ *   updated_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+ * );
+ * CREATE INDEX IF NOT EXISTS idx_jobs_deleted ON jobs (is_deleted, updated_at DESC);
  */
 
-const { getFirestore, FieldValue } = require('firebase-admin/firestore');
-const logger = require('../../../../shared/logger');
+const logger = require('../../../../utils/logger');
+
+function getSupabase() { return require('../../../../core/supabaseClient'); }
 
 class JobRepository {
-  constructor() {
-    this._db  = getFirestore();
-    this._col = 'jobs';
-  }
 
-  _ref() {
-    return this._db.collection(this._col);
-  }
-
-  /**
-   * Normalize and sanitize jobCode for safe Firestore doc ID.
-   * - Trim whitespace
-   * - Convert to uppercase (optional but recommended for consistency)
-   * - Remove forward slashes
-   */
   _normalizeJobCode(jobCode) {
-    if (!jobCode || typeof jobCode !== 'string') {
-      throw new Error('Invalid jobCode provided to repository');
-    }
-
-    return jobCode
-      .trim()
-      .toUpperCase()
-      .replace(/\//g, '_');
+    if (!jobCode || typeof jobCode !== 'string') throw new Error('Invalid jobCode provided');
+    return jobCode.trim().toUpperCase().replace(/\//g, '_');
   }
 
-  _docRef(jobCode) {
-    const normalized = this._normalizeJobCode(jobCode);
-    return this._ref().doc(normalized);
-  }
-
-  // ---------------------------------------------------------------------------
-  // Batch API
-  // ---------------------------------------------------------------------------
-
+  // Supabase does not need batch objects — we collect records and upsert in bulk.
+  // We keep the same interface (createBatch / addUpsertToBatch / commitBatch)
+  // so jobSync.service.js needs no changes.
   createBatch() {
-    return this._db.batch();
+    return { _records: [], _isNew: [] };
   }
 
   addUpsertToBatch(batch, jobData, isNew) {
     const normalizedCode = this._normalizeJobCode(jobData.jobCode);
-    const ref            = this._ref().doc(normalizedCode);
-    const now            = FieldValue.serverTimestamp();
-
-    const payload = {
-      ...jobData,
-      jobCode: normalizedCode, // ensure stored value matches doc ID
-      isDeleted: false,
-      updatedAt: now,
-      ...(isNew ? { createdAt: now } : {}),
-    };
-
-    batch.set(ref, payload, { merge: true });
+    batch._records.push({
+      job_code:    normalizedCode,
+      title:       jobData.title       || null,
+      company:     jobData.company     || null,
+      location:    jobData.location    || null,
+      description: jobData.description || null,
+      salary_min:  jobData.salaryMin   || null,
+      salary_max:  jobData.salaryMax   || null,
+      currency:    jobData.currency    || 'INR',
+      source_type: jobData.sourceType  || null,
+      source_url:  jobData.sourceUrl   || null,
+      is_deleted:  false,
+      updated_at:  new Date().toISOString(),
+      ...(isNew ? { created_at: new Date().toISOString() } : {}),
+    });
   }
 
   async commitBatch(batch) {
-    try {
-      await batch.commit();
-    } catch (err) {
-      logger.error('[JobRepository.commitBatch] failed', { error: err.message });
-      throw err;
-    }
-  }
+    if (!batch._records.length) return;
+    const supabase = getSupabase();
 
-  // ---------------------------------------------------------------------------
-  // Existence check
-  // ---------------------------------------------------------------------------
+    // Upsert in chunks of 500
+    const CHUNK = 500;
+    for (let i = 0; i < batch._records.length; i += CHUNK) {
+      const chunk = batch._records.slice(i, i + CHUNK);
+      const { error } = await supabase
+        .from('jobs')
+        .upsert(chunk, { onConflict: 'job_code' });
+      if (error) {
+        logger.error('[JobRepository.commitBatch] Supabase upsert failed', { error: error.message });
+        throw new Error(error.message);
+      }
+    }
+    logger.info('[JobRepository] Batch committed', { count: batch._records.length });
+  }
 
   async exists(jobCode) {
     try {
-      const snap = await this._docRef(jobCode).get();
-      return snap.exists; // we don't care about isDeleted for sync
+      const supabase = getSupabase();
+      const normalized = this._normalizeJobCode(jobCode);
+      const { data } = await supabase
+        .from('jobs').select('job_code').eq('job_code', normalized).single();
+      return !!data;
     } catch (err) {
       logger.error('[JobRepository.exists]', { jobCode, error: err.message });
-      throw err;
+      return false;
     }
   }
 
-  // ---------------------------------------------------------------------------
-  // Read API
-  // ---------------------------------------------------------------------------
-
   async findByJobCode(jobCode) {
     try {
-      const snap = await this._docRef(jobCode).get();
-      if (!snap.exists) return null;
-      return { id: snap.id, ...snap.data() };
+      const supabase = getSupabase();
+      const normalized = this._normalizeJobCode(jobCode);
+      const { data } = await supabase
+        .from('jobs').select('*').eq('job_code', normalized).single();
+      return data || null;
     } catch (err) {
       logger.error('[JobRepository.findByJobCode]', { jobCode, error: err.message });
-      throw err;
+      return null;
     }
   }
 }
 
 module.exports = new JobRepository();
+
+
+
+
+
+
+
+

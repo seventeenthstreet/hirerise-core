@@ -18,3 +18,11 @@ describe('Skills API', () => {
     expect(res.statusCode).toBe(400);
   });
 });
+
+
+
+
+
+
+
+

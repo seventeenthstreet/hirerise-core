@@ -79,3 +79,11 @@ module.exports = {
   PROFILES_COLLECTION,
   INDUSTRY_SECTORS,
 };
+
+
+
+
+
+
+
+

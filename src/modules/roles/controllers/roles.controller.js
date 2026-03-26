@@ -16,7 +16,6 @@
 const rolesService = require('../roles.service');
 const { AppError: _AppError, ErrorCodes: _ErrorCodes } = require('../../../middleware/errorHandler');
 const { AppError, ErrorCodes } = require('../../../middleware/errorHandler');
-
 // ─── GET /api/v1/roles ────────────────────────────────────────────────────────
 
 async function listRoles(req, res, next) {
@@ -135,10 +134,54 @@ async function searchRolesForOnboarding(req, res, next) {
   }
 }
 
+// ─── GET /api/v1/onboarding/suggest-roles (P1-05) ────────────────────────────
+
+/**
+ * P1-05: Role suggestions for Quick Start pre-fill.
+ *
+ * Query params:
+ *   q     — job title string typed by the user (required)
+ *   limit — max results (default 5, max 10)
+ *
+ * Response:
+ *   { suggestions: [{roleId, title, confidence, category}], total }
+ *
+ * Confidence 0-100: frontend shows high-confidence suggestions as primary,
+ * lower-confidence as "Did you mean...?" secondary suggestions.
+ */
+async function suggestRolesForOnboarding(req, res, next) {
+  try {
+    const { q, limit } = req.query;
+    const parsedLimit  = limit ? Math.min(parseInt(limit, 10) || 5, 10) : 5;
+
+    if (!q || !String(q).trim()) {
+      return res.status(200).json({ success: true, data: { suggestions: [], total: 0 } });
+    }
+
+    const result = await rolesService.suggestRolesForOnboarding({
+      jobTitle: String(q).trim(),
+      limit:    parsedLimit,
+    });
+
+    return res.status(200).json({ success: true, data: result });
+  } catch (err) {
+    return next(err);
+  }
+}
+
 module.exports = {
   listRoles,
   getRoleById,
   searchRolesForOnboarding, // G-06
+  suggestRolesForOnboarding, // P1-05
   saveOnboardingRoles,
   getOnboardingRoles,
 };
+
+
+
+
+
+
+
+

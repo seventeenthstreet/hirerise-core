@@ -56,3 +56,30 @@ pids
 .dataconnect
 .DS_Store
 Thumbs.db
+# ==============================
+# 🧪 Test fixtures & debug scripts (C-04)
+# ==============================
+personal.json
+chi.json
+body.json
+career.json
+gencv.json
+growth.json
+score.json
+test.json
+get-token.js
+get-firebase-token.mjs
+test-tier-integration.js
+"Get test token · JS"
+==============================
+# 🧪 Fire Base related
+# ==============================
+firebase-admin*.json
+gcp-service-account*.json
+.firebase/
+get-firebase-token.js
+get-firebase-token.mjs
+serviceAccountKey*.json
+*-adminsdk-*.json
+firestore-backup.json
+firestore-debug.log

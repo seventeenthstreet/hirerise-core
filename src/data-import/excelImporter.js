@@ -20,10 +20,10 @@
 'use strict';
 
 require('dotenv').config({ path: require('path').resolve(__dirname, '../../.env') });
-require('../config/firebase');
+require('../config/supabase');
 
-const XLSX    = require('xlsx');
-const { db }  = require('../config/firebase');
+const ExcelJS = require('exceljs'); // D-06 FIX: replaced xlsx (CVE-2023-30533) with exceljs
+const { db }  = require('../config/supabase');
 const logger  = require('../utils/logger');
 
 // Max Firestore batch size is 500; use 400 for safety headroom
@@ -177,14 +177,27 @@ const importSheet = async (sheetName, filePath) => {
 
   logger.info(`[Importer] Starting import: sheet='${sheetName}', file='${filePath}'`);
 
-  const workbook   = XLSX.readFile(filePath);
-  const worksheet  = workbook.Sheets[sheetName];
+  const workbook = new ExcelJS.Workbook();
+  await workbook.xlsx.readFile(filePath);
+  const worksheet = workbook.getWorksheet(sheetName);
 
   if (!worksheet) {
-    throw new Error(`Sheet '${sheetName}' not found in workbook. Available: ${workbook.SheetNames.join(', ')}`);
+    const available = workbook.worksheets.map(ws => ws.name).join(', ');
+    throw new Error(`Sheet '${sheetName}' not found in workbook. Available: ${available}`);
   }
 
-  const rows = XLSX.utils.sheet_to_json(worksheet, { defval: null });
+  // ExcelJS uses 1-based rows; row 1 is the header row
+  const headerRow  = worksheet.getRow(1).values.slice(1); // slice(1) removes leading undefined
+  const rows = [];
+  worksheet.eachRow((row, rowNumber) => {
+    if (rowNumber === 1) return; // skip header
+    const obj = {};
+    row.values.slice(1).forEach((val, i) => {
+      const key = headerRow[i];
+      if (key) obj[key] = val ?? null;
+    });
+    rows.push(obj);
+  });
   logger.info(`[Importer] Parsed ${rows.length} rows from sheet '${sheetName}'`);
 
   if (rows.length === 0) {
@@ -251,3 +264,11 @@ if (require.main === module) {
 }
 
 module.exports = { importSheet };
+
+
+
+
+
+
+
+

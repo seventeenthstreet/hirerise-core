@@ -34,7 +34,7 @@
  *   DAILY_SPIKE_MULTIPLIER:      3×   — today's cost > 3× 7-day avg = spike
  */
 
-const { getFirestore, Timestamp } = require('firebase-admin/firestore');
+const { db, Timestamp } = require('../../config/supabase');
 const logger = require('../../utils/logger');
 
 // ─── Thresholds ───────────────────────────────────────────────────────────────
@@ -57,7 +57,7 @@ const THRESHOLDS = {
 // ─── Fetch today's cost summary from usageLogs ────────────────────────────────
 
 async function fetchDayCostSummary(dateStr) {
-  const db   = getFirestore();
+  
   const start = new Date(`${dateStr}T00:00:00.000Z`);
   const end   = new Date(`${dateStr}T23:59:59.999Z`);
 
@@ -99,7 +99,7 @@ async function fetchDayCostSummary(dateStr) {
 // ─── Fetch 7-day rolling average cost ────────────────────────────────────────
 
 async function fetch7DayAvgCost(endDateStr) {
-  const db      = getFirestore();
+  
   const endDate = new Date(`${endDateStr}T23:59:59.000Z`);
   const start7  = new Date(endDate);
   start7.setDate(start7.getDate() - 7);
@@ -123,7 +123,7 @@ async function fetch7DayAvgCost(endDateStr) {
 // ─── Write alert to Firestore ai_alerts ───────────────────────────────────────
 
 async function writeAlert(alert) {
-  const db = getFirestore();
+  
   try {
     const ref = db.collection('ai_alerts').doc();
     await ref.set({
@@ -330,3 +330,12 @@ async function runDailyChecks(dateStr) {
 }
 
 module.exports = { runDailyChecks, THRESHOLDS };
+
+
+
+
+
+
+
+
+

@@ -1,0 +1,9 @@
+name,jobFamilyId,level,track,description
+Software Engineer,software_engineering,L3,individual_contributor,Entry-level software engineer
+Senior Software Engineer,software_engineering,L5,individual_contributor,Senior individual contributor
+Staff Engineer,software_engineering,L6,individual_contributor,Cross-team technical leadership
+Engineering Manager,software_engineering,L6,management,People manager for engineering teams
+Director of Engineering,software_engineering,L7,management,Engineering director leading multiple teams
+Product Manager,product_management,L4,individual_contributor,Core product manager
+Senior Product Manager,product_management,L5,individual_contributor,Senior PM with ownership of key areas
+Director of Product,product_management,L7,management,Product director overseeing PM org

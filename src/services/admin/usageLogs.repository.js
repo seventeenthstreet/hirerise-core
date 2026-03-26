@@ -5,13 +5,13 @@
  * Converted from usageLogs.repository.ts
  */
 
-const { getFirestore, FieldValue, Timestamp } = require('firebase-admin/firestore');
+const { db, FieldValue, Timestamp } = require('../../config/supabase');
 
 const COLLECTION = 'usageLogs';
 const DOC_LIMIT  = 10_000;
 
 class UsageLogsRepository {
-  get db() { return getFirestore(); }
+  get db() { return require('../../config/supabase').db; }
 
   async logUsage({ userId, feature, tier, model, inputTokens, outputTokens, costUSD, revenueUSD }) {
     try {
@@ -50,7 +50,7 @@ class UsageLogsRepository {
     const rows = snap.docs.map(doc => {
       const data = doc.data();
       return {
-        userId:       data.userId,
+        user_id:       data.userId,
         feature:      data.feature,
         tier:         data.tier,
         model:        data.model,
@@ -80,3 +80,12 @@ class UsageLogsRepository {
 
 const usageLogsRepository = new UsageLogsRepository();
 module.exports = { usageLogsRepository };
+
+
+
+
+
+
+
+
+

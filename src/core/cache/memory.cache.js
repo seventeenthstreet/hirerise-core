@@ -37,6 +37,11 @@ class MemoryCache extends ICache {
     this.store.delete(key);
   }
 
+  /** Alias for delete() — matches node-cache / ioredis .del() convention */
+  async del(key) {
+    return this.delete(key);
+  }
+
   async clearByPrefix(prefix) {
     for (let key of this.store.keys()) {
       if (key.startsWith(prefix)) {
@@ -56,3 +61,11 @@ class MemoryCache extends ICache {
 }
 
 module.exports = MemoryCache;
+
+
+
+
+
+
+
+

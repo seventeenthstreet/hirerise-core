@@ -1,4 +1,3 @@
-import { initializeApp } from 'firebase-admin/app';
 import { loadConfig } from '../../shared/config/index.js';
 import { logger } from '../../shared/logger/index.js';
 import { createSubscriber, publishEvent, EventTypes } from '../../shared/pubsub/index.js';
@@ -9,7 +8,6 @@ import { CareerPathEngineV1 } from './engines/career-path-v1.engine.js';
 process.env.SERVICE_NAME = 'career-worker';
 
 const config = loadConfig('career-worker');
-initializeApp();
 
 const ENGINE_MAP = {
   'career_path_v1.0': CareerPathEngineV1,

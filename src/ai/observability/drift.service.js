@@ -114,7 +114,7 @@ class DriftService {
 
     const observation = {
       feature,
-      userId: userId || 'anonymous',
+      user_id: userId || 'anonymous',
       model: model || 'unknown',
       score: score != null ? Number(score) : null,
       salaryMedian: salaryMedian != null ? Number(salaryMedian) : null,
@@ -289,3 +289,11 @@ class DriftService {
 }
 
 module.exports = new DriftService();
+
+
+
+
+
+
+
+

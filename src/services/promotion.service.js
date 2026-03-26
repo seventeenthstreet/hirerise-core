@@ -18,3 +18,12 @@ function calculatePromotionProbability(readinessScore) {
 module.exports = {
   calculatePromotionProbability
 };
+
+
+
+
+
+
+
+
+

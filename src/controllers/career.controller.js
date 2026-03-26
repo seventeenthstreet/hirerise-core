@@ -80,3 +80,11 @@ module.exports = {
   getCareerPathsWithGap,
   matchJobDescription,
 };
+
+
+
+
+
+
+
+

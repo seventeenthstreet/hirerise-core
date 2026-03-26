@@ -17,20 +17,39 @@
  *   retry: max 1 attempt, 1500ms delay
  *   Credits deducted by caller before this function runs.
  *   If this throws → caller refunds.
+ *
+ * PHASE 2 CHANGES:
+ *   1. callClaude() replaced with cbRegistry.execute() — circuit breaker protection.
+ *      Direct anthropic.messages.create() is gone from both engine functions.
+ *
+ *   2. Both engine functions wrapped with withAiConcurrency()
+ *      — global Redis semaphore prevents concurrent call spikes.
+ *
+ *   3. resumeText and jobDescription passed through sanitizePromptInput()
+ *      before being placed in the user prompt.
+ *
+ *   4. aiModelVersion included in both return objects.
  */
 
 const logger = require('../../utils/logger');
 const { AppError, ErrorCodes } = require('../../middleware/errorHandler');
 
+// ── PHASE 2: circuit breaker ───────────────────────────────────────────────────
+const cbRegistry = require('../../core/circuitBreaker.registry');
+
+// ── PHASE 2: global concurrency semaphore ─────────────────────────────────────
+const { withAiConcurrency } = require('../../core/aiConcurrency');
+
+// ── PHASE 2: prompt injection sanitizer ───────────────────────────────────────
+const { sanitizePromptInput } = require('../../middleware/aiSanitizer.middleware');
+
 const MODEL       = process.env.ANTHROPIC_MODEL || 'claude-sonnet-4-20250514';
 const TEMPERATURE = 0.3;
 const MAX_TOKENS  = {
   jobMatchAnalysis: 1200,
-  jobSpecificCV:    1800,  // larger — includes tailored CV content
+  jobSpecificCV:    1800,
 };
-const MAX_RETRIES     = 1;
-const RETRY_DELAY_MS  = 1500;
-const TEXT_LIMIT      = 3500; // chars per input field
+const TEXT_LIMIT = 3500;
 
 function getAnthropicClient() {
   if (process.env.NODE_ENV === 'test') return null;
@@ -48,25 +67,7 @@ function parseJsonSafe(raw) {
   return null;
 }
 
-async function callClaude(anthropic, params) {
-  let lastError;
-  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
-    if (attempt > 0) {
-      logger.warn('[JobMatchPremiumEngine] Retrying Claude call', { attempt });
-      await sleep(RETRY_DELAY_MS);
-    }
-    try {
-      const res = await anthropic.messages.create(params);
-      return res.content.filter(b => b.type === 'text').map(b => b.text).join('');
-    } catch (err) {
-      lastError = err;
-      logger.warn('[JobMatchPremiumEngine] Attempt failed', { attempt, error: err.message });
-    }
-  }
-  throw lastError;
-}
-
-// ─── Prompts ──────────────────────────────────────────────────
+// ─── Prompts ──────────────────────────────────────────────────────────────────
 
 const MATCH_ANALYSIS_PROMPT = `You are a senior career strategist and hiring consultant specialising in the Indian job market.
 You will receive a resume and a job description.
@@ -111,33 +112,52 @@ Required structure:
   }
 }`;
 
-// ─── Engine functions ─────────────────────────────────────────
+// ─── runJobMatchAnalysis ──────────────────────────────────────────────────────
 
 /**
- * runJobMatchAnalysis({ resumeText, jobDescription })
- * operationType: 'jobMatchAnalysis'
- * Returns: match score + gaps + suggestions (no CV)
+ * PHASE 2 CHANGES:
+ *   - resumeText and jobDescription sanitized before prompt construction
+ *   - callClaude() replaced with withAiConcurrency + cbRegistry.execute
  */
-async function runJobMatchAnalysis({ resumeText, jobDescription }) {
+async function runJobMatchAnalysis({ resumeText, jobDescription, userId = 'unknown' }) {
   logger.info('[JobMatchPremiumEngine] jobMatchAnalysis start');
 
-  const anthropic  = getAnthropicClient();
+  // ── PHASE 2: sanitize user-controlled inputs ───────────────────────────────
+  const safeResumeText    = sanitizePromptInput(resumeText,    'resumeText');
+  const safeJobDescription = sanitizePromptInput(jobDescription, 'jobDescription');
+
   const userPrompt =
-    `Resume:\n${resumeText.trim().slice(0, TEXT_LIMIT)}\n\nJob Description:\n${jobDescription.trim().slice(0, TEXT_LIMIT)}`;
+    `Resume:\n${safeResumeText.trim().slice(0, TEXT_LIMIT)}\n\nJob Description:\n${safeJobDescription.trim().slice(0, TEXT_LIMIT)}`;
 
   let raw;
+  let resolvedModel = MODEL;
+
   try {
-    raw = await callClaude(anthropic, {
-      model:       MODEL,
-      max_tokens:  MAX_TOKENS.jobMatchAnalysis,
-      temperature: TEMPERATURE,
-      system:      MATCH_ANALYSIS_PROMPT,
-      messages:    [{ role: 'user', content: userPrompt }],
+    // ── PHASE 2: concurrency semaphore + circuit breaker ──────────────────
+    const response = await withAiConcurrency('jobMatchAnalysis', userId, async () => {
+      return cbRegistry.execute(
+        cbRegistry.FEATURES.RESUME_SCORING, // job match shares model chain with resume scoring
+        async (model) => {
+          resolvedModel = model;
+          const anthropic = getAnthropicClient();
+          return anthropic.messages.create({
+            model,
+            max_tokens:  MAX_TOKENS.jobMatchAnalysis,
+            temperature: TEMPERATURE,
+            system:      MATCH_ANALYSIS_PROMPT,
+            messages:    [{ role: 'user', content: userPrompt }],
+          });
+        }
+      );
     });
+
+    raw = response.content.filter(b => b.type === 'text').map(b => b.text).join('');
+
   } catch (err) {
-    logger.error('[JobMatchPremiumEngine] Claude unavailable after retry', { error: err.message });
+    logger.error('[JobMatchPremiumEngine] Claude unavailable', { error: err.message });
+    if (err.statusCode === 503 || err.status === 503) throw err;
     throw new AppError(
-      'JD analysis failed after retry. Your credits have been refunded.',
+      'JD analysis failed. Your credits have been refunded.',
       502, {}, ErrorCodes.EXTERNAL_SERVICE_ERROR
     );
   }
@@ -151,39 +171,63 @@ async function runJobMatchAnalysis({ resumeText, jobDescription }) {
     );
   }
 
-  logger.info('[JobMatchPremiumEngine] jobMatchAnalysis complete', { matchScore: parsed.matchScore });
+  logger.info('[JobMatchPremiumEngine] jobMatchAnalysis complete', {
+    matchScore: parsed.matchScore, model: resolvedModel,
+  });
 
   return {
-    engine: 'premium',
+    engine:         'premium',
+    aiModelVersion: resolvedModel,
     ...parsed,
-    tailoredCV:  null,  // not requested in this operation
+    tailoredCV:  null,
     analysedAt:  new Date().toISOString(),
   };
 }
 
+// ─── runJobSpecificCV ─────────────────────────────────────────────────────────
+
 /**
- * runJobSpecificCV({ resumeText, jobDescription, personalDetails })
- * operationType: 'jobSpecificCV'
- * Returns: match analysis + fully tailored CV
+ * PHASE 2 CHANGES:
+ *   - resumeText and jobDescription sanitized before prompt construction
+ *   - callClaude() replaced with withAiConcurrency + cbRegistry.execute
  */
-async function runJobSpecificCV({ resumeText, jobDescription, personalDetails = {} }) {
+async function runJobSpecificCV({ resumeText, jobDescription, personalDetails = {}, userId = 'unknown' }) {
   logger.info('[JobMatchPremiumEngine] jobSpecificCV start');
 
-  const anthropic  = getAnthropicClient();
+  // ── PHASE 2: sanitize user-controlled inputs ───────────────────────────────
+  const safeResumeText     = sanitizePromptInput(resumeText,    'resumeText');
+  const safeJobDescription = sanitizePromptInput(jobDescription, 'jobDescription');
+
   const userPrompt =
-    `Resume:\n${resumeText.trim().slice(0, TEXT_LIMIT)}\n\nJob Description:\n${jobDescription.trim().slice(0, TEXT_LIMIT)}\n\nProfile Details:\n${JSON.stringify(personalDetails)}`;
+    `Resume:\n${safeResumeText.trim().slice(0, TEXT_LIMIT)}\n\nJob Description:\n${safeJobDescription.trim().slice(0, TEXT_LIMIT)}\n\nProfile Details:\n${JSON.stringify(personalDetails)}`;
 
   let raw;
+  let resolvedModel = MODEL;
+
   try {
-    raw = await callClaude(anthropic, {
-      model:       MODEL,
-      max_tokens:  MAX_TOKENS.jobSpecificCV,
-      temperature: TEMPERATURE,
-      system:      JOB_SPECIFIC_CV_PROMPT,
-      messages:    [{ role: 'user', content: userPrompt }],
+    // ── PHASE 2: concurrency semaphore + circuit breaker ──────────────────
+    const response = await withAiConcurrency('jobSpecificCV', userId, async () => {
+      return cbRegistry.execute(
+        cbRegistry.FEATURES.RESUME_SCORING,
+        async (model) => {
+          resolvedModel = model;
+          const anthropic = getAnthropicClient();
+          return anthropic.messages.create({
+            model,
+            max_tokens:  MAX_TOKENS.jobSpecificCV,
+            temperature: TEMPERATURE,
+            system:      JOB_SPECIFIC_CV_PROMPT,
+            messages:    [{ role: 'user', content: userPrompt }],
+          });
+        }
+      );
     });
+
+    raw = response.content.filter(b => b.type === 'text').map(b => b.text).join('');
+
   } catch (err) {
-    logger.error('[JobMatchPremiumEngine] CV generation failed after retry', { error: err.message });
+    logger.error('[JobMatchPremiumEngine] CV generation failed', { error: err.message });
+    if (err.statusCode === 503 || err.status === 503) throw err;
     throw new AppError(
       'Tailored CV generation failed. Credits refunded.',
       502, {}, ErrorCodes.EXTERNAL_SERVICE_ERROR
@@ -198,13 +242,24 @@ async function runJobSpecificCV({ resumeText, jobDescription, personalDetails = 
     );
   }
 
-  logger.info('[JobMatchPremiumEngine] jobSpecificCV complete', { matchScore: parsed.matchScore });
+  logger.info('[JobMatchPremiumEngine] jobSpecificCV complete', {
+    matchScore: parsed.matchScore, model: resolvedModel,
+  });
 
   return {
-    engine:     'premium',
+    engine:         'premium',
+    aiModelVersion: resolvedModel,
     ...parsed,
     analysedAt: new Date().toISOString(),
   };
 }
 
 module.exports = { runJobMatchAnalysis, runJobSpecificCV };
+
+
+
+
+
+
+
+

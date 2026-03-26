@@ -116,3 +116,11 @@ class ResumeService {
 }
 
 module.exports = new ResumeService();
+
+
+
+
+
+
+
+

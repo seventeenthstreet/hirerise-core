@@ -5,7 +5,7 @@
  * Converted from adminMetrics.service.ts
  */
 
-const { getFirestore } = require('firebase-admin/firestore');
+const { db } = require('../../config/supabase');
 const { usageLogsRepository } = require('./usageLogs.repository');
 const { calculateCostUSD, MARGIN_THRESHOLDS, FREE_BURN_THRESHOLDS } = require('../../config/pricing.config');
 
@@ -73,7 +73,7 @@ function computeHealthAlerts(grossMarginPercent, freeTierCostUSD, totalCostUSD) 
 }
 
 async function estimateRevenueFromUsers() {
-  const db   = getFirestore();
+  
   const snap = await db.collection('users').where('tier', '!=', 'free').where('subscriptionStatus', '==', 'active').get();
   const INR_TO_USD = 0.012;
   let totalRevenueUSD = 0, paidUserCount = 0;
@@ -130,7 +130,7 @@ class AdminMetricsService {
 
   async getAggregatedMetrics(params) {
     const period   = resolvePeriodWindow(params);
-    const db       = getFirestore();
+    
     const startStr = period.startDate.toISOString().split('T')[0];
     const endStr   = period.endDate.toISOString().split('T')[0];
 
@@ -174,3 +174,12 @@ class AdminMetricsService {
 
 const adminMetricsService = new AdminMetricsService();
 module.exports = { adminMetricsService };
+
+
+
+
+
+
+
+
+

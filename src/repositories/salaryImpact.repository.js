@@ -111,3 +111,12 @@ class SalaryImpactRepository {
 }
 
 module.exports = SalaryImpactRepository;
+
+
+
+
+
+
+
+
+

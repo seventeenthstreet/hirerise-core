@@ -1,0 +1,355 @@
+{
+  "_meta": {
+    "title": "HireRise Onboarding API — Phase 1 Contract Spec",
+    "version": "1.1.0",
+    "phase": "Phase 1 — Core Data Contract",
+    "date": "2026-03",
+    "status": "FROZEN — additive changes only after frontend sign-off",
+    "baseUrl": "/api/v1/onboarding",
+    "auth": "All endpoints require Firebase ID token in Authorization: Bearer <token> header, except where noted",
+    "errorShape": {
+      "description": "All errors follow this envelope",
+      "shape": {
+        "success": false,
+        "errorCode": "string — machine-readable code from ErrorCodes registry",
+        "message": "string — technical description (for logs)",
+        "userMessage": "string | undefined — plain-language copy safe to render in UI. Present when the error has UI-relevant context. When absent, frontend should render a generic fallback message.",
+        "details": "object | undefined — structured extra context",
+        "timestamp": "ISO 8601 string"
+      }
+    }
+  },
+
+  "endpoints": {
+
+    "POST /consent": {
+      "description": "Step 0 — Record user consent to Terms of Service and Privacy Policy. Idempotent: calling again with the same consentVersion returns the existing record.",
+      "auth": "required",
+      "request": {
+        "body": {
+          "consentVersion": { "type": "string", "required": true, "example": "1.0", "description": "Version of T&C/Privacy Policy the user accepted. Must exist in consentVersions collection (P0-05)." },
+          "consentSource": { "type": "string", "required": false, "default": "onboarding_step_0" },
+          "referralSource": { "type": "string", "required": false, "enum": ["organic_search","paid_search","social_organic","social_paid","referral_link","email_campaign","app_store","direct","other"], "description": "Acquisition channel. Invalid values coerced to 'other'." }
+        }
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "success": true,
+          "data": {
+            "userId": "string",
+            "step": "consent_saved",
+            "consentVersion": "string",
+            "consentGrantedAt": "ISO 8601 string",
+            "alreadyRecorded": "boolean — true when this version was already stored (idempotent replay)"
+          }
+        }
+      },
+      "errors": [
+        { "status": 400, "errorCode": "VALIDATION_ERROR", "when": "consentVersion missing or empty" },
+        { "status": 400, "errorCode": "VALIDATION_ERROR", "userMessage": "This version of our Terms & Privacy Policy has been updated. Please refresh the page and accept the latest version.", "when": "consentVersion is deprecated in consentVersions collection" }
+      ]
+    },
+
+    "POST /quick-start": {
+      "description": "P1-01 — Phase 1 minimum viable data save. Accepts 4 required fields and fires provisional CHI immediately. Replaces the old 7-field wall with a progressive two-phase model. CHI generation is async — response returns immediately with chiStatus: 'generating'.",
+      "auth": "required",
+      "request": {
+        "body": {
+          "jobTitle": { "type": "string", "required": true, "maxLength": 200, "example": "Senior Product Manager" },
+          "company": { "type": "string", "required": true, "maxLength": 200, "example": "Accenture" },
+          "startDate": { "type": "string", "required": true, "format": "YYYY-MM", "example": "2021-03", "description": "Cannot be in the future." },
+          "isCurrent": { "type": "boolean", "required": false, "default": true },
+          "endDate": { "type": "string", "required": false, "format": "YYYY-MM", "description": "Required when isCurrent=false." },
+          "expectedRoleIds": { "type": "string[]", "required": "conditional", "description": "At least one required, UNLESS targetRoleFreeText is provided. Each ID validated against roles collection." },
+          "targetRoleFreeText": { "type": "string", "required": false, "maxLength": 120, "description": "P1-10: Free-text fallback when user cannot find their role in the picker. Stored as-is without Firestore lookup. When provided, expectedRoleIds may be empty." },
+          "skills": { "type": "SkillEntry[]", "required": false, "maxItems": 10, "description": "Each entry: { name: string, proficiency?: 'beginner'|'intermediate'|'advanced'|'expert' }. proficiency defaults to 'intermediate'." },
+          "industryId": { "type": "string", "required": false }
+        }
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "success": true,
+          "data": {
+            "userId": "string",
+            "step": "quick_start_saved",
+            "quickStartCompleted": true,
+            "chiStatus": "'generating' — CHI fires async. Poll GET /progress or GET /chi-explainer to check when ready.",
+            "message": "string",
+            "savedAt": "ISO 8601 string"
+          }
+        }
+      },
+      "errors": [
+        { "status": 400, "errorCode": "VALIDATION_ERROR", "userMessage": "Please enter your current or most recent job title.", "when": "jobTitle missing" },
+        { "status": 400, "errorCode": "VALIDATION_ERROR", "userMessage": "Please enter the company name for your current or most recent role.", "when": "company missing" },
+        { "status": 400, "errorCode": "VALIDATION_ERROR", "userMessage": "Please enter when you started this role (month and year).", "when": "startDate missing" },
+        { "status": 400, "errorCode": "VALIDATION_ERROR", "userMessage": "Please select the role you're targeting, or type it in if you don't see it in the list.", "when": "expectedRoleIds empty AND targetRoleFreeText absent" },
+        { "status": 400, "errorCode": "VALIDATION_ERROR", "when": "One or more expectedRoleIds not found in roles collection" }
+      ]
+    },
+
+    "POST /education-experience": {
+      "description": "P1-02 — Enrichment step. All fields are now optional (P1-02: no required field gates except basic structure). Accepts full education[], experience[], skills[], salary, seniority, career gaps. CHI recalculates after save with higher completeness score.",
+      "auth": "required",
+      "notes": [
+        "P1-02: education[] and experience[] are no longer mutually required — at least one was previously enforced, now relaxed for enrichment-only calls",
+        "P1-03: currentSalaryLPA is fully optional. Use salaryDeclined:true to explicitly indicate non-disclosure.",
+        "The integer sentinel -1 is still accepted for backwards compatibility but salaryDeclined:true is preferred"
+      ],
+      "request": {
+        "body": {
+          "education": { "type": "EducationEntry[]", "required": false, "description": "Each entry: { qualificationId|qualificationName (one required), institution, yearOfGraduation?, grade?, specialization? }" },
+          "experience": { "type": "ExperienceEntry[]", "required": false, "description": "Each entry: { jobTitle, company (both required), startDate, endDate?, isCurrent?, responsibilities[]?, achievements[]?, industryId? }" },
+          "skills": { "type": "SkillEntry[]", "required": false, "maxItems": 20 },
+          "expectedRoleIds": { "type": "string[]", "required": false, "description": "If provided, validated against roles collection. At least 1 if array is non-empty." },
+          "targetRoleFreeText": { "type": "string", "required": false, "maxLength": 120 },
+          "currentSalaryLPA": { "type": "number", "required": false, "description": "Annual salary in LPA. Optional. When absent, salaryTrajectory CHI dimension defaults to 40." },
+          "salaryDeclined": { "type": "boolean", "required": false, "description": "P1-03: Set true to explicitly indicate user declined to share salary. Preferred over -1 sentinel." },
+          "expectedSalaryLPA": { "type": "number", "required": false },
+          "selfDeclaredSeniority": { "type": "string", "required": false, "enum": ["intern","junior","mid","senior","lead","principal","director","executive"] },
+          "careerGaps": { "type": "CareerGapEntry[]", "required": false, "description": "Each entry: { startDate (YYYY-MM), endDate (YYYY-MM), reason: 'education'|'personal'|'health'|'relocation'|'other', description? }" },
+          "targetRoleId": { "type": "string", "required": false, "description": "Single primary target role. Validated against roles collection if provided." }
+        }
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "success": true,
+          "data": {
+            "userId": "string",
+            "step": "string — 'education_experience_saved' or 'quick_start_saved' (when no prior data)",
+            "educationCount": "number",
+            "experienceCount": "number",
+            "skillsCount": "number",
+            "hasSalary": "boolean",
+            "savedAt": "ISO 8601 string"
+          }
+        }
+      },
+      "errors": [
+        { "status": 400, "errorCode": "VALIDATION_ERROR", "userMessage": "Please select at least one role you're targeting.", "when": "expectedRoleIds provided but empty" },
+        { "status": 400, "errorCode": "VALIDATION_ERROR", "userMessage": "Please enter a valid salary amount, or leave it blank to skip.", "when": "currentSalaryLPA is negative or non-numeric" },
+        { "status": 400, "errorCode": "VALIDATION_ERROR", "when": "experience entry missing jobTitle or company" },
+        { "status": 400, "errorCode": "VALIDATION_ERROR", "when": "education entry missing qualificationId/Name or institution" }
+      ]
+    },
+
+    "GET /suggest-roles": {
+      "description": "P1-05 — Returns role suggestions based on a free-text job title string. Used to pre-fill the expectedRoleIds[] picker in Quick Start. Results are cached 1 hour in memory.",
+      "auth": "required",
+      "request": {
+        "query": {
+          "q": { "type": "string", "required": true, "description": "Job title to match against. E.g. 'Product Manager', 'Software Engineer'." },
+          "limit": { "type": "number", "required": false, "default": 5, "max": 10 }
+        }
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "success": true,
+          "data": {
+            "suggestions": [
+              {
+                "roleId": "string",
+                "title": "string",
+                "confidence": "number (0-100) — 100=exact match, 80=all tokens match, 60=prefix match, 40=partial match, 20=weak match",
+                "category": "string | null"
+              }
+            ],
+            "total": "number"
+          }
+        }
+      },
+      "notes": [
+        "Returns empty suggestions array (not 404) when q is blank or no matches found",
+        "Confidence score is for frontend display only — sort order already reflects relevance"
+      ]
+    },
+
+    "GET /teaser-chi": {
+      "description": "P1-06 — Returns an industry-average CHI snapshot for a given job family. No user data needed. Shown on the onboarding entry screen before Step 1 as a value hook. Falls back to 'general' industry average if jobFamilyId not found.",
+      "auth": "required (user must be logged in to reach onboarding, but no user data is read)",
+      "request": {
+        "query": {
+          "jobFamilyId": { "type": "string", "required": false, "description": "Job family ID. Available: software_engineering, product, data, sales, marketing, general (default)." }
+        }
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "success": true,
+          "data": {
+            "jobFamilyId": "string",
+            "jobFamilyLabel": "string",
+            "chiScore": "number (0-100) — industry average score",
+            "topPercentile": "number — score of top 25% in this family",
+            "dimensions": {
+              "skillVelocity":    { "score": "number", "label": "string", "description": "string" },
+              "experienceDepth":  { "score": "number", "label": "string", "description": "string" },
+              "marketAlignment":  { "score": "number", "label": "string", "description": "string" },
+              "salaryTrajectory": { "score": "number", "label": "string", "description": "string" },
+              "careerMomentum":   { "score": "number", "label": "string", "description": "string" }
+            },
+            "callToAction": "string — e.g. 'This is the industry average. Complete your profile to see where you stand.'",
+            "analysisSource": "teaser"
+          }
+        }
+      },
+      "notes": [
+        "analysisSource: 'teaser' — frontend should NEVER show this as the user's personal score",
+        "Never returns 404 — falls back to hardcoded fallback if teaserChi collection is not seeded",
+        "Seed with: node scripts/seedTeaserChi.js"
+      ]
+    },
+
+    "GET /progress": {
+      "description": "P1-08 — Returns the full onboarding progress state. Updated for two-phase model. Frontend uses this to route the user to the correct step, render progress bars, and show CHI enrichment nudges.",
+      "auth": "required",
+      "response": {
+        "status": 200,
+        "body": {
+          "success": true,
+          "data": {
+            "userId": "string",
+            "step": "string — last written step name",
+            "onboardingCompleted": "boolean",
+            "tracks": {
+              "trackA": "boolean — education/experience saved",
+              "trackB": "boolean — career intent saved",
+              "isComplete": "boolean"
+            },
+            "steps": [
+              {
+                "stepId": "string — 'quick_start' | 'career_report' | 'enrich_profile' | 'personal_details' | 'generate_cv'",
+                "label": "string",
+                "isRequired": "boolean",
+                "isComplete": "boolean",
+                "isCurrent": "boolean — true for the step the user should act on next",
+                "estimatedTimeMinutes": "number — P1-08: time estimate for this step",
+                "description": "string — one-line description for UI"
+              }
+            ],
+            "nextRequiredStep": "string | null — 'quick_start' | 'career_report' | null (when all required steps done)",
+            "quickStartCompleted": "boolean — P1-08: true when POST /quick-start has been called",
+            "progressPercent": "number (0-100)",
+            "totalSteps": "number",
+            "completedSteps": "number",
+            "chiDataCompleteness": "number (0-100) — how complete the CHI input data is",
+            "chiDataMissing": [
+              {
+                "field": "string — e.g. 'salary', 'skills', 'education'",
+                "label": "string — human-readable label",
+                "impact": "string — e.g. 'HIGH' | 'MEDIUM' | 'LOW'"
+              }
+            ],
+            "remainingQuota": "object | null — free tier quota remaining",
+            "quotaExhausted": "object | null — { careerReport: boolean, generateCV: boolean, upgradeUrl: string }",
+            "draft": "object | null — saved draft from PATCH /draft",
+            "data": "object — full raw onboardingProgress document (for debugging)"
+          }
+        }
+      }
+    },
+
+    "PATCH /draft": {
+      "description": "Auto-save endpoint. Accepts any partial subset of Quick Start or enrichment fields. No validation — stores as-is. Frontend calls this on blur/change to prevent data loss.",
+      "auth": "required",
+      "request": {
+        "body": "Any subset of Quick Start or education-experience fields. No required fields."
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "success": true,
+          "data": { "userId": "string", "step": "draft_saved", "savedAt": "ISO 8601 string" }
+        }
+      }
+    },
+
+    "GET /roles/search": {
+      "description": "G-06 / P1-04 — Onboarding-optimised role search. Returns roles matching a text query with relevance scoring and job family grouping. Registered at GET /api/v1/roles/search (roles module, not onboarding module).",
+      "baseUrl": "/api/v1/roles",
+      "auth": "required",
+      "request": {
+        "query": {
+          "q": { "type": "string", "required": false, "description": "Text search across role title and aliases." },
+          "jobFamilyId": { "type": "string", "required": false, "description": "Filter by job family." },
+          "limit": { "type": "number", "required": false, "default": 30, "max": 100 }
+        }
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "success": true,
+          "data": {
+            "roles": [
+              {
+                "id": "string",
+                "title": "string",
+                "level": "string | null",
+                "track": "string | null",
+                "jobFamilyId": "string | null",
+                "jobFamilyName": "string | null",
+                "aliases": "string[]"
+              }
+            ],
+            "grouped": [
+              {
+                "jobFamilyId": "string",
+                "jobFamilyName": "string",
+                "roles": "Role[]"
+              }
+            ],
+            "total": "number"
+          }
+        }
+      }
+    }
+
+  },
+
+  "types": {
+    "SkillEntry": {
+      "name": "string (required)",
+      "proficiency": "'beginner' | 'intermediate' | 'advanced' | 'expert' (optional, default: 'intermediate')"
+    },
+    "EducationEntry": {
+      "qualificationId": "string (one of qualificationId or qualificationName required)",
+      "qualificationName": "string (one of qualificationId or qualificationName required)",
+      "institution": "string (required)",
+      "yearOfGraduation": "number (optional)",
+      "grade": "string (optional)",
+      "specialization": "string (optional)"
+    },
+    "ExperienceEntry": {
+      "jobTitle": "string (required)",
+      "company": "string (required)",
+      "startDate": "YYYY-MM string (required)",
+      "endDate": "YYYY-MM string (required when isCurrent=false)",
+      "isCurrent": "boolean (optional, default: false)",
+      "responsibilities": "string[] (optional, each 10-500 chars)",
+      "achievements": "AchievementEntry[] (optional)",
+      "industryId": "string (optional)"
+    },
+    "AchievementEntry": {
+      "metric": "string (required) — quantifiable result, e.g. '40%'",
+      "action": "string (required) — what was done, e.g. 'Reduced latency'",
+      "context": "string (optional) — by doing what"
+    },
+    "CareerGapEntry": {
+      "startDate": "YYYY-MM string (required)",
+      "endDate": "YYYY-MM string (required)",
+      "reason": "'education' | 'personal' | 'health' | 'relocation' | 'other' (optional, default: 'other')",
+      "description": "string (optional, max 600 chars)"
+    }
+  },
+
+  "migrationNotes": {
+    "P1-02": "POST /education-experience no longer requires both education[] and experience[]. All fields are now optional for enrichment calls.",
+    "P1-03": "currentSalaryLPA is now optional. Replace integer sentinel -1 with salaryDeclined:true. Both are still accepted.",
+    "P1-10": "targetRoleFreeText accepted on both POST /quick-start and POST /education-experience. Stored but not validated against Firestore roles.",
+    "P0-04": "All 4xx/422 error responses now include userMessage field when the error is user-facing. Frontend should prefer userMessage over message for display."
+  }
+}

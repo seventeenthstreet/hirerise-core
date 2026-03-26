@@ -3,9 +3,8 @@
 const { Router }       = require('express');
 const rateLimit        = require('express-rate-limit');
 const { syncJobs }     = require('./controllers/jobSync.controller');
-const { authenticateJWT } = require('../../../shared/middleware/auth.middleware');
-const { authorizeRole }   = require('../../../shared/middleware/rbac.middleware');
-const logger = require('../../../shared/logger');
+const { authenticate, requireAdmin } = require('../../../middleware/auth.middleware');
+const logger = require('../../../utils/logger');
 
 const router = Router();
 
@@ -46,8 +45,8 @@ const syncRateLimiter = rateLimit({
 router.post(
   '/sync',
   syncRateLimiter,
-  authenticateJWT,
-  authorizeRole('admin'),
+  authenticate,
+  requireAdmin,
   syncJobs
 );
 
@@ -62,3 +61,11 @@ router.all('/sync', (req, res) => {
 });
 
 module.exports = router;
+
+
+
+
+
+
+
+

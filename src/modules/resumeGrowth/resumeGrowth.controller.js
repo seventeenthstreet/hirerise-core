@@ -64,7 +64,7 @@ exports.analyze = async (req, res, next) => {
     };
 
     const result = await resumeGrowthService.analyze({
-      userId: req.user.uid, // FIX-4: was hardcoded 'anonymous'
+      user_id: req.user.uid, // FIX-4: was hardcoded 'anonymous'
       roleId,
       resume: sanitizedResume,
       persist: persist !== false,
@@ -112,3 +112,12 @@ exports.getLatest = async (req, res, next) => {
     next(err);
   }
 };
+
+
+
+
+
+
+
+
+

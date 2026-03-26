@@ -1,3 +1,5 @@
+'use strict';
+
 /**
  * shared/pubsub/index.js
  *
@@ -7,12 +9,14 @@
  * - Structured error handling
  * - Safe subscriber with JSON guard
  * - No duplicate EventTypes definition
+ *
+ * FIX: Converted from ESM (import/export) to CJS (require/module.exports)
+ * to match the rest of the codebase.
  */
 
-import { PubSub } from '@google-cloud/pubsub';
-import { logger } from '../logger/index.js';
-import { buildEnvelope, EventTypes } from '../events/index.js';
-import { ErrorCodes, HireRiseError } from '../errors/index.js';
+const { PubSub }                       = require('@google-cloud/pubsub');
+const logger                           = require('../logger');
+const { buildEnvelope, EventTypes }    = require('../events');
 
 let _client = null;
 
@@ -29,7 +33,7 @@ function getClient() {
 // ────────────────────────────────────────────────────────────
 //
 
-export async function publishEvent(topicName, eventType, payload, attributes = {}) {
+async function publishEvent(topicName, eventType, payload, attributes = {}) {
   const client = getClient();
 
   // Build envelope using canonical registry
@@ -38,9 +42,9 @@ export async function publishEvent(topicName, eventType, payload, attributes = {
   const data = Buffer.from(JSON.stringify(envelope));
 
   const msgAttributes = {
-    eventType: envelope.eventType,
+    eventType:     envelope.eventType,
     schemaVersion: envelope.schemaVersion,
-    eventId: envelope.eventId,
+    eventId:       envelope.eventId,
     ...attributes,
   };
 
@@ -66,11 +70,11 @@ export async function publishEvent(topicName, eventType, payload, attributes = {
       topicName,
     });
 
-    throw new HireRiseError(
-      ErrorCodes.PUBSUB_PUBLISH_FAILED,
-      `Failed to publish event ${eventType}`,
-      { topicName }
-    );
+    // Re-throw as a plain error so callers don't need to import HireRiseError
+    const wrapped = new Error(`Failed to publish event ${eventType} to ${topicName}: ${err.message}`);
+    wrapped.code  = 'PUBSUB_PUBLISH_FAILED';
+    wrapped.cause = err;
+    throw wrapped;
   }
 }
 
@@ -80,7 +84,7 @@ export async function publishEvent(topicName, eventType, payload, attributes = {
 // ────────────────────────────────────────────────────────────
 //
 
-export function createSubscriber(subscriptionName, handler, options = {}) {
+function createSubscriber(subscriptionName, handler, options = {}) {
   const client = getClient();
 
   const subscription = client.subscription(subscriptionName, {
@@ -112,8 +116,8 @@ export function createSubscriber(subscriptionName, handler, options = {}) {
     const childLogger = logger.child({
       subscriptionName,
       pubsubMessageId,
-      eventId: envelope?.eventId,
-      eventType: envelope?.eventType,
+      eventId:         envelope?.eventId,
+      eventType:       envelope?.eventType,
       deliveryAttempt: message.deliveryAttempt,
     });
 
@@ -149,5 +153,8 @@ export function createSubscriber(subscriptionName, handler, options = {}) {
   return subscription;
 }
 
-// Re-export canonical EventTypes (no duplication!)
-export { EventTypes };
+module.exports = {
+  publishEvent,
+  createSubscriber,
+  EventTypes, // re-export for convenience
+};

@@ -89,7 +89,7 @@ exports.generateProjection = async ({
 
   // 4️⃣ Return structured output
   return {
-    userId: userId || 'anonymous',
+    user_id: userId || 'anonymous',
     targetRoleId,
     baselineLevel: baseLevel,
     baseSkillCoverage,
@@ -97,3 +97,11 @@ exports.generateProjection = async ({
     projection,
   };
 };
+
+
+
+
+
+
+
+

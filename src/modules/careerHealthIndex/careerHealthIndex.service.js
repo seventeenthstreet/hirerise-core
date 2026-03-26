@@ -23,7 +23,7 @@
  */
 
 const crypto = require('crypto');
-const { db } = require('../../config/firebase');
+const { db } = require('../../config/supabase');
 const { AppError, ErrorCodes } = require('../../middleware/errorHandler');
 const logger = require('../../utils/logger');
 // PROMPT-3: import canonical weights from config — single source of truth
@@ -45,6 +45,18 @@ function stripJson(text) {
 
 // ─── GAP C6: raised from 2 to 5 ──────────────────────────────────────────────
 const TREND_THRESHOLD = 5;
+
+// P2-04: CHI analysisSource state machine.
+// Higher rank = higher quality. A snapshot should only replace an existing one
+// if the new state's rank is >= the existing state's rank.
+// This prevents a quick_provisional from overwriting a full CHI on retry.
+const ANALYSIS_SOURCE_RANK = {
+  teaser:             0,   // industry average — never stored per user
+  quick_provisional:  1,   // from POST /quick-start (4 fields, no career report)
+  provisional:        2,   // from POST /career-report (onboarding data, no resume)
+  resume_scored:      3,   // resume uploaded + scorer ran
+  full:               4,   // resume scored + Track B enrichment
+};
 
 // PROMPT-3: weights injected from careerReadiness.weights.js — not hardcoded
 function buildChiSystemPrompt(region = 'India') {
@@ -73,6 +85,8 @@ Dimensions to score (0-100 each):
 Return this exact structure:
 {
   "chiScore": <integer 0-100, weighted composite>,
+  "detectedProfession": "<the candidate's actual profession/domain detected from their CV — e.g. 'Accountant', 'Software Engineer', 'Doctor', 'HR Manager', 'Data Scientist', 'Nurse', 'Teacher', 'Marketing Manager'. Be specific and accurate — this drives career path suggestions.>",
+  "currentJobTitle": "<their most recent job title exactly as written in their CV>",
   "dimensions": {
     "skillVelocity":   { "score": <0-100>, "insight": "<max 15 words>", "flag": <true|false> },
     "experienceDepth": { "score": <0-100>, "insight": "<max 15 words>", "flag": <true|false> },
@@ -100,15 +114,29 @@ async function fetchResumeData(userId, resumeId) {
     const doc = await db.collection('resumes').doc(resumeId).get();
     if (doc.exists && doc.data().userId === userId) return { ...doc.data(), resumeId };
   }
-  const snap = await db.collection('resumes')
+
+  // Primary: find a fully-scored resume
+  const scoredSnap = await db.collection('resumes')
     .where('userId', '==', userId)
     .where('analysisStatus', '==', 'completed')
     .where('softDeleted', '==', false)
     .orderBy('scoredAt', 'desc')
     .limit(1)
     .get();
-  if (snap.empty) return null;
-  return { ...snap.docs[0].data(), resumeId: snap.docs[0].id };
+  if (!scoredSnap.empty) return { ...scoredSnap.docs[0].data(), resumeId: scoredSnap.docs[0].id };
+
+  // Fallback: use any non-deleted resume even if scoring is still pending.
+  // This handles onboarding-path users whose CV was generated but not yet scored.
+  // The CHI AI prompt can still run against cvContentStructured / resumeText.
+  const anySnap = await db.collection('resumes')
+    .where('userId', '==', userId)
+    .where('softDeleted', '==', false)
+    .orderBy('createdAt', 'desc')
+    .limit(1)
+    .get();
+  if (!anySnap.empty) return { ...anySnap.docs[0].data(), resumeId: anySnap.docs[0].id };
+
+  return null;
 }
 
 async function fetchPreviousSnapshot(userId) {
@@ -212,12 +240,23 @@ function buildPrompt(resumeData, salaryContext, userProfile = {}, jobDemandCount
   }
 
   // careerHistory[] → career momentum arc (roleId + durationMonths are the canonical fields)
+  // P2-02: careerHistory → career momentum arc.
+  // Handles both Track B canonical entries (roleId + durationMonths) and
+  // Track A synthetic fallback entries (jobTitle + durationMonths, source: 'track_a_fallback').
   if (userProfile.careerHistory?.length) {
     const histSummary = userProfile.careerHistory
       .slice(0, 5)
-      .map(r => `${r.roleId}(${r.durationMonths}mo)${r.isCurrent ? ' [current]' : ''}`)
+      .map(r => {
+        const label  = r.roleId || r.jobTitle || 'Unknown Role';
+        const months = r.durationMonths ? r.durationMonths + 'mo' : 'duration unknown';
+        const current = r.isCurrent ? ' [current]' : '';
+        const company = r.company ? ' @ ' + r.company : '';
+        return label + company + '(' + months + ')' + current;
+      })
       .join(', ');
-    parts.push(`- Career History: ${histSummary}`);
+    const sourceNote = userProfile.careerHistory.some(r => r.source === 'track_a_fallback')
+      ? ' [derived from onboarding data]' : '';
+    parts.push('- Career History' + sourceNote + ': ' + histSummary);
   }
 
   if (userProfile.careerStabilityScore !== undefined) {
@@ -364,145 +403,162 @@ function calculateChiConfidence({
 
   return Math.min(100, confidence);
 }
-// ─── CALCULATE CHI (full — requires scored resume) ────────────────────────────
+
+/**
+ * P2-03: Convert numeric confidence score (0-100) to a labelled tier.
+ * Frontend uses the label to decide how to render the score (grey/blue/normal/badge).
+ *
+ * Thresholds:
+ *   < 40  → 'low'       — based on very limited data
+ *   40-69 → 'moderate'  — reasonable estimate, more data would help
+ *   70-84 → 'high'      — solid data foundation
+ *   85+   → 'very_high' — comprehensive profile
+ */
+function getConfidenceLabel(score) {
+  if (score >= 85) return 'very_high';
+  if (score >= 70) return 'high';
+  if (score >= 40) return 'moderate';
+  return 'low';
+}
 
 async function calculateChi(userId, resumeId) {
   if (!userId) throw new AppError('userId is required', 400, {}, ErrorCodes.VALIDATION_ERROR);
 
-  const resumeData = await fetchResumeData(userId, resumeId);
-  if (!resumeData) throw new AppError('No scored resume found. Please upload and score a resume first.', 404, { userId }, ErrorCodes.NOT_FOUND);
-
-  // GAP C3/C5: fetch profile and job demand in parallel
-  const [previousSnapshot, salaryContext, userProfile, jobDemandCount] = await Promise.all([
-    fetchPreviousSnapshot(userId),
-    fetchSalaryContext(resumeData.targetRole),
-    db.collection('userProfiles').doc(userId).get().then(s => s.exists ? s.data() : {}),
-    fetchJobDemandCount(resumeData.targetRole),
-  ]);
-
-  // GAP C2: infer region from profile
-  const region    = _inferRegion(userProfile.currentCountry, userProfile.currentCity);
-  const userPrompt = buildPrompt(resumeData, salaryContext, userProfile, jobDemandCount);
-
-  let analysis;
   try {
-    const anthropic = getAnthropicClient();
-    const response  = await anthropic.messages.create({
-      model: MODEL, max_tokens: 1024,
-      system: buildChiSystemPrompt(region),
-      messages: [{ role: 'user', content: userPrompt }],
+
+    // ── 1. Fetch resume ──────────────────────────────────────────────────────
+    const resumeData = await fetchResumeData(userId, resumeId);
+    if (!resumeData) {
+      throw new AppError(
+        'No resume found. Please upload and score a resume first.',
+        404, { userId }, ErrorCodes.NOT_FOUND
+      );
+    }
+
+    // ── 2. Fetch supporting context in parallel ───────────────────────────────
+    const [previousSnapshot, salaryContext, userProfile, jobDemandCount] = await Promise.all([
+      fetchPreviousSnapshot(userId),
+      fetchSalaryContext(resumeData.targetRole),
+      db.collection('userProfiles').doc(userId).get().then(s => s.exists ? s.data() : {}),
+      fetchJobDemandCount(resumeData.targetRole),
+    ]);
+
+    // ── 3. Build prompt ───────────────────────────────────────────────────────
+    const region     = _inferRegion(userProfile.currentCountry, userProfile.currentCity);
+    const userPrompt = buildPrompt(resumeData, salaryContext, userProfile, jobDemandCount);
+
+    // ── 4. Call Anthropic ─────────────────────────────────────────────────────
+    let analysis;
+    try {
+      const anthropic = getAnthropicClient();
+      const response  = await anthropic.messages.create({
+        model: MODEL, max_tokens: 1024,
+        system: buildChiSystemPrompt(region),
+        messages: [{ role: 'user', content: userPrompt }],
+      });
+      const rawText = response.content.filter(b => b.type === 'text').map(b => b.text).join('');
+      analysis = JSON.parse(stripJson(rawText));
+    } catch (aiErr) {
+      logger.error('[CHIService] Anthropic call failed', { userId, error: aiErr.message, stack: aiErr.stack });
+      throw new AppError(
+        'Career Health Index calculation failed. Please try again.',
+        502, { userId }, ErrorCodes.EXTERNAL_SERVICE_ERROR
+      );
+    }
+
+    // ── 5. Blend deterministic score with AI dimensions ───────────────────────
+    const deterministicScore = calculateDeterministicScore({ resumeData, userProfile, jobDemandCount });
+    const blendedDimensions  = {};
+
+    for (const key of Object.keys(analysis.dimensions ?? {})) {
+      const aiScore = analysis.dimensions[key]?.score ?? 50;
+      blendedDimensions[key] = {
+        score:   Math.min(100, Math.max(0, Math.round((aiScore + deterministicScore) / 2))),
+        insight: analysis.dimensions[key]?.insight || '',
+        flag:    aiScore < 50,
+      };
+    }
+
+    if (Object.keys(blendedDimensions).length === 0) {
+      Object.assign(blendedDimensions, analysis.dimensions ?? {});
+    }
+
+    // ── 6. Compute final weighted CHI score ───────────────────────────────────
+    const finalChiScore = CHI_DIMENSIONS.reduce(
+      (sum, dim) => sum + (blendedDimensions[dim]?.score ?? analysis.dimensions?.[dim]?.score ?? 0) * WEIGHTS[dim],
+      0
+    );
+    analysis.chiScore   = Math.round(finalChiScore);
+    analysis.dimensions = blendedDimensions;
+
+    const chiConfidence = calculateChiConfidence({ resumeData, userProfile, jobDemandCount });
+
+    // ── 7. Build and persist snapshot ────────────────────────────────────────
+    const trend      = calculateTrend(analysis.chiScore, previousSnapshot);
+    const now        = new Date();
+    const snapshotId = crypto.randomUUID();
+
+    const snapshot = {
+      snapshotId,
+      userId,
+      resumeId:                    resumeData.resumeId,
+      chiScore:                    analysis.chiScore,
+      chiConfidence,
+      confidence:                  getConfidenceLabel(chiConfidence),
+      dimensions:                  blendedDimensions,
+      // CV-derived profession fields — used by frontend for accurate career path suggestions
+      detectedProfession:          analysis.detectedProfession ?? null,
+      currentJobTitle:             analysis.currentJobTitle ?? null,
+      // topSkills from the resume — required by deriveCareerPaths() on the frontend
+      // to route to the correct career domain block (accounting, engineering, etc.)
+      topSkills:                   resumeData.topSkills ?? [],
+      // Phase 3: store experience years so career stage timeline uses real data
+      estimatedExperienceYears:    resumeData.estimatedExperienceYears ?? null,
+      topStrength:                 analysis.topStrength,
+      criticalGap:                 analysis.criticalGap,
+      marketPosition:              analysis.marketPosition,
+      peerComparison:              analysis.peerComparison,
+      projectedLevelUpMonths:      analysis.projectedLevelUpMonths,
+      currentEstimatedSalaryLPA:   analysis.currentEstimatedSalaryLPA,
+      nextLevelEstimatedSalaryLPA: analysis.nextLevelEstimatedSalaryLPA,
+      trend,
+      analysisSource:              'full',
+      aiModelVersion:              MODEL,
+      region,
+      generatedAt:                 now,
+      softDeleted:                 false,
+    };
+
+    try {
+      await db.collection('careerHealthIndex').doc(snapshotId).set(snapshot);
+    } catch (persistErr) {
+      logger.warn('[CHIService] Failed to persist CHI snapshot', { userId, error: persistErr.message });
+    }
+
+    logger.info('[CHIService] CHI calculated successfully', {
+      userId, chiScore: analysis.chiScore, snapshotId, region,
     });
-    const rawText = response.content.filter(b => b.type === 'text').map(b => b.text).join('');
-    analysis = JSON.parse(stripJson(rawText));
 
-/* ──────────────────────────────────────────────────────────────
-   Deterministic Dimension Engine
-────────────────────────────────────────────────────────────── */
+    // Phase 3: log activity event for streak tracking (non-blocking)
+    try {
+      const { logEvent } = require('../userActivity/userActivity.service');
+      logEvent(userId, 'chi_calculated', { chiScore: analysis.chiScore, snapshotId });
+    } catch { /* non-fatal */ }
 
-const deterministic = calculateDeterministicDimensions({
-  resumeData,
-  userProfile,
-  jobDemandCount
-});
+    return { ...snapshot, generatedAt: now.toISOString() };
 
-/* ──────────────────────────────────────────────────────────────
-   Blend Each Dimension (60% deterministic / 40% AI)
-────────────────────────────────────────────────────────────── */
-
-const blendedDimensions = {};
-
-for (const key of Object.keys(deterministic)) {
-
-  const aiScore = analysis.dimensions?.[key]?.score ?? 50;
-  const deterministicScore = deterministic[key];
-
-  const blendedScore = Math.round(
-    (deterministicScore * 0.6) +
-    (aiScore * 0.4)
-  );
-
-  blendedDimensions[key] = {
-    score: blendedScore,
-    insight: analysis.dimensions?.[key]?.insight || '',
-    flag: blendedScore < 50
-  };
-}
-
-/* ──────────────────────────────────────────────────────────────
-   Compute Final Weighted CHI Score (System-Controlled)
-────────────────────────────────────────────────────────────── */
-
-// PROMPT-3: compute final score from config WEIGHTS — no hardcoded values
-const finalChiScore = CHI_DIMENSIONS.reduce(
-  (sum, dim) => sum + (blendedDimensions[dim]?.score ?? 0) * WEIGHTS[dim],
-  0
-);
-
-analysis.chiScore = Math.round(finalChiScore);
-analysis.dimensions = blendedDimensions;
-const chiConfidence = calculateChiConfidence({
-  resumeData,
-  userProfile,
-  jobDemandCount
-});
-    // ── Deterministic Score Layer ─────────────────────────
-
-const deterministicScore = calculateDeterministicScore({
-  resumeData,
-  userProfile,
-  jobDemandCount
-});
-
-// 50/50 blend
-const blendedScore = Math.round(
-  (analysis.chiScore * 0.5) +
-  (deterministicScore * 0.5)
-);
-
-analysis.chiScore = blendedScore;
-analysis.deterministicScore = deterministicScore;
-analysis.aiScore = analysis.chiScore;
   } catch (err) {
-    logger.error('[CHIService] Claude CHI analysis failed', { userId, error: err.message });
-    throw new AppError('Career Health Index calculation failed. Please try again.', 502, { userId }, ErrorCodes.EXTERNAL_SERVICE_ERROR);
+    // Re-throw AppErrors as-is (they have statusCode + isOperational)
+    if (err.isOperational) throw err;
+    // Wrap any unexpected raw errors so they return 500 with a clean message
+    logger.error('[CHIService] Unexpected error in calculateChi', {
+      userId, error: err.message, stack: err.stack,
+    });
+    throw new AppError(
+      'Career Health Index calculation failed. Please try again.',
+      500, { userId }, ErrorCodes.INTERNAL_ERROR
+    );
   }
-
-  const trend      = calculateTrend(analysis.chiScore, previousSnapshot);
-  const now        = new Date();
-  const snapshotId = crypto.randomUUID();
-
-  const snapshot = {
-  snapshotId,
-  userId,
-  resumeId: resumeData.resumeId,
-
-  chiScore: analysis.chiScore,
-  chiConfidence,                // ✅ NEW
-  dimensions: blendedDimensions,
-  deterministicDimensions: deterministic,
-
-  topStrength: analysis.topStrength,
-  criticalGap: analysis.criticalGap,
-  marketPosition: analysis.marketPosition,
-  peerComparison: analysis.peerComparison,
-  projectedLevelUpMonths: analysis.projectedLevelUpMonths,
-  currentEstimatedSalaryLPA: analysis.currentEstimatedSalaryLPA,
-  nextLevelEstimatedSalaryLPA: analysis.nextLevelEstimatedSalaryLPA,
-
-  trend,
-  analysisSource: 'full',
-  region,
-  generatedAt: now,
-  softDeleted: false,
-};
-
-  try {
-    await db.collection('careerHealthIndex').doc(snapshotId).set(snapshot);
-  } catch (err) {
-    logger.warn('[CHIService] Failed to persist CHI snapshot', { userId, error: err.message });
-  }
-
-  return { ...snapshot, generatedAt: now.toISOString() };
 }
 
 // ─── GAP S2: PROVISIONAL CHI (no resume required) ────────────────────────────
@@ -525,37 +581,61 @@ analysis.aiScore = analysis.chiScore;
 async function calculateProvisionalChi(userId, onboardingData, profileData, careerReport, userTier = 'free') {
   if (!userId) return;
 
-  // HOTFIX FIX-4: Idempotency guard — skip if a provisional CHI already exists
-  // that was generated after the career report was saved to onboardingProgress.
-  // Uses the careerReport's updatedAt as a reference fence.
+  // A-01 FIX: Rank guard — fetch the most recent snapshot of ANY analysisSource.
+  // If an existing snapshot has a rank >= the rank we are about to write, skip.
+  // This prevents a provisional (rank 2) or quick_provisional (rank 1) write from
+  // silently overwriting a resume_scored (rank 3) or full (rank 4) snapshot on retry.
+  //
+  // Previously this guard only checked .where('analysisSource', '==', 'provisional'),
+  // meaning a retry after a full CHI was generated would still overwrite it.
+  const newSource = careerReport ? 'provisional' : 'quick_provisional';
+  const newRank   = ANALYSIS_SOURCE_RANK[newSource] ?? 0;
+
   try {
-    const existingSnap = await db.collection('careerHealthIndex')
+    const latestSnap = await db.collection('careerHealthIndex')
       .where('userId', '==', userId)
-      .where('analysisSource', '==', 'provisional')
       .where('softDeleted', '==', false)
       .orderBy('generatedAt', 'desc')
       .limit(1)
       .get();
 
-    if (!existingSnap.empty) {
-      const existing = existingSnap.docs[0].data();
-      // careerReportSavedAt is set by generateCareerReport before triggerProvisionalChi fires.
-      // If a provisional CHI already exists from after the report was saved, skip.
-      const reportSavedAt = onboardingData.updatedAt
-        ? new Date(onboardingData.updatedAt instanceof Date
-            ? onboardingData.updatedAt
-            : onboardingData.updatedAt.toDate?.() ?? onboardingData.updatedAt)
-        : null;
-      const chiGeneratedAt = existing.generatedAt?.toDate?.() ?? new Date(existing.generatedAt);
+    if (!latestSnap.empty) {
+      const existing      = latestSnap.docs[0].data();
+      const existingRank  = ANALYSIS_SOURCE_RANK[existing.analysisSource] ?? 0;
 
-      if (reportSavedAt && chiGeneratedAt >= reportSavedAt) {
-        logger.info('[CHIService] Provisional CHI already exists for current career report — skipping', { userId });
+      // A-01 FIX (corrected): use strict > so the === branch below is reachable.
+      // existingRank > newRank  → existing is higher quality, always skip.
+      // existingRank === newRank → same quality tier; apply idempotency fence.
+      // existingRank < newRank  → we are upgrading quality, proceed.
+      if (existingRank > newRank) {
+        logger.info('[CHIService] Rank guard — skipping provisional write (existing snapshot has higher quality)', {
+          userId,
+          existingSource: existing.analysisSource,
+          existingRank,
+          newSource,
+          newRank,
+        });
         return;
+      }
+
+      // Idempotency fence: same rank — skip only if the existing snapshot was
+      // generated AFTER the current career report was saved (prevents double-write on retry).
+      if (existingRank === newRank) {
+        const reportSavedAt = onboardingData.updatedAt
+          ? new Date(onboardingData.updatedAt instanceof Date
+              ? onboardingData.updatedAt
+              : onboardingData.updatedAt.toDate?.() ?? onboardingData.updatedAt)
+          : null;
+        const chiGeneratedAt = existing.generatedAt?.toDate?.() ?? new Date(existing.generatedAt);
+        if (reportSavedAt && chiGeneratedAt >= reportSavedAt) {
+          logger.info('[CHIService] Idempotency fence — provisional CHI already exists for this career report', { userId });
+          return;
+        }
       }
     }
   } catch (guardErr) {
-    // Guard failure is non-fatal — proceed to generate CHI
-    logger.warn('[CHIService] Provisional CHI idempotency check failed — proceeding', { userId, error: guardErr.message });
+    // Guard failure is non-fatal — proceed to generate CHI rather than silently drop it.
+    logger.warn('[CHIService] Rank guard check failed — proceeding with generation', { userId, error: guardErr.message });
   }
 
   // HOTFIX FIX-1: Free-tier users use Sonnet instead of Opus for provisional CHI.
@@ -588,7 +668,39 @@ async function calculateProvisionalChi(userId, onboardingData, profileData, care
     fetchJobDemandCount(syntheticResumeData.targetRole),
   ]);
 
-  const userPrompt = buildPrompt(syntheticResumeData, salaryContext, profileData, jobDemandCount);
+  // P2-01: careerHistory fallback — derive synthetic entries from Track A experience[]
+  // when profileData.careerHistory is empty (Track B not yet completed).
+  // Without this, careerStabilityScore / promotionVelocity / specializationType are all null
+  // inside buildPrompt(), causing those CHI signals to score at 50 (default) for ~80% of users.
+  // The synthetic entries use jobTitle as a proxy for roleId — not ideal but prevents null signals.
+  const resolvedProfileData = { ...profileData };
+  if (!resolvedProfileData.careerHistory?.length) {
+    const experience = onboardingData.experience || [];
+    if (experience.length > 0) {
+      resolvedProfileData.careerHistory = experience.map(exp => {
+        // Compute durationMonths from startDate/endDate
+        let durationMonths = 0;
+        if (exp.startDate) {
+          const start = new Date(exp.startDate + '-01');
+          const end   = exp.isCurrent ? new Date() : (exp.endDate ? new Date(exp.endDate + '-01') : new Date());
+          durationMonths = Math.max(1, Math.round((end - start) / (1000 * 60 * 60 * 24 * 30.44)));
+        }
+        return {
+          roleId:         null,               // unknown — Track B maps this properly
+          jobTitle:       exp.jobTitle,        // proxy for roleId
+          company:        exp.company,
+          durationMonths,
+          isCurrent:      exp.isCurrent || false,
+          source:         'track_a_fallback',  // P2-01: marks synthetic entries
+        };
+      });
+      logger.debug('[CHIService] P2-01: synthetic careerHistory derived from Track A experience', {
+        userId, entryCount: resolvedProfileData.careerHistory.length,
+      });
+    }
+  }
+
+  const userPrompt = buildPrompt(syntheticResumeData, salaryContext, resolvedProfileData, jobDemandCount);
 
   let analysis;
   try {
@@ -613,6 +725,15 @@ async function calculateProvisionalChi(userId, onboardingData, profileData, care
     snapshotId, userId,
     resumeId:                    null,
     chiScore:                    analysis.chiScore,
+    // P2-03: confidence label — provisional scores are inherently moderate/low
+    // since no resume has been scored yet. Compute from available onboarding signals.
+    chiConfidence:               Math.max(10, Math.min(60,
+      (syntheticResumeData.topSkills?.length || 0) * 5 +
+      (syntheticResumeData.estimatedExperienceYears > 0 ? 15 : 0) +
+      ((onboardingData.expectedRoleIds || profileData.expectedRoleIds || []).length > 0 ? 15 : 0) +
+      (profileData.currentSalaryLPA ? 10 : 0)
+    )),
+    get confidence() { return getConfidenceLabel(this.chiConfidence); },
     dimensions:                  analysis.dimensions,
     topStrength:                 analysis.topStrength,
     criticalGap:                 analysis.criticalGap,
@@ -622,7 +743,13 @@ async function calculateProvisionalChi(userId, onboardingData, profileData, care
     currentEstimatedSalaryLPA:   analysis.currentEstimatedSalaryLPA,
     nextLevelEstimatedSalaryLPA: analysis.nextLevelEstimatedSalaryLPA,
     trend,
-    analysisSource: 'provisional', // Key distinction from full CHI
+    // P2-04: analysisSource reflects data quality tier.
+    // 'quick_provisional' — triggered from /quick-start before career report exists.
+    // 'provisional'       — triggered from /career-report with full onboarding data.
+    analysisSource: newSource, // A-01 FIX: reuses newSource computed in rank guard above
+    // GAP-M3: store the resolved model so provisional vs full CHI snapshots can be
+    // compared against the correct model version baseline.
+    aiModelVersion: resolvedModel,
     region,
     generatedAt:    now,
     softDeleted:    false,
@@ -686,12 +813,30 @@ function _buildProvisionalResumeText(onboardingData, profileData, careerReport) 
 }
 
 function _inferRegion(country, city) {
+  // P0-03: Match ISO 3166-1 alpha-2 codes FIRST (exact, case-insensitive) before
+  // falling through to the broader substring scan.
+  // Previously, "US" / "IN" / "GB" would not match "united states" / "india" / "united kingdom"
+  // substrings when the caller passed the short country code, causing all Gulf/SEA/Western
+  // users to fall through to the India default and break salary benchmarking.
+  const iso = (country || '').trim().toUpperCase();
+  const ISO_MAP = {
+    'AE': 'Gulf (UAE/Saudi)', 'SA': 'Gulf (UAE/Saudi)', 'QA': 'Gulf (UAE/Saudi)',
+    'BH': 'Gulf (UAE/Saudi)', 'KW': 'Gulf (UAE/Saudi)', 'OM': 'Gulf (UAE/Saudi)',
+    'GB': 'United Kingdom',
+    'US': 'United States',
+    'SG': 'Singapore',
+    'AU': 'Australia',
+    'IN': 'India',
+  };
+  if (ISO_MAP[iso]) return ISO_MAP[iso];
+
+  // Fallback: substring scan for full country names and major city names.
   const c = ((country || '') + ' ' + (city || '')).toLowerCase();
-  if (['ae', 'uae', 'dubai', 'abu dhabi', 'sharjah', 'saudi', 'qatar', 'bahrain', 'kuwait', 'oman'].some(k => c.includes(k))) return 'Gulf (UAE/Saudi)';
-  if (['uk', 'gb', 'united kingdom', 'london', 'manchester'].some(k => c.includes(k))) return 'United Kingdom';
-  if (['us', 'usa', 'united states'].some(k => c.includes(k))) return 'United States';
-  if (['sg', 'singapore'].some(k => c.includes(k))) return 'Singapore';
-  if (['au', 'australia'].some(k => c.includes(k))) return 'Australia';
+  if (['uae', 'dubai', 'abu dhabi', 'sharjah', 'saudi', 'qatar', 'bahrain', 'kuwait', 'oman'].some(k => c.includes(k))) return 'Gulf (UAE/Saudi)';
+  if (['united kingdom', 'london', 'manchester', 'birmingham', 'edinburgh'].some(k => c.includes(k))) return 'United Kingdom';
+  if (['united states', 'usa', 'new york', 'san francisco', 'seattle', 'chicago'].some(k => c.includes(k))) return 'United States';
+  if (['singapore'].some(k => c.includes(k))) return 'Singapore';
+  if (['australia', 'sydney', 'melbourne', 'brisbane'].some(k => c.includes(k))) return 'Australia';
   return 'India';
 }
 
@@ -749,4 +894,13 @@ module.exports = {
   calculateProvisionalChi,
   getLatestChi,
   getChiHistory,
+  ANALYSIS_SOURCE_RANK,   // P2-04: state machine rank table
 };
+
+
+
+
+
+
+
+

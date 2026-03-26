@@ -56,3 +56,11 @@ module.exports = {
   // ─── Experience Buckets (for validation) ─────────────────────────────────────
   VALID_EXPERIENCE_BUCKETS: ["0-2", "3-5", "6-10", "10+"],
 };
+
+
+
+
+
+
+
+

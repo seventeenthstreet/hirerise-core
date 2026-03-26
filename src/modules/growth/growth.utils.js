@@ -41,3 +41,12 @@ exports.projectPromotionReadiness = (
 
   return { score, label: 'Needs Work' };
 };
+
+
+
+
+
+
+
+
+

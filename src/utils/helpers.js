@@ -56,3 +56,12 @@ const sendPaginated = (res, items, { page, limit, total }) => {
 };
 
 module.exports = { asyncHandler, sendSuccess, sendPaginated };
+
+
+
+
+
+
+
+
+

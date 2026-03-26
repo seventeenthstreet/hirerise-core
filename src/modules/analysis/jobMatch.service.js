@@ -1,4 +1,5 @@
 'use strict';
+/* Canonical version — import from this path only. src/services/ copy deleted (B-02). */
 
 /**
  * analysis.service.js
@@ -21,7 +22,7 @@
  * Backend is the single authority.
  */
 
-const { db } = require('../../config/firebase');
+const { db } = require('../../config/supabase');
 const { AppError, ErrorCodes } = require('../../middleware/errorHandler');
 const logger = require('../../utils/logger');
 
@@ -307,3 +308,11 @@ async function runAnalysis({ userId, resumeId, operationType, tier }) {
 }
 
 module.exports = { runAnalysis };
+
+
+
+
+
+
+
+

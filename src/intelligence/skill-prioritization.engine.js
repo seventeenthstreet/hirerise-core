@@ -1,13 +1,75 @@
 "use strict";
 
+const path   = require('path');
+const fs     = require('fs');
 const config = require("../config/skillPriorityWeights");
 const logger = require("../utils/logger");
 
-const promotionModel = require("./models/promotion.model");
-const confidenceModel = require("./models/confidence.model");
-const synergyModel = require("./models/synergy.model");
-const explainabilityModel = require("./models/explainability.model");
-const learningModel = require("./models/learning.model");
+const promotionModel      = require("./models/promotion.model");
+const confidenceModel     = require("./models/confidence.model");
+const synergyModel        = require("./models/synergy.model");
+const explainabilityModel = require("../modules/explainability.model");
+const learningModel       = require("./models/learning.model");
+
+// ─── CSV dataset loader (in-memory cache) ─────────────────────────────────────
+
+const DATA_DIR           = path.resolve(__dirname, '../data');
+const SKILLS_DEMAND_FILE = path.join(DATA_DIR, 'skills-demand-india.csv');
+const ROLE_SKILLS_FILE   = path.join(DATA_DIR, 'role-skills.csv');
+
+let _csvCache = null;
+
+function _loadCSVDatasets() {
+  if (_csvCache) return _csvCache;
+
+  function parseCSV(filePath) {
+    if (!fs.existsSync(filePath)) return [];
+    const lines   = fs.readFileSync(filePath, 'utf8').split(/\r?\n/).filter(Boolean);
+    const headers = lines[0].split(',').map(h => h.trim().replace(/^"|"$/g, ''));
+    return lines.slice(1).map(line => {
+      // Handle quoted fields containing commas
+      const fields = [];
+      let cur = '', inQ = false;
+      for (const ch of line) {
+        if (ch === '"') { inQ = !inQ; }
+        else if (ch === ',' && !inQ) { fields.push(cur.trim()); cur = ''; }
+        else { cur += ch; }
+      }
+      fields.push(cur.trim());
+      const row = {};
+      headers.forEach((h, i) => { row[h] = (fields[i] || '').replace(/^"|"$/g, '').trim(); });
+      return row;
+    }).filter(r => Object.values(r).some(Boolean));
+  }
+
+  const skillRows = parseCSV(SKILLS_DEMAND_FILE);
+  const roleRows  = parseCSV(ROLE_SKILLS_FILE);
+
+  // Build skill demand map: normalised_name → record
+  const skillDemandMap = {};
+  for (const row of skillRows) {
+    if (!row.skill) continue;
+    const key = row.skill.toLowerCase().trim();
+    skillDemandMap[key] = {
+      skill:        row.skill,
+      demand_score: parseFloat(row.demand_score) || 0,
+      growth_rate:  parseFloat(row.growth_rate)  || 0,
+      salary_boost: parseFloat(row.salary_boost) || 0,
+      industry:     row.industry || 'General',
+    };
+  }
+
+  // Build role-skills map: normalised_role → string[]
+  const roleSkillsMap = {};
+  for (const row of roleRows) {
+    if (!row.role) continue;
+    const skills = (row.skills || '').split(',').map(s => s.trim()).filter(Boolean);
+    roleSkillsMap[row.role.toLowerCase().trim()] = skills;
+  }
+
+  _csvCache = { skillDemandMap, roleSkillsMap };
+  return _csvCache;
+}
 
 class SkillPrioritizationEngine {
   constructor({
@@ -17,9 +79,9 @@ class SkillPrioritizationEngine {
     userRepo,
   }) {
     this._roleSkillMatrixRepo = roleSkillMatrixRepo;
-    this._careerGraphRepo = careerGraphRepo;
-    this._skillMarketRepo = skillMarketRepo;
-    this._userRepo = userRepo;
+    this._careerGraphRepo     = careerGraphRepo;
+    this._skillMarketRepo     = skillMarketRepo;
+    this._userRepo            = userRepo;
   }
 
   // ═══════════════════════════════════════════════════════════════════
@@ -290,7 +352,7 @@ class SkillPrioritizationEngine {
     // ═══════════════════════════════════════════════════════════════════
 
     this._emitObservabilityLog({
-      userId: profile.userId,
+      user_id: profile.userId,
       targetRoleId:
         profile.targetRoleId,
       totalSkillsEvaluated:
@@ -307,6 +369,345 @@ class SkillPrioritizationEngine {
     });
 
     return result;
+  }
+
+  // ═══════════════════════════════════════════════════════════════════
+  // VALIDATE INPUT
+  // Normalises the caller's input into a clean profile object.
+  // ═══════════════════════════════════════════════════════════════════
+
+  validateInput(input) {
+    if (!input || typeof input !== 'object') {
+      throw Object.assign(new Error('Input must be an object'), { statusCode: 422 });
+    }
+
+    const userId         = input.userId         || null;
+    const experienceYears = Number(input.experienceYears) || 0;
+    const resumeScore     = Number(input.resumeScore)    || 50;
+
+    // Normalise role — accept display name (e.g. "Software Engineer") or role_id
+    const targetRoleId  = this._normaliseRoleId(
+      input.targetRoleId || input.targetRole || ''
+    );
+    const currentRoleId = this._normaliseRoleId(
+      input.currentRoleId || input.currentRole || ''
+    );
+
+    // Normalise skills — accept string[] or {skillId, proficiencyLevel}[]
+    const rawSkills = Array.isArray(input.skills) ? input.skills : [];
+    const skills = rawSkills.map(s => {
+      if (typeof s === 'string') {
+        return {
+          skillId:          this._normaliseSkillId(s),
+          skillName:        s,
+          proficiencyLevel: 50,
+        };
+      }
+      return {
+        skillId:          this._normaliseSkillId(s.skillId || s.name || ''),
+        skillName:        s.skillName || s.name || s.skillId || '',
+        proficiencyLevel: Number(s.proficiencyLevel || s.proficiency || 50),
+      };
+    }).filter(s => s.skillId);
+
+    if (!targetRoleId) {
+      throw Object.assign(
+        new Error('targetRoleId or targetRole is required'),
+        { statusCode: 422 }
+      );
+    }
+
+    return {
+      userId,
+      targetRoleId,
+      currentRoleId,
+      experienceYears,
+      resumeScore,
+      skills,
+    };
+  }
+
+  // ═══════════════════════════════════════════════════════════════════
+  // FETCH ROLE SKILL MATRIX
+  // Returns the required skills for the target role.
+  // Falls back to the existing repo, then to the CSV role-skills dataset.
+  // ═══════════════════════════════════════════════════════════════════
+
+  async fetchRoleSkillMatrix(targetRoleId, currentRoleId) {
+    // 1. Try configured repo (may be a stub — returns null/undefined gracefully)
+    if (this._roleSkillMatrixRepo?.getMatrix) {
+      try {
+        const matrix = await this._roleSkillMatrixRepo.getMatrix(targetRoleId);
+        if (matrix && Object.keys(matrix).length > 0) return matrix;
+      } catch (_) {}
+    }
+
+    // 2. Fall back to CSV role-skills dataset
+    const { roleSkillsMap, skillDemandMap } = _loadCSVDatasets();
+    const normRole = targetRoleId.replace(/_/g, ' ').toLowerCase();
+
+    // Try exact match first, then partial match
+    let required = roleSkillsMap[normRole];
+    if (!required) {
+      const key = Object.keys(roleSkillsMap).find(k =>
+        k.includes(normRole) || normRole.includes(k)
+      );
+      required = key ? roleSkillsMap[key] : [];
+    }
+
+    // Build matrix: { skillId → { skillId, skillName, targetProficiency, skillType } }
+    const matrix = {};
+    for (const skillName of required) {
+      const skillId = this._normaliseSkillId(skillName);
+      const demandRec = skillDemandMap[skillName.toLowerCase().trim()];
+      matrix[skillId] = {
+        skillId,
+        skillName,
+        targetProficiency:  75,
+        skillType:          demandRec ? 'CORE' : 'ADJACENT',
+        demandScore:        demandRec?.demand_score || 50,
+        growthRate:         demandRec?.growth_rate  || 0,
+        salaryBoost:        demandRec?.salary_boost || 0,
+      };
+    }
+
+    return matrix;
+  }
+
+  // ═══════════════════════════════════════════════════════════════════
+  // FETCH MARKET DEMAND DATA
+  // Returns a map: skillId → { demandScore, promotionBoost, cluster, futureTrend }
+  // ═══════════════════════════════════════════════════════════════════
+
+  async fetchMarketDemandData(targetRoleId) {
+    // Try configured repo first
+    if (this._skillMarketRepo?.getMarketData) {
+      try {
+        const data = await this._skillMarketRepo.getMarketData(targetRoleId);
+        if (data && Object.keys(data).length > 0) return data;
+      } catch (_) {}
+    }
+
+    // Fall back to CSV skills-demand-india.csv
+    const { skillDemandMap } = _loadCSVDatasets();
+    const result = {};
+
+    for (const [normName, rec] of Object.entries(skillDemandMap)) {
+      const skillId = this._normaliseSkillId(rec.skill);
+      result[skillId] = {
+        demandScore:    rec.demand_score,
+        // promotionBoost: derived from salary_boost + demand_score
+        promotionBoost: Math.round((rec.salary_boost * 0.5) + (rec.demand_score * 0.3)),
+        // cluster: simple heuristic from demand level
+        cluster: rec.demand_score >= 80 ? 'CORE'
+               : rec.demand_score >= 60 ? 'ADJACENT'
+               : rec.demand_score >= 40 ? 'TREND'
+               : 'LEADERSHIP',
+        // futureTrend: proxy from growth_rate
+        futureTrend: Math.min(100, Math.round(rec.growth_rate * 2 + 40)),
+      };
+    }
+
+    return result;
+  }
+
+  // ═══════════════════════════════════════════════════════════════════
+  // FETCH SALARY IMPACT DATA
+  // Returns a map: skillId → { salaryDelta }
+  // ═══════════════════════════════════════════════════════════════════
+
+  async fetchSalaryImpactData(targetRoleId) {
+    const { skillDemandMap } = _loadCSVDatasets();
+    const result = {};
+
+    for (const [, rec] of Object.entries(skillDemandMap)) {
+      const skillId = this._normaliseSkillId(rec.skill);
+      result[skillId] = {
+        // salary_boost is already 0-100 scale in the CSV
+        salaryDelta: Math.min(100, Math.max(0, rec.salary_boost || 0)),
+      };
+    }
+
+    return result;
+  }
+
+  // ═══════════════════════════════════════════════════════════════════
+  // COMPUTE SKILL GAP
+  // Compares user skills against role matrix to produce gap entries.
+  // ═══════════════════════════════════════════════════════════════════
+
+  computeSkillGap(userSkills, roleSkillMatrix) {
+    const userSkillMap = {};
+    for (const s of userSkills) {
+      userSkillMap[s.skillId] = s.proficiencyLevel;
+    }
+
+    const gaps = [];
+
+    for (const [skillId, roleSk] of Object.entries(roleSkillMatrix)) {
+      const currentProf       = userSkillMap[skillId] ?? 0;
+      const targetProf        = roleSk.targetProficiency ?? 75;
+      const proficiencyGap    = Math.max(0, targetProf - currentProf);
+
+      // Only include skills where there's a real gap
+      if (proficiencyGap > 0) {
+        gaps.push({
+          skillId,
+          skillName:           roleSk.skillName || skillId,
+          currentProficiency:  currentProf,
+          targetProficiency:   targetProf,
+          proficiencyGap,
+          skillType:           roleSk.skillType || 'CORE',
+        });
+      }
+    }
+
+    // Also include user skills not in role matrix but with high demand (market gaps)
+    const { skillDemandMap } = _loadCSVDatasets();
+    const matrixSkillIds     = new Set(Object.keys(roleSkillMatrix));
+
+    for (const userSkill of userSkills) {
+      if (matrixSkillIds.has(userSkill.skillId)) continue;
+      const demandKey = userSkill.skillName?.toLowerCase().trim() || '';
+      const demandRec = skillDemandMap[demandKey];
+      if (demandRec && demandRec.demand_score >= 70 && userSkill.proficiencyLevel < 70) {
+        gaps.push({
+          skillId:            userSkill.skillId,
+          skillName:          userSkill.skillName,
+          currentProficiency: userSkill.proficiencyLevel,
+          targetProficiency:  75,
+          proficiencyGap:     75 - userSkill.proficiencyLevel,
+          skillType:          'ADJACENT',
+        });
+      }
+    }
+
+    return gaps;
+  }
+
+  // ═══════════════════════════════════════════════════════════════════
+  // RESOLVE SKILL DEPENDENCIES
+  // Identifies which gap skills are "gateway" skills for career progression.
+  // ═══════════════════════════════════════════════════════════════════
+
+  async resolveSkillDependencies(skillIds, careerGraphData) {
+    const dependencies    = {};
+    const gatewaySkills   = new Set();
+    const gatewayWeightMap = {};
+
+    // If we have career graph data, use it to identify gateway skills
+    if (careerGraphData?.requiredSkills?.length) {
+      const requiredSet = new Set(
+        careerGraphData.requiredSkills.map(s =>
+          this._normaliseSkillId(s.skillId || s.name || s)
+        )
+      );
+      for (const skillId of skillIds) {
+        if (requiredSet.has(skillId)) {
+          gatewaySkills.add(skillId);
+          gatewayWeightMap[skillId] = 1 / requiredSet.size;
+        }
+        dependencies[skillId] = [];
+      }
+    } else {
+      // Without career graph: treat top-demand skills as gateway
+      const { skillDemandMap } = _loadCSVDatasets();
+      for (const skillId of skillIds) {
+        dependencies[skillId] = [];
+        // Derive skill name from id (reverse slug)
+        const skillName = skillId.replace(/_/g, ' ');
+        const demandRec = skillDemandMap[skillName] || skillDemandMap[skillId];
+        const demandScore = demandRec?.demand_score || 0;
+        if (demandScore >= 80) {
+          gatewaySkills.add(skillId);
+          gatewayWeightMap[skillId] = 1;
+        }
+      }
+    }
+
+    const totalGatewayWeight = Object.values(gatewayWeightMap)
+      .reduce((sum, w) => sum + w, 0);
+
+    return {
+      dependencies,
+      gatewaySkills,
+      gatewayWeightMap,
+      totalGatewayWeight,
+    };
+  }
+
+  // ═══════════════════════════════════════════════════════════════════
+  // APPLY PROFICIENCY OFFSET
+  // Reduces score for skills already partially mastered (diminishing return).
+  // ═══════════════════════════════════════════════════════════════════
+
+  applyProficiencyOffset(score, currentProficiency) {
+    if (currentProficiency >= config.highProficiencyThreshold) {
+      // High proficiency — significant diminishing return
+      const penalty = (currentProficiency - config.highProficiencyThreshold) / 100;
+      return Math.max(0, score * (1 - penalty * config.proficiencyPenaltyWeight));
+    }
+    if (currentProficiency <= config.weakProficiencyThreshold) {
+      // Very weak proficiency — slight urgency boost (foundational need)
+      return Math.min(100, score * 1.05);
+    }
+    return score;
+  }
+
+  // ═══════════════════════════════════════════════════════════════════
+  // CONTEXTUAL ADJUSTMENTS
+  // ═══════════════════════════════════════════════════════════════════
+
+  _applyContextualAdjustments(
+    marketScore,
+    skillType,
+    cluster,
+    experienceYears,
+    resumeScore
+  ) {
+    let adjusted = marketScore;
+
+    const exp = config.experience;
+
+    // Junior users: boost CORE skills
+    if (experienceYears <= exp.juniorMaxYears && skillType === 'CORE') {
+      adjusted *= (1 + exp.juniorCoreBoost);
+    }
+
+    // Senior users: boost LEADERSHIP cluster
+    if (experienceYears >= exp.seniorMinYears && cluster === 'LEADERSHIP') {
+      adjusted *= (1 + exp.seniorLeadershipBoost);
+    }
+
+    // Low resume score: boost foundational skills
+    if ((resumeScore || 50) < config.resumeScore.lowThreshold && skillType === 'CORE') {
+      adjusted *= (1 + config.resumeScore.foundationalBoost);
+    }
+
+    return Math.min(100, adjusted);
+  }
+
+  // ═══════════════════════════════════════════════════════════════════
+  // NORMALISATION HELPERS
+  // ═══════════════════════════════════════════════════════════════════
+
+  /**
+   * Convert display name or role_id to a normalised slug.
+   * "Software Engineer" → "software_engineer"
+   * "se_2"             → "se_2"  (already a slug)
+   */
+  _normaliseRoleId(raw) {
+    if (!raw) return '';
+    return raw.trim().toLowerCase().replace(/\s+/g, '_').replace(/[^a-z0-9_]/g, '');
+  }
+
+  /**
+   * Convert skill display name or id to a normalised slug.
+   * "Machine Learning" → "machine_learning"
+   */
+  _normaliseSkillId(raw) {
+    if (!raw) return '';
+    return raw.trim().toLowerCase().replace(/\s+/g, '_').replace(/[^a-z0-9_]/g, '');
   }
 
   // ═══════════════════════════════════════════════════════════════════
@@ -427,3 +828,11 @@ class SkillPrioritizationEngine {
 
 module.exports =
   SkillPrioritizationEngine;
+
+
+
+
+
+
+
+

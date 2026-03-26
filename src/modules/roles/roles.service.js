@@ -1,5 +1,15 @@
 'use strict';
 
+// ── Field compatibility helper ────────────────────────────────────────────────
+// CMS-created roles use { name, alternativeTitles, status: 'active' }
+// Seed-script roles use  { title, aliases, active: true }
+// These helpers normalise both shapes so search + validation work on either.
+
+function _roleTitle(d)    { return d.title || d.name || ''; }
+function _roleAliases(d)  { return d.aliases || d.alternativeTitles || []; }
+function _roleIsActive(d) { return d.active === true || d.status === 'active'; }
+
+
 /**
  * roles.service.js — Business logic for the Roles module.
  *
@@ -16,7 +26,7 @@
  *   userProfiles/{userId}       — written by saveOnboardingRoles()
  */
 
-const { db }                   = require('../../config/firebase');
+const { db }                   = require('../../config/supabase');
 const { AppError, ErrorCodes } = require('../../middleware/errorHandler');
 const logger                   = require('../../utils/logger');
 const {
@@ -27,6 +37,8 @@ const {
   PROFILES_COLLECTION,
   DEFAULT_SEARCH_LIMIT,
 } = require('./roles.types');
+
+const CMS_ROLES_COLLECTION = 'cms_roles'; // Admin CMS stores roles here
 
 // ─── Helper: get tier limit for expected roles ────────────────────────────────
 
@@ -64,24 +76,33 @@ async function validateRolesExist(roleIds) {
   // Deduplicate before hitting Firestore to avoid redundant reads
   const uniqueIds = [...new Set(roleIds)];
 
-  const snapshots = await Promise.all(
-    uniqueIds.map(id =>
-      db.collection(ROLES_COLLECTION).doc(id).get()
-        .then(snap => ({ id, snap }))
-    )
-  );
+  // Check both collections in parallel — CMS uses 'cms_roles', seed uses 'roles'
+  const [rolesSnaps, cmsSnaps] = await Promise.all([
+    Promise.all(uniqueIds.map(id =>
+      db.collection(ROLES_COLLECTION).doc(id).get().then(snap => ({ id, snap }))
+    )),
+    Promise.all(uniqueIds.map(id =>
+      db.collection(CMS_ROLES_COLLECTION).doc(id).get().then(snap => ({ id, snap }))
+    )),
+  ]);
 
   const invalidIds   = [];
   const inactiveIds  = [];
   const roleMap      = new Map();
 
-  for (const { id, snap } of snapshots) {
+  for (let i = 0; i < uniqueIds.length; i++) {
+    const id      = uniqueIds[i];
+    // Prefer 'roles' collection; fall back to 'cms_roles'
+    const primary = rolesSnaps[i].snap;
+    const cms     = cmsSnaps[i].snap;
+    const snap    = primary.exists ? primary : cms;
+
     if (!snap.exists) {
       invalidIds.push(id);
       continue;
     }
     const data = snap.data();
-    if (data.active === false) {
+    if (!_roleIsActive(data)) {
       inactiveIds.push(id);
       continue;
     }
@@ -427,7 +448,8 @@ async function getUserProfile(userId) {
  * @returns {Promise<{ roles: object[], grouped: object, total: number }>}
  */
 async function searchRolesForOnboarding({ q, jobFamilyId, limit = 30 } = {}) {
-  let query = db.collection(ROLES_COLLECTION).where('active', '==', true);
+  // Query both collections — CMS uses 'cms_roles', seed script uses 'roles'
+  // Merge results before text filtering.
 
   // jobFamilyId is a low-cardinality Firestore field — safe to filter server-side
   if (jobFamilyId) {
@@ -436,20 +458,30 @@ async function searchRolesForOnboarding({ q, jobFamilyId, limit = 30 } = {}) {
 
   // Over-fetch when text search is active (post-filter in memory)
   const fetchLimit = q ? Math.min(limit * 15, 1000) : limit;
-  query = query.limit(fetchLimit);
 
-  const snap = await query.get();
+  // Fetch from both collections in parallel, merge docs (deduplicate by id)
+  const [rolesSnap, cmsSnap] = await Promise.all([
+    db.collection(ROLES_COLLECTION).limit(fetchLimit).get(),
+    db.collection(CMS_ROLES_COLLECTION).limit(fetchLimit).get(),
+  ]);
+  const seenIds  = new Set();
+  const allDocs  = [];
+  for (const doc of [...rolesSnap.docs, ...cmsSnap.docs]) {
+    if (!seenIds.has(doc.id)) { seenIds.add(doc.id); allDocs.push(doc); }
+  }
 
-  let roles = snap.docs.map(doc => {
+  let roles = allDocs
+    .filter(doc => _roleIsActive(doc.data())) // handles active:true and status:'active'
+    .map(doc => {
     const d = doc.data();
     return {
       id:           doc.id,
-      title:        d.title         || '',
+      title:        _roleTitle(d),
       level:        d.level         || null,
       track:        d.track         || null,
       jobFamilyId:  d.jobFamilyId   || null,
       jobFamilyName: d.jobFamilyName || null,
-      aliases:      d.aliases       || [],
+      aliases:      _roleAliases(d),
       _score:       0, // relevance score, set below
     };
   });
@@ -503,12 +535,175 @@ async function searchRolesForOnboarding({ q, jobFamilyId, limit = 30 } = {}) {
   };
 }
 
+// ─── suggestRolesForOnboarding (P1-05) ───────────────────────────────────────
+
+/**
+ * suggestRolesForOnboarding({ jobTitle, limit })
+ *
+ * P1-05: Purpose-built role suggestion for Quick Start pre-fill.
+ *
+ * PROBLEM:
+ *   When a user types their job title in Quick Start (e.g. "Senior Product Manager"),
+ *   we need to suggest the matching roleId(s) from the roles collection so the
+ *   expectedRoleIds[] picker is pre-filled rather than empty.
+ *
+ * HOW IT WORKS:
+ *   1. Tokenise the input title (lowercase, stopwords removed).
+ *   2. Score every active role by matching tokens against title + aliases.
+ *   3. Return top N results with a 0-100 confidence score.
+ *
+ * Confidence scoring:
+ *   100 — exact title match
+ *   80  — all tokens match (subset)
+ *   60  — title starts with the query
+ *   40  — majority of tokens match
+ *   20  — at least one token matches
+ *
+ * CACHING:
+ *   Responses are cached in-process for 1 hour keyed by normalised jobTitle.
+ *   Role catalogue changes rarely — this avoids unnecessary Firestore reads.
+ *
+ * @param {{ jobTitle: string, limit?: number }} options
+ * @returns {Promise<{ suggestions: Array<{roleId, title, confidence}>, total: number }>}
+ */
+
+// D-03 FIX: Redis-backed suggestion cache shared across all Cloud Run instances.
+// Previously this was a per-instance Map — each instance built its own cache,
+// wasting Firestore reads and AI calls on every scale-out event.
+//
+// Primary:  Redis SETEX with 1-hour TTL (CACHE_PROVIDER=redis)
+// Fallback: In-memory Map (used when Redis is unavailable or not configured)
+//           Falls back gracefully with a warning log so ops can detect it.
+const redis = (() => {
+  try { return require('../../shared/redis.client'); } catch { return null; }
+})();
+
+const _suggestionCache = new Map(); // in-memory fallback — per-instance only
+const SUGGESTION_CACHE_TTL_S  = 60 * 60;       // 1 hour
+const SUGGESTION_CACHE_TTL_MS = SUGGESTION_CACHE_TTL_S * 1000;
+
+async function _getCachedSuggestion(cacheKey) {
+  if (redis) {
+    try {
+      const raw = await redis.get(cacheKey);
+      if (raw) return JSON.parse(raw);
+    } catch (err) {
+      logger.warn('[RolesService] Redis get failed — falling back to in-memory cache', { error: err.message });
+    }
+  }
+  // In-memory fallback
+  const cached = _suggestionCache.get(cacheKey);
+  if (cached && (Date.now() - cached.ts) < SUGGESTION_CACHE_TTL_MS) return cached.result;
+  return null;
+}
+
+async function _setCachedSuggestion(cacheKey, result) {
+  if (redis) {
+    try {
+      await redis.setex(cacheKey, SUGGESTION_CACHE_TTL_S, JSON.stringify(result));
+      return;
+    } catch (err) {
+      logger.warn('[RolesService] Redis setex failed — falling back to in-memory cache', { error: err.message });
+    }
+  }
+  // In-memory fallback
+  _suggestionCache.set(cacheKey, { result, ts: Date.now() });
+  if (_suggestionCache.size > 500) {
+    _suggestionCache.delete(_suggestionCache.keys().next().value);
+  }
+}
+
+async function suggestRolesForOnboarding({ jobTitle, limit = 5 } = {}) {
+  if (!jobTitle || !String(jobTitle).trim()) {
+    return { suggestions: [], total: 0 };
+  }
+
+  const normalised = String(jobTitle).toLowerCase().trim();
+
+  // ── Cache check ───────────────────────────────────────────────────────────
+  const cacheKey = `suggest:${normalised}`;
+  const cached   = await _getCachedSuggestion(cacheKey);
+  if (cached) return cached;
+
+  // ── Fetch active roles ────────────────────────────────────────────────────
+  // Fetch from both collections — CMS uses 'cms_roles', seed script uses 'roles'
+  const [rolesSnap2, cmsSnap2] = await Promise.all([
+    db.collection(ROLES_COLLECTION).limit(1000).get(),
+    db.collection(CMS_ROLES_COLLECTION).limit(1000).get(),
+  ]);
+  const seenIds2 = new Set();
+  const snap = { docs: [] };
+  for (const doc of [...rolesSnap2.docs, ...cmsSnap2.docs]) {
+    if (!seenIds2.has(doc.id)) { seenIds2.add(doc.id); snap.docs.push(doc); }
+  }
+
+  // ── Tokenise query ────────────────────────────────────────────────────────
+  const STOPWORDS = new Set(['a','an','the','of','in','at','for','to','and','or','is','be','with']);
+  const queryTokens = normalised
+    .split(/[\s\-_/]+/)
+    .map(t => t.replace(/[^a-z0-9]/g, ''))
+    .filter(t => t.length > 1 && !STOPWORDS.has(t));
+
+  // ── Score each role ───────────────────────────────────────────────────────
+  const scored = [];
+
+  for (const doc of snap.docs) {
+    const d = doc.data();
+    const allText = [_roleTitle(d), ..._roleAliases(d)].filter(Boolean).map(s => s.toLowerCase());
+    if (!_roleIsActive(d)) continue; // skip inactive/draft roles
+    let score = 0;
+
+    // Exact title match
+    if (allText.some(t => t === normalised)) { score = 100; }
+    // Title starts with query
+    else if (allText.some(t => t.startsWith(normalised))) { score = 60; }
+    // All query tokens present somewhere
+    else if (queryTokens.length > 0) {
+      const matchCount = queryTokens.filter(tok =>
+        allText.some(t => t.includes(tok))
+      ).length;
+      const ratio = matchCount / queryTokens.length;
+      if (ratio === 1)    score = 80;
+      else if (ratio >= 0.5) score = 40;
+      else if (ratio > 0) score = 20;
+    }
+
+    if (score > 0) {
+      scored.push({
+        roleId:     doc.id,
+        title:      _roleTitle(d),
+        confidence: score,
+        category:   d.category || null,
+      });
+    }
+  }
+
+  // Sort descending, take top N
+  scored.sort((a, b) => b.confidence - a.confidence);
+  const suggestions = scored.slice(0, limit);
+  const result      = { suggestions, total: suggestions.length };
+
+  // ── Cache result ──────────────────────────────────────────────────────────
+  await _setCachedSuggestion(cacheKey, result);
+
+  return result;
+}
+
 module.exports = {
   listRoles,
   getRoleById,
-  searchRolesForOnboarding, // G-06
+  searchRolesForOnboarding,    // G-06
+  suggestRolesForOnboarding,   // P1-05
   saveOnboardingRoles,
   getUserProfile,
   validateRolesExist,
   getExpectedRoleLimit,
 };
+
+
+
+
+
+
+
+

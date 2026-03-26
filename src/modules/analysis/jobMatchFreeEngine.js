@@ -91,3 +91,11 @@ function runJobMatchFree({ resumeText, jobDescription }) {
 }
 
 module.exports = { runJobMatchFree };
+
+
+
+
+
+
+
+

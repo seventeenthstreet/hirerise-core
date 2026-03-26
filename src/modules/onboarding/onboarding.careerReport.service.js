@@ -1,0 +1,299 @@
+'use strict';
+
+/**
+ * onboarding.careerReport.service.js — B-01 FIX: Career report sub-service
+ *
+ * Extracted from onboarding.service.js (god-object decomposition).
+ * Owns: generateCareerReport, getCareerReportStatus, triggerProvisionalChi,
+ *       buildCareerReportPrompt
+ */
+
+const { db } = require('../../config/supabase');
+const { AppError, ErrorCodes } = require('../../middleware/errorHandler');
+const { FieldValue } = require('../../config/supabase');
+const logger          = require('../../utils/logger');
+const { logAIInteraction } = require('../../infrastructure/aiLogger');
+let careerGraph = null;
+try { careerGraph = require('../careerGraph/CareerGraph'); } catch (_) {}
+const {
+  MODEL, IDEMPOTENCY_TTL_MS,
+  callAnthropicWithRetry, stripJson,
+  checkIdempotencyKey, saveIdempotencyKey, deductCredits,
+  emitOnboardingEvent, appendStepHistory, buildAIContext,
+  inferRegion, triggerProvisionalChi,
+} = require('./onboarding.helpers');
+
+const getAnthropicClient = () => {
+  if (process.env.NODE_ENV === 'test') return null;
+  return require('../../config/anthropic.client');
+};
+
+function buildCareerReportPrompt(region) {
+  return `You are a senior career counsellor with 20 years of experience in ${region}'s job market.
+
+Analyse the provided education and work experience and return a structured career report.
+
+You MUST respond with ONLY valid JSON — no preamble, no explanation, no markdown fences.
+
+Return this exact structure:
+{
+  "overallAssessment": "<2-3 sentence summary of the candidate's profile>",
+  "educationGaps": [
+    { "gap": "<gap>", "recommendation": "<recommendation>" }
+  ],
+  "experienceGaps": [
+    { "gap": "<gap>", "recommendation": "<recommendation>" }
+  ],
+  "skillRecommendations": [
+    { "skill": "<skill name>", "reason": "<why relevant in ${region}>", "priority": "high|medium|low" }
+  ],
+  "careerOpportunities": [
+    { "role": "<title>", "fit": "strong|good|possible", "reason": "<why this fits>" }
+  ],
+  "nextSteps": ["<step 1>", "<step 2>", "<step 3>"],
+  "marketInsight": "<1-2 sentences about this profile in the ${region} market>"
+}`;
+}
+
+async function generateCareerReport(userId, creditCost, idempotencyKey = null, userTier = 'free') {
+  if (!userId) throw new AppError('userId is required', 400, {}, ErrorCodes.VALIDATION_ERROR);
+
+  // GAP T4: idempotency
+  const cached = await checkIdempotencyKey(userId, 'careerReport', idempotencyKey);
+  if (cached) return cached;
+
+  const [progressSnap, profileSnap] = await Promise.all([
+    db.collection('onboardingProgress').doc(userId).get(),
+    db.collection('userProfiles').doc(userId).get(),
+  ]);
+
+  if (!progressSnap.exists) throw new AppError(
+    'No onboarding data found. Please complete Step 1 first.',
+    404, { userId }, ErrorCodes.NOT_FOUND,
+    'We couldn\'t find your profile. Please complete Step 1 before generating your career report.'
+  );
+
+  const data    = progressSnap.data();
+  const profile = profileSnap.data() || {};
+
+  if (!data.education?.length && !data.experience?.length) {
+    throw new AppError(
+      'No education or experience data found. Please complete Step 1 first.',
+      422, { userId }, ErrorCodes.VALIDATION_ERROR,
+      'Please add at least one job or education entry in Step 1 before generating your career report.'
+    );
+  }
+
+  // SPRINT-1 C1: expectedRoleIds is now required in Step 1 (saveEducationAndExperience),
+  // so by the time we reach generateCareerReport the profile will always have at least one.
+  // The guard below is retained as a defensive backstop for users who completed Step 1
+  // before this Sprint-1 migration was deployed.
+  const expectedRoleIds = profile.expectedRoleIds || [];
+  if (!expectedRoleIds.length) {
+    throw new AppError(
+      'Please add at least one target role before generating your career report. This helps us give you an accurate Career Health score.',
+      422,
+      { userId, hint: 'Re-submit Step 1 with expectedRoleIds[] populated.' },
+      ErrorCodes.VALIDATION_ERROR,
+      'Please select at least one target role in Step 1 before we generate your Career Health report.'
+    );
+  }
+
+  const aiContext = buildAIContext(data, profile);
+
+  const educationText = data.education?.length
+    ? data.education.map((e, i) => `Education ${i + 1}:\n  Qualification: ${e.qualificationName || e.qualificationId}\n  Institution: ${e.institution}\n  Year: ${e.yearOfGraduation || 'Not specified'}\n  Specialization: ${e.specialization || 'Not specified'}\n  Certifications: ${e.certifications?.join(', ') || 'None'}`).join('\n\n')
+    : 'No education provided';
+
+  const experienceText = data.experience?.length
+    ? data.experience.map((e, i) => `Experience ${i + 1}:\n  Role: ${e.jobTitle} at ${e.company}\n  Industry: ${e.industryText || (e.industryId ? INDUSTRY_SECTORS[e.industryId] || e.industryId : null) || e.industry || 'Not specified'}\n  Period: ${e.startDate || '?'} - ${e.isCurrent ? 'Present' : (e.endDate || '?')}\n  Responsibilities:\n${e.responsibilities?.map(r => `    - ${r}`).join('\n') || '    Not specified'}`).join('\n\n')
+    : 'No experience provided';
+
+  const contextLines = [];
+  if (aiContext.targetRole)                    contextLines.push(`Target Role: ${aiContext.targetRole}`);
+  if (aiContext.city)                          contextLines.push(`City: ${aiContext.city}`);
+  // SPRINT-1 C3: surface salary sentinel so AI knows not to estimate when user declined to disclose
+  if (aiContext.currentSalary === -1)          contextLines.push('Current Salary: User prefers not to disclose — use market estimation for salaryTrajectory.');
+  else if (aiContext.currentSalary)            contextLines.push(`Current Salary: ${aiContext.currentSalary} LPA`);
+  if (aiContext.expectedSalary === -1)         contextLines.push('Expected Salary: User prefers not to disclose.');
+  else if (aiContext.expectedSalary)           contextLines.push(`Expected Salary: ${aiContext.expectedSalary} LPA`);
+  if (aiContext.timeline)                      contextLines.push(`Job Search Timeline: ${aiContext.timeline}`);
+  if (aiContext.careerIntent?.length)          contextLines.push(`Target Role IDs: ${aiContext.careerIntent.join(', ')}`);
+  // SPRINT-1 C5: pass declared seniority so AI selects the correct peer group
+  if (aiContext.selfDeclaredSeniority)         contextLines.push(`Declared Seniority: ${aiContext.selfDeclaredSeniority}`);
+  // SPRINT-2 C4: pass jobFunction so AI scores against correct peer group
+  if (aiContext.jobFunction)                   contextLines.push(`Job Function: ${aiContext.jobFunction}`);
+  if (aiContext.skillsWithProficiency?.length) contextLines.push(`Skills: ${aiContext.skillsWithProficiency.map(s => `${s.name}(${s.proficiency})`).join(', ')}`);
+  if (aiContext.careerGaps?.length)            contextLines.push(`Career Gaps: ${aiContext.careerGaps.map(g => `${g.startDate}--${g.endDate} (${g.reason})`).join(', ')}`);
+
+  // ── Career Graph enrichment ─────────────────────────────────────────────────
+  // Inject graph-derived facts so the AI gives more accurate, role-specific scores.
+  try {
+    const targetRoleId   = profile.targetRoleId || (expectedRoleIds[0] || null);
+    const currentRoleId  = profile.currentRoleId || null;
+    const userSkills     = (data.skills || []).map(s => (typeof s === 'string' ? s : s.name));
+    const eduLevel       = data.education?.[0]?.educationLevel || null;
+    const expYears       = aiContext.totalExperienceYears || 0;
+
+    if (targetRoleId || aiContext.targetRole) {
+      const graphInsights = careerGraph.computeOnboardingInsights({
+        targetRoleId,
+        targetRoleName:   !targetRoleId ? aiContext.targetRole : undefined,
+        currentRoleId,
+        userSkills,
+        experienceYears:  expYears,
+        educationLevel:   eduLevel,
+        country:          aiContext.country || 'IN',
+      });
+
+      if (graphInsights && !graphInsights.error) {
+        contextLines.push(`Graph CHI Score: ${graphInsights.chi_score}/100 (${graphInsights.readiness_label})`);
+        contextLines.push(`Skill Match: ${graphInsights.skill_match_pct}% of required role skills`);
+
+        if (graphInsights.missing_skills?.length) {
+          const topMissing = graphInsights.missing_skills.slice(0, 3).map(s => s.skill_name).join(', ');
+          contextLines.push(`Top Missing Skills: ${topMissing}`);
+        }
+
+        if (graphInsights.salary_benchmark) {
+          const sb = graphInsights.salary_benchmark;
+          contextLines.push(`Market Salary Range: ${sb.currency} ${sb.p25?.toLocaleString()}–${sb.p75?.toLocaleString()} (median: ${sb.median?.toLocaleString()})`);
+        }
+
+        if (graphInsights.career_path?.steps?.length > 1) {
+          const pathStr = graphInsights.career_path.steps.map(s => s.title).join(' → ');
+          contextLines.push(`Career Path: ${pathStr} (${graphInsights.career_path.total_years} years)`);
+        }
+
+        if (graphInsights.education_match) {
+          contextLines.push(`Education Match: ${graphInsights.education_match.score}% (${graphInsights.education_match.label})`);
+        }
+      }
+    }
+  } catch (graphErr) {
+    // Non-fatal — graph enrichment is supplementary, not required for the report
+    logger.warn('[CareerReportService] CareerGraph enrichment failed — continuing without', { userId, error: graphErr.message });
+  }
+  // ── End graph enrichment ────────────────────────────────────────────────────
+
+  const userPrompt = `EDUCATION:\n${educationText}\n\nWORK EXPERIENCE:\n${experienceText}${contextLines.length ? '\n\nADDITIONAL CONTEXT:\n' + contextLines.join('\n') : ''}`;
+
+  let report;
+  const startMs = Date.now();
+
+  try {
+    const anthropic = getAnthropicClient();
+    // SPRINT-4A M4: retry on 529/503 with exponential backoff
+    const response = await callAnthropicWithRetry(
+      () => anthropic.messages.create({
+        model: MODEL, max_tokens: 2048,
+        system: buildCareerReportPrompt(aiContext.userRegion || 'India'),
+        messages: [{ role: 'user', content: userPrompt }],
+      }),
+      { module: 'onboarding.careerReport', model: MODEL, userId }
+    );
+    const rawText = response.content.filter(b => b.type === 'text').map(b => b.text).join('');
+    report = JSON.parse(stripJson(rawText));
+    if (creditCost) await deductCredits(userId, creditCost, idempotencyKey); // P4-05: idempotent deduction
+  } catch (err) {
+    logAIInteraction({ module: 'onboarding.careerReport', model: MODEL, latencyMs: Date.now() - startMs, status: 'error', error: err, userId });
+
+    // P2-06: Store failure so GET /career-report/status can surface retryable state to frontend.
+    // Non-fatal — if this write fails, the 502 is still returned correctly.
+    try {
+      await db.collection('onboardingProgress').doc(userId).set({
+        aiFailures: FieldValue.arrayUnion({
+          step:        'career_report',
+          errorCode:   err?.status || err?.code || 'UNKNOWN',
+          message:     err?.message || 'AI call failed',
+          failedAt:    new Date().toISOString(),
+          retryable:   true,
+        }),
+        updatedAt: FieldValue.serverTimestamp(),
+      }, { merge: true });
+    } catch (storeErr) {
+      logger.warn('[OnboardingService] Failed to store aiFailure record', { userId, error: storeErr.message });
+    }
+
+    const appErr = new AppError(
+      'Failed to generate career report. Please try again.',
+      502, { userId, retryAfterSeconds: 30 }, ErrorCodes.EXTERNAL_SERVICE_ERROR,
+      'We couldn\'t generate your career report right now. Please wait a moment and try again.'
+    );
+    // P2-06: surface retryAfterSeconds at top level so clients don't need to dig into details
+    appErr.retryAfterSeconds = 30;
+    throw appErr;
+  }
+
+  await db.collection('onboardingProgress').doc(userId).set({
+    step: 'career_report_generated', careerReport: report,
+    ...appendStepHistory('career_report_generated'),
+    // SPRINT-4A H12: track last active step for drop-off cohort analysis
+    lastActiveStep: 'career_report_generated',
+    lastActiveAt:   FieldValue.serverTimestamp(),
+    updatedAt: FieldValue.serverTimestamp(),
+  }, { merge: true });
+
+  const [updatedProgressSnap, updatedProfileSnap] = await Promise.all([
+    db.collection('onboardingProgress').doc(userId).get(),
+    db.collection('userProfiles').doc(userId).get(),
+  ]);
+  await persistCompletionIfReady(userId, updatedProgressSnap.data() || {}, updatedProfileSnap.data() || {});
+
+  // GAP S2: trigger provisional CHI immediately — no resume needed
+  triggerProvisionalChi(userId, data, profile, report, userTier);
+
+  emitOnboardingEvent(userId, 'onboarding_step_completed', { step: 'career_report_generated', trackA: true, aiUsed: true });
+
+  const result = { userId, step: 'career_report_generated', careerReport: report, prompt: 'Would you like us to build your professional CV?' };
+  await saveIdempotencyKey(userId, 'careerReport', idempotencyKey, result);
+  return result;
+}
+
+async function getCareerReportStatus(userId) {
+  if (!userId) throw new AppError('userId is required', 400, {}, ErrorCodes.VALIDATION_ERROR);
+
+  const snap = await db.collection('onboardingProgress').doc(userId).get();
+  if (!snap.exists) {
+    return { userId, status: 'pending', retryable: false, failureDetails: null };
+  }
+
+  const data = snap.data();
+
+  if (data.careerReport) {
+    return { userId, status: 'complete', retryable: false, failureDetails: null };
+  }
+
+  // Check for recorded AI failures
+  const failures = (data.aiFailures || []).filter(f => f.step === 'career_report');
+  if (failures.length > 0) {
+    const latest = failures[failures.length - 1];
+    return {
+      userId,
+      status:         'failed',
+      retryable:      latest.retryable !== false,
+      retryAfterSeconds: 30,
+      failureDetails: {
+        failedAt:  latest.failedAt,
+        errorCode: latest.errorCode,
+      },
+    };
+  }
+
+  return { userId, status: 'pending', retryable: false, failureDetails: null };
+}
+
+module.exports = {
+  buildCareerReportPrompt,
+  generateCareerReport,
+  getCareerReportStatus,
+};
+
+
+
+
+
+
+
+
+

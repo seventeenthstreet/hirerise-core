@@ -10,3 +10,11 @@ describe('Career API', () => {
     expect(res.statusCode).toBeGreaterThanOrEqual(400);
   });
 });
+
+
+
+
+
+
+
+

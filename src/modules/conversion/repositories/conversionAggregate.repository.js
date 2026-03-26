@@ -7,7 +7,7 @@
  * Uses centralized Firebase config (test-safe).
  */
 
-const { db, admin } = require('../../../config/firebase');
+const { db, admin } = require('../../../config/supabase');
 const logger = require('../utils/conversion.logger');
 const {
   HARD_COUNTER_LIMIT,
@@ -152,3 +152,12 @@ class ConversionAggregateRepository {
 }
 
 module.exports = new ConversionAggregateRepository();
+
+
+
+
+
+
+
+
+

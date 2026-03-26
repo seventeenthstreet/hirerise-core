@@ -1,100 +1,206 @@
 'use strict';
 
 /**
- * resumeScore.service.js
- * Enterprise-grade Resume Strength Scoring Service
- *
- * CHANGES (remediation sprint):
- *   FIX-10: Added isMockData: true flag to performAIScoring() return value.
- *            The service currently returns hardcoded stub data in production with
- *            no indication it is synthetic. This flag lets frontend engineers and
- *            QA detect that the score is not real and avoid displaying it as such.
- *            Remove this flag (and replace the stub) when real AI scoring is wired in.
- *
- * Features:
- *  - Distributed locking (prevents duplicate scoring)
- *  - Cache-first strategy
- *  - Double-check locking pattern
- *  - AI timeout protection
- *  - Crash-safe lock TTL
+ * resumeScore.service.js — Supabase Version
  */
 
-const lockService   = require('../core/infrastructure/locking/lock.service');
-const cacheManager  = require('../core/cache/cache.manager');
+const lockService  = require('../core/infrastructure/locking/lock.service');
+const cacheManager = require('../core/cache/cache.manager');
+const logger       = require('../utils/logger');
 
-const CACHE_TTL_SECONDS = 300;   // 5 minutes
-const LOCK_TTL_MS       = 30000; // 30 seconds
-const AI_TIMEOUT_MS     = 25000; // 25 seconds
+const supabase = require('../config/supabase');
 
 const cache = cacheManager.getClient();
 
-function withTimeout(promise, ms) {
-  const timeout = new Promise((_, reject) =>
-    setTimeout(() => reject(new Error('AI_TIMEOUT')), ms)
-  );
-  return Promise.race([promise, timeout]);
+// ── CONFIG ────────────────────────────────────────────────────────────────
+const CACHE_TTL_SECONDS = 300;
+const LOCK_TTL_MS       = 30000;
+const DB_TIMEOUT_MS     = 10000;
+
+// ── WEIGHTS ───────────────────────────────────────────────────────────────
+const W = {
+  skills: 30,
+  experience: 25,
+  roleMatch: 20,
+  education: 15,
+  completeness: 10,
+};
+
+const EDUCATION_ORDINAL = {
+  'High School': 1,
+  'Diploma': 2,
+  "Bachelor's Degree": 3,
+  'Professional Certification': 4,
+  "Master's Degree": 5,
+  'MBA': 5,
+  'PhD': 6,
+};
+
+const MAX_EDU_ORDINAL = 6;
+
+// ─────────────────────────────────────────────────────────────────────────
+// SCORING FUNCTIONS (UNCHANGED)
+// ─────────────────────────────────────────────────────────────────────────
+
+function scoreSkills(skills) {
+  if (!Array.isArray(skills) || skills.length === 0) return 0;
+  const unique = new Set(
+    skills.map(s => String(s).toLowerCase().trim().replace(/[.\-_]/g, ''))
+  ).size;
+  const raw = Math.sqrt(Math.min(unique, 40)) / Math.sqrt(40);
+  return Math.round(raw * W.skills);
 }
 
-/**
- * TODO: Replace with real AI scoring logic.
- * FIX-10: isMockData: true flags this as synthetic data to all consumers.
- */
-async function performAIScoring(userId) {
-  await new Promise(resolve => setTimeout(resolve, 500)); // simulate async delay
+function scoreExperience(yearsExperience) {
+  if (yearsExperience == null) return 0;
+  const years = Math.max(0, Number(yearsExperience) || 0);
+  return Math.min(W.experience, Math.round((years / 7) * W.experience));
+}
+
+function scoreRoleMatch(detectedRoles, confidenceScore) {
+  const confidence = Math.min(100, Math.max(0, Number(confidenceScore) || 0));
+
+  if (!Array.isArray(detectedRoles) || detectedRoles.length === 0) {
+    return Math.round((confidence / 100) * W.roleMatch * 0.4);
+  }
+
+  const topRole = detectedRoles[0];
+  const roleScore = typeof topRole === 'object' ? (topRole.score || 1) : 1;
+
+  const blended = (Math.min(roleScore / 5, 1) * 0.6) + ((confidence / 100) * 0.4);
+  return Math.round(blended * W.roleMatch);
+}
+
+function scoreEducation(education, educationLevel) {
+  let ordinal = EDUCATION_ORDINAL[educationLevel] || 0;
+
+  if (!ordinal && Array.isArray(education)) {
+    for (const entry of education) {
+      const entryStr = String(entry).toLowerCase();
+      for (const [label, val] of Object.entries(EDUCATION_ORDINAL)) {
+        if (entryStr.includes(label.toLowerCase()) && val > ordinal) {
+          ordinal = val;
+        }
+      }
+    }
+  }
+
+  return ordinal ? Math.round((ordinal / MAX_EDU_ORDINAL) * W.education) : 0;
+}
+
+function scoreCompleteness(p) {
+  const checks = [
+    !!p.name,
+    !!p.email,
+    !!p.phone,
+    !!(p.location && (p.location.city || p.location.country || typeof p.location === 'string')),
+    !!(p.linkedInUrl || p.portfolioUrl),
+  ];
+  return Math.round((checks.filter(Boolean).length / checks.length) * W.completeness);
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// CORE COMPUTATION
+// ─────────────────────────────────────────────────────────────────────────
+
+function computeScoreFromParsedData(parsedData, userId) {
+  const breakdown = {
+    skills: scoreSkills(parsedData.skills),
+    experience: scoreExperience(parsedData.yearsExperience),
+    roleMatch: scoreRoleMatch(parsedData.detectedRoles, parsedData.confidenceScore),
+    education: scoreEducation(parsedData.education, parsedData.educationLevel),
+    completeness: scoreCompleteness(parsedData),
+  };
+
+  const overallScore = Math.min(
+    100,
+    Object.values(breakdown).reduce((sum, v) => sum + v, 0)
+  );
+
+  const topRole = parsedData.detectedRoles?.[0];
+  const roleFit = topRole
+    ? (typeof topRole === 'object' ? (topRole.canonical || topRole.role) : String(topRole))
+    : 'unknown';
 
   return {
-    isMockData: true, // FIX-10: signals to consumers that this is stub data
+    isMockData: false,
     userId,
-    roleFit: 'software_engineer',
-    overallScore: 72,
-    breakdown: {
-      skills:     70,
-      experience: 75,
-      education:  65,
-    },
+    roleFit,
+    overallScore,
+    breakdown,
+    scoredAt: new Date().toISOString(),
   };
 }
 
+// ─────────────────────────────────────────────────────────────────────────
+// 🔥 SUPABASE FETCH (FIXED)
+// ─────────────────────────────────────────────────────────────────────────
+
+async function fetchLatestResume(userId) {
+  const { data, error } = await supabase
+    .from('resumes')
+    .select('*')
+    .eq('user_id', userId)
+    .eq('softDeleted', false)
+    .order('createdAt', { ascending: false })
+    .limit(1)
+    .maybeSingle();
+
+  if (error) {
+    throw new Error(`Supabase error: ${error.message}`);
+  }
+
+  return data || null;
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// SCORING FLOW
+// ─────────────────────────────────────────────────────────────────────────
+
+async function performScoring(userId) {
+  const resumeRow = await fetchLatestResume(userId);
+
+  if (!resumeRow) {
+    const err = new Error('No resume found');
+    err.code = 'RESUME_NOT_FOUND';
+    throw err;
+  }
+
+  const parsedData = resumeRow.parsedData || resumeRow.parsed_data;
+
+  if (!parsedData) {
+    return computeScoreFromParsedData({
+      skills: [],
+      detectedRoles: [],
+      yearsExperience: null,
+      education: [],
+      confidenceScore: 20,
+    }, userId);
+  }
+
+  return computeScoreFromParsedData(parsedData, userId);
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// PUBLIC API
+// ─────────────────────────────────────────────────────────────────────────
+
 async function calculate(userId) {
-  if (!userId) throw new Error('userId is required');
+  if (!userId) throw new Error('userId required');
 
   const cacheKey = `resumeScore:${userId}`;
-  const lockKey  = `lock:resumeScore:${userId}`;
 
-  // 1️⃣ Fast path: cache
   const cached = await cache.get(cacheKey);
-  if (cached) return { ...cached, source: 'cache' };
+  if (cached) return cached;
 
-  // 2️⃣ Acquire distributed lock
-  return lockService.executeWithLock(lockKey, async () => {
+  return lockService.executeWithLock(`lock:${userId}`, async () => {
+    const cached2 = await cache.get(cacheKey);
+    if (cached2) return cached2;
 
-    // 3️⃣ Double-check after lock
-    const cachedAfterLock = await cache.get(cacheKey);
-    if (cachedAfterLock) return { ...cachedAfterLock, source: 'cache' };
+    const result = await performScoring(userId);
+    await cache.set(cacheKey, result, CACHE_TTL_SECONDS);
 
-    try {
-      // 4️⃣ AI scoring with timeout guard
-      const aiResult = await withTimeout(performAIScoring(userId), AI_TIMEOUT_MS);
-
-      const result = {
-        ...aiResult,
-        calculatedAt: new Date().toISOString(),
-      };
-
-      // 5️⃣ Cache result
-      await cache.set(cacheKey, result, CACHE_TTL_SECONDS);
-
-      return { ...result, source: 'computed' };
-
-    } catch (error) {
-      if (error.message === 'AI_TIMEOUT') {
-        console.error(`AI scoring timed out for user: ${userId}`);
-      } else {
-        console.error(`Resume scoring failed for user ${userId}:`, error.message);
-      }
-      throw error;
-    }
-
+    return result;
   }, LOCK_TTL_MS);
 }
 
@@ -103,4 +209,15 @@ async function invalidate(userId) {
   await cache.delete(`resumeScore:${userId}`);
 }
 
-module.exports = { calculate, invalidate };
+module.exports = {
+  calculate,
+  invalidate,
+  computeScoreFromParsedData,
+};
+
+
+
+
+
+
+

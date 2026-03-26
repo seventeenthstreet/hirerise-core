@@ -29,3 +29,12 @@ function estimateTimeToPromotion(userProfile, targetRole, readinessDetails) {
 module.exports = {
   estimateTimeToPromotion
 };
+
+
+
+
+
+
+
+
+

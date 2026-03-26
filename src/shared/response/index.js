@@ -20,3 +20,12 @@ exports.errorResponse = (message = 'Something went wrong') => {
     message,
   };
 };
+
+
+
+
+
+
+
+
+

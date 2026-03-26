@@ -1,0 +1,102 @@
+skill,demand_score,growth_rate,salary_boost,industry
+Python,95,28,35,Technology
+SQL,90,15,25,Technology
+Machine Learning,92,42,45,Technology
+Data Analysis,88,30,30,Technology
+Excel,85,10,15,Finance
+Power BI,80,35,28,Technology
+Tableau,78,32,27,Technology
+Java,87,12,22,Technology
+React,89,25,30,Technology
+Node.js,86,22,28,Technology
+AWS,91,38,40,Technology
+Docker,84,35,32,Technology
+Kubernetes,83,40,38,Technology
+TensorFlow,88,45,42,Technology
+TypeScript,87,30,28,Technology
+Accounting,80,8,12,Finance
+Financial Reporting,82,10,15,Finance
+Tally,75,5,10,Finance
+GST Filing,78,12,14,Finance
+Taxation,81,10,13,Finance
+Bookkeeping,72,6,8,Finance
+Audit,83,9,14,Finance
+Cost Accounting,79,8,12,Finance
+Payroll Processing,74,7,9,Finance
+QuickBooks,73,8,11,Finance
+SAP Finance,85,15,20,Finance
+SAP,88,18,25,Technology
+Agile,82,20,18,Management
+JIRA,78,18,15,Technology
+Project Management,84,15,20,Management
+Stakeholder Management,80,12,16,Management
+Communication,75,8,10,Management
+Leadership,82,10,15,Management
+Requirements Gathering,79,14,16,Management
+Process Mapping,76,12,13,Management
+User Stories,77,18,14,Technology
+MS Project,75,8,12,Management
+Visio,70,6,8,Management
+Statistics,86,25,30,Technology
+R,82,22,28,Technology
+ETL,81,20,25,Technology
+Google Analytics,79,18,20,Marketing
+Looker,78,25,22,Technology
+Data Cleaning,80,20,22,Technology
+Data Visualisation,83,28,25,Technology
+MongoDB,82,25,24,Technology
+PostgreSQL,84,20,26,Technology
+Redis,80,28,28,Technology
+GraphQL,81,30,27,Technology
+REST API,88,15,22,Technology
+Microservices,85,32,30,Technology
+DevOps,89,35,35,Technology
+CI/CD,84,32,30,Technology
+Linux,82,12,20,Technology
+Git,87,10,18,Technology
+Cybersecurity,90,40,38,Technology
+Network Security,86,35,32,Technology
+Cloud Computing,91,38,35,Technology
+Azure,88,35,32,Technology
+Google Cloud,87,35,30,Technology
+Digital Marketing,79,25,22,Marketing
+SEO,76,20,18,Marketing
+Content Writing,72,15,12,Marketing
+Social Media,74,18,14,Marketing
+Email Marketing,73,15,13,Marketing
+CRM,78,18,16,Marketing
+Salesforce,83,22,25,Technology
+HubSpot,76,20,18,Marketing
+Product Management,86,28,30,Management
+UX Design,84,30,28,Technology
+Figma,83,35,27,Technology
+Adobe XD,79,25,22,Technology
+HTML,80,5,12,Technology
+CSS,79,5,12,Technology
+JavaScript,91,15,25,Technology
+Angular,84,18,24,Technology
+Vue.js,82,22,23,Technology
+Flutter,83,35,28,Technology
+Swift,82,20,26,Technology
+Kotlin,81,25,25,Technology
+C++,78,8,18,Technology
+C#,80,10,20,Technology
+.NET,81,12,21,Technology
+Spring Boot,84,18,24,Technology
+Django,82,20,23,Technology
+FastAPI,83,28,25,Technology
+Selenium,78,15,18,Technology
+Pytest,77,18,17,Technology
+NLP,89,45,42,Technology
+Computer Vision,88,43,40,Technology
+Deep Learning,90,44,44,Technology
+Blockchain,83,35,32,Technology
+IoT,82,38,30,Technology
+AR/VR,80,42,30,Technology
+Ethical Hacking,87,38,35,Technology
+Penetration Testing,86,38,34,Technology
+Risk Management,83,15,20,Finance
+Compliance,81,12,18,Finance
+Investment Analysis,84,14,22,Finance
+Portfolio Management,85,15,24,Finance
+Financial Modelling,86,18,25,Finance

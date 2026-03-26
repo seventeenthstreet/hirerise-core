@@ -1,12 +1,17 @@
 // ai.engine.js
-const Anthropic = require("@anthropic-ai/sdk");
+//
+// REFACTORED: Uses the shared anthropic.client shim (AI Router) instead of
+// instantiating the Anthropic SDK directly. All provider fallback logic is
+// handled transparently by the router — no other changes needed in this file.
+//
 const logger = require("../../utils/logger");
 
-const AI_MODEL = "claude-sonnet-4-6";
+const AI_MODEL = "claude-sonnet-4-6"; // kept for reference; router selects actual provider
 
 class AIEngine {
   constructor() {
-    this.client = new Anthropic(); // uses ANTHROPIC_API_KEY env
+    // The shared client is a router-backed proxy with the same messages.create() API.
+    this.client = require("../../config/anthropic.client");
   }
 
   buildPrompt(candidateProfile, roleMetadata, deterministicMeta) {
@@ -152,3 +157,11 @@ Return ONLY this JSON object. No prose. No markdown fences.
 }
 
 module.exports = AIEngine;
+
+
+
+
+
+
+
+

@@ -3,72 +3,80 @@
 /**
  * resumeGrowth.repository.js
  *
- * Thin persistence layer — stores growth signal snapshots only.
- * No direct Firestore access outside this file.
+ * Supabase version — stores growth signal snapshots.
  */
 
-const { db } = require('../../config/firebase');
+const supabase = require('../../core/supabaseClient');
 
-const COLLECTION = 'resume_growth_signals';
+const TABLE = 'resume_growth_signals';
 
 class ResumeGrowthRepository {
-  constructor() {
-    this._col = db.collection(COLLECTION);
-  }
 
   /**
    * Persist a growth signal result for a user + role.
    * Always appends (never overwrites).
    */
   async save(userId, roleId, signal) {
-    const ref = this._col.doc();
+    const { data, error } = await supabase
+      .from(TABLE)
+      .insert({
+        user_id: userId,
+        role_id: roleId,
+        signal,
+        created_at: new Date().toISOString(),
+      })
+      .select()
+      .single();
 
-    await ref.set({
-      user_id:    userId,
-      role_id:    roleId,
-      signal,
-      created_at: new Date(), // better for Firestore indexing
-    });
+    if (error) {
+      throw new Error(`[ResumeGrowthRepository] save failed: ${error.message}`);
+    }
 
-    return ref.id;
+    return data.id;
   }
 
   /**
    * Fetch most recent signal.
    */
   async getLatest(userId, roleId) {
-    const snap = await this._col
-      .where('user_id', '==', userId)
-      .where('role_id', '==', roleId)
-      .orderBy('created_at', 'desc')
+    const { data, error } = await supabase
+      .from(TABLE)
+      .select('*')
+      .eq('user_id', userId)
+      .eq('role_id', roleId)
+      .order('created_at', { ascending: false })
       .limit(1)
-      .get();
+      .maybeSingle();
 
-    if (snap.empty) return null;
+    if (error) {
+      throw new Error(`[ResumeGrowthRepository] getLatest failed: ${error.message}`);
+    }
 
-    const doc = snap.docs[0];
-
-    return {
-      id: doc.id,
-      ...doc.data(),
-    };
+    return data || null;
   }
 
   /**
-   * Fetch full history (future delta use).
+   * Fetch full history.
    */
   async getHistory(userId, roleId) {
-    const snap = await this._col
-      .where('user_id', '==', userId)
-      .where('role_id', '==', roleId)
-      .orderBy('created_at', 'asc')
-      .get();
+    const { data, error } = await supabase
+      .from(TABLE)
+      .select('*')
+      .eq('user_id', userId)
+      .eq('role_id', roleId)
+      .order('created_at', { ascending: true });
 
-    return snap.docs.map(d => ({
-      id: d.id,
-      ...d.data(),
-    }));
+    if (error) {
+      throw new Error(`[ResumeGrowthRepository] getHistory failed: ${error.message}`);
+    }
+
+    return data || [];
   }
 }
 
 module.exports = ResumeGrowthRepository;
+
+
+
+
+

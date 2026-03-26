@@ -19,9 +19,9 @@
  *   2. [userId ASC, status ASC, createdAt DESC]    — future status filter
  */
 
-const { db, admin }            = require('../../../config/firebase');
-const { AppError, ErrorCodes } = require('../../../middleware/errorHandler');
-const logger                   = require('../../../utils/logger');
+const { db, admin }            = require('../../config/supabase');
+const { AppError, ErrorCodes } = require('../../middleware/errorHandler');
+const logger                   = require('../../utils/logger');
 
 const COLLECTION = 'jobApplications';
 
@@ -214,3 +214,11 @@ module.exports = {
   VALID_STATUSES,
   VALID_SOURCES,   // ← CHANGE 5: exported for routes schema
 };
+
+
+
+
+
+
+
+

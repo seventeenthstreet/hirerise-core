@@ -1,0 +1,49 @@
+{
+  "_meta": {
+    "version": "1.0.0",
+    "description": "Role transition graph edges. Each entry defines a directed edge from from_role_id → to_role_id with transition probability (0-1) and typical years required.",
+    "probability_note": "1.0 = virtually certain with time, 0.6 = common path, 0.3 = less common but viable, 0.1 = rare cross-family leap"
+  },
+  "transitions": [
+    { "from_role_id": "se_1",             "to_role_id": "se_2",                 "transition_type": "vertical",  "probability": 0.95, "years_required": 2.0, "notes": "Standard IC progression" },
+    { "from_role_id": "se_2",             "to_role_id": "se_3",                 "transition_type": "vertical",  "probability": 0.85, "years_required": 2.5, "notes": "Senior engineer — most engineers reach this" },
+    { "from_role_id": "se_3",             "to_role_id": "tech_lead",            "transition_type": "vertical",  "probability": 0.55, "years_required": 2.0, "notes": "IC leadership track" },
+    { "from_role_id": "se_3",             "to_role_id": "engineering_manager",  "transition_type": "vertical",  "probability": 0.35, "years_required": 2.0, "notes": "People management track" },
+    { "from_role_id": "se_2",             "to_role_id": "product_manager_1",    "transition_type": "lateral",   "probability": 0.20, "years_required": 1.0, "notes": "Tech-to-PM pivot, needs product mindset" },
+    { "from_role_id": "se_3",             "to_role_id": "product_manager_1",    "transition_type": "lateral",   "probability": 0.15, "years_required": 0.5, "notes": "Senior engineer to PM, strong technical PM" },
+    { "from_role_id": "tech_lead",        "to_role_id": "engineering_manager",  "transition_type": "vertical",  "probability": 0.70, "years_required": 2.0, "notes": "Natural TL → EM progression" },
+    { "from_role_id": "engineering_manager", "to_role_id": "director_engineering", "transition_type": "vertical", "probability": 0.60, "years_required": 3.0, "notes": "" },
+
+    { "from_role_id": "da_analyst",       "to_role_id": "da_senior_analyst",    "transition_type": "vertical",  "probability": 0.92, "years_required": 2.5, "notes": "" },
+    { "from_role_id": "da_senior_analyst","to_role_id": "da_analytics_manager", "transition_type": "vertical",  "probability": 0.50, "years_required": 2.5, "notes": "Management track" },
+    { "from_role_id": "da_senior_analyst","to_role_id": "da_scientist",         "transition_type": "vertical",  "probability": 0.45, "years_required": 1.5, "notes": "Requires ML skills upskill" },
+    { "from_role_id": "da_analytics_manager", "to_role_id": "da_director",      "transition_type": "vertical",  "probability": 0.55, "years_required": 3.0, "notes": "" },
+    { "from_role_id": "da_scientist",     "to_role_id": "da_analytics_manager", "transition_type": "lateral",   "probability": 0.35, "years_required": 2.0, "notes": "IC → management pivot" },
+    { "from_role_id": "da_analyst",       "to_role_id": "de_engineer",          "transition_type": "lateral",   "probability": 0.25, "years_required": 1.0, "notes": "Analyst to engineering, needs Python/pipeline skills" },
+
+    { "from_role_id": "de_engineer",      "to_role_id": "de_senior_engineer",   "transition_type": "vertical",  "probability": 0.90, "years_required": 3.0, "notes": "" },
+    { "from_role_id": "de_senior_engineer","to_role_id": "de_lead_engineer",    "transition_type": "vertical",  "probability": 0.60, "years_required": 3.0, "notes": "" },
+    { "from_role_id": "de_senior_engineer","to_role_id": "da_analytics_manager","transition_type": "lateral",   "probability": 0.20, "years_required": 1.5, "notes": "Engineering to analytics leadership" },
+
+    { "from_role_id": "fin_accountant",   "to_role_id": "fin_senior_accountant","transition_type": "vertical",  "probability": 0.90, "years_required": 3.0, "notes": "" },
+    { "from_role_id": "fin_accountant",   "to_role_id": "fin_financial_analyst","transition_type": "lateral",   "probability": 0.40, "years_required": 1.5, "notes": "Accounting to FP&A, needs modelling skills" },
+    { "from_role_id": "fin_senior_accountant","to_role_id": "fin_finance_manager","transition_type": "vertical","probability": 0.60, "years_required": 3.0, "notes": "" },
+    { "from_role_id": "fin_financial_analyst","to_role_id": "fin_finance_manager","transition_type": "vertical","probability": 0.65, "years_required": 3.0, "notes": "" },
+    { "from_role_id": "fin_finance_manager","to_role_id": "fin_cfo",            "transition_type": "vertical",  "probability": 0.40, "years_required": 5.0, "notes": "" },
+
+    { "from_role_id": "product_manager_1","to_role_id": "senior_product_manager","transition_type": "vertical", "probability": 0.85, "years_required": 3.0, "notes": "" },
+    { "from_role_id": "senior_product_manager","to_role_id": "director_product", "transition_type": "vertical", "probability": 0.55, "years_required": 3.5, "notes": "" },
+    { "from_role_id": "product_manager_1","to_role_id": "da_analytics_manager", "transition_type": "lateral",   "probability": 0.15, "years_required": 1.5, "notes": "Data-focused PM pivot" },
+
+    { "from_role_id": "ux_designer",      "to_role_id": "senior_ux_designer",   "transition_type": "vertical",  "probability": 0.90, "years_required": 2.5, "notes": "" },
+    { "from_role_id": "senior_ux_designer","to_role_id": "design_manager",      "transition_type": "vertical",  "probability": 0.50, "years_required": 3.0, "notes": "IC to management" },
+    { "from_role_id": "senior_ux_designer","to_role_id": "product_manager_1",   "transition_type": "lateral",   "probability": 0.25, "years_required": 1.0, "notes": "Design-to-PM is a well-travelled path" },
+
+    { "from_role_id": "mkt_executive",    "to_role_id": "mkt_senior_executive", "transition_type": "vertical",  "probability": 0.90, "years_required": 2.5, "notes": "" },
+    { "from_role_id": "mkt_senior_executive","to_role_id": "mkt_manager",       "transition_type": "vertical",  "probability": 0.65, "years_required": 2.5, "notes": "" },
+    { "from_role_id": "mkt_manager",      "to_role_id": "mkt_director",         "transition_type": "vertical",  "probability": 0.50, "years_required": 3.5, "notes": "" },
+
+    { "from_role_id": "hr_executive",     "to_role_id": "hr_manager",           "transition_type": "vertical",  "probability": 0.85, "years_required": 3.0, "notes": "" },
+    { "from_role_id": "hr_manager",       "to_role_id": "hr_director",          "transition_type": "vertical",  "probability": 0.55, "years_required": 4.0, "notes": "" }
+  ]
+}

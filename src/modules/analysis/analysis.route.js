@@ -1,99 +1,128 @@
 'use strict';
 
 /**
- * analysis.route.js — HARDENED VERSION
- * =====================================
- * CHANGES FROM ORIGINAL:
+ * analysis.route.js — PHASE 3 UPDATE
  *
- *   1. Added Zod validation middleware (validateBody)
- *      replaces the manual if(!resumeId) / if(!operationType) checks
- *      that were inline in the route handler.
+ * CHANGES FROM PHASE 2:
  *
- *   2. Added tierQuota middleware BEFORE creditGuard.
- *      tierQuota blocks free users who've hit monthly cap.
- *      creditGuard blocks pro users with no credits.
- *      Together they form a complete 3-layer protection system.
+ *   1. aiCostGuard added to middleware stack (after authenticate, before creditGuard).
+ *      Blocks requests when a user has exceeded their daily AI cost limit.
+ *      Free: $0.10/day, Pro: $2.00/day, Elite: $10.00/day.
  *
- *   3. Moved remaining inline validation out of the handler —
- *      handler now contains ONLY the service call and response formatting.
- *      No business logic, no validation logic.
+ *   2. tier forwarded into runAnalysis() call so engines can pass it down
+ *      to resolveModelForTier() for cost-aware model selection.
  *
- *   4. Added logUsageToFirestore hook (non-blocking) after successful analysis.
- *      This populates the usageLogs collection for admin metrics.
+ *   3. recordAiCost() called after successful synchronous analysis calls
+ *      (async dispatch path handled by aiJobQueue processor which calls engine directly).
  *
- * MIGRATION NOTE:
- *   Replace src/modules/analysis/analysis.route.js with this file.
- *   Requires: zod package (`npm install zod`)
+ * PHASE 2 CHANGES RETAINED:
+ *   - sanitizeAiInputs
+ *   - 202 async dispatch for fullAnalysis
+ *   - creditGuard, tierQuota, aiUsageService
  */
 
 const express = require('express');
-const { authenticate }   = require('../../middleware/auth.middleware');
-const { creditGuard }    = require('../../middleware/creditGuard.middleware');
-const { tierQuota }      = require('../../middleware/tierquota.middleware');
+const { authenticate }     = require('../../middleware/auth.middleware');
+const { creditGuard }      = require('../../middleware/creditGuard.middleware');
+const { tierQuota }        = require('../../middleware/tierquota.middleware');
 const { validateBody, AnalysisBodySchema } = require('../../middleware/validation.schemas');
-const { runAnalysis }    = require('./analysis.service');
-const { normalizeTier }  = require('../../middleware/requireTier.middleware');
-const aiUsageService     = require('../../services/aiUsage.service');
+const { sanitizeAiInputs } = require('../../middleware/aiSanitizer.middleware');
+const { aiCostGuard, recordAiCost } = require('../../middleware/aiCostGuard.middleware');  // Phase 3
+const { runAnalysis }      = require('./analysis.service');
+const { normalizeTier }    = require('../../middleware/requireTier.middleware');
+const aiUsageService       = require('../../services/aiUsage.service');
+const modelRegistry        = require('../../ai/circuit-breaker/model-registry');  // Phase 3
 
-// Import from previous session's delivered files
-// (adjust path based on where you put them)
+const { isAsyncOperation, enqueueAiJob } = require('../../core/aiJobQueue');
+
 let logUsageToFirestore;
 try {
   logUsageToFirestore = require('../../services/admin/logUsageToFirestore').logUsageToFirestore;
 } catch (_) {
-  // Graceful fallback if admin services aren't yet wired
   logUsageToFirestore = async () => {};
 }
 
 const router = express.Router();
 
 // ── POST /api/v1/analyze ──────────────────────────────────────────────────────
-// Resume analysis: fullAnalysis | generateCV
 router.post(
   '/',
-  authenticate,
-  validateBody(AnalysisBodySchema),          // ← Phase 1: Zod validation
-  tierQuota('fullAnalysis'),                 // ← Phase 3: monthly cap check
-  creditGuard('fullAnalysis'),               // ← existing credit check
+  validateBody(AnalysisBodySchema),
+  tierQuota('fullAnalysis'),
+  sanitizeAiInputs(['resumeText']),
+  aiCostGuard,                               // Phase 3: daily cost cap check
+  creditGuard('fullAnalysis'),
   async (req, res, next) => {
     try {
-      const userId    = req.user.uid;
-      const tier      = req.user.normalizedTier ?? normalizeTier(req.user.plan);
-      const { resumeId, operationType } = req.body; // already validated + typed by Zod
+      const userId         = req.user.uid;
+      const tier           = req.user.normalizedTier ?? normalizeTier(req.user.plan);
+      const { resumeId, operationType } = req.body;
 
-      // ── AI monthly hard-cap check ────────────────────────────────────────
-      // checkAndIncrement throws 429 AppError if cap reached.
-      // It also atomically increments the counter on success.
       await aiUsageService.checkAndIncrement(userId, tier);
 
-      const result = await runAnalysis({ userId, resumeId, operationType, tier });
+      // ── Async dispatch (fullAnalysis) ─────────────────────────────────────
+      if (operationType === 'fullAnalysis' && isAsyncOperation('fullAnalysis')) {
+        const { jobId, pollUrl } = await enqueueAiJob({
+          userId,
+          operationType: 'fullAnalysis',
+          payload: {
+            resumeId,
+            tier,                            // Phase 3: forward tier for engine model selection
+            _creditReservation: req._creditReservation ?? null,
+          },
+          tier,
+        });
 
-      // ── Non-blocking usage logging ───────────────────────────────────────
-      const model = process.env.ANTHROPIC_MODEL || 'claude-sonnet-4-20250514';
+        aiUsageService.logAiCall({
+          userId, feature: operationType,
+          model:     modelRegistry.resolveModelForTier(operationType, tier),  // Phase 3
+          success:   true, errorCode: null,
+        }).catch(() => {});
+
+        return res.status(202).json({
+          success: true, async: true,
+          data: {
+            jobId, pollUrl,
+            message: 'Analysis queued. Poll the pollUrl for results.',
+            estimatedWaitSeconds: 15,
+          },
+        });
+      }
+
+      // ── Synchronous path (generateCV) ─────────────────────────────────────
+      const result = await runAnalysis({
+        userId, resumeId, operationType, tier,
+        req,
+        userTier: tier,   // Phase 3: explicit tier forwarding
+      });
+
+      const model = modelRegistry.resolveModelForTier(operationType, tier);  // Phase 3
+
+      // Phase 3: record actual cost for per-user budget enforcement
+      if (result && !result._cached) {
+        const costUSD = modelRegistry.estimateCost(
+          model,
+          result._inputTokens  ?? 0,
+          result._outputTokens ?? 0
+        );
+        recordAiCost(userId, tier, costUSD).catch(() => {});
+      }
 
       aiUsageService.logAiCall({
-        userId,
-        feature:   operationType,
-        model,
-        success:   true,
-        errorCode: null,
+        userId, feature: operationType, model, success: true, errorCode: null,
       }).catch(() => {});
 
       logUsageToFirestore({
-        userId,
-        feature:     operationType,
-        tier,
-        model,
+        userId, feature: operationType, tier, model,
         inputTokens:  result._inputTokens  ?? 0,
         outputTokens: result._outputTokens ?? 0,
         planAmount:   req.user.planAmount   ?? null,
       }).catch(() => {});
 
-      // Strip internal fields from response
       const { _inputTokens, _outputTokens, ...cleanResult } = result;
 
       return res.status(200).json({
-        success: true,
+        success: true, async: false,
         data: {
           analysis:         cleanResult,
           creditsRemaining: cleanResult.creditsRemaining ?? null,
@@ -106,7 +135,14 @@ router.post(
   }
 );
 
-// ── Sub-routes for job matching ────────────────────────────────────────────────
 router.use('/', require('./jobMatch.route'));
 
 module.exports = router;
+
+
+
+
+
+
+
+

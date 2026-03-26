@@ -56,3 +56,12 @@ function calculateReadiness(userProfile, targetRole) {
 module.exports = {
   calculateReadiness
 };
+
+
+
+
+
+
+
+
+

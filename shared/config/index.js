@@ -27,7 +27,7 @@ const REQUIRED_VARS = {
   ],
 };
 
-export function loadConfig(serviceName) {
+function loadConfig(serviceName) { // C-01 FIX: converted from ESM export to CJS module.exports
   const required = REQUIRED_VARS[serviceName] ?? [];
   const missing = required.filter((v) => !process.env[v]);
 
@@ -74,3 +74,5 @@ export function loadConfig(serviceName) {
     },
   };
 }
+
+module.exports = { loadConfig };

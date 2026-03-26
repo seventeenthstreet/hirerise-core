@@ -77,3 +77,12 @@ function simulateCareerPath(startRoleId, userProfile, maxSteps = 5) {
 module.exports = {
   simulateCareerPath
 };
+
+
+
+
+
+
+
+
+

@@ -122,3 +122,11 @@ async function generateCoverLetter({ userId, companyName, jobTitle, jobDescripti
 }
 
 module.exports = { generateCoverLetter, VALID_TONES };
+
+
+
+
+
+
+
+

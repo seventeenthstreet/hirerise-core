@@ -3,7 +3,7 @@
 const crypto = require('crypto');
 const jobSyncService = require('../services/jobSync.service');
 const { validateSyncRequest } = require('../validators/jobSync.validator');
-const logger = require('../../../../shared/logger');
+const logger = require('../../../../utils/logger');
 
 const MAX_RESPONSE_ERRORS = 200; // prevent huge payloads
 
@@ -85,3 +85,11 @@ async function syncJobs(req, res, next) {
 }
 
 module.exports = { syncJobs };
+
+
+
+
+
+
+
+

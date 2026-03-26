@@ -8,3 +8,12 @@ const userProfile = {
 const result = careerPathService.getCareerPath("se_3", userProfile);
 
 console.log(JSON.stringify(result, null, 2));
+
+
+
+
+
+
+
+
+

@@ -16,6 +16,7 @@ const { AppError, ErrorCodes } = require('../middleware/errorHandler');
 const logger = require('../utils/logger');
 
 const roleRepo = new RoleRepository();
+const cmsRolesRepo = new BaseRepository('cms_roles'); // CMS-created roles live here
 const roleSkillsRepo = new BaseRepository('roleSkills');
 const certificationsRepo = new BaseRepository('certifications');
 const skillsRepo = new BaseRepository('skills');
@@ -49,6 +50,47 @@ const buildSkillMap = (skills = []) =>
     map[normalizeSkillName(skill.name)] = skill;
     return map;
   }, {});
+
+// ── Built-in role → skill map ─────────────────────────────────────────────────
+// Used as fallback when roleSkills collection has no doc for the requested role.
+// Keys are substrings matched against the role title (case-insensitive).
+const BUILTIN_ROLE_SKILLS = {
+  accountant:        ['Accounting','Financial Reporting','Tally','GST Filing','Taxation','Bookkeeping','Excel','Audit','Cost Accounting','Payroll Processing','QuickBooks','SAP Finance'],
+  'business analyst':['Requirements Gathering','Process Mapping','SQL','Stakeholder Management','Agile','JIRA','Data Analysis','Excel','Visio','User Stories','MS Project','Power BI'],
+  'data analyst':    ['SQL','Python','Excel','Tableau','Power BI','Statistics','Data Cleaning','Data Visualisation','R','ETL','Google Analytics','Looker'],
+  'data scientist':  ['Python','Machine Learning','Statistics','SQL','TensorFlow','PyTorch','Feature Engineering','Pandas','Scikit-learn','Deep Learning','NLP','MLOps'],
+  'data engineer':   ['Python','Spark','Airflow','dbt','SQL','Kafka','AWS','GCP','BigQuery','ETL','Databricks','Terraform'],
+  'software engineer':['Python','JavaScript','TypeScript','React','Node.js','Docker','AWS','Kubernetes','CI/CD','System Design','SQL','Git'],
+  'frontend engineer':['React','TypeScript','JavaScript','CSS','HTML','Next.js','Figma','Web Performance','Accessibility','GraphQL','Jest','Webpack'],
+  'backend engineer': ['Node.js','Python','Go','Java','SQL','PostgreSQL','Redis','REST APIs','Microservices','Docker','AWS','System Design'],
+  'full stack':      ['React','Node.js','TypeScript','PostgreSQL','Docker','AWS','REST APIs','GraphQL','CI/CD','Git','Redis','MongoDB'],
+  'devops':          ['Kubernetes','Docker','Terraform','CI/CD','AWS','GCP','Azure','Linux','Bash','Monitoring','Ansible','Helm'],
+  'ml engineer':     ['Python','TensorFlow','PyTorch','MLOps','Kubernetes','Docker','AWS','Feature Engineering','SQL','CI/CD','Spark','Apache Beam'],
+  'product manager': ['Product Strategy','Roadmapping','Agile','User Research','A/B Testing','SQL','JIRA','Stakeholder Management','OKRs','Data Analysis','Wireframing','Go-to-Market'],
+  'ux designer':     ['Figma','User Research','Wireframing','Prototyping','Usability Testing','Design Thinking','Adobe XD','Information Architecture','Accessibility','Sketch','Motion Design','Design Systems'],
+  'product designer':['Figma','Prototyping','User Research','Design Thinking','Visual Design','CSS','HTML','Accessibility','Design Systems','Adobe XD','Motion Design','Sketch'],
+  'scrum master':    ['Scrum','Kanban','JIRA','Agile Coaching','Facilitation','Retrospectives','Sprint Planning','Conflict Resolution','Confluence','Risk Management','Stakeholder Management','SAFe'],
+  'project manager': ['Project Planning','Risk Management','Stakeholder Management','MS Project','Agile','Budgeting','Gantt Charts','Resource Management','PRINCE2','PMP','Communication','Change Management'],
+  'sales':           ['Consultative Selling','CRM','Salesforce','Pipeline Management','Cold Outreach','Negotiation','Objection Handling','HubSpot','Account Management','Forecasting','LinkedIn Sales Navigator','Proposal Writing'],
+  'hr':              ['Recruitment','Onboarding','Performance Management','HRIS','Compensation & Benefits','Employee Relations','Labour Law','Training & Development','HR Analytics','Conflict Resolution','Payroll','Workday'],
+  'finance':         ['Financial Modelling','Excel','Forecasting','Budgeting','Accounting','ERP','Variance Analysis','PowerPoint','SQL','SAP','Cash Flow Management','IFRS'],
+  'marketing':       ['Digital Marketing','SEO','Google Ads','Social Media','Content Strategy','Analytics','Email Marketing','HubSpot','Copywriting','A/B Testing','CRM','Brand Strategy'],
+  'operations':      ['Process Improvement','Six Sigma','Supply Chain','ERP','Data Analysis','Lean','Project Management','Vendor Management','KPI Tracking','Excel','Risk Management','Logistics'],
+  'customer success':['Customer Onboarding','CRM','NPS','Churn Analysis','Product Knowledge','Communication','Upselling','SaaS','Zendesk','SQL','Account Management','Stakeholder Management'],
+};
+
+function _getBuiltinSkillsForRole(roleTitle) {
+  if (!roleTitle) return [];
+  const lower = roleTitle.toLowerCase();
+  for (const [key, skills] of Object.entries(BUILTIN_ROLE_SKILLS)) {
+    if (lower.includes(key)) {
+      return skills.map(name => ({ name, category: 'technical', source: 'builtin' }));
+    }
+  }
+  return [];
+}
+
+
 
 const classifySkillMatch = (userSkill, requiredSkill) => {
   if (!userSkill) return 'missing';
@@ -277,12 +319,35 @@ const getRequiredSkillsForRole = async (roleId) => {
     throw new AppError('roleId is required', 400, {}, ErrorCodes.VALIDATION_ERROR);
   }
 
-  const [role, skillDoc] = await Promise.all([
+  // ── Priority 1: CareerGraph engine (rich skills with category + demand scores)
+  let careerGraph = null;
+  try { careerGraph = require('../modules/careerGraph/CareerGraph'); } catch (_) {}
+  const graphNode   = careerGraph ? (careerGraph.getRole(roleId) || careerGraph.resolveRole(roleId)) : null;
+  const graphSkills = (careerGraph && graphNode) ? careerGraph.getSkillsForRole(roleId) : [];
+
+  if (graphSkills.length > 0) {
+    return {
+      role:   { id: graphNode.role_id, title: graphNode.title },
+      skills: graphSkills.map(s => ({
+        name:               s.skill_name,
+        category:           s.skill_category,
+        importance:         s.importance,
+        demand_score:       s.demand_score,
+        source:             'career_graph',
+      })),
+      source: 'career_graph',
+    };
+  }
+
+  // ── Priority 2: Firestore roleSkills collection (admin-curated overrides)
+  const [rolePrimary, cmsRole, skillDoc] = await Promise.all([
     roleRepo.findById(roleId),
+    cmsRolesRepo.findById(roleId),
     roleSkillsRepo.findById(roleId),
   ]);
+  const role = rolePrimary || cmsRole;
 
-  if (!role) {
+  if (!role && !skillDoc) {
     throw new AppError(
       `Role '${roleId}' not found`,
       404,
@@ -291,18 +356,15 @@ const getRequiredSkillsForRole = async (roleId) => {
     );
   }
 
-  if (!skillDoc) {
-    throw new AppError(
-      `Skill requirements not configured for role '${roleId}'`,
-      404,
-      {},
-      ErrorCodes.SKILL_DATA_NOT_FOUND
-    );
-  }
+  // ── Priority 3: Firestore roleSkills doc, then BUILTIN_ROLE_SKILLS name map
+  const skills = skillDoc?.skills?.length
+    ? skillDoc.skills
+    : _getBuiltinSkillsForRole(role?.title || role?.name || roleId);
 
   return {
-    role: { id: role.id, title: role.title },
-    skills: skillDoc.skills || [],
+    role:   { id: role?.id || roleId, title: role?.title || role?.name || roleId },
+    skills,
+    source: skillDoc ? 'firestore' : 'builtin',
   };
 };
 
@@ -320,26 +382,91 @@ const searchSkillsByName = async ({ query, category } = {}) => {
     );
   }
 
-  const normalizedQuery = normalizeSkillName(query);
+  const q = query.trim();
 
-  const filters = [];
-  if (category) {
-    filters.push({ field: 'category', op: '==', value: category });
+  // ── Strategy 1: Supabase cms_skills ILIKE ────────────────────────────────
+  try {
+    const supabase = require('../core/supabaseClient');
+    let dbQuery = supabase
+      .from('cms_skills')
+      .select('id, name, category, aliases')
+      .ilike('name', `%${q}%`)
+      .eq('soft_deleted', false)
+      .eq('status', 'active')
+      .order('name', { ascending: true })
+      .limit(10);
+
+    if (category) dbQuery = dbQuery.eq('category', category);
+
+    const { data, error } = await dbQuery;
+
+    if (error) {
+      logger.warn('[SkillGap] cms_skills ILIKE failed', { error: error.message, query: q });
+    } else if (data && data.length > 0) {
+      return data.map(row => ({
+        id:       row.id,
+        name:     row.name,
+        category: row.category || 'General',
+        aliases:  row.aliases  || [],
+      }));
+    }
+  } catch (supaErr) {
+    logger.warn('[SkillGap] cms_skills query threw', { error: supaErr.message });
   }
 
-  const result = await skillsRepo.find(filters, { limit: 50 });
+  // ── Strategy 2: cms_skills without status filter (some rows may lack it) ─
+  try {
+    const supabase = require('../core/supabaseClient');
+    let dbQuery = supabase
+      .from('cms_skills')
+      .select('id, name, category, aliases')
+      .ilike('name', `%${q}%`)
+      .order('name', { ascending: true })
+      .limit(10);
 
-  // Client-side name filtering since Firestore doesn't support LIKE queries
-  const matched = result.docs.filter(skill =>
-    normalizeSkillName(skill.name || '').includes(normalizedQuery)
-  );
+    if (category) dbQuery = dbQuery.eq('category', category);
 
-  return matched.map(skill => ({
-    id: skill.id,
-    name: skill.name,
-    category: skill.category,
-    aliases: skill.aliases || [],
-  }));
+    const { data, error } = await dbQuery;
+
+    if (!error && data && data.length > 0) {
+      return data.map(row => ({
+        id:       row.id,
+        name:     row.name,
+        category: row.category || 'General',
+        aliases:  row.aliases  || [],
+      }));
+    }
+    logger.debug('[SkillGap] cms_skills no-filter returned empty', { query: q, error: error?.message });
+  } catch (e2) {
+    logger.warn('[SkillGap] cms_skills fallback query threw', { error: e2.message });
+  }
+
+  // ── Strategy 3: static benchmark list ────────────────────────────────────
+  const STATIC_SKILLS = [
+    'Advanced Excel','Tally ERP','GST Compliance','Financial Reporting','Tax Planning',
+    'Financial Modelling','Cost Accounting','MIS Reporting','Accounts Payable','Bank Reconciliation',
+    'React','Node.js','TypeScript','Python','SQL','AWS','Docker','Kubernetes','Git','REST APIs',
+    'Machine Learning','TensorFlow','Data Analysis','Tableau','Power BI','Statistics',
+    'Digital Marketing','SEO','Google Analytics','Content Strategy','Social Media','Email Marketing',
+    'Talent Acquisition','Performance Management','HR Analytics','Payroll Management','HRIS',
+    'Project Management','Agile','Scrum','Stakeholder Management','Team Leadership',
+    'Figma','UX Design','UI Design','User Research','Wireframing','Prototyping',
+    'Salesforce','CRM','B2B Sales','Pipeline Management','Account Management','Negotiation',
+    'Budgeting','Forecasting','P&L Management','ERP Systems','Cash Flow','Variance Analysis',
+    'Communication','Problem Solving','Critical Thinking','Time Management','Teamwork',
+    'Recruitment','Onboarding','Employee Relations','Labour Law','Compensation & Benefits',
+    'Inventory Management','Supply Chain','Vendor Management','Lean Six Sigma','Process Improvement',
+    'Business Analysis','Requirement Gathering','Gap Analysis','Process Mapping','User Stories',
+  ];
+
+  const lower   = q.toLowerCase();
+  const matched = STATIC_SKILLS
+    .filter(s => s.toLowerCase().includes(lower))
+    .slice(0, 10)
+    .map((name, i) => ({ id: `static_${i}`, name, category: 'General', aliases: [] }));
+
+  logger.debug('[SkillGap] returning static fallback results', { query: q, count: matched.length });
+  return matched;
 };
 
 // ─────────────────────────────────────────────
@@ -395,3 +522,11 @@ module.exports = {
   searchSkillsByName,       // FIX-12
   computeBulkGapAnalysis,   // FIX-12
 };
+
+
+
+
+
+
+
+

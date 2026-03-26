@@ -22,7 +22,7 @@
  *    - timestamp ASC
  */
 
-const { getFirestore, FieldValue } = require('firebase-admin/firestore');
+const { db, FieldValue } = require('../../../config/supabase');
 const {
   ENGAGEMENT_WEIGHTS,
   MONETIZATION_WEIGHTS,
@@ -77,7 +77,7 @@ async function _countEventsForType(db, eventType, start, end) {
 async function runNightlySummaryJob() {
   logger.info('conversionSummaryJob: starting');
 
-  const db = getFirestore();
+  
 
   const yesterday = new Date();
   yesterday.setUTCDate(yesterday.getUTCDate() - 1);
@@ -134,3 +134,12 @@ async function runNightlySummaryJob() {
 }
 
 module.exports = { runNightlySummaryJob };
+
+
+
+
+
+
+
+
+

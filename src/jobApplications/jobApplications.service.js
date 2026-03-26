@@ -13,8 +13,8 @@
  * No Firestore operations here — all data access via repository.
  */
 
-const { AppError, ErrorCodes } = require('../../middleware/errorHandler');
-const logger                   = require('../../utils/logger');
+const { AppError, ErrorCodes } = require('../middleware/errorHandler');
+const logger                   = require('../utils/logger');
 const repo                     = require('./repository/jobApplications.repository');
 
 // ─── Constants ────────────────────────────────────────────────────────────────
@@ -108,3 +108,11 @@ module.exports = {
   deleteApplication,
   FREE_TIER_MAX_APPLICATIONS,
 };
+
+
+
+
+
+
+
+

@@ -23,18 +23,22 @@ const logger = require('../utils/logger');
  * These are errors that have a meaningful HTTP status and a message
  * safe to surface to API consumers.
  *
- * @param {string}  message     - Human-readable description safe for clients
- * @param {number}  statusCode  - HTTP status code (4xx or 5xx)
- * @param {object}  [details]   - Optional structured extra context
- * @param {string}  [errorCode] - Optional machine-readable code, e.g. "ROLE_NOT_FOUND"
+ * @param {string}  message      - Technical description (for logs / developers)
+ * @param {number}  statusCode   - HTTP status code (4xx or 5xx)
+ * @param {object}  [details]    - Optional structured extra context
+ * @param {string}  [errorCode]  - Optional machine-readable code, e.g. "ROLE_NOT_FOUND"
+ * @param {string}  [userMessage] - P0-04: Plain-language copy safe to render directly in UI.
+ *                                  When absent, the API response omits the userMessage field
+ *                                  and the frontend falls back to a generic message.
  */
 class AppError extends Error {
-  constructor(message, statusCode = 500, details = null, errorCode = null) {
+  constructor(message, statusCode = 500, details = null, errorCode = null, userMessage = null) {
     super(message);
-    this.name        = 'AppError';
-    this.statusCode  = statusCode;
-    this.details     = details;
-    this.errorCode   = errorCode;
+    this.name         = 'AppError';
+    this.statusCode   = statusCode;
+    this.details      = details;
+    this.errorCode    = errorCode;
+    this.userMessage  = userMessage; // P0-04: plain-language UI copy
     this.isOperational = true;
 
     // Capture proper stack trace, excluding this constructor frame
@@ -53,6 +57,7 @@ const ErrorCodes = {
   RATE_LIMITED:            'RATE_LIMITED',
   UNAUTHORIZED:            'UNAUTHORIZED',
   FORBIDDEN:               'FORBIDDEN',
+  CONFLICT:                'CONFLICT',
 
   // Domain-specific
   ROLE_NOT_FOUND:          'ROLE_NOT_FOUND',
@@ -65,12 +70,13 @@ const ErrorCodes = {
   EXTERNAL_SERVICE_ERROR:   'EXTERNAL_SERVICE_ERROR',
   PAYMENT_REQUIRED:         'PAYMENT_REQUIRED',
   QUOTA_EXCEEDED:           'QUOTA_EXCEEDED',
-  JD_PARSE_FAILED:         'JD_PARSE_FAILED',
-  INSUFFICIENT_PROFILE:    'INSUFFICIENT_PROFILE',
+
+  // CMS duplicate prevention
+  DUPLICATE_RECORD:        'DUPLICATE_RECORD',
 };
 
 // ── Firestore error normalizer ─────────────────────────────────────────────────
-// Firebase Admin SDK throws non-standard error objects. We normalize them
+// // Legacy backend errors may have non-standard formats. We normalize them
 // so the central handler produces consistent responses.
 const normalizeFirebaseError = (err) => {
   const codeMap = {
@@ -146,14 +152,22 @@ const errorHandler = (err, req, res, next) => { // eslint-disable-line no-unused
   // ── Response envelope ──────────────────────────────────────────────────────
   const isDev = process.env.NODE_ENV === 'development';
 
+  // MED-01 FIX: Canonical error envelope { success, error: { code, message } }.
+  // All routes and middleware in the codebase must use this shape.
   const response = {
-    success:   false,
-    errorCode: resolvedErr.errorCode || ErrorCodes.INTERNAL_ERROR,
-    message:   isOperational
-      ? resolvedErr.message
-      : 'An unexpected internal error occurred. Please try again.',
-    ...(resolvedErr.details && { details: resolvedErr.details }),
-    ...(isDev && { stack: err.stack }), // Only expose stack in dev
+    success: false,
+    error: {
+      code:    resolvedErr.errorCode || ErrorCodes.INTERNAL_ERROR,
+      message: isOperational
+        ? resolvedErr.message
+        : 'An unexpected internal error occurred. Please try again.',
+    },
+    // P0-04: userMessage — plain-language copy safe to render in the UI.
+    ...(resolvedErr.userMessage    && { userMessage:        resolvedErr.userMessage }),
+    // P2-06: retryAfterSeconds
+    ...(resolvedErr.retryAfterSeconds && { retryAfterSeconds: resolvedErr.retryAfterSeconds }),
+    ...(resolvedErr.details        && { details:            resolvedErr.details }),
+    ...(isDev                      && { stack:              err.stack }),
     timestamp: new Date().toISOString(),
   };
 
@@ -177,5 +191,10 @@ module.exports = {
   ErrorCodes,
 };
 
-// ── Additional error codes added for gap remediation ─────────────────────────
-// (appended — existing codes unchanged)
+
+
+
+
+
+
+

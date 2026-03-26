@@ -1,119 +1,75 @@
 'use strict';
 
 /**
- * syncLock.repository.js  (v3 — hardened with lock expiry)
- *
- * Improvements:
- * - Lock auto-expiry (crash recovery safe)
- * - Defensive lockedBy validation
- * - merge: true on release
- * - Configurable LOCK_TIMEOUT_MINUTES
+ * syncLock.repository.js — Job Sync Distributed Lock (Supabase)
+ * MIGRATED: Firestore syncLocks → Supabase sync_locks table
  */
 
-const { getFirestore, FieldValue } = require('firebase-admin/firestore');
-const logger = require('../../../../shared/logger');
+const logger = require('../../../../utils/logger');
 
-const LOCK_DOC_ID        = 'jobSync';
-const LOCK_COLLECTION    = 'syncLocks';
-const LOCK_TIMEOUT_MINUTES = 30; // crash recovery window
+function getSupabase() { return require('../../../../core/supabaseClient'); }
+const LOCK_ID = 'jobSync';
+const LOCK_TIMEOUT_MINUTES = 30;
 
 class SyncLockRepository {
-  constructor() {
-    this._db = getFirestore();
-  }
-
-  _lockRef() {
-    return this._db.collection(LOCK_COLLECTION).doc(LOCK_DOC_ID);
-  }
 
   async acquireLock(lockedBy) {
-    if (!lockedBy || typeof lockedBy !== 'string') {
-      throw new Error('Invalid lockedBy value for sync lock');
-    }
+    if (!lockedBy) throw new Error('Invalid lockedBy value for sync lock');
+    const supabase = getSupabase();
 
-    const lockRef = this._lockRef();
+    // Read current lock
+    const { data: current } = await supabase
+      .from('sync_locks').select('*').eq('lock_id', LOCK_ID).single();
 
-    try {
-      let acquired = false;
-      let reason;
+    const now = new Date();
 
-      await this._db.runTransaction(async (tx) => {
-        const snap = await tx.get(lockRef);
-
-        if (snap.exists) {
-          const data = snap.data();
-          const status   = data?.status;
-          const lockedAt = data?.lockedAt?.toDate?.();
-
-          if (status === 'running') {
-            const now = new Date();
-
-            // Check if lock is stale
-            if (lockedAt) {
-              const diffMinutes =
-                (now.getTime() - lockedAt.getTime()) / (1000 * 60);
-
-              if (diffMinutes > LOCK_TIMEOUT_MINUTES) {
-                logger.warn('[SyncLockRepository] Stale lock detected. Taking over.', {
-                  previousLockedBy: data.lockedBy,
-                  lockedAt,
-                });
-              } else {
-                acquired = false;
-                reason = `Sync already running (started by ${data.lockedBy} at ${lockedAt.toISOString()})`;
-                return;
-              }
-            } else {
-              acquired = false;
-              reason = 'Sync already running (no timestamp available)';
-              return;
-            }
-          }
+    if (current?.status === 'running') {
+      const lockedAt = current.locked_at ? new Date(current.locked_at) : null;
+      if (lockedAt) {
+        const diffMinutes = (now.getTime() - lockedAt.getTime()) / (1000 * 60);
+        if (diffMinutes <= LOCK_TIMEOUT_MINUTES) {
+          return { acquired: false, reason: `Already locked by ${current.locked_by}` };
         }
-
-        // Claim lock (new or stale takeover)
-        tx.set(lockRef, {
-          status:     'running',
-          lockedBy,
-          lockedAt:   FieldValue.serverTimestamp(),
-          releasedAt: null,
-        }, { merge: true });
-
-        acquired = true;
-      });
-
-      if (acquired) {
-        logger.info('[SyncLockRepository.acquireLock] acquired', { lockedBy });
-      } else {
-        logger.warn('[SyncLockRepository.acquireLock] rejected', { reason });
+        logger.warn('[SyncLock] Stale lock detected — taking over', { previousLockedBy: current.locked_by });
       }
-
-      return { acquired, reason };
-    } catch (err) {
-      logger.error('[SyncLockRepository.acquireLock] transaction failed', {
-        error: err.message,
-      });
-      throw err;
     }
+
+    const { error } = await supabase.from('sync_locks').upsert({
+      lock_id:   LOCK_ID,
+      status:    'running',
+      locked_by: lockedBy,
+      locked_at: now.toISOString(),
+    }, { onConflict: 'lock_id' });
+
+    if (error) return { acquired: false, reason: error.message };
+    logger.info('[SyncLock] Lock acquired', { lockedBy });
+    return { acquired: true };
   }
 
-  async releaseLock() {
-    try {
-      await this._lockRef().set({
-        status:     'idle',
-        lockedBy:   null,
-        lockedAt:   null,
-        releasedAt: FieldValue.serverTimestamp(),
-      }, { merge: true });
+  async releaseLock(lockedBy) {
+    const supabase = getSupabase();
+    await supabase.from('sync_locks').update({
+      status:       'idle',
+      locked_by:    null,
+      locked_at:    null,
+      released_at:  new Date().toISOString(),
+    }).eq('lock_id', LOCK_ID);
+    logger.info('[SyncLock] Lock released', { lockedBy });
+  }
 
-      logger.info('[SyncLockRepository.releaseLock] released');
-    } catch (err) {
-      logger.error(
-        '[SyncLockRepository.releaseLock] failed — manual reset may be required',
-        { error: err.message }
-      );
-    }
+  async getStatus() {
+    const supabase = getSupabase();
+    const { data } = await supabase.from('sync_locks').select('*').eq('lock_id', LOCK_ID).single();
+    return data || { lock_id: LOCK_ID, status: 'idle' };
   }
 }
 
 module.exports = new SyncLockRepository();
+
+
+
+
+
+
+
+

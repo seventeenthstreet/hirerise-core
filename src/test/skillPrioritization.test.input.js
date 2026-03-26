@@ -1,7 +1,7 @@
 // test/skillPrioritization.test.input.js
 
 const testInput = {
-  userId:          "usr_01HXYZ9KBM3T7Q2WNPF6R",
+  user_id:          "usr_01HXYZ9KBM3T7Q2WNPF6R",
   targetRoleId:    "role_senior_backend_engineer",
   currentRoleId:   "role_mid_backend_engineer",
   experienceYears: 3,
@@ -19,3 +19,11 @@ const testInput = {
 };
 
 module.exports = testInput;
+
+
+
+
+
+
+
+

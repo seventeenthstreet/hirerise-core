@@ -98,3 +98,11 @@ exports.compareSalaries = asyncHandler(async (req, res) => {
     meta: { requestedAt: new Date().toISOString() },
   });
 });
+
+
+
+
+
+
+
+

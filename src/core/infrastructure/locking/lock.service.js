@@ -1,98 +1,111 @@
 'use strict';
 
-/**
- * lock.service.js
- */
+const supabase = require('../../../core/supabaseClient');
+const { v4: uuidv4 } = require('uuid');
+const logger = require('../../../utils/logger');
 
+const TABLE = 'distributed_locks';
+
+// Test stub
 if (process.env.NODE_ENV === 'test') {
   class MockLockService {
-    async acquire() {
-      return { release: async () => true };
-    }
-
-    async release() {
-      return true;
-    }
-
-    async executeWithLock(_resource, fn) {
-      return await fn();
-    }
+    async acquire()               { return { release: async () => true }; }
+    async release()               { return true; }
+    async executeWithLock(_r, fn) { return await fn(); }
   }
-
   module.exports = new MockLockService();
-
 } else {
 
-  const Redis = require("ioredis");
-  const Redlock = require("redlock").default;
-
   class LockService {
-    constructor() {
-      if (!process.env.REDIS_URL) {
-        throw new Error("REDIS_URL is not defined in environment variables.");
-      }
-
-      this.redis = new Redis(process.env.REDIS_URL, {
-        enableReadyCheck: true,
-        maxRetriesPerRequest: 2,
-        reconnectOnError: (err) => {
-          return err.message.includes("READONLY");
-        },
-      });
-
-      this.redis.on("connect", () => {
-        console.log("✅ Redis connected successfully");
-      });
-
-      this.redis.on("error", (err) => {
-        console.error("❌ Redis connection error:", err.message);
-      });
-
-      this.redlock = new Redlock(
-        [this.redis],
-        {
-          driftFactor: 0.01,
-          retryCount: 3,
-          retryDelay: 200,
-          retryJitter: 200,
-        }
-      );
-
-      this.redlock.on("clientError", (err) => {
-        console.error("❌ Redlock client error:", err.message);
-      });
-    }
 
     async acquire(resource, ttl = 30000) {
-      try {
-        return await this.redlock.acquire([resource], ttl);
-      } catch (error) {
-        console.error(`Lock acquisition failed for ${resource}:`, error.message);
-        throw new Error("RESOURCE_LOCKED");
+      const lockId = uuidv4();
+      const now = new Date();
+      const expiresAt = new Date(Date.now() + ttl);
+
+      // Try insert (atomic due to PK constraint)
+      const { error } = await supabase
+        .from(TABLE)
+        .insert({
+          resource,
+          lock_id: lockId,
+          expires_at: expiresAt.toISOString(),
+          acquired_at: now.toISOString(),
+        });
+
+      if (error) {
+        // Check if expired → overwrite
+        const { data: existing } = await supabase
+          .from(TABLE)
+          .select('*')
+          .eq('resource', resource)
+          .maybeSingle();
+
+        if (existing) {
+          const expiry = new Date(existing.expires_at);
+
+          if (expiry > now) {
+            throw new Error('RESOURCE_LOCKED');
+          }
+
+          // expired → overwrite
+          const { error: updateError } = await supabase
+            .from(TABLE)
+            .update({
+              lock_id: lockId,
+              expires_at: expiresAt.toISOString(),
+              acquired_at: now.toISOString(),
+            })
+            .eq('resource', resource);
+
+          if (updateError) {
+            throw new Error(updateError.message);
+          }
+        } else {
+          throw new Error(error.message);
+        }
       }
+
+      logger.debug('[LockService] Lock acquired', { resource, lockId });
+
+      return { resource, lockId, expiresAt };
     }
 
     async release(lock) {
-      if (!lock) return;
-      try {
-        await lock.release();
-      } catch (error) {
-        console.error("Lock release failed:", error.message);
-      }
+      if (!lock?.lockId || !lock?.resource) return;
+
+      const { data } = await supabase
+        .from(TABLE)
+        .select('*')
+        .eq('resource', lock.resource)
+        .maybeSingle();
+
+      if (!data) return;
+
+      if (data.lock_id !== lock.lockId) return;
+
+      await supabase
+        .from(TABLE)
+        .delete()
+        .eq('resource', lock.resource);
+
+      logger.debug('[LockService] Lock released', { resource: lock.resource });
     }
 
     async executeWithLock(resource, fn, ttl = 30000) {
-      let lock;
+      const lock = await this.acquire(resource, ttl);
       try {
-        lock = await this.acquire(resource, ttl);
         return await fn();
       } finally {
-        if (lock) {
-          await this.release(lock);
-        }
+        await this.release(lock);
       }
     }
   }
 
   module.exports = new LockService();
 }
+
+
+
+
+

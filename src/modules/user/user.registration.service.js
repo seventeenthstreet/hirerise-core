@@ -39,8 +39,8 @@
  *   userProfiles/{userId}  — career/onboarding profile (MUST exist before Track A)
  */
 
-const { db }        = require('../../config/firebase');
-const { FieldValue } = require('firebase-admin/firestore');
+const { db }        = require('../../config/supabase');
+const { FieldValue } = require('../../config/supabase');
 const logger         = require('../../utils/logger');
 
 /**
@@ -49,7 +49,7 @@ const logger         = require('../../utils/logger');
  * Idempotently ensures both users/{userId} and userProfiles/{userId} exist
  * in Firestore. Uses set(merge:true) so existing data is never overwritten.
  *
- * @param {string} userId        - Firebase UID
+ * @param {string} userId        - user ID
  * @param {object} firebaseUser  - Decoded Firebase token (req.user)
  * @returns {Promise<{ created: boolean }>}
  *   created: true  → at least one doc was newly written
@@ -213,3 +213,12 @@ async function syncProfileDisplayFields(userId, firebaseUser, existingFields = {
 }
 
 module.exports = { ensureUserSeeded, syncProfileDisplayFields };
+
+
+
+
+
+
+
+
+

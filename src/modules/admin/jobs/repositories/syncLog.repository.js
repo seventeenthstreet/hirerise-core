@@ -1,91 +1,63 @@
 'use strict';
 
 /**
- * syncLog.repository.js  (v2 — hardened & observable)
- *
- * Improvements:
- * - Stores requestId for traceability
- * - Redacts sourceUrl to origin only
- * - Stores durationMs for performance analytics
- * - Defensive payload validation
- * - Safe truncation of errors
- *
- * Recommended Firestore TTL:
- *   Enable TTL policy on `timestamp` field if logs should auto-expire.
+ * syncLog.repository.js — Job Sync Log (Supabase)
+ * MIGRATED: Firestore syncLogs → Supabase sync_logs table
  */
 
-const { getFirestore, FieldValue } = require('firebase-admin/firestore');
-const logger = require('../../../../shared/logger');
-
+const logger = require('../../../../utils/logger');
 const MAX_STORED_ERRORS = 100;
 
+function getSupabase() { return require('../../../../core/supabaseClient'); }
+
 class SyncLogRepository {
-  constructor() {
-    this._db  = getFirestore();
-    this._col = 'syncLogs';
-  }
 
   async create(payload) {
-    try {
+    const { sourceType, sourceUrl, totalRecords, successCount,
+            failCount, initiatedBy, errors = [], requestId, durationMs } = payload;
 
-      const {
-        sourceType,
-        sourceUrl,
-        totalRecords,
-        successCount,
-        failCount,
-        initiatedBy,
-        errors = [],
-        requestId,
-        durationMs,
-      } = payload;
-
-      // Defensive validation
-      if (!Number.isFinite(totalRecords) ||
-          !Number.isFinite(successCount) ||
-          !Number.isFinite(failCount)) {
-        throw new Error('Invalid numeric values in sync log payload');
-      }
-
-      let safeOrigin = 'invalid-url';
-      try {
-        safeOrigin = new URL(sourceUrl).origin;
-      } catch {
-        // ignore
-      }
-
-      const ref = this._db.collection(this._col).doc();
-
-      await ref.set({
-        type:         'JOB_SYNC',
-        sourceType,
-        sourceUrl:    safeOrigin,
-        totalRecords,
-        successCount,
-        failCount,
-        initiatedBy,
-        requestId:    requestId ?? null,
-        durationMs:   Number.isFinite(durationMs) ? durationMs : null,
-        errors:       errors.slice(0, MAX_STORED_ERRORS),
-        timestamp:    FieldValue.serverTimestamp(),
-      });
-
-      logger.info('[SyncLogRepository.create]', {
-        logId: ref.id,
-        totalRecords,
-        successCount,
-        failCount,
-      });
-
-      return ref.id;
-
-    } catch (err) {
-      logger.error('[SyncLogRepository.create] failed', {
-        error: err.message,
-      });
-      throw err;
+    if (!Number.isFinite(totalRecords) || !Number.isFinite(successCount) || !Number.isFinite(failCount)) {
+      throw new Error('Invalid numeric values in sync log payload');
     }
+
+    let safeOrigin = 'invalid-url';
+    try { safeOrigin = new URL(sourceUrl).origin; } catch {}
+
+    const supabase = getSupabase();
+    const { data, error } = await supabase.from('sync_logs').insert({
+      type:          'JOB_SYNC',
+      source_type:   sourceType || null,
+      source_origin: safeOrigin,
+      total_records: totalRecords,
+      success_count: successCount,
+      fail_count:    failCount,
+      duration_ms:   durationMs || null,
+      errors:        errors.slice(0, MAX_STORED_ERRORS),
+      initiated_by:  initiatedBy || null,
+      request_id:    requestId   || null,
+    }).select().single();
+
+    if (error) {
+      logger.error('[SyncLog] Failed to create log entry', { error: error.message });
+      return null;
+    }
+    return data;
+  }
+
+  async list({ limit = 20 } = {}) {
+    const supabase = getSupabase();
+    const { data } = await supabase.from('sync_logs')
+      .select('*').order('created_at', { ascending: false }).limit(limit);
+    return data || [];
   }
 }
 
 module.exports = new SyncLogRepository();
+
+
+
+
+
+
+
+

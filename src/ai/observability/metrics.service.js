@@ -127,7 +127,7 @@ class MetricsService {
    */
   async _fetchLogsForDate(feature, dateStr) {
     // ai_logs has a 'date' string field (YYYY-MM-DD) for efficient daily partitioning
-    const db = require('firebase-admin/firestore').getFirestore();
+    const { db } = require('../../config/supabase');
     const snap = await db.collection('ai_logs')
       .where('feature', '==', feature)
       .where('date', '==', dateStr)
@@ -188,3 +188,12 @@ class MetricsService {
 }
 
 module.exports = new MetricsService();
+
+
+
+
+
+
+
+
+

@@ -1,5 +1,4 @@
 import express from 'express';
-import { initializeApp, cert } from 'firebase-admin/app';
 import { loadConfig } from '../../shared/config/index.js';
 import { logger } from '../../shared/logger/index.js';
 import { errorHandler } from './middleware/error.middleware.js';
@@ -12,9 +11,6 @@ import { healthRouter } from './routes/health.routes.js';
 process.env.SERVICE_NAME = 'api-service';
 
 const config = loadConfig('api-service');
-
-// Firebase Admin init — uses Application Default Credentials in Cloud Run
-initializeApp();
 
 const app = express();
 

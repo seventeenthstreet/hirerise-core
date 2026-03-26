@@ -42,3 +42,12 @@ function generateNarrative({
 module.exports = {
   generateNarrative,
 };
+
+
+
+
+
+
+
+
+

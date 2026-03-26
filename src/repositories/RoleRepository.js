@@ -332,3 +332,12 @@ class RoleRepository extends BaseRepository {
 }
 
 module.exports = RoleRepository;
+
+
+
+
+
+
+
+
+

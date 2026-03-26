@@ -1,8 +1,10 @@
-import { createRequire } from 'module';
+'use strict';
+
+// FIX: Converted from ESM to CJS to match the rest of the codebase.
 
 // ─── Field Validators ─────────────────────────────────────────────────────────
 
-export function validateRequired(obj, fields) {
+function validateRequired(obj, fields) {
   const missing = fields.filter((f) => obj[f] === undefined || obj[f] === null || obj[f] === '');
   if (missing.length > 0) {
     return { valid: false, error: `Missing required fields: ${missing.join(', ')}` };
@@ -10,7 +12,7 @@ export function validateRequired(obj, fields) {
   return { valid: true };
 }
 
-export function sanitizeString(value, maxLength = 10000) {
+function sanitizeString(value, maxLength = 10000) {
   if (typeof value !== 'string') return null;
   return value
     .trim()
@@ -18,7 +20,7 @@ export function sanitizeString(value, maxLength = 10000) {
     .replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, ''); // strip control chars
 }
 
-export function sanitizeObject(obj, allowedKeys) {
+function sanitizeObject(obj, allowedKeys) {
   if (!obj || typeof obj !== 'object' || Array.isArray(obj)) return {};
   return Object.fromEntries(
     Object.entries(obj)
@@ -27,7 +29,7 @@ export function sanitizeObject(obj, allowedKeys) {
   );
 }
 
-export function isValidFirestoreId(id) {
+function isValidFirestoreId(id) {
   if (typeof id !== 'string') return false;
   if (id.length === 0 || id.length > 1500) return false;
   return !/[\/\x00]/.test(id);
@@ -35,7 +37,7 @@ export function isValidFirestoreId(id) {
 
 // ─── Resume Submission Validator ─────────────────────────────────────────────
 
-export function validateResumeSubmission(body) {
+function validateResumeSubmission(body) {
   const ALLOWED_MIME = ['application/pdf', 'text/plain', 'application/msword',
     'application/vnd.openxmlformats-officedocument.wordprocessingml.document'];
 
@@ -55,7 +57,7 @@ export function validateResumeSubmission(body) {
 
 // ─── Salary Request Validator ─────────────────────────────────────────────────
 
-export function validateSalaryRequest(body) {
+function validateSalaryRequest(body) {
   const required = validateRequired(body, ['jobTitle', 'location', 'yearsExperience']);
   if (!required.valid) return required;
 
@@ -68,6 +70,16 @@ export function validateSalaryRequest(body) {
 
 // ─── Career Path Request Validator ───────────────────────────────────────────
 
-export function validateCareerPathRequest(body) {
+function validateCareerPathRequest(body) {
   return validateRequired(body, ['currentTitle', 'targetTitle', 'userId']);
 }
+
+module.exports = {
+  validateRequired,
+  sanitizeString,
+  sanitizeObject,
+  isValidFirestoreId,
+  validateResumeSubmission,
+  validateSalaryRequest,
+  validateCareerPathRequest,
+};

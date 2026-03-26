@@ -271,3 +271,11 @@ class ObservabilityAdapter {
 // Export singleton
 const adapter = new ObservabilityAdapter();
 module.exports = adapter;
+
+
+
+
+
+
+
+

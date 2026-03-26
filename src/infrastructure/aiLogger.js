@@ -71,12 +71,11 @@ async function logAIInteraction({
     const ENV      = process.env.NODE_ENV || 'development';
 
     // Lazy-require Firestore to avoid import-time failures in test mode
-    const { getFirestore, FieldValue } = require('firebase-admin/firestore');
-    const db = getFirestore();
+    const { db, FieldValue } = require('../config/supabase');
 
     await db.collection('ai_usage_logs').add({
       logId,
-      userId:     userId   ?? null,
+      user_id:     userId   ?? null,
       module,
       model,
       status,
@@ -104,3 +103,12 @@ async function logAIInteraction({
 }
 
 module.exports = { logAIInteraction };
+
+
+
+
+
+
+
+
+

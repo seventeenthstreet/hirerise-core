@@ -9,7 +9,7 @@
  * Uses collectionGroup('jobs') for cross-shard queries.
  */
 
-import { getFirestore, FieldValue, Timestamp } from 'firebase-admin/firestore';
+const { db, FieldValue, Timestamp } = require('../../../../src/core/supabaseDbShim');
 import { logger } from '../../../shared/logger/index.js';
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -74,7 +74,7 @@ export function rateLimit({ counterKey, limit, window = 'minute' }) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 export async function checkPendingJobLimit(userId) {
-  const db = getFirestore();
+  
 
   const snap = await db
     .collectionGroup('jobs') // 🔥 Updated for sharded structure
@@ -170,7 +170,7 @@ export async function pendingJobLimitMiddleware(req, res, next) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 async function checkAndIncrement(docId, limit, window) {
-  const db = getFirestore();
+  
   const ref = db.collection(COLLECTION).doc(docId);
   const expiresAt = getWindowExpiry(window);
 

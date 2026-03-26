@@ -26,7 +26,7 @@ require('dotenv').config();
 const path  = require('path');
 const fs    = require('fs');
 const admin = require('firebase-admin');
-const XLSX  = require('xlsx');
+const XLSX  = require('exceljs'); // D-06 FIX: replaced xlsx (CVE-2023-30533) with exceljs
 
 // ─────────────────────────────────────────────────────────────
 // CLI FLAGS
@@ -52,12 +52,27 @@ function splitPipe(val) {
 
 /** Read a sheet and return array of row objects keyed by header */
 function readSheet(workbook, sheetName) {
-  const sheet = workbook.Sheets[sheetName];
+  const sheet = workbook.getWorksheet(sheetName);
   if (!sheet) {
     console.warn(`  ⚠️  Sheet "${sheetName}" not found in workbook`);
     return [];
   }
-  return XLSX.utils.sheet_to_json(sheet, { defval: null });
+  // ExcelJS: build row objects from header row + data rows (mirrors xlsx sheet_to_json defval:null).
+  const headers = [];
+  const rows = [];
+  sheet.eachRow((row, rowNumber) => {
+    if (rowNumber === 1) {
+      row.eachCell((cell, col) => { headers[col] = String(cell.value ?? ''); });
+    } else {
+      const obj = {};
+      row.eachCell({ includeEmpty: true }, (cell, col) => {
+        if (headers[col]) obj[headers[col]] = cell.value ?? null;
+      });
+      headers.forEach((h, i) => { if (h && !(h in obj)) obj[h] = null; });
+      rows.push(obj);
+    }
+  });
+  return rows;
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -281,8 +296,10 @@ async function main() {
 
   // ── Read Excel ────────────────────────────────────────────
   console.log('\n📖  Reading Excel file...');
-  const workbook = XLSX.readFile(EXCEL_PATH);
-  console.log(`    Sheets found: ${workbook.SheetNames.join(', ')}`);
+  const workbook = new XLSX.Workbook(); // D-06 FIX: ExcelJS uses async readFile
+  await workbook.xlsx.readFile(EXCEL_PATH);
+  const sheetNames = workbook.worksheets.map(ws => ws.name);
+  console.log(`    Sheets found: ${sheetNames.join(', ')}`);
 
   // ── Transform all sheets ──────────────────────────────────
   const jobFamilies       = transformJobFamilies(readSheet(workbook, 'job_families'));
@@ -294,7 +311,7 @@ async function main() {
 
   // ── Init Firebase & seed ──────────────────────────────────
   initAdmin();
-  const db = admin.firestore();
+  const { db } = require('../src/core/supabaseDbShim');
   db.settings({ ignoreUndefinedProperties: true });
 
   await seedCollection(db, 'jobFamilies',       jobFamilies);

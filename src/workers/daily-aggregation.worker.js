@@ -56,15 +56,12 @@ class DailyAggregationWorker {
 }
 
 // Entry point when invoked directly (e.g., via Cloud Run Job)
+// MIGRATION: firebase-admin initializeApp() removed — this worker delegates
+// entirely to metricsService.runDailyAggregation() which uses Supabase
+// internally. No Firebase initialisation is needed.
 if (require.main === module) {
-  const worker = new DailyAggregationWorker();
+  const worker  = new DailyAggregationWorker();
   const dateArg = process.argv[2] || null; // optional: pass YYYY-MM-DD as CLI arg
-
-  // Initialize Firebase Admin before running
-  const admin = require('firebase-admin');
-  if (!admin.apps.length) {
-    admin.initializeApp();
-  }
 
   worker.runJob(dateArg)
     .then(result => {
@@ -78,3 +75,11 @@ if (require.main === module) {
 }
 
 module.exports = new DailyAggregationWorker();
+
+
+
+
+
+
+
+

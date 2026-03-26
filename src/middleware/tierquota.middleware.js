@@ -45,7 +45,7 @@
  *   );
  */
 
-const { getFirestore, FieldValue, Timestamp } = require('firebase-admin/firestore');
+const { db, FieldValue, Timestamp } = require('../config/supabase');
 const { AppError, ErrorCodes } = require('./errorHandler');
 const logger = require('../utils/logger');
 
@@ -126,17 +126,20 @@ function tierQuota(feature) {
       return next();
     }
 
-    const db        = getFirestore();
+    
     const monthKey  = currentMonthKey();
-    const quotaRef  = db
-      .collection('userQuota')
-      .doc(userId)
-      .collection('monthly')
-      .doc(monthKey);
+    // Query Supabase user_quota table directly (flat schema)
+    const supabase = require('../core/supabaseClient');
 
     try {
-      const quotaDoc = await quotaRef.get();
-      const current  = quotaDoc.exists ? (quotaDoc.data()?.[feature] ?? 0) : 0;
+      const { data: quotaRow } = await supabase
+        .from('user_quota')
+        .select('count')
+        .eq('user_id', userId)
+        .eq('month_key', monthKey)
+        .eq('feature', feature)
+        .maybeSingle();
+      const current = quotaRow?.count ?? 0;
 
       if (current >= limit) {
         logger.warn('[TierQuota] Monthly limit reached', {
@@ -173,25 +176,27 @@ function tierQuota(feature) {
       // We increment AFTER the response is sent, not before.
       // This prevents counting failed requests against quota.
       // The increment happens in the response finish hook below.
-      req._quotaRef     = quotaRef;
-      req._quotaFeature = feature;
-      req._quotaMonthKey = monthKey;
-
       // Register post-response hook to increment counter on success
       res.on('finish', () => {
         // Only count 2xx responses
         if (res.statusCode >= 200 && res.statusCode < 300) {
-          quotaRef.set({
-            [feature]:   FieldValue.increment(1),
-            lastUpdated: FieldValue.serverTimestamp(),
-            expiresAt:   ttlTimestamp(QUOTA_DOC_TTL_DAYS),
-            userId,
-            monthKey,
-          }, { merge: true }).catch(err => {
-            logger.error('[TierQuota] Failed to increment quota counter', {
-              userId, feature, error: err.message,
+          // Upsert quota count in Supabase user_quota table
+          supabase
+            .from('user_quota')
+            .upsert({
+              user_id:      userId,
+              month_key:    monthKey,
+              feature:      feature,
+              count:        (current + 1),
+              last_updated: new Date().toISOString(),
+              expires_at:   ttlTimestamp(QUOTA_DOC_TTL_DAYS),
+            }, { onConflict: 'user_id,month_key,feature' })
+            .then(() => {})
+            .catch(err => {
+              logger.error('[TierQuota] Failed to increment quota counter', {
+                userId, feature, error: err.message,
+              });
             });
-          });
         }
       });
 
@@ -227,18 +232,19 @@ function tierQuota(feature) {
  * Used by GET /users/me to show remaining quota to frontend.
  */
 async function getUserQuotaUsage(userId) {
-  const db       = getFirestore();
+  
+  const supabase = require('../core/supabaseClient');
   const monthKey = currentMonthKey();
 
   try {
-    const quotaDoc = await db
-      .collection('userQuota')
-      .doc(userId)
-      .collection('monthly')
-      .doc(monthKey)
-      .get();
+    const { data: rows } = await supabase
+      .from('user_quota')
+      .select('feature, count')
+      .eq('user_id', userId)
+      .eq('month_key', monthKey);
 
-    return quotaDoc.exists ? quotaDoc.data() : {};
+    if (!rows || rows.length === 0) return {};
+    return rows.reduce((acc, row) => { acc[row.feature] = row.count; return acc; }, {});
   } catch (err) {
     logger.error('[TierQuota] Failed to fetch quota usage', { userId, error: err.message });
     return {};
@@ -273,3 +279,12 @@ module.exports = {
   getRemainingQuota,
   TIER_MONTHLY_QUOTAS,
 };
+
+
+
+
+
+
+
+
+

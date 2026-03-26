@@ -124,3 +124,12 @@ function round(num) {
 module.exports = {
   calculateConfidence,
 };
+
+
+
+
+
+
+
+
+

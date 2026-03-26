@@ -25,7 +25,7 @@
  *   aiUsageService.logAiCall({ userId, feature, model, success, errorCode }).catch(() => {});
  */
 
-const { getFirestore, FieldValue, Timestamp } = require('firebase-admin/firestore');
+const { db, FieldValue, Timestamp } = require('../config/supabase');
 const { AppError } = require('../middleware/errorHandler');
 const logger = require('../utils/logger');
 
@@ -69,7 +69,7 @@ function limitForTier(tier) {
  * Fails OPEN on Firestore error — metering failure must not block users.
  */
 async function checkAndIncrement(userId, tier) {
-  const db    = getFirestore();
+  
   const ref   = db.collection('userProfiles').doc(userId);
   const limit = limitForTier(tier);
   const now   = new Date();
@@ -88,7 +88,7 @@ async function checkAndIncrement(userId, tier) {
         const data   = snap.data();
         currentCount = data.monthlyAiUsageCount ?? 0;
         resetDate    = data.aiUsageResetDate
-          ? data.aiUsageResetDate.toDate()
+          ? (typeof data.aiUsageResetDate === "string" ? new Date(data.aiUsageResetDate) : (typeof data.aiUsageResetDate?.toDate === "function" ? data.aiUsageResetDate.toDate() : new Date(data.aiUsageResetDate)))
           : null;
       }
 
@@ -152,7 +152,7 @@ async function checkAndIncrement(userId, tier) {
  */
 async function logAiCall({ userId, feature, model, success, errorCode = null }) {
   try {
-    const db = getFirestore();
+    
     await db.collection('ai_usage_logs').add({
       userId,
       feature:   feature   ?? 'unknown',
@@ -172,3 +172,12 @@ module.exports = {
   limitForTier,
   MONTHLY_LIMITS,
 };
+
+
+
+
+
+
+
+
+

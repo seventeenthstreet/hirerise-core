@@ -62,7 +62,7 @@ const withObservability = async (config, fn, options = {}) => {
   // OTel trace span for this inference call
   const span = observabilityAdapter.emitTrace(
     `ai.inference.${feature}`,
-    { feature, model: primaryModel, userId: userId || 'anonymous' },
+    { feature, model: primaryModel, user_id: userId || 'anonymous' },
     correlationId
   );
 
@@ -203,3 +203,11 @@ const observabilityMiddleware = ({ feature } = {}) => {
 };
 
 module.exports = { observabilityMiddleware, withObservability };
+
+
+
+
+
+
+
+

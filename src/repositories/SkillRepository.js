@@ -82,3 +82,12 @@ class SkillRepository {
 }
 
 module.exports = SkillRepository;
+
+
+
+
+
+
+
+
+

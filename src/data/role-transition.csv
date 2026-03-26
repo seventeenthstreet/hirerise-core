@@ -1,0 +1,110 @@
+current_role,next_role,skill_overlap_weight
+Junior Accountant,Senior Accountant,0.9
+Junior Accountant,Financial Analyst,0.7
+Junior Accountant,Accounts Executive,0.8
+Senior Accountant,Finance Manager,0.85
+Senior Accountant,Financial Controller,0.8
+Senior Accountant,Tax Consultant,0.75
+Finance Manager,Finance Director,0.9
+Finance Manager,Chief Financial Officer,0.7
+Finance Manager,VP Finance,0.8
+Financial Analyst,Senior Financial Analyst,0.92
+Financial Analyst,Investment Analyst,0.78
+Financial Analyst,Business Analyst,0.72
+Junior Data Analyst,Data Analyst,0.92
+Junior Data Analyst,Business Intelligence Analyst,0.75
+Junior Data Analyst,Reporting Analyst,0.8
+Data Analyst,Senior Data Analyst,0.9
+Data Analyst,Data Scientist,0.7
+Data Analyst,Business Intelligence Developer,0.72
+Senior Data Analyst,Lead Data Analyst,0.92
+Senior Data Analyst,Data Science Manager,0.75
+Senior Data Analyst,Analytics Manager,0.78
+Data Scientist,Senior Data Scientist,0.9
+Data Scientist,ML Engineer,0.78
+Data Scientist,AI Research Scientist,0.72
+Senior Data Scientist,Lead Data Scientist,0.92
+Senior Data Scientist,Data Science Manager,0.8
+Senior Data Scientist,Principal Data Scientist,0.85
+Junior Software Engineer,Software Engineer,0.92
+Junior Software Engineer,Full Stack Developer,0.78
+Junior Software Engineer,Backend Developer,0.8
+Software Engineer,Senior Software Engineer,0.9
+Software Engineer,Full Stack Developer,0.78
+Software Engineer,DevOps Engineer,0.65
+Senior Software Engineer,Tech Lead,0.85
+Senior Software Engineer,Staff Engineer,0.8
+Senior Software Engineer,Engineering Manager,0.7
+Tech Lead,Engineering Manager,0.82
+Tech Lead,Principal Engineer,0.85
+Tech Lead,Director of Engineering,0.7
+Engineering Manager,Director of Engineering,0.88
+Engineering Manager,VP Engineering,0.78
+Engineering Manager,Senior Engineering Manager,0.9
+Junior HR Executive,HR Executive,0.92
+Junior HR Executive,Recruiter,0.8
+HR Executive,Senior HR Executive,0.9
+HR Executive,HR Business Partner,0.78
+HR Executive,Talent Acquisition Manager,0.75
+Senior HR Executive,HR Manager,0.88
+Senior HR Executive,HR Business Partner,0.82
+HR Manager,HR Director,0.88
+HR Manager,Head of People,0.82
+HR Manager,VP Human Resources,0.75
+Junior Marketing Executive,Marketing Executive,0.9
+Junior Marketing Executive,Digital Marketing Specialist,0.8
+Marketing Executive,Senior Marketing Executive,0.9
+Marketing Executive,Marketing Manager,0.78
+Marketing Executive,Brand Manager,0.72
+Senior Marketing Executive,Marketing Manager,0.88
+Senior Marketing Executive,Digital Marketing Manager,0.8
+Marketing Manager,Head of Marketing,0.88
+Marketing Manager,VP Marketing,0.78
+Marketing Manager,Chief Marketing Officer,0.65
+Junior Sales Executive,Sales Executive,0.92
+Junior Sales Executive,Business Development Executive,0.78
+Sales Executive,Senior Sales Executive,0.9
+Sales Executive,Sales Manager,0.78
+Sales Manager,Regional Sales Manager,0.88
+Sales Manager,Head of Sales,0.82
+Sales Manager,VP Sales,0.75
+Junior Business Analyst,Business Analyst,0.92
+Junior Business Analyst,Systems Analyst,0.78
+Business Analyst,Senior Business Analyst,0.9
+Business Analyst,Product Analyst,0.75
+Business Analyst,Business Intelligence Analyst,0.72
+Senior Business Analyst,Lead Business Analyst,0.9
+Senior Business Analyst,Product Manager,0.72
+Senior Business Analyst,Project Manager,0.75
+Junior Project Manager,Project Manager,0.92
+Project Manager,Senior Project Manager,0.9
+Project Manager,Program Manager,0.78
+Senior Project Manager,Program Manager,0.88
+Senior Project Manager,Portfolio Manager,0.8
+Program Manager,PMO Head,0.85
+Program Manager,VP Program Management,0.78
+Junior Product Manager,Product Manager,0.92
+Product Manager,Senior Product Manager,0.9
+Product Manager,Product Lead,0.85
+Senior Product Manager,Product Director,0.88
+Senior Product Manager,Group Product Manager,0.85
+Product Director,VP Product,0.9
+VP Product,Chief Product Officer,0.88
+Junior UX Designer,UX Designer,0.92
+UX Designer,Senior UX Designer,0.9
+UX Designer,UI/UX Lead,0.82
+Senior UX Designer,UX Lead,0.9
+Senior UX Designer,Design Manager,0.78
+UX Lead,Head of Design,0.88
+Head of Design,VP Design,0.88
+Junior DevOps Engineer,DevOps Engineer,0.92
+DevOps Engineer,Senior DevOps Engineer,0.9
+DevOps Engineer,Site Reliability Engineer,0.82
+Senior DevOps Engineer,Lead DevOps Engineer,0.9
+Senior DevOps Engineer,DevOps Architect,0.82
+Lead DevOps Engineer,DevOps Manager,0.85
+Junior Data Engineer,Data Engineer,0.92
+Data Engineer,Senior Data Engineer,0.9
+Data Engineer,Data Architect,0.72
+Senior Data Engineer,Lead Data Engineer,0.9
+Senior Data Engineer,Data Engineering Manager,0.82

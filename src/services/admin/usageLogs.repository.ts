@@ -6,7 +6,7 @@
  * Firestore repository for the `usageLogs` collection.
  */
 
-import { getFirestore, FieldValue, Timestamp } from 'firebase-admin/firestore';
+const { db, FieldValue, Timestamp } = require('../../core/supabaseDbShim');
 import type { CostRow, UserTier } from '../../types/metrics.types';
 
 const COLLECTION = 'usageLogs';
@@ -31,7 +31,7 @@ export interface FetchResult {
 
 class UsageLogsRepository {
   private get db() {
-    return getFirestore();
+    return require('../../core/supabaseDbShim').db;
   }
 
   // ───────────────── WRITE ─────────────────

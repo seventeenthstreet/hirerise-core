@@ -12,7 +12,7 @@
  *   Provider-agnostic: Razorpay and Stripe webhooks both call activateProUser().
  */
 
-const { db }      = require('../../config/firebase');
+const { db }      = require('../../config/supabase');
 const { AppError, ErrorCodes } = require('../../middleware/errorHandler');
 const logger      = require('../../utils/logger');
 const { getCreditsForPlan } = require('../analysis/analysis.constants');
@@ -90,3 +90,11 @@ async function downgradeUser(userId) {
 }
 
 module.exports = { activateProUser, downgradeUser };
+
+
+
+
+
+
+
+

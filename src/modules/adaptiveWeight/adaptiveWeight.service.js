@@ -409,3 +409,11 @@ function normalizeWeights(weightsObj) {
 }
 
 module.exports = { AdaptiveWeightService, normalizeWeights };
+
+
+
+
+
+
+
+

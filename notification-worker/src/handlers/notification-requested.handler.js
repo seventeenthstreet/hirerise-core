@@ -1,11 +1,11 @@
-import { getFirestore, FieldValue } from 'firebase-admin/firestore';
+const { db, FieldValue } = require('../../../src/core/supabaseDbShim');
 import { publishEvent, EventTypes } from '../../../shared/pubsub/index.js';
 import { logger } from '../../../shared/logger/index.js';
 import { safeValidateEnvelope } from '../../../shared/validators/envelope.validator.js';
 import { claimEvent, releaseEvent } from '../../../shared/deduplication/index.js';
 import { ErrorCodes } from '../../../shared/errors/index.js';
 
-const db = getFirestore();
+
 
 const NOTIFICATION_TEMPLATES = {
   RESUME_SCORED: (data) => ({

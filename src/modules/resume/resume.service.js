@@ -8,7 +8,7 @@
  *   FIX-14: scoreResume() now uses Anthropic Claude API for AI-powered
  *            resume scoring. Fetches resume from Firestore by resumeId,
  *            sends resumeText to Claude, returns structured score.
- *   FIX-15: uploadResume() now stores file in Firebase Storage, extracts
+ *   FIX-15: uploadResume() now stores file in Supabase Storage, extracts
  *            text from PDF/DOCX via pdf-parse / mammoth, and persists a
  *            resume document to Firestore with analysisStatus:'pending'.
  *   FIX-16: pdf-parse fix for Node 18+ DOMMatrix error using version option.
@@ -20,7 +20,8 @@
 const path   = require('path');
 const crypto = require('crypto');
 
-const { db, storage } = require('../../config/firebase');
+const { db } = require('../../config/supabase');
+const supabase = require('../../core/supabaseClient');
 const { AppError, ErrorCodes } = require('../../middleware/errorHandler');
 const logger = require('../../utils/logger');
 
@@ -286,29 +287,31 @@ async function validateIsResume(resumeText, originalname) {
 }
 
 /**
- * Upload a buffer to Firebase Storage and return the signed URL.
+ * Upload a buffer to Supabase Storage and return a signed URL.
  */
 async function uploadToStorage(buffer, storagePath, mimetype) {
-  const bucket = storage.bucket(process.env.FIREBASE_STORAGE_BUCKET);
-  const file   = bucket.file(storagePath);
+  const BUCKET = process.env.SUPABASE_STORAGE_BUCKET || 'resumes';
 
-  await file.save(buffer, {
-    metadata: { contentType: mimetype },
-    resumable: false,
-  });
+  const { error: uploadError } = await supabase.storage
+    .from(BUCKET)
+    .upload(storagePath, buffer, {
+      contentType: mimetype,
+      upsert:      true,
+    });
 
-  // FIX G-03: Calculate and return the expiry time so callers can store it.
-  // Storing signedUrlExpiresAt enables the refreshSignedUrl endpoint to detect
-  // stale URLs and regenerate them before they cause 403s for users.
-  const URL_TTL_MS   = 7 * 24 * 60 * 60 * 1000;
-  const expiresAt    = new Date(Date.now() + URL_TTL_MS);
+  if (uploadError) throw new Error(uploadError.message);
 
-  const [signedUrl] = await file.getSignedUrl({
-    action:  'read',
-    expires: expiresAt.getTime(),
-  });
+  // Signed URL valid for 7 days
+  const URL_TTL_SECONDS = 7 * 24 * 60 * 60;
+  const expiresAt       = new Date(Date.now() + URL_TTL_SECONDS * 1000);
 
-  return { signedUrl, expiresAt };
+  const { data, error: urlError } = await supabase.storage
+    .from(BUCKET)
+    .createSignedUrl(storagePath, URL_TTL_SECONDS);
+
+  if (urlError) throw new Error(urlError.message);
+
+  return { signedUrl: data.signedUrl, expiresAt };
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -322,7 +325,7 @@ async function uploadToStorage(buffer, storagePath, mimetype) {
  *  1. Validate file presence + size
  *  2. Extract plain text from PDF / DOCX / TXT
  *  3. Validate extracted text is actually a CV (Claude)
- *  4. Upload original file buffer to Firebase Storage
+ *  4. Upload original file buffer to Supabase Storage
  *  5. Write resume document to Firestore (analysisStatus: 'pending')
  *  6. Return { resumeId, fileName, status }
  */
@@ -382,10 +385,23 @@ async function uploadResume(userId, file, options = {}) {
     );
   }
 
+  // ── Step 1b: Parse structured data locally (zero API cost) ─────────────
+  let parsedResumeData = null;
+  try {
+    const { parseResumeText } = require('../../services/resumeParser');
+    parsedResumeData = parseResumeText(resumeText);
+    logger.debug('[ResumeService] Local parser complete', {
+      userId, confidenceScore: parsedResumeData.confidenceScore,
+      skillsFound: parsedResumeData.skills.length,
+    });
+  } catch (parseErr) {
+    logger.warn('[ResumeService] Local parser failed (non-fatal)', { error: parseErr.message });
+  }
+
   // ── Step 2: Validate it's actually a CV ──────────────────
   await validateIsResume(resumeText, originalname);
 
-  // ── Step 3: Upload to Firebase Storage ───────────────────
+  // ── Step 3: Upload to Supabase Storage ───────────────────
   const resumeId    = crypto.randomUUID();
   const ext         = path.extname(originalname) || '';
   const storagePath = `resumes/${userId}/${resumeId}${ext}`;
@@ -428,23 +444,119 @@ async function uploadResume(userId, file, options = {}) {
     scoreBreakdown:           null,
     strengths:                [],
     improvements:             [],
-    topSkills:                [],
-    estimatedExperienceYears: null,
+    // Populate topSkills from local parser immediately (no AI cost)
+    topSkills:                parsedResumeData?.skills?.slice(0, 10) ?? [],
+    estimatedExperienceYears: parsedResumeData?.yearsExperience ?? null,
+    // Store full parsed data for downstream services (CHI, onboarding, analytics)
+    parsedData:               parsedResumeData ? {
+      name:              parsedResumeData.name,
+      email:             parsedResumeData.email,
+      phone:             parsedResumeData.phone,
+      location:          parsedResumeData.location,
+      skills:            parsedResumeData.skills,
+      detectedRoles:     parsedResumeData.detectedRoles,
+      yearsExperience:   parsedResumeData.yearsExperience,
+      education:         parsedResumeData.education,
+      certifications:    parsedResumeData.certifications,
+      confidenceScore:   parsedResumeData.confidenceScore,
+      needsAIParsing:    parsedResumeData.needsAIParsing,
+      parserVersion:     parsedResumeData.parserVersion,
+    } : null,
     createdAt:                now,
     updatedAt:                now,
     softDeleted:              false,
+    source:                   'uploaded',  // required NOT NULL — identifies CV upload path
   };
 
-  await db.collection('resumes').doc(resumeId).set(resumeDoc);
+  // ── Step 4 (PATCHED): Atomic batch — write resume + sync ALL profile collections ──
+  // FIX-A: resume.service wrote skills only to users/{userId}, but jobMatchingEngine
+  //         reads from userProfiles/{userId}. This mismatch caused the engine to find
+  //         no skills => neutral 50% score on every component => all roles showed 53%.
+  // FIX-B: userProfiles also needs industry + yearsExperience for the weighted scorer
+  //         (_industryScore, _experienceScore). Without them every role gets neutral
+  //         fallback values and all match scores end up identical.
+  // FIX-C: onboardingProgress/{userId}.skills feeds the fallback branch in _loadUserProfile.
+  //         Syncing it ensures skills are available even before a full onboarding run.
+  const { FieldValue } = require('../../config/supabase');
+  const batch = db.batch();
+
+  // 1. Write resume document
+  // Use set+merge so retries don't hit the unique constraint
+  batch.set(db.collection('resumes').doc(resumeId), resumeDoc, { merge: true });
+
+  // 2. Update users/{userId} — only columns that exist in the Supabase users table.
+  // Uses batch.update (not batch.set) so unset columns (email, role, etc.) are never
+  // overwritten with null. Strips: skills, experience, resume, latestResumeId
+  // (not in schema). Uses snake_case column names that match the actual table.
+  batch.update(db.collection('users').doc(userId), {
+    resume_uploaded: true,
+    updated_at:      FieldValue.serverTimestamp(),
+  });
+
+  // 3. Sync userProfiles/{userId} — READ by jobMatchingEngine._loadUserProfile()
+  //    Without this, skills/industry/experience are always empty => all roles score 53%.
+  const skillsForProfile = (parsedResumeData?.skills ?? []).map(name => ({
+    name,
+    proficiency: 'intermediate',
+  }));
+  batch.set(db.collection('userProfiles').doc(userId), {
+    skills:          skillsForProfile,
+    industry:        parsedResumeData?.industry        ?? null,
+    experienceYears: parsedResumeData?.yearsExperience ?? null,
+    targetRole:      parsedResumeData?.detectedRoles?.[0] ?? null,
+    resumeId,
+    updatedAt: FieldValue.serverTimestamp(),
+  }, { merge: true });
+
+  // 4. Sync onboardingProgress/{userId}.skills — fallback branch in _loadUserProfile
+  batch.set(db.collection('onboardingProgress').doc(userId), {
+    skills:    skillsForProfile,
+    updatedAt: FieldValue.serverTimestamp(),
+  }, { merge: true });
+
+  await batch.commit();
+
+  // Bust job-match cache so the next dashboard load recomputes with the
+  // newly uploaded CV skills rather than serving the stale cached result.
+  try {
+    const { invalidateUserMatchCache } = require('../jobSeeker/jobMatchingEngine.service');
+    await invalidateUserMatchCache(userId);
+  } catch (cacheErr) {
+    logger.warn('[ResumeService] Job match cache invalidation failed (non-fatal)', { error: cacheErr.message });
+  }
 
   logger.debug('[ResumeService] uploadResume complete', { userId, resumeId });
 
+  // ── Step 5: Enqueue async AI job for CHI calculation ─────
+  let jobId = resumeId; // fallback: use resumeId as jobId for polling
+  try {
+    const { enqueueAiJob } = require('../../core/aiJobQueue');
+    const jobResult = await enqueueAiJob({
+      userId,
+      operationType: 'chi_calculation',
+      payload: { resumeId, userId },
+    });
+    jobId = jobResult.jobId;
+    logger.info('[ResumeService] uploadResume — AI job enqueued', { userId, resumeId, jobId });
+  } catch (err) {
+    // Non-fatal: job dispatch failure should not block the upload response.
+    // The user still gets their resume stored; scoring can be triggered manually.
+    logger.warn('[ResumeService] uploadResume — failed to enqueue AI job', {
+      userId, resumeId, error: err.message,
+    });
+  }
+
   return {
+    jobId,
     resumeId,
     fileName:       originalname,
     status:         'pending',
     charactersRead: resumeText.trim().length,
     createdAt:      now.toISOString(),
+    // Pass resumeText back so onboarding controller can parse without a DB roundtrip
+    resumeText:     resumeText.trim(),
+    // Pass parsedData if available
+    parsedData:     parsedResumeData || null,
   };
 }
 
@@ -795,7 +907,7 @@ async function analyzeResumeGrowth(userId, payload) {
  * PROBLEM BEING FIXED:
  *   Signed URLs generated during CV creation expire after exactly 7 days.
  *   Before this fix, there was no mechanism to detect expiry or regenerate.
- *   After day 7, the user's CV link silently returned 403 from Firebase Storage.
+ *   After day 7, the user's CV link silently returned 403 from Supabase Storage.
  *   The dashboard showed a broken link with no error message or recovery path.
  *
  * HOW IT WORKS:
@@ -849,20 +961,20 @@ async function refreshSignedUrl(userId, resumeId) {
     };
   }
 
-  // Generate a new signed URL for the same file in storage
-  const URL_TTL_MS         = 7 * 24 * 60 * 60 * 1000;
-  const newExpiresAt       = new Date(Date.now() + URL_TTL_MS);
+  // Generate a new signed URL for the same file in Supabase Storage
+  const URL_TTL_SECONDS    = 7 * 24 * 60 * 60;
+  const newExpiresAt       = new Date(Date.now() + URL_TTL_SECONDS * 1000);
   let   newFileUrl         = null;
 
   try {
-    const bucket = storage.bucket(process.env.FIREBASE_STORAGE_BUCKET);
-    const file   = bucket.file(resumeData.storagePath);
+    const BUCKET = process.env.SUPABASE_STORAGE_BUCKET || 'resumes';
 
-    const [signedUrl] = await file.getSignedUrl({
-      action:  'read',
-      expires: newExpiresAt.getTime(),
-    });
-    newFileUrl = signedUrl;
+    const { data, error: urlError } = await supabase.storage
+      .from(BUCKET)
+      .createSignedUrl(resumeData.storagePath, URL_TTL_SECONDS);
+
+    if (urlError) throw new Error(urlError.message);
+    newFileUrl = data.signedUrl;
   } catch (err) {
     logger.error('[ResumeService] refreshSignedUrl — storage error', { resumeId, error: err.message });
     throw new AppError('Failed to refresh CV URL. Please try again.', 502, { resumeId }, ErrorCodes.EXTERNAL_SERVICE_ERROR);
@@ -885,9 +997,129 @@ async function refreshSignedUrl(userId, resumeId) {
   };
 }
 
+// ─────────────────────────────────────────────────────────────
+// LIST RESUMES (FIX-A)
+// ─────────────────────────────────────────────────────────────
+
+/**
+ * listResumes(userId)
+ *
+ * Returns all non-deleted resumes for a user, sorted by createdAt desc.
+ * Maps Firestore field names to frontend interface field names.
+ */
+async function listResumes(userId) {
+  if (!userId) {
+    throw new AppError('userId is required', 400, {}, ErrorCodes.VALIDATION_ERROR);
+  }
+
+  const snap = await db.collection('resumes')
+    .where('userId', '==', userId)
+    .where('softDeleted', '==', false)
+    .orderBy('createdAt', 'desc')
+    .limit(50)
+    .get();
+
+  const items = snap.docs.map(doc => {
+    const d = doc.data();
+    return {
+      id:              doc.id,
+      fileName:        d.fileName,
+      fileSize:        d.sizeBytes ?? d.fileSize ?? 0,
+      mimeType:        d.mimetype  ?? d.mimeType ?? '',
+      status:          d.analysisStatus ?? 'processing',
+      extractedSkills: d.topSkills ?? d.extractedSkills ?? [],
+      uploadedAt:      d.createdAt?.toDate?.()?.toISOString?.() ?? new Date().toISOString(),
+      analysedAt:      d.scoredAt?.toDate?.()?.toISOString?.() ?? null,
+      // ATS coaching data — used by Ava Coaching System on the dashboard
+      resumeScore:     d.score          ?? null,
+      scoreBreakdown:  d.scoreBreakdown ?? null,
+      improvements:    d.improvements   ?? [],
+      topSkills:       d.topSkills      ?? [],
+    };
+  });
+
+  return { items, total: items.length };
+}
+
+// ─────────────────────────────────────────────────────────────
+// GET SINGLE RESUME (FIX-B)
+// ─────────────────────────────────────────────────────────────
+
+async function getResume(userId, resumeId) {
+  if (!userId)   throw new AppError('userId is required',   400, {}, ErrorCodes.VALIDATION_ERROR);
+  if (!resumeId) throw new AppError('resumeId is required', 400, {}, ErrorCodes.VALIDATION_ERROR);
+
+  const snap = await db.collection('resumes').doc(resumeId).get();
+
+  if (!snap.exists) {
+    throw new AppError(`Resume '${resumeId}' not found`, 404, { resumeId }, ErrorCodes.NOT_FOUND);
+  }
+
+  const d = snap.data();
+
+  if (d.userId !== userId) {
+    throw new AppError('Unauthorized access to resume', 403, { resumeId }, ErrorCodes.UNAUTHORIZED);
+  }
+
+  return {
+    id:              snap.id,
+    fileName:        d.fileName,
+    fileSize:        d.sizeBytes ?? d.fileSize ?? 0,
+    mimeType:        d.mimetype  ?? d.mimeType ?? '',
+    status:          d.analysisStatus ?? 'processing',
+    extractedSkills: d.topSkills ?? d.extractedSkills ?? [],
+    uploadedAt:      d.createdAt?.toDate?.()?.toISOString?.() ?? new Date().toISOString(),
+    analysedAt:      d.scoredAt?.toDate?.()?.toISOString?.() ?? null,
+    resumeScore:     d.score          ?? null,
+    scoreBreakdown:  d.scoreBreakdown ?? null,
+    improvements:    d.improvements   ?? [],
+    topSkills:       d.topSkills      ?? [],
+  };
+}
+
+// ─────────────────────────────────────────────────────────────
+// DELETE RESUME (FIX-C)
+// ─────────────────────────────────────────────────────────────
+
+async function deleteResume(userId, resumeId) {
+  if (!userId)   throw new AppError('userId is required',   400, {}, ErrorCodes.VALIDATION_ERROR);
+  if (!resumeId) throw new AppError('resumeId is required', 400, {}, ErrorCodes.VALIDATION_ERROR);
+
+  const snap = await db.collection('resumes').doc(resumeId).get();
+
+  if (!snap.exists) {
+    throw new AppError(`Resume '${resumeId}' not found`, 404, { resumeId }, ErrorCodes.NOT_FOUND);
+  }
+
+  const d = snap.data();
+
+  if (d.userId !== userId) {
+    throw new AppError('Unauthorized access to resume', 403, { resumeId }, ErrorCodes.UNAUTHORIZED);
+  }
+
+  await db.collection('resumes').doc(resumeId).update({
+    softDeleted: true,
+    deletedAt:   new Date(),
+  });
+
+  logger.info('[ResumeService] deleteResume — soft deleted', { userId, resumeId });
+}
+
 module.exports = {
   scoreResume,
   uploadResume,
   analyzeResumeGrowth,
   refreshSignedUrl,
+  listResumes,
+  getResume,
+  deleteResume,
 };
+
+
+
+
+
+
+
+
+

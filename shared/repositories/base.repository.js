@@ -1,22 +1,23 @@
-import { getFirestore, FieldValue, Timestamp } from 'firebase-admin/firestore';
-import { logger } from '../logger/index.js';
+'use strict';
 
-export class BaseRepository {
-  #db;
-  #collectionName;
+// FIX: Converted from ESM to CJS to match the rest of the codebase.
 
+const { db, FieldValue, Timestamp } = require('../../src/core/supabaseDbShim');
+const logger = require('../logger');
+
+class BaseRepository {
   constructor(collectionName) {
     if (!collectionName) throw new Error('BaseRepository requires a collection name');
-    this.#collectionName = collectionName;
-    this.#db = getFirestore();
+    this._collectionName = collectionName;
+    this._db = require('../../src/core/supabaseDbShim').db;
   }
 
   get collection() {
-    return this.#db.collection(this.#collectionName);
+    return this._db.collection(this._collectionName);
   }
 
   get db() {
-    return this.#db;
+    return this._db;
   }
 
   get serverTimestamp() {
@@ -28,7 +29,7 @@ export class BaseRepository {
     if (!snap.exists) return null;
     const data = snap.data();
     if (data.deletedAt) return null;
-    return this.#normalize({ id: snap.id, ...data });
+    return this._normalize({ id: snap.id, ...data });
   }
 
   async findOneWhere(conditions = []) {
@@ -39,7 +40,7 @@ export class BaseRepository {
     const snap = await query.limit(1).get();
     if (snap.empty) return null;
     const doc = snap.docs[0];
-    return this.#normalize({ id: doc.id, ...doc.data() });
+    return this._normalize({ id: doc.id, ...doc.data() });
   }
 
   async findWhere(conditions = [], { limit = 100, orderBy = null, startAfter = null } = {}) {
@@ -52,7 +53,7 @@ export class BaseRepository {
     query = query.limit(limit);
 
     const snap = await query.get();
-    return snap.docs.map((d) => this.#normalize({ id: d.id, ...d.data() }));
+    return snap.docs.map((d) => this._normalize({ id: d.id, ...d.data() }));
   }
 
   async create(id, data) {
@@ -71,7 +72,7 @@ export class BaseRepository {
     const ref = this.collection.doc(id);
     const snap = await ref.get();
     if (!snap.exists || snap.data().deletedAt) {
-      throw new Error(`Document ${id} not found in ${this.#collectionName}`);
+      throw new Error(`Document ${id} not found in ${this._collectionName}`);
     }
     await ref.update({ ...data, updatedAt: this.serverTimestamp });
   }
@@ -100,16 +101,16 @@ export class BaseRepository {
   }
 
   async runTransaction(fn) {
-    return this.#db.runTransaction(fn);
+    return this._db.runTransaction(fn);
   }
 
   async batchWrite(operations) {
-    const chunks = this.#chunk(operations, 500);
+    const chunks = this._chunk(operations, 500);
     for (const chunk of chunks) {
-      const batch = this.#db.batch();
+      const batch = this._db.batch();
       for (const op of chunk) {
         const ref = this.collection.doc(op.id);
-        if (op.type === 'set') batch.set(ref, op.data, op.options ?? {});
+        if (op.type === 'set')    batch.set(ref, op.data, op.options ?? {});
         else if (op.type === 'update') batch.update(ref, op.data);
         else if (op.type === 'delete') batch.delete(ref);
       }
@@ -117,7 +118,7 @@ export class BaseRepository {
     }
   }
 
-  #normalize(data) {
+  _normalize(data) {
     const result = { ...data };
     for (const [key, val] of Object.entries(result)) {
       if (val instanceof Timestamp) {
@@ -127,7 +128,7 @@ export class BaseRepository {
     return result;
   }
 
-  #chunk(array, size) {
+  _chunk(array, size) {
     const chunks = [];
     for (let i = 0; i < array.length; i += size) {
       chunks.push(array.slice(i, i + size));
@@ -135,3 +136,5 @@ export class BaseRepository {
     return chunks;
   }
 }
+
+module.exports = { BaseRepository };

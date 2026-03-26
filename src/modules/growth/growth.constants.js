@@ -7,3 +7,12 @@ exports.SALARY_BANDS = {
   lead:      { min: 130000, max: 180000 },
   principal: { min: 170000, max: 230000 },
 };
+
+
+
+
+
+
+
+
+

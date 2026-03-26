@@ -30,3 +30,11 @@ function getWeightedRoleContext(careerHistory = []) {
 }
 
 module.exports = { getWeightedRoleContext };
+
+
+
+
+
+
+
+

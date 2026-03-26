@@ -1,0 +1,292 @@
+{
+  "_doc": "AI Event Bus — Example Event Flows and API Responses",
+
+  "event_flow_cv_upload": {
+    "description": "Full async flow triggered when a user uploads a CV",
+    "steps": [
+      {
+        "step": 1,
+        "actor": "ResumeIntelligenceEngine (existing)",
+        "action": "Parses CV, extracts skills",
+        "output": "parsedResult = { skills: ['Python', 'SQL', ...], ... }"
+      },
+      {
+        "step": 2,
+        "actor": "resume.service.js (patched)",
+        "action": "Publishes CV_PARSED event to AIEventBus",
+        "code": "await bus.publish('CV_PARSED', { userId, resumeId, skills })"
+      },
+      {
+        "step": 3,
+        "actor": "AIEventBus",
+        "action": "Creates pipeline job record, dispatches to 5 queues in parallel",
+        "queues_dispatched": [
+          "hirerise:skill-graph:queue",
+          "hirerise:career-health:queue",
+          "hirerise:job-matching:queue",
+          "hirerise:risk-analysis:queue",
+          "hirerise:opportunity-radar:queue"
+        ],
+        "returns": {
+          "pipelineJobId": "a3f1c2d4-...",
+          "queuesDispatched": 5
+        }
+      },
+      {
+        "step": "4a",
+        "actor": "SkillGraphWorker (parallel)",
+        "action": "Runs getUserSkillGraph + detectSkillGap, writes to cache + Supabase"
+      },
+      {
+        "step": "4b",
+        "actor": "CareerHealthWorker (parallel)",
+        "action": "Runs CHI v2 engine, writes chi_score + dimensions to career_health_results"
+      },
+      {
+        "step": "4c",
+        "actor": "JobMatchingWorker (parallel)",
+        "action": "Runs semantic/keyword job match, writes to job_match_results"
+      },
+      {
+        "step": "4d",
+        "actor": "RiskAnalysisWorker (parallel)",
+        "action": "Runs CareerRiskPredictorEngine, writes to risk_analysis_results"
+      },
+      {
+        "step": "4e",
+        "actor": "OpportunityRadarWorker (parallel)",
+        "action": "Runs OpportunityRadarEngine, writes to opportunity_radar_results"
+      },
+      {
+        "step": 5,
+        "actor": "Dashboard",
+        "action": "GET /api/v1/career/intelligence-report — reads from Supabase result tables"
+      }
+    ],
+    "client_perspective": {
+      "on_upload_response": { "pipelineJobId": "a3f1c2d4-...", "status": 202 },
+      "polling": "GET /api/v1/career/pipeline-status/a3f1c2d4-...",
+      "when_complete": "GET /api/v1/career/intelligence-report"
+    }
+  },
+
+  "POST /api/v1/career/trigger-analysis": {
+    "description": "Manually trigger full pipeline refresh",
+    "response_202": {
+      "success": true,
+      "data": {
+        "pipelineJobId": "b7e2a1f3-9c4d-4e8a-b2f1-0d3e5c7a9b1d",
+        "queuesDispatched": [
+          "hirerise:skill-graph:queue",
+          "hirerise:career-health:queue",
+          "hirerise:job-matching:queue",
+          "hirerise:risk-analysis:queue",
+          "hirerise:opportunity-radar:queue",
+          "hirerise:career-advisor:queue"
+        ],
+        "pollUrl": "/api/v1/career/pipeline-status/b7e2a1f3-9c4d-4e8a-b2f1-0d3e5c7a9b1d",
+        "message": "Full career analysis queued. Results will be available shortly."
+      }
+    }
+  },
+
+  "GET /api/v1/career/pipeline-status/:jobId": {
+    "description": "Poll job status while waiting for analysis",
+    "response_pending": {
+      "success": true,
+      "data": {
+        "pipelineJobId": "b7e2a1f3-...",
+        "status": "processing",
+        "event_type": "CAREER_ANALYSIS_REQUESTED",
+        "queued_at": "2025-09-12T10:43:00.000Z",
+        "started_at": "2025-09-12T10:43:02.000Z",
+        "completed_at": null,
+        "error_message": null,
+        "is_complete": false,
+        "is_failed": false
+      }
+    },
+    "response_complete": {
+      "success": true,
+      "data": {
+        "pipelineJobId": "b7e2a1f3-...",
+        "status": "completed",
+        "event_type": "CAREER_ANALYSIS_REQUESTED",
+        "queued_at": "2025-09-12T10:43:00.000Z",
+        "started_at": "2025-09-12T10:43:02.000Z",
+        "completed_at": "2025-09-12T10:43:18.000Z",
+        "is_complete": true,
+        "is_failed": false
+      }
+    }
+  },
+
+  "GET /api/v1/career/intelligence-report": {
+    "description": "Full merged intelligence report from all result tables",
+    "response": {
+      "success": true,
+      "data": {
+        "user_id": "uid_firebase_123",
+        "generated_at": "2025-09-12T10:43:25.000Z",
+        "_cached": true,
+        "career_health": {
+          "chi_score": 72,
+          "dimensions": {
+            "skillMatch": 68,
+            "skillDepth": 55,
+            "careerDistance": 80,
+            "experience": 70,
+            "education": 90,
+            "marketSalary": 65
+          },
+          "skill_gaps": ["Power BI", "Process Optimization"],
+          "analysis_source": "bullmq_async",
+          "computed_at": "2025-09-12T10:43:10.000Z"
+        },
+        "job_matches": {
+          "recommended_jobs": [
+            {
+              "title": "Operations Analyst",
+              "company": "Infosys",
+              "match_score": 82,
+              "semantic_score": 87,
+              "missing_skills": ["Power BI", "SQL"]
+            }
+          ],
+          "total_evaluated": 42,
+          "scoring_mode": "semantic",
+          "computed_at": "2025-09-12T10:43:12.000Z"
+        },
+        "risk_analysis": {
+          "overall_risk_score": 32,
+          "risk_level": "Low",
+          "risk_factors": [
+            { "factor": "Skill Obsolescence", "score": 25, "description": "Core skills remain in demand" }
+          ],
+          "recommendations": ["Learn Power BI within 6 months to maintain market value"],
+          "computed_at": "2025-09-12T10:43:14.000Z"
+        },
+        "opportunity_radar": {
+          "emerging_opportunities": [
+            {
+              "role": "Operations Analyst",
+              "opportunity_score": 88,
+              "match_score": 72,
+              "growth_trend": "High",
+              "average_salary": "₹12L",
+              "skills_to_learn": ["Power BI", "Process Optimization"]
+            }
+          ],
+          "total_signals_evaluated": 42,
+          "computed_at": "2025-09-12T10:43:16.000Z"
+        },
+        "career_advice": {
+          "career_insight": "Your administrative experience combined with Excel skills positions you well for an Operations role. Learning Power BI could increase salary potential by 50% within 3 years.",
+          "key_opportunity": "Pursue Power BI certification and apply for Operations Analyst roles.",
+          "salary_potential": "₹8–14 LPA after Power BI + Process Optimization",
+          "timeline": "12–18 months",
+          "skills_to_prioritise": ["Power BI", "Process Optimization", "SQL"],
+          "computed_at": "2025-09-12T10:43:18.000Z"
+        }
+      }
+    }
+  },
+
+  "GET /api/v1/jobs/matches": {
+    "description": "Job match results only (lightweight endpoint for job-matches page)",
+    "response": {
+      "success": true,
+      "data": {
+        "recommended_jobs": [
+          {
+            "title": "Operations Analyst",
+            "company": "Infosys",
+            "match_score": 82,
+            "semantic_score": 87,
+            "missing_skills": ["Power BI", "SQL"],
+            "breakdown": { "semantic": 87, "experience": 75, "industry": 80, "location": 90 }
+          },
+          {
+            "title": "Business Intelligence Analyst",
+            "company": "Deloitte",
+            "match_score": 74,
+            "semantic_score": 79,
+            "missing_skills": ["Power BI", "Tableau"],
+            "breakdown": { "semantic": 79, "experience": 65, "industry": 70, "location": 80 }
+          }
+        ],
+        "total_evaluated": 42,
+        "scoring_mode": "semantic",
+        "computed_at": "2025-09-12T10:43:12.000Z",
+        "_cached": false
+      }
+    },
+    "response_pending": {
+      "success": true,
+      "data": {
+        "_status": "pending",
+        "_message": "Job matches is being computed. Check pipeline-status for updates.",
+        "data": null
+      }
+    }
+  },
+
+  "GET /api/v1/career/risk": {
+    "response": {
+      "success": true,
+      "data": {
+        "overall_risk_score": 32,
+        "risk_level": "Low",
+        "risk_factors": [
+          {
+            "factor": "Skill Obsolescence",
+            "score": 25,
+            "description": "Core skills remain in demand for 3+ years",
+            "mitigation": "Add Power BI to portfolio within 6 months"
+          },
+          {
+            "factor": "Market Competition",
+            "score": 40,
+            "description": "Operations roles have moderate competition",
+            "mitigation": "Target niche industries: FinTech, HealthTech"
+          }
+        ],
+        "recommendations": [
+          "Learn Power BI within 6 months to maintain market value",
+          "Build operations metrics portfolio with public datasets"
+        ],
+        "market_stability": "Stable",
+        "computed_at": "2025-09-12T10:43:14.000Z"
+      }
+    }
+  },
+
+  "retry_behaviour": {
+    "description": "What happens when a worker job fails",
+    "flow": [
+      "Attempt 1 fails → BullMQ waits 2s → retries",
+      "Attempt 2 fails → BullMQ waits 4s → retries",
+      "Attempt 3 fails → isFinalAttempt=true → _storeFailure() writes error to result table → publishFailure() updates ai_pipeline_jobs.status='failed'",
+      "Dashboard receives _error field in result: { _status: 'failed', error: 'Engine timeout' }"
+    ],
+    "backoff": "exponential: 2000ms → 4000ms → 8000ms",
+    "career_advisor_override": "attempts=2, backoff=fixed 5000ms (LLM retries are expensive)"
+  },
+
+  "redis_cache_keys": {
+    "description": "All Redis keys used by the event bus system",
+    "keys": [
+      { "key": "worker:skill-graph:<userId>",       "ttl": "10 min", "writer": "SkillGraphWorker" },
+      { "key": "worker:career-health:<userId>",     "ttl": "10 min", "writer": "CareerHealthWorker" },
+      { "key": "worker:job-matching:<userId>",      "ttl": "10 min", "writer": "JobMatchingWorker" },
+      { "key": "worker:risk-analysis:<userId>",     "ttl": "10 min", "writer": "RiskAnalysisWorker" },
+      { "key": "worker:opportunity-radar:<userId>", "ttl": "10 min", "writer": "OpportunityRadarWorker" },
+      { "key": "worker:career-advisor:<userId>",    "ttl": "10 min", "writer": "CareerAdvisorWorker" },
+      { "key": "dashboard:intelligence-report:<userId>", "ttl": "10 min", "writer": "intelligenceResults.service" },
+      { "key": "dashboard:job-matches:<userId>",    "ttl": "10 min", "writer": "intelligenceResults.service" },
+      { "key": "dashboard:risk-analysis:<userId>",  "ttl": "10 min", "writer": "intelligenceResults.service" },
+      { "key": "dashboard:opportunities:<userId>",  "ttl": "10 min", "writer": "intelligenceResults.service" },
+      { "key": "ai:concurrency:current",            "ttl": "60s",    "writer": "aiConcurrency.js (existing)" }
+    ]
+  }
+}

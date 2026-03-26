@@ -45,3 +45,12 @@ const getRoleById = asyncHandler(async (req, res) => {
 });
 
 module.exports = { listJobFamilies, listRoles, getRoleById };
+
+
+
+
+
+
+
+
+

@@ -21,13 +21,13 @@
  * FIRESTORE PATH: metrics/daily/snapshots/{YYYY-MM-DD}
  */
 
-import { getFirestore, FieldValue, Timestamp } from 'firebase-admin/firestore';
+const { db, FieldValue, Timestamp } = require('../core/supabaseDbShim');
 import type { DailyMetricsAggregate, CostRow } from '../types/metrics.types';
 
 const COLLECTION_PATH = {
   usageLogs: 'usageLogs',
   snapshots: (date: string) =>
-    getFirestore().collection('metrics').doc('daily').collection('snapshots').doc(date),
+    require('../core/supabaseDbShim').db.collection('metrics').doc('daily').collection('snapshots').doc(date),
 };
 
 class AdminMetricsAggregator {
@@ -44,7 +44,7 @@ class AdminMetricsAggregator {
     console.log(`[AdminMetricsAggregator] Starting for ${targetDate}`);
 
     // ── 1. Fetch all usageLogs for the target date ───────────────────────────
-    const db        = getFirestore();
+    
     const startDate = new Date(`${targetDate}T00:00:00.000Z`);
     const endDate   = new Date(`${targetDate}T23:59:59.999Z`);
 

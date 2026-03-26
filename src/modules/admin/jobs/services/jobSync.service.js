@@ -5,7 +5,7 @@ const syncLogRepository  = require('../repositories/syncLog.repository');
 const syncLockRepository = require('../repositories/syncLock.repository');
 const { fetchJobRecords }   = require('../utils/jobSourceFetcher.util');
 const { validateJobRecord } = require('../validators/jobSync.validator');
-const logger = require('../../../../shared/logger');
+const logger = require('../../../../utils/logger');
 
 const BATCH_SIZE     = 50;
 const MAX_RECORDS    = 20000; // safety guard
@@ -188,3 +188,11 @@ class JobSyncService {
 }
 
 module.exports = new JobSyncService();
+
+
+
+
+
+
+
+

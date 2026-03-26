@@ -15,7 +15,7 @@
 
 'use strict';
 
-const { db }                   = require('../config/firebase');
+const { db }                   = require('../config/supabase');
 const { AppError, ErrorCodes } = require('../middleware/errorHandler');
 
 const COLLECTIONS = {
@@ -101,3 +101,12 @@ const getRoleById = async (roleId) => {
 };
 
 module.exports = { listJobFamilies, listRoles, getRoleById };
+
+
+
+
+
+
+
+
+

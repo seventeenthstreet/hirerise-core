@@ -1,0 +1,226 @@
+{
+  "_doc": "Multi-Agent Career Copilot — Example API Responses",
+
+  "POST /api/v1/copilot/agent/ask — skill intent": {
+    "request": {
+      "message": "What skills should I learn to become a Data Analyst?",
+      "session_id": null,
+      "force_refresh": false
+    },
+    "response_200": {
+      "success": true,
+      "data": {
+        "session_id": "b7e2a1f3-9c4d-4e8a-b2f1-0d3e5c7a9b1d",
+        "intent_detected": "skill",
+        "agents_used": [
+          "SkillIntelligenceAgent",
+          "MarketIntelligenceAgent",
+          "CareerAdvisorAgent"
+        ],
+        "agent_errors": [],
+        "skills_to_learn": ["Power BI", "SQL", "Python", "Tableau", "Excel"],
+        "adjacent_skills":  ["Data Visualization", "Statistical Analysis"],
+        "learning_paths": [
+          {
+            "skill": "Power BI",
+            "path": [
+              { "step": 1, "title": "Excel Fundamentals", "weeks": 2 },
+              { "step": 2, "title": "Power BI Desktop Basics", "weeks": 3 },
+              { "step": 3, "title": "DAX and Data Modeling", "weeks": 4 }
+            ]
+          }
+        ],
+        "job_matches": [
+          { "title": "Operations Analyst",       "match_score": 78, "missing_skills": ["Power BI", "SQL"] },
+          { "title": "Business Analyst",          "match_score": 65, "missing_skills": ["SQL", "Tableau"] }
+        ],
+        "career_risk":  null,
+        "risk_score":   null,
+        "risk_factors": [],
+        "opportunities": [],
+        "trending_skills": [
+          { "skill": "Python",  "demand_score": 95 },
+          { "skill": "SQL",     "demand_score": 92 },
+          { "skill": "Power BI","demand_score": 88 }
+        ],
+        "target_role_salary": null,
+        "ai_recommendation": "Your highest-priority gaps based on the Skill Intelligence data are Power BI (demand: 88) and SQL (demand: 92). The Job Matching data shows these two skills appear as missing in your top matches — Operations Analyst (78%) and Business Analyst (65%). Start with the free Microsoft Learn Power BI Fundamentals path today, then move to SQL basics on Mode Analytics.",
+        "confidence":        0.72,
+        "data_completeness": 0.4,
+        "duration_ms":       1247,
+        "generated_at":      "2026-03-15T11:00:00.000Z"
+      }
+    }
+  },
+
+  "POST /api/v1/copilot/agent/ask — salary intent": {
+    "request": { "message": "What salary can I earn as an Operations Analyst?" },
+    "response_200": {
+      "success": true,
+      "data": {
+        "intent_detected": "salary",
+        "agents_used": ["MarketIntelligenceAgent", "JobMatchingAgent", "CareerAdvisorAgent"],
+        "skills_to_learn": [],
+        "job_matches": [
+          { "title": "Operations Analyst", "match_score": 78, "salary": { "min": 800000, "max": 1400000 } }
+        ],
+        "target_role_salary": {
+          "career":        "Operations Analyst",
+          "entry_salary":  "₹8.0L",
+          "mid_salary":    "₹12.5L",
+          "senior_salary": "₹18.0L"
+        },
+        "ai_recommendation": "Based on Market Intelligence data, Operations Analyst salaries range from ₹8.0L at entry level to ₹18.0L at senior level. Your current 78% job match suggests you are positioned for an entry-to-mid role. Adding Power BI and SQL (from your Skill Intelligence data) typically boosts salary by ₹2–3L in this career path.",
+        "confidence": 0.78,
+        "duration_ms": 1034
+      }
+    }
+  },
+
+  "POST /api/v1/copilot/agent/analyze — full analysis": {
+    "request": { "force_refresh": true },
+    "response_200": {
+      "success": true,
+      "data": {
+        "session_id":      "a3f1c2d4-7e8b-4c9d-a1b2-3e4f5a6b7c8d",
+        "intent_detected": "general",
+        "agents_used": [
+          "SkillIntelligenceAgent",
+          "JobMatchingAgent",
+          "MarketIntelligenceAgent",
+          "CareerRiskAgent",
+          "OpportunityRadarAgent",
+          "CareerAdvisorAgent"
+        ],
+        "agent_errors": [],
+        "skills_to_learn": ["Power BI", "SQL", "Python", "Process Optimization"],
+        "adjacent_skills":  ["Data Analysis", "Business Analysis", "Tableau"],
+        "learning_paths": [
+          { "skill": "Power BI", "path": [{ "step": 1, "title": "Excel Fundamentals" }] }
+        ],
+        "job_matches": [
+          {
+            "title": "Operations Analyst",
+            "match_score": 78,
+            "missing_skills": ["Power BI", "SQL"],
+            "salary": { "min": 800000, "max": 1400000 }
+          },
+          {
+            "title": "Business Analyst",
+            "match_score": 65,
+            "missing_skills": ["SQL", "Tableau"],
+            "salary": null
+          }
+        ],
+        "career_risk":  "Low",
+        "risk_score":   28,
+        "risk_factors": [
+          { "factor": "Skill Currency",   "description": "Core skills remain in demand" },
+          { "factor": "Market Competition", "description": "Operations roles have moderate competition" }
+        ],
+        "opportunities": [
+          {
+            "role":         "Operations Analyst",
+            "growth_score": 88,
+            "match_score":  72,
+            "growth_trend": "High",
+            "salary":       "₹12L"
+          },
+          {
+            "role":         "Business Intelligence Analyst",
+            "growth_score": 82,
+            "match_score":  58,
+            "growth_trend": "High",
+            "salary":       "₹14L"
+          }
+        ],
+        "trending_skills": [
+          { "skill": "Python",  "demand_score": 95 },
+          { "skill": "SQL",     "demand_score": 92 },
+          { "skill": "Power BI","demand_score": 88 }
+        ],
+        "target_role_salary": {
+          "career":       "Operations Analyst",
+          "entry_salary": "₹8.0L",
+          "mid_salary":   "₹12.5L",
+          "senior_salary":"₹18.0L"
+        },
+        "ai_recommendation": "Your strongest career transition is toward Operations Analyst (78% job match, opportunity score 88). The Skill Intelligence data shows Power BI and SQL as your highest-priority gaps — both appear as missing skills in your top job matches and are ranked in the top-3 trending skills by MarketIntelligence. Your career risk is Low (28/100), meaning your current skills are not under immediate threat. Start with Microsoft Learn Power BI Fundamentals this week, then take Mode Analytics' free SQL course.",
+        "confidence":        0.95,
+        "data_completeness": 1.0,
+        "duration_ms":       2183,
+        "generated_at":      "2026-03-15T11:05:00.000Z"
+      }
+    }
+  },
+
+  "GET /api/v1/copilot/agent/status": {
+    "response_200": {
+      "success": true,
+      "data": {
+        "agents": {
+          "skill":       { "name": "SkillIntelligenceAgent",  "cachePrefix": "agent:skill" },
+          "jobs":        { "name": "JobMatchingAgent",         "cachePrefix": "agent:jobs" },
+          "market":      { "name": "MarketIntelligenceAgent",  "cachePrefix": "agent:market" },
+          "risk":        { "name": "CareerRiskAgent",          "cachePrefix": "agent:risk" },
+          "opportunity": { "name": "OpportunityRadarAgent",    "cachePrefix": "agent:radar" },
+          "advisor":     { "name": "CareerAdvisorAgent",       "cachePrefix": "agent:advisor" }
+        },
+        "intent_map": {
+          "skill":       ["skill", "market"],
+          "jobs":        ["jobs", "skill"],
+          "salary":      ["market", "jobs"],
+          "risk":        ["risk", "market"],
+          "opportunity": ["opportunity", "market"],
+          "transition":  ["skill", "jobs", "opportunity"],
+          "general":     ["skill", "jobs", "market", "risk", "opportunity"],
+          "full":        ["skill", "jobs", "market", "risk", "opportunity"]
+        },
+        "total_agents": 6
+      }
+    }
+  },
+
+  "GET /api/v1/copilot/agent/history": {
+    "response_200": {
+      "success": true,
+      "data": {
+        "history": [
+          {
+            "id":          "d4e5f6a7-...",
+            "session_id":  "b7e2a1f3-...",
+            "turn_index":  0,
+            "user_query":  "What skills should I learn?",
+            "intent":      "skill",
+            "agents_used": ["SkillIntelligenceAgent", "MarketIntelligenceAgent", "CareerAdvisorAgent"],
+            "confidence":  0.72,
+            "duration_ms": 1247,
+            "created_at":  "2026-03-15T11:00:00.000Z"
+          }
+        ],
+        "total": 1
+      }
+    }
+  },
+
+  "intent_classification_examples": {
+    "What skills should I learn?"               : "skill",
+    "Which jobs match my profile?"              : "jobs",
+    "What salary will I earn as a Data Analyst?": "salary",
+    "Is my career at risk of automation?"       : "risk",
+    "Show me emerging career opportunities"     : "opportunity",
+    "How do I transition to product management?": "transition",
+    "Tell me about my career"                   : "general",
+    "(no question — full analysis)"             : "general"
+  },
+
+  "redis_cache_keys": {
+    "agent:skill:<userId>":       "10 min — SkillIntelligenceAgent output",
+    "agent:jobs:<userId>":        "10 min — JobMatchingAgent output",
+    "agent:market:<userId>":      "10 min — MarketIntelligenceAgent output",
+    "agent:risk:<userId>":        "10 min — CareerRiskAgent output",
+    "agent:radar:<userId>":       "10 min — OpportunityRadarAgent output",
+    "agent:advisor:<userId>":     "10 min — CareerAdvisorAgent output",
+    "coordinator:<userId>:<intent>": "10 min — full coordinator response"
+  }
+}

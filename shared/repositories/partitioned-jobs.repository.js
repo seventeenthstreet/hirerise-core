@@ -25,7 +25,7 @@
  *     - createdAt (desc)
  */
 
-import { getFirestore, FieldValue, Timestamp } from 'firebase-admin/firestore';
+const { db, FieldValue, Timestamp } = require('../../src/core/supabaseDbShim');
 import { createHash } from 'crypto';
 import { logger } from '../logger/index.js';
 
@@ -37,7 +37,7 @@ export class PartitionedJobRepository {
   #db;
 
   constructor() {
-    this.#db = getFirestore();
+    this.#db = require('../../src/core/supabaseDbShim').db;
   }
 
   // ────────────────────────────────────────────────────────────────────────────

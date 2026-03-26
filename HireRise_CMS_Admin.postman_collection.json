@@ -1,0 +1,834 @@
+{
+  "info": {
+    "name": "HireRise — Admin CMS Dataset Ingestion",
+    "description": "Complete test suite for the Admin CMS duplicate-prevention endpoints.\n\n## Setup\n1. Set the `baseUrl` variable to your server (default: http://localhost:3000)\n2. Set the `adminToken` variable to a valid Firebase ID token for an admin user.\n   - Run `node get-firebase-token.mjs` from the project root to get one, or\n   - Use the Firebase Console → Authentication → copy a user's token.\n3. Run the **🔧 Health Check** request first to confirm the server is up.\n4. Run folders top-to-bottom — later tests reference IDs created by earlier ones.\n\n## Duplicate Prevention Behaviour\n- Creating the same skill twice returns **409 DUPLICATE_RECORD**\n- Names are normalized before comparison: 'JavaScript', 'javascript', 'java-script' all conflict\n- Roles are unique per job family: 'Director' in engineering ≠ 'Director' in product\n- Bulk import returns **207 Multi-Status** when some rows pass and some are duplicates",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    { "key": "baseUrl",    "value": "http://localhost:3000",  "type": "string" },
+    { "key": "apiPrefix",  "value": "/api/v1",                "type": "string" },
+    { "key": "adminToken", "value": "PASTE_YOUR_FIREBASE_ADMIN_TOKEN_HERE", "type": "string" },
+    { "key": "skillId",    "value": "", "type": "string" },
+    { "key": "roleId",     "value": "", "type": "string" },
+    { "key": "jobFamilyId","value": "", "type": "string" }
+  ],
+  "item": [
+
+    {
+      "name": "🔧 Health Check",
+      "request": {
+        "method": "GET",
+        "url": "{{baseUrl}}{{apiPrefix}}/health",
+        "description": "Confirm the server is running before running any CMS tests."
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "exec": [
+              "pm.test('Server is healthy', () => {",
+              "  pm.response.to.have.status(200);",
+              "  pm.expect(pm.response.json().status).to.eql('healthy');",
+              "});"
+            ]
+          }
+        }
+      ]
+    },
+
+    {
+      "name": "📁 Skills",
+      "item": [
+
+        {
+          "name": "✅ Create skill — JavaScript",
+          "request": {
+            "method": "POST",
+            "url": "{{baseUrl}}{{apiPrefix}}/admin/cms/skills",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{adminToken}}" },
+              { "key": "Content-Type",  "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"name\": \"JavaScript\",\n  \"category\": \"language\",\n  \"description\": \"High-level interpreted programming language\",\n  \"aliases\": [\"JS\", \"ECMAScript\"],\n  \"demandScore\": 95\n}"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('201 Created', () => pm.response.to.have.status(201));",
+                  "pm.test('success flag is true', () => {",
+                  "  pm.expect(pm.response.json().success).to.be.true;",
+                  "});",
+                  "pm.test('skill has an id', () => {",
+                  "  const id = pm.response.json().data?.id || pm.response.json().data?.skillId;",
+                  "  pm.expect(id).to.be.a('string');",
+                  "  pm.collectionVariables.set('skillId', id);",
+                  "  console.log('Saved skillId:', id);",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+
+        {
+          "name": "❌ Duplicate skill — same name exact case",
+          "request": {
+            "method": "POST",
+            "url": "{{baseUrl}}{{apiPrefix}}/admin/cms/skills",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{adminToken}}" },
+              { "key": "Content-Type",  "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"name\": \"JavaScript\",\n  \"category\": \"language\"\n}"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('409 Conflict for exact duplicate', () => pm.response.to.have.status(409));",
+                  "pm.test('error code is DUPLICATE_RECORD', () => {",
+                  "  const body = pm.response.json();",
+                  "  pm.expect(body.success).to.be.false;",
+                  "  pm.expect(body.error?.code || body.errorCode).to.eql('DUPLICATE_RECORD');",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+
+        {
+          "name": "❌ Duplicate skill — lowercase variant",
+          "request": {
+            "method": "POST",
+            "url": "{{baseUrl}}{{apiPrefix}}/admin/cms/skills",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{adminToken}}" },
+              { "key": "Content-Type",  "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"name\": \"javascript\",\n  \"category\": \"language\"\n}"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('409 Conflict — normalised name collision', () => pm.response.to.have.status(409));",
+                  "pm.test('error code is DUPLICATE_RECORD', () => {",
+                  "  pm.expect(pm.response.json().error?.code || pm.response.json().errorCode).to.eql('DUPLICATE_RECORD');",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+
+        {
+          "name": "❌ Duplicate skill — punctuation variant (java-script)",
+          "request": {
+            "method": "POST",
+            "url": "{{baseUrl}}{{apiPrefix}}/admin/cms/skills",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{adminToken}}" },
+              { "key": "Content-Type",  "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"name\": \"java-script\",\n  \"category\": \"language\"\n}"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('409 Conflict — punctuation-normalized collision', () => pm.response.to.have.status(409));"
+                ]
+              }
+            }
+          ]
+        },
+
+        {
+          "name": "🔒 Security — blocked adminId injection",
+          "request": {
+            "method": "POST",
+            "url": "{{baseUrl}}{{apiPrefix}}/admin/cms/skills",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{adminToken}}" },
+              { "key": "Content-Type",  "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"name\": \"TypeScript\",\n  \"category\": \"language\",\n  \"adminId\": \"injected-fake-admin\",\n  \"createdByAdminId\": \"another-fake-id\"\n}"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('400 — identity injection blocked by validator', () => {",
+                  "  pm.response.to.have.status(400);",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+
+        {
+          "name": "✅ Create skill — TypeScript (different name)",
+          "request": {
+            "method": "POST",
+            "url": "{{baseUrl}}{{apiPrefix}}/admin/cms/skills",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{adminToken}}" },
+              { "key": "Content-Type",  "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"name\": \"TypeScript\",\n  \"category\": \"language\",\n  \"demandScore\": 88\n}"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('201 Created', () => pm.response.to.have.status(201));"
+                ]
+              }
+            }
+          ]
+        },
+
+        {
+          "name": "✅ Update skill — rename with dedup check",
+          "request": {
+            "method": "PATCH",
+            "url": "{{baseUrl}}{{apiPrefix}}/admin/cms/skills/{{skillId}}",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{adminToken}}" },
+              { "key": "Content-Type",  "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"description\": \"Updated description for JavaScript\",\n  \"demandScore\": 97\n}"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('200 OK on update', () => pm.response.to.have.status(200));",
+                  "pm.test('success is true', () => pm.expect(pm.response.json().success).to.be.true);"
+                ]
+              }
+            }
+          ]
+        },
+
+        {
+          "name": "✅ List skills",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{baseUrl}}{{apiPrefix}}/admin/cms/skills?limit=20&category=language",
+              "query": [
+                { "key": "limit",    "value": "20" },
+                { "key": "category", "value": "language" }
+              ]
+            },
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{adminToken}}" }
+            ]
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));",
+                  "pm.test('returns array of skills', () => {",
+                  "  const body = pm.response.json();",
+                  "  pm.expect(body.success).to.be.true;",
+                  "  pm.expect(body.data).to.be.an('array');",
+                  "  pm.expect(body.data.length).to.be.at.least(1);",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+
+        {
+          "name": "🔒 No token — 401",
+          "request": {
+            "method": "GET",
+            "url": "{{baseUrl}}{{apiPrefix}}/admin/cms/skills"
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('401 without token', () => pm.response.to.have.status(401));"
+                ]
+              }
+            }
+          ]
+        }
+
+      ]
+    },
+
+    {
+      "name": "📁 Job Families",
+      "item": [
+
+        {
+          "name": "✅ Create job family — Software Engineering",
+          "request": {
+            "method": "POST",
+            "url": "{{baseUrl}}{{apiPrefix}}/admin/cms/job-families",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{adminToken}}" },
+              { "key": "Content-Type",  "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"name\": \"Software Engineering\",\n  \"description\": \"Engineering roles focused on software development\"\n}"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('201 Created', () => pm.response.to.have.status(201));",
+                  "const id = pm.response.json().data?.id;",
+                  "if (id) pm.collectionVariables.set('jobFamilyId', id);",
+                  "console.log('Saved jobFamilyId:', id);"
+                ]
+              }
+            }
+          ]
+        },
+
+        {
+          "name": "❌ Duplicate job family",
+          "request": {
+            "method": "POST",
+            "url": "{{baseUrl}}{{apiPrefix}}/admin/cms/job-families",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{adminToken}}" },
+              { "key": "Content-Type",  "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"name\": \"software engineering\"\n}"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('409 Conflict — case-insensitive duplicate', () => pm.response.to.have.status(409));"
+                ]
+              }
+            }
+          ]
+        },
+
+        {
+          "name": "✅ Create job family — Product Management",
+          "request": {
+            "method": "POST",
+            "url": "{{baseUrl}}{{apiPrefix}}/admin/cms/job-families",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{adminToken}}" },
+              { "key": "Content-Type",  "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"name\": \"Product Management\",\n  \"description\": \"Roles focused on product strategy and execution\"\n}"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('201 Created', () => pm.response.to.have.status(201));"
+                ]
+              }
+            }
+          ]
+        },
+
+        {
+          "name": "✅ List job families",
+          "request": {
+            "method": "GET",
+            "url": "{{baseUrl}}{{apiPrefix}}/admin/cms/job-families",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{adminToken}}" }
+            ]
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));",
+                  "pm.test('at least 2 job families', () => {",
+                  "  pm.expect(pm.response.json().data.length).to.be.at.least(2);",
+                  "});"
+                ]
+              }
+            }
+          ]
+        }
+
+      ]
+    },
+
+    {
+      "name": "📁 Roles",
+      "item": [
+
+        {
+          "name": "✅ Create role — Director (Software Engineering)",
+          "request": {
+            "method": "POST",
+            "url": "{{baseUrl}}{{apiPrefix}}/admin/cms/roles",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{adminToken}}" },
+              { "key": "Content-Type",  "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"name\": \"Director\",\n  \"jobFamilyId\": \"{{jobFamilyId}}\",\n  \"level\": \"L7\",\n  \"track\": \"management\",\n  \"description\": \"Engineering director leading multiple teams\"\n}"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('201 Created', () => pm.response.to.have.status(201));",
+                  "const id = pm.response.json().data?.id;",
+                  "if (id) pm.collectionVariables.set('roleId', id);",
+                  "console.log('Saved roleId:', id);"
+                ]
+              }
+            }
+          ]
+        },
+
+        {
+          "name": "❌ Duplicate role — same family, same name",
+          "request": {
+            "method": "POST",
+            "url": "{{baseUrl}}{{apiPrefix}}/admin/cms/roles",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{adminToken}}" },
+              { "key": "Content-Type",  "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"name\": \"director\",\n  \"jobFamilyId\": \"{{jobFamilyId}}\",\n  \"track\": \"management\"\n}"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('409 — composite key collision (same family)', () => pm.response.to.have.status(409));",
+                  "pm.test('error code DUPLICATE_RECORD', () => {",
+                  "  pm.expect(pm.response.json().error?.code || pm.response.json().errorCode).to.eql('DUPLICATE_RECORD');",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+
+        {
+          "name": "✅ Create role — Director (Product Management, different family)",
+          "request": {
+            "method": "POST",
+            "url": "{{baseUrl}}{{apiPrefix}}/admin/cms/roles",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{adminToken}}" },
+              { "key": "Content-Type",  "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"name\": \"Director\",\n  \"jobFamilyId\": \"product_management\",\n  \"track\": \"management\",\n  \"description\": \"Product director — different family, so not a duplicate\"\n}"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('201 Created — same name, different family is allowed', () => {",
+                  "  pm.response.to.have.status(201);",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+
+        {
+          "name": "✅ List roles",
+          "request": {
+            "method": "GET",
+            "url": "{{baseUrl}}{{apiPrefix}}/admin/cms/roles?limit=20",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{adminToken}}" }
+            ]
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));"
+                ]
+              }
+            }
+          ]
+        }
+
+      ]
+    },
+
+    {
+      "name": "📁 Education Levels",
+      "item": [
+
+        {
+          "name": "✅ Create education level — Bachelor's Degree",
+          "request": {
+            "method": "POST",
+            "url": "{{baseUrl}}{{apiPrefix}}/admin/cms/education-levels",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{adminToken}}" },
+              { "key": "Content-Type",  "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"name\": \"Bachelor's Degree\"\n}"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('201 Created', () => pm.response.to.have.status(201));"
+                ]
+              }
+            }
+          ]
+        },
+
+        {
+          "name": "❌ Duplicate education level",
+          "request": {
+            "method": "POST",
+            "url": "{{baseUrl}}{{apiPrefix}}/admin/cms/education-levels",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{adminToken}}" },
+              { "key": "Content-Type",  "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"name\": \"bachelors degree\"\n}"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('409 Conflict — normalized duplicate', () => pm.response.to.have.status(409));"
+                ]
+              }
+            }
+          ]
+        }
+
+      ]
+    },
+
+    {
+      "name": "📁 Salary Benchmarks",
+      "item": [
+
+        {
+          "name": "✅ Create salary benchmark",
+          "request": {
+            "method": "POST",
+            "url": "{{baseUrl}}{{apiPrefix}}/admin/cms/salary-benchmarks",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{adminToken}}" },
+              { "key": "Content-Type",  "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"name\": \"SE L5 Bangalore 2025\",\n  \"roleId\": \"{{roleId}}\",\n  \"region\": \"Bangalore\",\n  \"currency\": \"INR\",\n  \"minSalary\": 2000000,\n  \"maxSalary\": 3500000,\n  \"medianSalary\": 2700000,\n  \"year\": 2025\n}"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('201 Created', () => pm.response.to.have.status(201));"
+                ]
+              }
+            }
+          ]
+        },
+
+        {
+          "name": "❌ Duplicate salary benchmark",
+          "request": {
+            "method": "POST",
+            "url": "{{baseUrl}}{{apiPrefix}}/admin/cms/salary-benchmarks",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{adminToken}}" },
+              { "key": "Content-Type",  "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"name\": \"SE L5 Bangalore 2025\",\n  \"roleId\": \"{{roleId}}\"\n}"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('409 Conflict', () => pm.response.to.have.status(409));"
+                ]
+              }
+            }
+          ]
+        }
+
+      ]
+    },
+
+    {
+      "name": "📁 Bulk CSV Import",
+      "item": [
+
+        {
+          "name": "✅ Import — all clean rows",
+          "request": {
+            "method": "POST",
+            "url": "{{baseUrl}}{{apiPrefix}}/admin/cms/import",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{adminToken}}" },
+              { "key": "Content-Type",  "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"datasetType\": \"skills\",\n  \"rows\": [\n    { \"name\": \"React\",      \"category\": \"framework\" },\n    { \"name\": \"Node.js\",    \"category\": \"framework\" },\n    { \"name\": \"PostgreSQL\", \"category\": \"tool\" }\n  ]\n}"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('201 Created — all rows inserted', () => pm.response.to.have.status(201));",
+                  "pm.test('inserted count matches row count', () => {",
+                  "  const body = pm.response.json();",
+                  "  pm.expect(body.data.inserted).to.eql(3);",
+                  "  pm.expect(body.data.total).to.eql(3);",
+                  "  pm.expect(body.duplicates).to.be.an('array').with.lengthOf(0);",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+
+        {
+          "name": "✅ Import — mixed (some new, some duplicate) → 207",
+          "request": {
+            "method": "POST",
+            "url": "{{baseUrl}}{{apiPrefix}}/admin/cms/import",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{adminToken}}" },
+              { "key": "Content-Type",  "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"datasetType\": \"skills\",\n  \"rows\": [\n    { \"name\": \"Python\",     \"category\": \"language\" },\n    { \"name\": \"react\",      \"category\": \"framework\" },\n    { \"name\": \"Kubernetes\", \"category\": \"tool\" },\n    { \"name\": \"NODE.JS\",    \"category\": \"framework\" }\n  ]\n}"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('207 Multi-Status — partial success', () => pm.response.to.have.status(207));",
+                  "pm.test('2 inserted, 2 duplicate', () => {",
+                  "  const body = pm.response.json();",
+                  "  pm.expect(body.data.inserted).to.eql(2);",
+                  "  pm.expect(body.duplicates.length).to.eql(2);",
+                  "});",
+                  "pm.test('duplicates identify reason as database', () => {",
+                  "  pm.response.json().duplicates.forEach(d => {",
+                  "    pm.expect(d.reason).to.be.oneOf(['database', 'file']);",
+                  "    pm.expect(d.row).to.be.a('number');",
+                  "  });",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+
+        {
+          "name": "✅ Import — internal file duplicates detected",
+          "request": {
+            "method": "POST",
+            "url": "{{baseUrl}}{{apiPrefix}}/admin/cms/import",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{adminToken}}" },
+              { "key": "Content-Type",  "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"datasetType\": \"skills\",\n  \"rows\": [\n    { \"name\": \"Docker\",  \"category\": \"tool\" },\n    { \"name\": \"Docker\",  \"category\": \"tool\" },\n    { \"name\": \"DOCKER\",  \"category\": \"tool\" }\n  ]\n}"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('1 inserted, 2 are file-level duplicates', () => {",
+                  "  const body = pm.response.json();",
+                  "  pm.expect(body.data.inserted).to.eql(1);",
+                  "  const fileDupes = body.duplicates.filter(d => d.reason === 'file');",
+                  "  pm.expect(fileDupes.length).to.eql(2);",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+
+        {
+          "name": "❌ Import — all duplicates → 409",
+          "request": {
+            "method": "POST",
+            "url": "{{baseUrl}}{{apiPrefix}}/admin/cms/import",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{adminToken}}" },
+              { "key": "Content-Type",  "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"datasetType\": \"skills\",\n  \"rows\": [\n    { \"name\": \"JavaScript\", \"category\": \"language\" },\n    { \"name\": \"TypeScript\", \"category\": \"language\" }\n  ]\n}"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('409 — all rows are duplicates', () => pm.response.to.have.status(409));",
+                  "pm.test('0 inserted', () => {",
+                  "  pm.expect(pm.response.json().data.inserted).to.eql(0);",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+
+        {
+          "name": "❌ Import — missing required field",
+          "request": {
+            "method": "POST",
+            "url": "{{baseUrl}}{{apiPrefix}}/admin/cms/import",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{adminToken}}" },
+              { "key": "Content-Type",  "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"datasetType\": \"skills\",\n  \"rows\": [\n    { \"category\": \"language\" }\n  ]\n}"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('400 — missing name field fails validation', () => pm.response.to.have.status(400));"
+                ]
+              }
+            }
+          ]
+        },
+
+        {
+          "name": "🔒 Security — sourceAgency injection blocked",
+          "request": {
+            "method": "POST",
+            "url": "{{baseUrl}}{{apiPrefix}}/admin/cms/import",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{adminToken}}" },
+              { "key": "Content-Type",  "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"datasetType\": \"skills\",\n  \"rows\": [\n    {\n      \"name\": \"Rust\",\n      \"category\": \"language\",\n      \"sourceAgency\": \"injected-agency\",\n      \"createdByAdminId\": \"fake-admin\"\n    }\n  ]\n}"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('400 — sourceAgency and createdByAdminId injection blocked', () => {",
+                  "  pm.response.to.have.status(400);",
+                  "});"
+                ]
+              }
+            }
+          ]
+        }
+
+      ]
+    }
+
+  ]
+}

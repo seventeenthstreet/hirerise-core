@@ -170,7 +170,7 @@ const { validateBody } = require('../middleware/validation.schemas');
 const { z } = require('zod');
 
 const ManualActivationSchema = z.object({
-  userId:          z.string().min(1),
+  user_id:          z.string().min(1),
   planAmount:      z.coerce.number().positive(),
   subscriptionId:  z.string().min(1),
   currency:        z.enum(['INR', 'USD']).default('INR'),
@@ -197,7 +197,7 @@ router.post(
 
       logger.info('[Webhook/Manual] Manual activation by admin', {
         adminUid:       req.user.uid,
-        targetUserId:   userId,
+        targetuser_id:   userId,
         planAmount,
       });
 
@@ -209,3 +209,11 @@ router.post(
 );
 
 module.exports = router;
+
+
+
+
+
+
+
+

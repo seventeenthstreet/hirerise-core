@@ -1,0 +1,16 @@
+name,category,description,demandScore
+JavaScript,language,High-level interpreted programming language,95
+TypeScript,language,Typed superset of JavaScript,88
+Python,language,General-purpose high-level language,92
+SQL,tool,Structured Query Language for databases,85
+React,framework,JavaScript library for building UIs,90
+Node.js,framework,JavaScript runtime built on V8,82
+Docker,tool,Container platform for application deployment,80
+Kubernetes,tool,Container orchestration system,75
+PostgreSQL,tool,Advanced open-source relational database,78
+Redis,tool,In-memory data structure store,72
+GraphQL,language,Query language for APIs,68
+AWS,tool,Amazon Web Services cloud platform,85
+Git,tool,Distributed version control system,95
+REST API,technical,Representational State Transfer API design,88
+Machine Learning,technical,Subset of AI enabling systems to learn,70

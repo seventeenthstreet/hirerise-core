@@ -1,84 +1,145 @@
 'use strict';
 
 /**
- * resume.routes.js
+ * jobApplications.routes.js
  *
- * CHANGES (remediation sprint):
- *   FIX-1e: Fixed auth.middleware import path — was pointing to
- *            '../../shared/middleware/auth.middleware' which does not exist,
- *            causing server crash on startup. Corrected to '../../middleware/auth.middleware'.
- *   FIX-17: Added Multer fileFilter to explicitly allow PDF, DOCX, DOC, TXT
- *            and reject all other file types with a clean 415 error.
+ * Mounted at: /api/v1/applications
+ * Auth:       authenticate applied by server.js at mount — do NOT add here.
  *
  * Route chain:
- *   authenticate → conversionHookMiddleware → controller
+ *   server.js: authenticate → [validateBody|validateQuery] → controller
+ *
+ * COLLECTION FIELDS (from repository):
+ *   companyName, jobTitle, emailSentTo, appliedDate, status,
+ *   notes, followUpDate, source, deleted, createdAt, updatedAt
+ *
+ * VALID_STATUSES (from repository):
+ *   applied, rejected, interview_scheduled, interview_completed,
+ *   offer_received, offer_accepted, offer_rejected, no_response, withdrawn
+ *
+ * VALID_SOURCES (from repository):
+ *   LinkedIn, Indeed, Referral, Company Website, Other
  */
 
 const { Router } = require('express');
-const multer = require('multer');
+const { z }      = require('zod');
 
-const { scoreResume, uploadResume, analyzeResumeGrowth, refreshSignedUrl } = require('../modules/resume/controllers/resume.controller');
-const conversionHookMiddleware    = require('../modules/conversion/middleware/conversionHook.middleware');
-const { authenticate }                = require('../middleware/auth.middleware');
+const {
+  create,
+  list,
+  update,
+  remove,
+} = require('./controllers/jobApplications.controller');
+
+const {
+  validateBody,
+  validateQuery,
+  dateString,
+} = require('../middleware/validation.schemas');
+
+const {
+  VALID_STATUSES,
+  VALID_SOURCES,
+} = require('./repository/jobApplications.repository');
 
 const router = Router();
 
 // ─────────────────────────────────────────────────────────────
-// ALLOWED FILE TYPES
+// SCHEMAS
 // ─────────────────────────────────────────────────────────────
-const ALLOWED_MIMETYPES = new Set([
-  'application/pdf',                                                              // .pdf
-  'application/msword',                                                           // .doc
-  'application/vnd.openxmlformats-officedocument.wordprocessingml.document',     // .docx
-  'text/plain',                                                                   // .txt
-]);
 
-const ALLOWED_EXTENSIONS = new Set(['.pdf', '.doc', '.docx', '.txt']);
+/**
+ * CreateApplicationSchema
+ * Validates POST /applications body.
+ * companyName + jobTitle are required; everything else is optional.
+ */
+const CreateApplicationSchema = z.object({
+  companyName:  z.string().min(1, 'companyName is required').max(200),
+  jobTitle:     z.string().min(1, 'jobTitle is required').max(200),
+  emailSentTo:  z.string().email('Must be a valid email').optional().nullable(),
+  appliedDate:  dateString.optional(),                           // YYYY-MM-DD
+  status:       z.enum(VALID_STATUSES).default('applied'),
+  notes:        z.string().max(2000).optional().nullable(),
+  followUpDate: dateString.optional().nullable(),                // YYYY-MM-DD
+  source:       z.enum(VALID_SOURCES).optional().nullable(),
+}).strict();
 
-function fileFilter(req, file, cb) {
-  const ext = require('path')
-    .extname(file.originalname)
-    .toLowerCase();
+/**
+ * UpdateApplicationSchema
+ * Validates PATCH /applications/:id body.
+ * All fields optional — only send what you want to change.
+ */
+const UpdateApplicationSchema = z.object({
+  companyName:  z.string().min(1).max(200).optional(),
+  jobTitle:     z.string().min(1).max(200).optional(),
+  emailSentTo:  z.string().email().optional().nullable(),
+  appliedDate:  dateString.optional(),
+  status:       z.enum(VALID_STATUSES).optional(),
+  notes:        z.string().max(2000).optional().nullable(),
+  followUpDate: dateString.optional().nullable(),
+  source:       z.enum(VALID_SOURCES).optional().nullable(),
+}).strict().refine(
+  (data) => Object.keys(data).length > 0,
+  { message: 'At least one field must be provided to update.' }
+);
 
-  if (ALLOWED_MIMETYPES.has(file.mimetype) || ALLOWED_EXTENSIONS.has(ext)) {
-    cb(null, true);
-  } else {
-    cb(
-      new multer.MulterError(
-        'LIMIT_UNEXPECTED_FILE',
-        `Unsupported file type "${ext || file.mimetype}". ` +
-        'Please upload a PDF, DOC, DOCX, or TXT file.'
-      ),
-      false
-    );
-  }
-}
-
-// ─────────────────────────────────────────────────────────────
-// MULTER CONFIG
-// ─────────────────────────────────────────────────────────────
-const upload = multer({
-  storage:    multer.memoryStorage(),
-  limits:     { fileSize: 10 * 1024 * 1024 }, // 10 MB (matches service)
-  fileFilter,
+/**
+ * ListApplicationsQuerySchema
+ * Validates GET /applications query params.
+ */
+const ListApplicationsQuerySchema = z.object({
+  limit:  z.coerce.number().int().min(1).max(50).default(20),
+  cursor: z.string().max(200).optional(),
+  status: z.enum(VALID_STATUSES).optional(),
 });
 
 // ─────────────────────────────────────────────────────────────
 // ROUTES
 // ─────────────────────────────────────────────────────────────
 
-// POST /api/v1/resumes/score
-router.post('/score', conversionHookMiddleware, scoreResume);
+// POST /api/v1/applications
+// Create a new tracked job application.
+// Free tier: max 8 applications (enforced in service layer).
+router.post(
+  '/',
+  validateBody(CreateApplicationSchema),
+  create,
+);
 
-// POST /api/v1/resumes/upload
-router.post('/upload', upload.single('resume'), conversionHookMiddleware, uploadResume);
+// GET /api/v1/applications
+// List all applications for the authenticated user.
+// Supports cursor-based pagination and optional status filter.
+router.get(
+  '/',
+  validateQuery(ListApplicationsQuerySchema),
+  list,
+);
 
-// POST /api/v1/resumes/growth
-router.post('/growth', conversionHookMiddleware, analyzeResumeGrowth);
+// PATCH /api/v1/applications/:id
+// Update one or more fields of an existing application.
+// Ownership enforced in repository (IDOR guard).
+// Blocked on soft-deleted documents.
+router.patch(
+  '/:id',
+  validateBody(UpdateApplicationSchema),
+  update,
+);
 
-// POST /api/v1/resumes/:resumeId/refresh-url  (FIX G-03)
-// Regenerates a fresh 7-day signed URL for a resume PDF stored in Firebase Storage.
-// Call when signedUrlExpiresAt is within 1 hour of expiry, or when URL returns 403.
-router.post('/:resumeId/refresh-url', refreshSignedUrl);
+// DELETE /api/v1/applications/:id
+// Soft-delete an application (sets deleted:true + deletedAt).
+// Ownership enforced in repository.
+// Restores free-tier slot (countByUser excludes soft-deleted).
+router.delete(
+  '/:id',
+  remove,
+);
 
 module.exports = router;
+
+
+
+
+
+
+
+

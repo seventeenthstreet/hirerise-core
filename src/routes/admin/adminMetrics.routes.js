@@ -10,6 +10,78 @@ const { adminMetricsService }    = require('../../services/admin/adminMetrics.se
 const { adminMetricsAggregator } = require('../../workers/adminMetrics.aggregator');
 const { verifySuperAdmin }       = require('../../middleware/verifyAdmin.middleware');
 
+// ── Content counts ─────────────────────────────────────────────────────────────
+// Fetches document counts for the five CMS collections shown on the dashboard.
+// Uses Firestore COUNT aggregation queries (one round-trip per collection).
+// Results are cached for 60 s to avoid hammering Firestore on every page load.
+
+let _contentCountsCache   = null;
+let _contentCountsCachedAt = 0;
+const CONTENT_COUNTS_TTL  = 60 * 1000; // 60 seconds
+
+async function getContentCounts() {
+  const now = Date.now();
+  if (_contentCountsCache && now - _contentCountsCachedAt < CONTENT_COUNTS_TTL) {
+    return _contentCountsCache;
+  }
+
+  const db = require('../../config/supabase').db;
+
+  // Safe count helper — tries COUNT aggregation first (firebase-admin ≥11, Firestore native mode).
+  // Falls back to a full .get() if aggregation isn't supported (emulator, Datastore mode).
+  async function safeCount(collectionName) {
+    try {
+      const snap = await db.collection(collectionName).count().get();
+      return snap.data().count;
+    } catch (_) {
+      const snap = await db.collection(collectionName).get();
+      return snap.size;
+    }
+  }
+
+  // Run all six counts in parallel
+  const [totalSkills, totalRoles, totalJobFamilies, totalEducationLevels, totalSalaryRecords, totalUsers] =
+    await Promise.all([
+      safeCount('cms_skills'),
+      safeCount('cms_roles'),
+      safeCount('cms_job_families'),
+      safeCount('cms_education_levels'),
+      safeCount('cms_salary_benchmarks'),
+      safeCount('users'),
+    ]);
+
+  // Find the most recent createdAt across all five CMS collections
+  const [lastSkill, lastRole, lastJobFamily, lastEdu, lastSalary] = await Promise.all([
+    db.collection('cms_skills').orderBy('createdAt', 'desc').limit(1).get(),
+    db.collection('cms_roles').orderBy('createdAt', 'desc').limit(1).get(),
+    db.collection('cms_job_families').orderBy('createdAt', 'desc').limit(1).get(),
+    db.collection('cms_education_levels').orderBy('createdAt', 'desc').limit(1).get(),
+    db.collection('cms_salary_benchmarks').orderBy('createdAt', 'desc').limit(1).get(),
+  ]);
+
+  const importDates = [lastSkill, lastRole, lastJobFamily, lastEdu, lastSalary]
+    .map(snap => snap.docs[0]?.data()?.createdAt ?? null)
+    .filter(Boolean);
+
+  const lastImportAt = importDates.length > 0
+    ? importDates.sort().at(-1)
+    : null;
+
+  const result = {
+    totalSkills,
+    totalRoles,
+    totalJobFamilies,
+    totalEducationLevels,
+    totalSalaryRecords,
+    totalUsers,
+    lastImportAt,
+  };
+
+  _contentCountsCache   = result;
+  _contentCountsCachedAt = now;
+  return result;
+}
+
 const router = Router();
 
 const VALID_PERIODS = new Set(['7d', '30d', '90d', '1y']);
@@ -33,7 +105,27 @@ router.get('/', async (req, res) => {
   const { params, error } = validateQueryParams(req);
   if (error) return res.status(400).json({ success: false, errorCode: 'VALIDATION_ERROR', message: error, timestamp: new Date().toISOString() });
   try {
-    const data = await adminMetricsService.getMetrics(params);
+    // Fetch content counts and AI/billing metrics in parallel
+    const [contentCounts, aiMetrics] = await Promise.all([
+      getContentCounts(),
+      adminMetricsService.getMetrics(params),
+    ]);
+
+    // Merge: content counts (dashboard stat cards) + AI billing data (metrics deep-dive)
+    // The frontend AdminMetrics type reads: totalSkills, totalRoles, totalJobFamilies,
+    // totalEducationLevels, totalSalaryRecords, totalUsers, activeUsers30d, lastImportAt
+    const data = {
+      ...aiMetrics,
+      totalSkills:          contentCounts.totalSkills,
+      totalRoles:           contentCounts.totalRoles,
+      totalJobFamilies:     contentCounts.totalJobFamilies,
+      totalEducationLevels: contentCounts.totalEducationLevels,
+      totalSalaryRecords:   contentCounts.totalSalaryRecords,
+      totalUsers:           contentCounts.totalUsers,
+      activeUsers30d:       aiMetrics.activeUsers ?? 0,
+      lastImportAt:         contentCounts.lastImportAt,
+    };
+
     return res.status(200).json({ success: true, data, meta: { generatedAt: new Date().toISOString() } });
   } catch (err) {
     console.error('[AdminMetrics] getMetrics failed:', err?.message);
@@ -68,3 +160,12 @@ router.post('/aggregate', verifySuperAdmin, async (req, res) => {
 });
 
 module.exports = router;
+
+
+
+
+
+
+
+
+

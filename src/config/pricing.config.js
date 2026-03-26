@@ -52,3 +52,11 @@ const PLAN_REVENUE_USD = {
 };
 
 module.exports = { MODEL_PRICING, calculateCostUSD, MARGIN_THRESHOLDS, FREE_BURN_THRESHOLDS, PLAN_REVENUE_USD };
+
+
+
+
+
+
+
+

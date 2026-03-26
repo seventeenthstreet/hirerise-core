@@ -47,7 +47,7 @@
  *   subscriptionEvents: [provider ASC, externalEventId ASC]  (idempotency)
  */
 
-const { getFirestore, FieldValue, Timestamp } = require('firebase-admin/firestore');
+const { db, FieldValue, Timestamp } = require('../../config/supabase');
 const { AppError, ErrorCodes } = require('../../middleware/errorHandler');
 const logger = require('../../utils/logger');
 const { getCreditsForPlan } = require('../../modules/analysis/analysis.constants');
@@ -75,7 +75,7 @@ function getPlanConfig(amount, currency = 'INR') {
 
 /*
   subscriptions/{userId}: {
-    userId:               string
+    user_id:               string
     tier:                 'free' | 'pro' | 'enterprise'
     status:               'active' | 'cancelled' | 'expired' | 'paused' | 'trialing'
     planAmount:           number         (INR or USD)
@@ -95,7 +95,7 @@ function getPlanConfig(amount, currency = 'INR') {
   }
 
   subscriptionEvents/{eventId}: {
-    userId:           string
+    user_id:           string
     eventType:        'activated' | 'renewed' | 'cancelled' | 'downgraded' | 'refunded' | 'expired' | 'paused'
     provider:         string
     externalEventId:  string         (Stripe event ID or Razorpay payment ID)
@@ -113,7 +113,7 @@ function getPlanConfig(amount, currency = 'INR') {
 // ─── Idempotency check ────────────────────────────────────────────────────────
 
 async function isEventAlreadyProcessed(idempotencyKey) {
-  const db   = getFirestore();
+  
   const snap = await db
     .collection('subscriptionEvents')
     .where('idempotencyKey', '==', idempotencyKey)
@@ -146,7 +146,7 @@ async function activateSubscription({ userId, planAmount, subscriptionId, provid
   }
 
   const plan = getPlanConfig(planAmount, currency);
-  const db   = getFirestore();
+  
   const now  = new Date();
 
   const expiresAt = new Date(now);
@@ -251,7 +251,7 @@ async function cancelSubscription({ userId, subscriptionId, provider, reason = '
     return { skipped: true };
   }
 
-  const db  = getFirestore();
+  
   const now = new Date();
 
   const userDoc     = await db.collection('users').doc(userId).get();
@@ -333,7 +333,7 @@ async function refundSubscription({ userId, subscriptionId, provider, externalEv
  *   Required index: subscriptions [status ASC, expiresAt ASC]
  */
 async function expireOverdueSubscriptions() {
-  const db  = getFirestore();
+  
   const now = Timestamp.now();
 
   const expired = await db
@@ -351,7 +351,7 @@ async function expireOverdueSubscriptions() {
   const results = await Promise.allSettled(
     expired.docs.map(doc =>
       cancelSubscription({
-        userId:         doc.id,
+        user_id:         doc.id,
         subscriptionId: doc.data().subscriptionId ?? 'expired',
         provider:       doc.data().provider ?? 'system',
         reason:         'expired',
@@ -417,7 +417,7 @@ async function handleRazorpayWebhook(payload, verified = false) {
       if (!refund) break;
 
       // Map refund back to subscription via payment ID
-      const db   = getFirestore();
+      
       const snap = await db
         .collection('subscriptions')
         .where('subscriptionId', '==', refund.payment_id)
@@ -518,7 +518,7 @@ async function handleStripeWebhook(event, verified = false) {
  * Returns current subscription state for /users/me and admin lookups.
  */
 async function getSubscriptionStatus(userId) {
-  const db  = getFirestore();
+  
   const doc = await db.collection('subscriptions').doc(userId).get();
 
   if (!doc.exists) {
@@ -558,3 +558,12 @@ module.exports = {
   getSubscriptionStatus,
   PLAN_CONFIG,
 };
+
+
+
+
+
+
+
+
+

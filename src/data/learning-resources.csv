@@ -1,0 +1,180 @@
+skill,course_name,provider,level,duration_hours,url
+Python,Python for Everybody,Coursera,Beginner,30,https://www.coursera.org/specializations/python
+Python,Complete Python Bootcamp,Udemy,Beginner,22,https://www.udemy.com/course/complete-python-bootcamp
+Python,Python Data Science Handbook,O'Reilly,Intermediate,20,https://www.oreilly.com/library/view/python-data-science
+Python,Advanced Python Programming,Pluralsight,Advanced,15,https://www.pluralsight.com/courses/advanced-python
+SQL,SQL for Beginners,Udemy,Beginner,10,https://www.udemy.com/course/sql-mysql-for-data-analytics
+SQL,SQL Fundamentals,Coursera,Beginner,12,https://www.coursera.org/learn/sql-for-data-science
+SQL,Advanced SQL for Data Analysis,Coursera,Intermediate,16,https://www.coursera.org/learn/advanced-sql
+SQL,SQL Performance Tuning,Pluralsight,Advanced,12,https://www.pluralsight.com/courses/sql-server-performance-tuning
+Machine Learning,Machine Learning by Andrew Ng,Coursera,Intermediate,60,https://www.coursera.org/learn/machine-learning
+Machine Learning,Machine Learning A-Z,Udemy,Beginner,44,https://www.udemy.com/course/machinelearning
+Machine Learning,Advanced Machine Learning Specialization,Coursera,Advanced,40,https://www.coursera.org/specializations/aml
+Data Analysis,Data Analysis with Python,Coursera,Beginner,20,https://www.coursera.org/learn/data-analysis-with-python
+Data Analysis,Google Data Analytics Certificate,Coursera,Beginner,40,https://www.coursera.org/professional-certificates/google-data-analytics
+Data Analysis,Data Analysis Nanodegree,Udacity,Intermediate,40,https://www.udacity.com/course/data-analyst-nanodegree
+Excel,Microsoft Excel - Excel from Beginner to Advanced,Udemy,Beginner,18,https://www.udemy.com/course/microsoft-excel-2013-from-beginner-to-advanced
+Excel,Excel Skills for Business,Coursera,Beginner,20,https://www.coursera.org/specializations/excel
+Excel,Advanced Excel Training,Microsoft Learn,Intermediate,10,https://learn.microsoft.com/en-us/training/paths/excel-advanced
+Power BI,Power BI for Beginners,Coursera,Beginner,15,https://www.coursera.org/learn/power-bi-desktop
+Power BI,Microsoft Power BI Certification DA-100,Microsoft,Intermediate,30,https://learn.microsoft.com/en-us/certifications/power-bi-data-analyst-associate
+Power BI,Power BI - Business Intelligence for Beginners,Udemy,Beginner,12,https://www.udemy.com/course/powerbi-complete-introduction
+Power BI,Advanced Power BI,Udemy,Advanced,18,https://www.udemy.com/course/mspowerbi
+Tableau,Tableau 2024 A-Z,Udemy,Beginner,14,https://www.udemy.com/course/tableau10
+Tableau,Tableau Desktop Specialist,Tableau,Intermediate,20,https://www.tableau.com/learn/certification/desktop-specialist
+Tableau,Advanced Tableau,Pluralsight,Advanced,12,https://www.pluralsight.com/courses/tableau-advanced
+Java,Java Programming Masterclass,Udemy,Beginner,80,https://www.udemy.com/course/java-the-complete-java-developer-course
+Java,Java Programming for Complete Beginners,Udemy,Beginner,35,https://www.udemy.com/course/java-programming-tutorial-for-beginners
+Java,Java SE 11 Developer Certification,Oracle,Advanced,40,https://education.oracle.com/java-se-11-developer
+React,React - The Complete Guide,Udemy,Beginner,48,https://www.udemy.com/course/react-the-complete-guide-incl-redux
+React,Full Stack Open - React,University of Helsinki,Intermediate,30,https://fullstackopen.com/en
+React,Advanced React Patterns,Frontend Masters,Advanced,10,https://frontendmasters.com/courses/advanced-react-patterns
+Node.js,The Complete Node.js Developer Course,Udemy,Beginner,35,https://www.udemy.com/course/the-complete-nodejs-developer-course-2
+Node.js,Node.js: The Complete Guide,Udemy,Intermediate,40,https://www.udemy.com/course/nodejs-the-complete-guide
+Node.js,Advanced Node.js,Pluralsight,Advanced,12,https://www.pluralsight.com/courses/nodejs-advanced
+AWS,AWS Certified Cloud Practitioner,AWS,Beginner,20,https://aws.amazon.com/certification/certified-cloud-practitioner
+AWS,AWS Solutions Architect Associate,AWS,Intermediate,40,https://aws.amazon.com/certification/certified-solutions-architect-associate
+AWS,AWS DevOps Engineer Professional,AWS,Advanced,50,https://aws.amazon.com/certification/certified-devops-engineer-professional
+Docker,Docker Mastery,Udemy,Beginner,19,https://www.udemy.com/course/docker-mastery
+Docker,Docker and Kubernetes: The Complete Guide,Udemy,Intermediate,22,https://www.udemy.com/course/docker-and-kubernetes-the-complete-guide
+Kubernetes,Kubernetes for the Absolute Beginners,Udemy,Beginner,8,https://www.udemy.com/course/learn-kubernetes
+Kubernetes,Certified Kubernetes Administrator (CKA),CNCF,Intermediate,30,https://training.linuxfoundation.org/certification/certified-kubernetes-administrator-cka
+Kubernetes,Kubernetes Advanced Concepts,Pluralsight,Advanced,15,https://www.pluralsight.com/courses/kubernetes-advanced-concepts
+TensorFlow,TensorFlow Developer Certificate,Google,Intermediate,40,https://www.tensorflow.org/certificate
+TensorFlow,Intro to TensorFlow for Deep Learning,Udacity,Beginner,20,https://www.udacity.com/course/intro-to-tensorflow-for-deep-learning
+TypeScript,TypeScript: The Complete Developer's Guide,Udemy,Beginner,25,https://www.udemy.com/course/typescript-the-complete-developers-guide
+TypeScript,Understanding TypeScript,Udemy,Intermediate,15,https://www.udemy.com/course/understanding-typescript
+Accounting,Accounting Fundamentals,Coursera,Beginner,12,https://www.coursera.org/learn/accounting
+Accounting,Financial Accounting,edX,Beginner,15,https://www.edx.org/course/financial-accounting
+Accounting,CPA Exam Preparation,Becker,Intermediate,100,https://www.becker.com/cpa-review
+Financial Reporting,Financial Reporting and Analysis,Coursera,Intermediate,20,https://www.coursera.org/learn/financial-reporting
+Financial Reporting,IFRS Fundamentals,ACCA,Intermediate,15,https://www.accaglobal.com/gb/en/qualifications/ifrs.html
+Tally,Tally ERP 9 Complete Course,Udemy,Beginner,10,https://www.udemy.com/course/tally-erp9
+Tally,Tally Prime with GST,Udemy,Intermediate,12,https://www.udemy.com/course/tally-prime
+GST Filing,GST Practitioner Course,ClearTax,Beginner,8,https://learn.cleartax.in/gst-practitioner
+GST Filing,GST Returns and Compliance,Udemy,Intermediate,10,https://www.udemy.com/course/gst-course
+Taxation,Indian Taxation Fundamentals,Udemy,Beginner,12,https://www.udemy.com/course/income-tax-india
+Taxation,Advanced Direct Tax,ICAI,Advanced,30,https://www.icai.org/post.html
+Bookkeeping,Bookkeeping Basics,LinkedIn Learning,Beginner,5,https://www.linkedin.com/learning/bookkeeping-fundamentals
+Bookkeeping,Complete Bookkeeping Course,Udemy,Beginner,8,https://www.udemy.com/course/bookkeeping-for-small-business
+Audit,Audit Fundamentals,ACCA,Intermediate,20,https://www.accaglobal.com/gb/en/qualifications.html
+Cost Accounting,Cost and Management Accounting,Coursera,Intermediate,15,https://www.coursera.org/learn/cost-accounting
+Payroll Processing,Payroll Management,HR Payroll Institute,Beginner,10,https://www.hrpayrollinstitute.com
+QuickBooks,QuickBooks Online Training,Intuit,Beginner,8,https://quickbooks.intuit.com/tutorials
+QuickBooks,QuickBooks ProAdvisor Certification,Intuit,Intermediate,20,https://quickbooks.intuit.com/accountants/proadvisor
+SAP Finance,SAP FI (Financial Accounting) Basics,Udemy,Beginner,18,https://www.udemy.com/course/sap-fi
+SAP Finance,SAP FI/CO Certification,SAP,Intermediate,40,https://training.sap.com
+SAP,SAP S/4HANA Fundamentals,SAP,Beginner,20,https://learning.sap.com
+SAP,SAP Certified Application Associate,SAP,Intermediate,40,https://training.sap.com/certification
+Agile,Agile Fundamentals,Coursera,Beginner,8,https://www.coursera.org/learn/agile-development
+Agile,Professional Scrum Master (PSM I),Scrum.org,Intermediate,16,https://www.scrum.org/assessments/professional-scrum-master-i-certification
+Agile,SAFe Agile Certification,Scaled Agile,Advanced,16,https://scaledagile.com/certification
+JIRA,JIRA for Beginners,Udemy,Beginner,6,https://www.udemy.com/course/the-complete-guide-to-jira
+JIRA,Atlassian JIRA Advanced,Atlassian University,Intermediate,10,https://university.atlassian.com
+Project Management,PMP Certification Prep,PMI,Advanced,35,https://www.pmi.org/certifications/project-management-pmp
+Project Management,Google Project Management Certificate,Coursera,Beginner,30,https://www.coursera.org/professional-certificates/google-project-management
+Project Management,PRINCE2 Foundation,Axelos,Intermediate,20,https://www.axelos.com/certifications/propath/prince2-project-management
+Stakeholder Management,Stakeholder Management,LinkedIn Learning,Beginner,5,https://www.linkedin.com/learning/stakeholder-management
+Communication,Business Communication,Coursera,Beginner,10,https://www.coursera.org/learn/communication-for-business
+Communication,Effective Communication Skills,LinkedIn Learning,Beginner,6,https://www.linkedin.com/learning/communication-foundations
+Leadership,Leadership and Management,Coursera,Intermediate,20,https://www.coursera.org/specializations/leadership-and-management
+Leadership,Harvard Leadership Principles,edX,Advanced,40,https://www.edx.org/course/leadership-principles
+Requirements Gathering,Business Analysis Fundamentals,Udemy,Beginner,10,https://www.udemy.com/course/business-analysis-ba
+Process Mapping,Business Process Mapping,LinkedIn Learning,Beginner,4,https://www.linkedin.com/learning/business-process-improvement
+User Stories,Writing User Stories,Pluralsight,Beginner,4,https://www.pluralsight.com/courses/user-stories-applied-agile-software-development
+MS Project,Microsoft Project - Complete Course,Udemy,Beginner,10,https://www.udemy.com/course/microsoft-project-2019
+Visio,Microsoft Visio Training,LinkedIn Learning,Beginner,5,https://www.linkedin.com/learning/visio-essential-training
+Statistics,Statistics with Python,Coursera,Beginner,15,https://www.coursera.org/specializations/statistics-with-python
+Statistics,Statistics and Probability,Khan Academy,Beginner,20,https://www.khanacademy.org/math/statistics-probability
+Statistics,Applied Statistics,MIT OpenCourseWare,Advanced,40,https://ocw.mit.edu/courses/mathematics/18-650-statistics-for-applications
+R,R Programming,Coursera,Beginner,16,https://www.coursera.org/learn/r-programming
+R,Data Science: R Basics,edX,Beginner,8,https://www.edx.org/course/data-science-r-basics
+R,Advanced R,O'Reilly,Advanced,20,https://www.oreilly.com/library/view/advanced-r
+ETL,ETL and Data Warehousing,Udemy,Beginner,12,https://www.udemy.com/course/dwbi
+ETL,Informatica PowerCenter ETL,Udemy,Intermediate,15,https://www.udemy.com/course/informatica-powercenter
+Google Analytics,Google Analytics for Beginners,Google,Beginner,8,https://analytics.google.com/analytics/academy/course/6
+Google Analytics,Advanced Google Analytics,Google,Intermediate,6,https://analytics.google.com/analytics/academy/course/7
+Looker,Looker Studio Fundamentals,Google,Beginner,6,https://cloud.google.com/training/data-ml
+Data Cleaning,Data Cleaning with Python,Kaggle,Beginner,4,https://www.kaggle.com/learn/data-cleaning
+Data Visualisation,Data Visualisation with Python,Coursera,Beginner,12,https://www.coursera.org/learn/python-for-data-visualization
+Data Visualisation,Data Visualisation Fundamentals,Tableau,Beginner,8,https://www.tableau.com/learn/training
+MongoDB,MongoDB Basics,MongoDB University,Beginner,10,https://university.mongodb.com/courses/M001/about
+MongoDB,MongoDB Developer Certification,MongoDB,Intermediate,20,https://university.mongodb.com/certification
+PostgreSQL,Learn PostgreSQL,Udemy,Beginner,10,https://www.udemy.com/course/postgresqlmasterclass
+PostgreSQL,Advanced PostgreSQL,Pluralsight,Intermediate,12,https://www.pluralsight.com/courses/postgresql-advanced
+Redis,Redis for Beginners,Udemy,Beginner,6,https://www.udemy.com/course/redis-bootcamp-for-beginners
+GraphQL,GraphQL with React,Udemy,Intermediate,14,https://www.udemy.com/course/graphql-with-react-course
+REST API,REST API Design,Udemy,Beginner,8,https://www.udemy.com/course/rest-api-flask-and-python
+Microservices,Microservices with Node.js,Udemy,Intermediate,20,https://www.udemy.com/course/microservices-with-node-js-and-react
+Microservices,Microservices Architecture,Coursera,Advanced,15,https://www.coursera.org/learn/ibm-containers-docker-kubernetes-openshift
+DevOps,DevOps Foundations,LinkedIn Learning,Beginner,8,https://www.linkedin.com/learning/devops-foundations
+DevOps,DevOps Engineer Bootcamp,Udemy,Intermediate,24,https://www.udemy.com/course/devops-training
+CI/CD,CI/CD with GitHub Actions,GitHub Learning Lab,Beginner,6,https://lab.github.com/githubtraining/github-actions
+CI/CD,Jenkins Fundamentals,Udemy,Intermediate,10,https://www.udemy.com/course/jenkins-from-zero-to-hero
+Linux,Linux Command Line Basics,Udemy,Beginner,10,https://www.udemy.com/course/linux-command-line-volume1
+Linux,Linux Foundation Certified Associate (LFCA),Linux Foundation,Intermediate,20,https://training.linuxfoundation.org/certification/certified-it-associate
+Git,Git and GitHub for Beginners,freeCodeCamp,Beginner,4,https://www.freecodecamp.org/news/git-and-github-for-beginners
+Git,Advanced Git,Pluralsight,Intermediate,6,https://www.pluralsight.com/courses/advanced-git
+Cybersecurity,CompTIA Security+ Certification,CompTIA,Intermediate,30,https://www.comptia.org/certifications/security
+Cybersecurity,Introduction to Cybersecurity,Cisco,Beginner,15,https://skillsforall.com/course/introduction-to-cybersecurity
+Network Security,Network Security Fundamentals,Coursera,Beginner,12,https://www.coursera.org/learn/network-security
+Network Security,CompTIA Network+ Certification,CompTIA,Intermediate,25,https://www.comptia.org/certifications/network
+Cloud Computing,Cloud Computing Fundamentals,Coursera,Beginner,15,https://www.coursera.org/learn/cloud-computing
+Cloud Computing,Google Cloud Digital Leader,Google,Beginner,10,https://cloud.google.com/certification/cloud-digital-leader
+Azure,Microsoft Azure Fundamentals (AZ-900),Microsoft,Beginner,15,https://learn.microsoft.com/en-us/certifications/azure-fundamentals
+Azure,Microsoft Azure Administrator (AZ-104),Microsoft,Intermediate,35,https://learn.microsoft.com/en-us/certifications/azure-administrator
+Google Cloud,Google Cloud Associate Cloud Engineer,Google,Intermediate,30,https://cloud.google.com/certification/cloud-engineer
+Digital Marketing,Google Digital Marketing Certification,Google,Beginner,12,https://skillshop.withgoogle.com
+Digital Marketing,Digital Marketing Specialization,Coursera,Intermediate,25,https://www.coursera.org/specializations/digital-marketing
+SEO,SEO Fundamentals,SEMrush Academy,Beginner,6,https://www.semrush.com/academy/courses/seo-fundamentals
+SEO,Advanced SEO,Moz,Intermediate,10,https://moz.com/learn/seo
+Content Writing,Content Writing Mastery,Udemy,Beginner,8,https://www.udemy.com/course/content-writing-master
+Social Media,Social Media Marketing,Coursera,Beginner,10,https://www.coursera.org/learn/social-media-marketing
+Email Marketing,Email Marketing Certification,HubSpot,Beginner,6,https://academy.hubspot.com/courses/email-marketing
+CRM,CRM Fundamentals,Salesforce Trailhead,Beginner,8,https://trailhead.salesforce.com
+Salesforce,Salesforce Administrator Certification,Salesforce,Intermediate,30,https://trailhead.salesforce.com/credentials/administrator
+Salesforce,Salesforce Developer Fundamentals,Salesforce,Intermediate,25,https://trailhead.salesforce.com/credentials/platformdeveloperI
+HubSpot,HubSpot CRM Certification,HubSpot,Beginner,6,https://academy.hubspot.com/courses/hubspot-crm
+HubSpot,HubSpot Marketing Hub Certification,HubSpot,Intermediate,10,https://academy.hubspot.com/courses/inbound-marketing
+Product Management,Product Management Fundamentals,Coursera,Beginner,15,https://www.coursera.org/learn/product-management
+Product Management,Become a Product Manager,Udemy,Intermediate,20,https://www.udemy.com/course/become-a-product-manager-learn-the-skills-get-a-job
+UX Design,Google UX Design Certificate,Coursera,Beginner,40,https://www.coursera.org/professional-certificates/google-ux-design
+UX Design,UX Design Fundamentals,Interaction Design Foundation,Intermediate,15,https://www.interaction-design.org/courses
+Figma,Figma for UX Design,LinkedIn Learning,Beginner,6,https://www.linkedin.com/learning/figma-for-ux-design
+Figma,Advanced Figma,Udemy,Intermediate,10,https://www.udemy.com/course/figma-ui-design
+Adobe XD,Adobe XD Beginner to Expert,Udemy,Beginner,8,https://www.udemy.com/course/adobe-xd-design
+HTML,HTML & CSS Full Course,freeCodeCamp,Beginner,6,https://www.freecodecamp.org/learn/responsive-web-design
+CSS,CSS - The Complete Guide,Udemy,Beginner,22,https://www.udemy.com/course/css-the-complete-guide-incl-flexbox-grid-sass
+JavaScript,The Complete JavaScript Course,Udemy,Beginner,69,https://www.udemy.com/course/the-complete-javascript-course
+JavaScript,JavaScript Algorithms and Data Structures,freeCodeCamp,Intermediate,40,https://www.freecodecamp.org/learn/javascript-algorithms-and-data-structures
+Angular,Angular - The Complete Guide,Udemy,Intermediate,35,https://www.udemy.com/course/the-complete-guide-to-angular-2
+Vue.js,Vue - The Complete Guide,Udemy,Intermediate,32,https://www.udemy.com/course/vuejs-2-the-complete-guide
+Flutter,Flutter & Dart - The Complete Guide,Udemy,Beginner,44,https://www.udemy.com/course/learn-flutter-dart-to-build-ios-android-apps
+Swift,iOS Development with Swift,Apple,Beginner,20,https://developer.apple.com/tutorials/swiftui
+Kotlin,Kotlin for Android Developers,Udacity,Intermediate,15,https://www.udacity.com/course/kotlin-for-android-developers--ud888
+C++,C++ Programming Course,Udemy,Beginner,30,https://www.udemy.com/course/beginning-c-plus-plus-programming
+C#,C# Complete Masterclass,Udemy,Beginner,30,https://www.udemy.com/course/complete-csharp-masterclass
+.NET,ASP.NET Core Full Course,Udemy,Intermediate,25,https://www.udemy.com/course/complete-aspnet-core-21-course
+Spring Boot,Spring Boot 3 Complete Course,Udemy,Intermediate,20,https://www.udemy.com/course/spring-framework-5-beginner-to-guru
+Django,Django for Beginners,Udemy,Beginner,16,https://www.udemy.com/course/django-the-practical-guide
+FastAPI,FastAPI - Beyond CRUD,Udemy,Intermediate,10,https://www.udemy.com/course/fastapi-rest-api-in-python
+Selenium,Selenium WebDriver with Python,Udemy,Beginner,12,https://www.udemy.com/course/selenium-real-time-examplesinterview-questions
+Pytest,Pytest with Python,Udemy,Intermediate,8,https://www.udemy.com/course/pytest-with-eric
+NLP,Natural Language Processing with Python,Coursera,Intermediate,20,https://www.coursera.org/learn/natural-language-processing-tensorflow
+Computer Vision,Computer Vision with Python,Udemy,Intermediate,15,https://www.udemy.com/course/python-for-computer-vision-with-opencv-and-deep-learning
+Deep Learning,Deep Learning Specialization,Coursera,Advanced,60,https://www.coursera.org/specializations/deep-learning
+Deep Learning,Practical Deep Learning for Coders,fast.ai,Intermediate,30,https://www.fast.ai
+Blockchain,Blockchain and Cryptocurrency,Coursera,Beginner,12,https://www.coursera.org/learn/cryptocurrency
+Blockchain,Ethereum Developer Certification,ConsenSys,Intermediate,20,https://consensys.net/academy
+IoT,IoT Fundamentals,Cisco,Beginner,10,https://skillsforall.com/course/iot-fundamentals
+AR/VR,Introduction to VR Development,Coursera,Beginner,12,https://www.coursera.org/learn/introduction-virtual-reality
+Ethical Hacking,Certified Ethical Hacker (CEH),EC-Council,Advanced,40,https://www.eccouncil.org/programs/certified-ethical-hacker-ceh
+Penetration Testing,CompTIA PenTest+ Certification,CompTIA,Advanced,35,https://www.comptia.org/certifications/pentest
+Risk Management,Risk Management Fundamentals,Coursera,Beginner,10,https://www.coursera.org/learn/risk-management-for-projects
+Risk Management,PMI-RMP Certification,PMI,Advanced,30,https://www.pmi.org/certifications/risk-management-rmp
+Compliance,Compliance Fundamentals,LinkedIn Learning,Beginner,6,https://www.linkedin.com/learning/compliance-foundations
+Investment Analysis,Investment Analysis,Coursera,Intermediate,20,https://www.coursera.org/learn/investment-management
+Investment Analysis,CFA Level I Preparation,CFA Institute,Advanced,300,https://www.cfainstitute.org/en/programs/cfa
+Portfolio Management,Portfolio and Risk Management,Coursera,Advanced,25,https://www.coursera.org/learn/portfolio-selection-risk-management
+Financial Modelling,Financial Modelling for Professionals,Udemy,Intermediate,12,https://www.udemy.com/course/financial-modeling
+Financial Modelling,FMVA Certification,CFI,Advanced,50,https://corporatefinanceinstitute.com/certifications/financial-modeling-valuation-analyst-fmva-program

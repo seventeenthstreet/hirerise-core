@@ -104,7 +104,7 @@ async function runSimulation() {
   for (let i = 1; i <= 5; i++) {
     try {
       const result = await careerService.generateCareerIntelligence({
-        userId: `test-user-${i}`,
+        user_id: `test-user-${i}`,
         advancedMode: false,
         overrides: {
           resumeScore: generateMockResume(),
@@ -133,3 +133,12 @@ async function runSimulation() {
 }
 
 runSimulation();
+
+
+
+
+
+
+
+
+

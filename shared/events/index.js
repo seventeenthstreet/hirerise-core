@@ -1,3 +1,5 @@
+'use strict';
+
 /**
  * shared/events/index.js
  *
@@ -9,13 +11,16 @@
  * Backward Compatibility:
  *   MINOR version bumps: additive fields only. Consumers must tolerate unknown fields.
  *   MAJOR version bumps: new topic suffix (.v2). Workers migrate explicitly.
+ *
+ * FIX: Converted from ESM (import/export) to CJS (require/module.exports)
+ * to match the rest of the codebase.
  */
 
-import { randomUUID } from 'crypto';
+const { randomUUID } = require('crypto');
 
 // ─── Event Type Enum ──────────────────────────────────────────────────────────
 
-export const EventTypes = Object.freeze({
+const EventTypes = Object.freeze({
   RESUME_SUBMITTED:           'RESUME_SUBMITTED',
   RESUME_PARSED:              'RESUME_PARSED',
   SCORE_UPDATED:              'SCORE_UPDATED',
@@ -32,7 +37,7 @@ export const EventTypes = Object.freeze({
 
 // ─── Topic Registry ───────────────────────────────────────────────────────────
 
-export const Topics = Object.freeze({
+const Topics = Object.freeze({
   RESUME_SUBMITTED:           'hirerise.resume.submitted.v1',
   SALARY_BENCHMARK_REQUESTED: 'hirerise.salary.benchmark_requested.v1',
   CAREER_PATH_REQUESTED:      'hirerise.career.path_requested.v1',
@@ -46,7 +51,7 @@ export const Topics = Object.freeze({
 
 // ─── Schema Version Registry ──────────────────────────────────────────────────
 
-export const SchemaVersions = Object.freeze({
+const SchemaVersions = Object.freeze({
   [EventTypes.RESUME_SUBMITTED]:           '1.0',
   [EventTypes.SALARY_BENCHMARK_REQUESTED]: '1.0',
   [EventTypes.CAREER_PATH_REQUESTED]:      '1.0',
@@ -57,9 +62,8 @@ export const SchemaVersions = Object.freeze({
 });
 
 // ─── Payload Contracts ────────────────────────────────────────────────────────
-// Defines required fields and types per event. Used for worker-level validation.
 
-export const PayloadContracts = Object.freeze({
+const PayloadContracts = Object.freeze({
   [EventTypes.RESUME_SUBMITTED]: {
     required: ['userId', 'resumeId', 'jobId', 'resumeStoragePath', 'mimeType'],
     types: {
@@ -96,7 +100,7 @@ export const PayloadContracts = Object.freeze({
 
 const ENVELOPE_REQUIRED = ['eventId', 'eventType', 'schemaVersion', 'publishedAt', 'source', 'payload'];
 
-export function validateEnvelope(envelope) {
+function validateEnvelope(envelope) {
   const errors = [];
 
   if (!envelope || typeof envelope !== 'object' || Array.isArray(envelope)) {
@@ -125,7 +129,7 @@ export function validateEnvelope(envelope) {
   return { valid: errors.length === 0, errors };
 }
 
-export function validatePayload(eventType, payload) {
+function validatePayload(eventType, payload) {
   const errors = [];
   const contract = PayloadContracts[eventType];
   if (!contract) return { valid: true, errors: [] };
@@ -152,7 +156,6 @@ export function validatePayload(eventType, payload) {
 }
 
 // ─── Schema Version Compatibility ────────────────────────────────────────────
-// MAJOR must match. MINOR incoming >= expected minor (forward compatible reads).
 
 function isCompatibleVersion(incoming, expected) {
   if (!incoming || !expected) return false;
@@ -163,7 +166,7 @@ function isCompatibleVersion(incoming, expected) {
 
 // ─── Envelope Builder ─────────────────────────────────────────────────────────
 
-export function buildEnvelope(eventType, payload, source) {
+function buildEnvelope(eventType, payload, source) {
   if (!Object.values(EventTypes).includes(eventType)) {
     throw new Error(`buildEnvelope: unknown eventType "${eventType}"`);
   }
@@ -182,3 +185,13 @@ export function buildEnvelope(eventType, payload, source) {
     payload,
   };
 }
+
+module.exports = {
+  EventTypes,
+  Topics,
+  SchemaVersions,
+  PayloadContracts,
+  validateEnvelope,
+  validatePayload,
+  buildEnvelope,
+};

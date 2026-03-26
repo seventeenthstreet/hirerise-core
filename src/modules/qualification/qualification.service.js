@@ -12,7 +12,7 @@
  *   - category is always one of: 'degree' | 'professional' | 'diploma' | 'certificate'
  */
 
-const { db }                   = require('../../config/firebase');
+const { db }                   = require('../../config/supabase');
 const { AppError, ErrorCodes } = require('../../middleware/errorHandler');
 
 // Level sort order — controls the sort for listActiveQualifications.
@@ -144,3 +144,11 @@ module.exports = {
   listActiveQualifications,
   getQualificationById,
 };
+
+
+
+
+
+
+
+

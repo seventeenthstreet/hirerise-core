@@ -71,3 +71,12 @@ class SalaryBandRepository extends BaseRepository {
 }
 
 module.exports = SalaryBandRepository;
+
+
+
+
+
+
+
+
+

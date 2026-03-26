@@ -50,9 +50,18 @@ exports.validateProjectionQuery = (query = {}) => {
 
   // 4️⃣ Return sanitized object
   return {
-    userId: userId || null,
+    user_id: userId || null,
     targetRoleId: targetRoleId.trim(),
     years: parsedYears,
     currentExperienceYears: parsedExperience,
   };
 };
+
+
+
+
+
+
+
+
+

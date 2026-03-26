@@ -16,7 +16,7 @@
  * CREDIT COST: 2 credits (same as fullAnalysis — similar token usage)
  */
 
-const { db }                   = require('../../config/firebase');
+const { db }                   = require('../../config/supabase');
 const { AppError, ErrorCodes } = require('../../middleware/errorHandler');
 const logger                   = require('../../utils/logger');
 const { generateCoverLetter }  = require('./engine/coverLetter.engine');
@@ -172,3 +172,12 @@ async function generateCoverLetterForUser({ userId, tier, planAmount, companyNam
 }
 
 module.exports = { generateCoverLetterForUser, CREDIT_COST, FEATURE_ID };
+
+
+
+
+
+
+
+
+

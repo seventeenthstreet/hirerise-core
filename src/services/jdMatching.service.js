@@ -25,7 +25,7 @@
 
 const natural          = require('natural');
 const { removeStopwords, eng } = require('stopword');
-const { db }           = require('../config/firebase');
+const { db }           = require('../config/supabase');
 const { AppError, ErrorCodes } = require('../middleware/errorHandler');
 const logger           = require('../utils/logger');
 
@@ -389,3 +389,12 @@ const matchJD = async ({ userProfile, rawJobDescription }) => {
 };
 
 module.exports = { matchJD };
+
+
+
+
+
+
+
+
+

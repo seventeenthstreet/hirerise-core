@@ -15,6 +15,7 @@ const express = require('express');
 const { body, param, query } = require('express-validator');
 const { validate } = require('../middleware/requestValidator');
 const salaryController = require('../controllers/salary.controller');
+const { aiRateLimit }  = require('../middleware/aiRateLimit.middleware'); // AI cost protection
 
 const router = express.Router();
 
@@ -23,6 +24,7 @@ const router = express.Router();
 // ─────────────────────────────────────────────────────────────
 router.post(
   '/benchmark',
+  aiRateLimit,          // burst protection — max 5 AI calls/60s per user
   validate([
     body('roleId')
       .isString()
@@ -37,7 +39,7 @@ router.post(
       .withMessage('experienceYears must be an integer between 0 and 60'),
 
     body('location')
-      .optional()
+      .optional({ nullable: true })   // FIX: allow null, default to 'metro' in service
       .isString()
       .trim()
       .isIn(['metro', 'tier1', 'tier2', 'tier3'])
@@ -52,6 +54,7 @@ router.post(
 // Advanced salary intelligence analysis
 router.post(
   '/intelligence',
+  aiRateLimit,          // burst protection — max 5 AI calls/60s per user
   validate([
     body('roleId')
       .isString()
@@ -73,14 +76,14 @@ router.post(
       .withMessage('location must be one of: metro, tier1, tier2, tier3'),
 
     body('industry')
-      .optional()
+      .optional({ nullable: true })   // FIX: frontend sends null explicitly
       .isString()
       .trim()
       .isLength({ max: 50 })
       .withMessage('industry must be a valid string'),
 
     body('currentSalary')
-      .optional()
+      .optional({ nullable: true })   // FIX: frontend sends null explicitly
       .isInt({ min: 0 })
       .toInt()
       .withMessage('currentSalary must be a positive integer'),
@@ -131,3 +134,11 @@ router.get(
 );
 
 module.exports = router;
+
+
+
+
+
+
+
+

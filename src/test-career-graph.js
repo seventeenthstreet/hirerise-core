@@ -38,3 +38,12 @@ if (!nextRoles || nextRoles.length === 0) {
 console.log("\n🔎 Debug Check:");
 console.log("tech_lead:", careerRepo.getRole("tech_lead"));
 console.log("engineering_manager:", careerRepo.getRole("engineering_manager"));
+
+
+
+
+
+
+
+
+

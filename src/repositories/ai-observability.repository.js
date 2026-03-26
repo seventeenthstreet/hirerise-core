@@ -1,257 +1,229 @@
 'use strict';
 
-const { getFirestore, FieldValue, Timestamp } = require('firebase-admin/firestore');
+const supabase = require('../config/supabase');
+const logger   = require('../utils/logger');
+
 const OBSERVABILITY_CONFIG = require('../config/observability.config');
 
-/**
- * Repository: AI Observability Logs
- * 
- * Firestore Collections:
- *   ai_logs              - per-call structured logs (TTL: 90 days)
- *   ai_metrics_daily     - daily aggregated metrics per feature (TTL: 365 days)
- *   ai_drift_tracking    - drift snapshots per feature (TTL: 180 days)
- *   ai_cost_tracking     - cost ledger per user/feature/day (TTL: 730 days)
- *   ai_alerts            - fired alerts (TTL: 180 days)
- */
 class AIObservabilityRepository {
-  constructor() {
-    this.db = getFirestore();
-    this.collections = {
-      logs: 'ai_logs',
-      metricsDaily: 'ai_metrics_daily',
-      drift: 'ai_drift_tracking',
-      cost: 'ai_cost_tracking',
-      alerts: 'ai_alerts',
-    };
-  }
 
-  // ─── AI LOGS ────────────────────────────────────────────────────────────────
+  // ─── AI LOGS ─────────────────────────────────────────────────────────────
 
-  /**
-   * Write a single AI call log.
-   * @param {Object} logEntry - validated log object
-   * @returns {string} docId
-   */
   async writeLog(logEntry) {
-    const docRef = this.db.collection(this.collections.logs).doc();
-    await docRef.set({
+    const record = {
       ...logEntry,
-      createdAt: FieldValue.serverTimestamp(),
-      expiresAt: this._ttlTimestamp(OBSERVABILITY_CONFIG.retention.aiLogsRetentionDays),
-    });
-    return docRef.id;
+      created_at: new Date().toISOString(),
+      expires_at: this._ttlDate(OBSERVABILITY_CONFIG.retention.aiLogsRetentionDays),
+      is_deleted: false,
+    };
+
+    const { data, error } = await supabase
+      .from('ai_logs')
+      .insert(record)
+      .select()
+      .single();
+
+    if (error) throw error;
+    return data.id;
   }
 
-  /**
-   * Batch write logs (used by async queue flusher).
-   */
   async batchWriteLogs(logEntries) {
-    const chunks = this._chunk(logEntries, 500);
-    for (const chunk of chunks) {
-      const batch = this.db.batch();
-      chunk.forEach(entry => {
-        const ref = this.db.collection(this.collections.logs).doc();
-        batch.set(ref, {
-          ...entry,
-          createdAt: FieldValue.serverTimestamp(),
-          expiresAt: this._ttlTimestamp(OBSERVABILITY_CONFIG.retention.aiLogsRetentionDays),
-        });
-      });
-      await batch.commit();
-    }
+    const records = logEntries.map(entry => ({
+      ...entry,
+      created_at: new Date().toISOString(),
+      expires_at: this._ttlDate(OBSERVABILITY_CONFIG.retention.aiLogsRetentionDays),
+      is_deleted: false,
+    }));
+
+    const { error } = await supabase.from('ai_logs').insert(records);
+    if (error) throw error;
   }
 
-  /**
-   * Fetch recent logs for a feature within a time window.
-   */
-  async getLogsByFeature(feature, { fromDate, toDate, limit = 500 } = {}) {
-    let query = this.db.collection(this.collections.logs)
-      .where('feature', '==', feature)
-      .where('isDeleted', '==', false)
-      .orderBy('createdAt', 'desc')
+  async getLogsByFeature(feature, { limit = 500 } = {}) {
+    const { data, error } = await supabase
+      .from('ai_logs')
+      .select('*')
+      .eq('feature', feature)
+      .eq('is_deleted', false)
+      .order('created_at', { ascending: false })
       .limit(limit);
 
-    if (fromDate) query = query.where('createdAt', '>=', Timestamp.fromDate(fromDate));
-    if (toDate) query = query.where('createdAt', '<=', Timestamp.fromDate(toDate));
-
-    const snap = await query.get();
-    return snap.docs.map(d => ({ id: d.id, ...d.data() }));
+    if (error) throw error;
+    return data || [];
   }
 
-  // ─── DAILY METRICS ──────────────────────────────────────────────────────────
+  // ─── DAILY METRICS ───────────────────────────────────────────────────────
 
-  /**
-   * Upsert daily metrics document (idempotent via merge).
-   * DocId pattern: `{feature}_{YYYY-MM-DD}`
-   */
-  async upsertDailyMetrics(feature, dateStr, metricsPayload) {
-    const docId = `${feature}_${dateStr}`;
-    const ref = this.db.collection(this.collections.metricsDaily).doc(docId);
-    await ref.set({
+  async upsertDailyMetrics(feature, dateStr, payload) {
+    const record = {
+      id: `${feature}_${dateStr}`,
       feature,
       date: dateStr,
-      ...metricsPayload,
-      updatedAt: FieldValue.serverTimestamp(),
-      expiresAt: this._ttlTimestamp(OBSERVABILITY_CONFIG.retention.metricsRetentionDays),
-      isDeleted: false,
-    }, { merge: true });
-    return docId;
+      ...payload,
+      updated_at: new Date().toISOString(),
+      expires_at: this._ttlDate(OBSERVABILITY_CONFIG.retention.metricsRetentionDays),
+      is_deleted: false,
+    };
+
+    const { error } = await supabase.from('ai_metrics_daily').upsert(record);
+    if (error) throw error;
+
+    return record.id;
   }
 
-  async getDailyMetrics(feature, { fromDate, toDate, limit = 90 } = {}) {
-    let query = this.db.collection(this.collections.metricsDaily)
-      .where('feature', '==', feature)
-      .where('isDeleted', '==', false)
-      .orderBy('date', 'desc')
+  async getDailyMetrics(feature, { limit = 90 } = {}) {
+    const { data, error } = await supabase
+      .from('ai_metrics_daily')
+      .select('*')
+      .eq('feature', feature)
+      .eq('is_deleted', false)
+      .order('date', { ascending: false })
       .limit(limit);
 
-    const snap = await query.get();
-    return snap.docs.map(d => ({ id: d.id, ...d.data() }));
+    if (error) throw error;
+    return data || [];
   }
 
   async getAggregatedMetricsSummary({ limit = 30 } = {}) {
-    const snap = await this.db.collection(this.collections.metricsDaily)
-      .where('isDeleted', '==', false)
-      .orderBy('updatedAt', 'desc')
-      .limit(limit)
-      .get();
-    return snap.docs.map(d => ({ id: d.id, ...d.data() }));
+    const { data, error } = await supabase
+      .from('ai_metrics_daily')
+      .select('*')
+      .eq('is_deleted', false)
+      .order('updated_at', { ascending: false })
+      .limit(limit);
+
+    if (error) throw error;
+    return data || [];
   }
 
-  // ─── DRIFT TRACKING ─────────────────────────────────────────────────────────
+  // ─── DRIFT ───────────────────────────────────────────────────────────────
 
-  async writeDriftSnapshot(driftEntry) {
-    const docRef = this.db.collection(this.collections.drift).doc();
-    await docRef.set({
-      ...driftEntry,
-      createdAt: FieldValue.serverTimestamp(),
-      expiresAt: this._ttlTimestamp(OBSERVABILITY_CONFIG.retention.driftRetentionDays),
-      isDeleted: false,
-    });
-    return docRef.id;
-  }
+  async writeDriftSnapshot(entry) {
+    const record = {
+      ...entry,
+      created_at: new Date().toISOString(),
+      expires_at: this._ttlDate(OBSERVABILITY_CONFIG.retention.driftRetentionDays),
+      is_deleted: false,
+    };
 
-  /**
-   * Get last N drift snapshots for a feature (for baseline calculation).
-   */
-  async getDriftHistory(feature, days = 30) {
-    const since = new Date();
-    since.setDate(since.getDate() - days);
+    const { data, error } = await supabase
+      .from('ai_drift_tracking')
+      .insert(record)
+      .select()
+      .single();
 
-    const snap = await this.db.collection(this.collections.drift)
-      .where('feature', '==', feature)
-      .where('isDeleted', '==', false)
-      .where('createdAt', '>=', Timestamp.fromDate(since))
-      .orderBy('createdAt', 'desc')
-      .limit(500)
-      .get();
-
-    return snap.docs.map(d => ({ id: d.id, ...d.data() }));
+    if (error) throw error;
+    return data.id;
   }
 
   async getDriftSummary({ limit = 50 } = {}) {
-    const snap = await this.db.collection(this.collections.drift)
-      .where('isDeleted', '==', false)
-      .orderBy('createdAt', 'desc')
-      .limit(limit)
-      .get();
-    return snap.docs.map(d => ({ id: d.id, ...d.data() }));
-  }
-
-  // ─── COST TRACKING ──────────────────────────────────────────────────────────
-
-  /**
-   * Upsert daily cost entry per user+feature.
-   * DocId: `{userId}_{feature}_{YYYY-MM-DD}`
-   */
-  async upsertCostEntry(userId, feature, dateStr, costDelta) {
-    const docId = `${userId}_${feature}_${dateStr}`;
-    const ref = this.db.collection(this.collections.cost).doc(docId);
-    await ref.set({
-      userId,
-      feature,
-      date: dateStr,
-      totalCostUSD: FieldValue.increment(costDelta.totalCostUSD || 0),
-      inputTokens: FieldValue.increment(costDelta.inputTokens || 0),
-      outputTokens: FieldValue.increment(costDelta.outputTokens || 0),
-      callCount: FieldValue.increment(1),
-      updatedAt: FieldValue.serverTimestamp(),
-      expiresAt: this._ttlTimestamp(OBSERVABILITY_CONFIG.retention.costRetentionDays),
-      isDeleted: false,
-    }, { merge: true });
-    return docId;
-  }
-
-  async getCostByDateRange(fromDate, toDate, { feature, userId } = {}) {
-    let query = this.db.collection(this.collections.cost)
-      .where('isDeleted', '==', false)
-      .where('date', '>=', fromDate)
-      .where('date', '<=', toDate);
-
-    if (feature) query = query.where('feature', '==', feature);
-    if (userId) query = query.where('userId', '==', userId);
-
-    const snap = await query.get();
-    return snap.docs.map(d => ({ id: d.id, ...d.data() }));
-  }
-
-  async getMonthlyCostSummary(monthStr) { // 'YYYY-MM'
-    const from = `${monthStr}-01`;
-    const to = `${monthStr}-31`;
-    return this.getCostByDateRange(from, to);
-  }
-
-  // ─── ALERTS ─────────────────────────────────────────────────────────────────
-
-  async writeAlert(alertEntry) {
-    const docRef = this.db.collection(this.collections.alerts).doc();
-    await docRef.set({
-      ...alertEntry,
-      createdAt: FieldValue.serverTimestamp(),
-      expiresAt: this._ttlTimestamp(OBSERVABILITY_CONFIG.retention.alertsRetentionDays),
-      resolved: false,
-      isDeleted: false,
-    });
-    return docRef.id;
-  }
-
-  async getActiveAlerts({ feature, severity, limit = 50 } = {}) {
-    let query = this.db.collection(this.collections.alerts)
-      .where('resolved', '==', false)
-      .where('isDeleted', '==', false)
-      .orderBy('createdAt', 'desc')
+    const { data, error } = await supabase
+      .from('ai_drift_tracking')
+      .select('*')
+      .eq('is_deleted', false)
+      .order('created_at', { ascending: false })
       .limit(limit);
 
-    if (feature) query = query.where('feature', '==', feature);
-    if (severity) query = query.where('severity', '==', severity);
+    if (error) throw error;
+    return data || [];
+  }
 
-    const snap = await query.get();
-    return snap.docs.map(d => ({ id: d.id, ...d.data() }));
+  // ─── COST ────────────────────────────────────────────────────────────────
+
+  async upsertCostEntry(userId, feature, dateStr, delta) {
+    const id = `${userId}_${feature}_${dateStr}`;
+
+    const record = {
+      id,
+      user_id: userId,
+      feature,
+      date: dateStr,
+      total_cost_usd: delta.totalCostUSD || 0,
+      input_tokens: delta.inputTokens || 0,
+      output_tokens: delta.outputTokens || 0,
+      call_count: 1,
+      updated_at: new Date().toISOString(),
+      expires_at: this._ttlDate(OBSERVABILITY_CONFIG.retention.costRetentionDays),
+      is_deleted: false,
+    };
+
+    const { error } = await supabase.from('ai_cost_tracking').upsert(record);
+    if (error) throw error;
+
+    return id;
+  }
+
+  async getCostByDateRange(from, to) {
+    const { data, error } = await supabase
+      .from('ai_cost_tracking')
+      .select('*')
+      .gte('date', from)
+      .lte('date', to)
+      .eq('is_deleted', false);
+
+    if (error) throw error;
+    return data || [];
+  }
+
+  // ─── ALERTS ──────────────────────────────────────────────────────────────
+
+  async writeAlert(entry) {
+    const record = {
+      ...entry,
+      created_at: new Date().toISOString(),
+      expires_at: this._ttlDate(OBSERVABILITY_CONFIG.retention.alertsRetentionDays),
+      resolved: false,
+      is_deleted: false,
+    };
+
+    const { data, error } = await supabase
+      .from('ai_alerts')
+      .insert(record)
+      .select()
+      .single();
+
+    if (error) throw error;
+    return data.id;
+  }
+
+  async getActiveAlerts({ limit = 50 } = {}) {
+    const { data, error } = await supabase
+      .from('ai_alerts')
+      .select('*')
+      .eq('resolved', false)
+      .eq('is_deleted', false)
+      .order('created_at', { ascending: false })
+      .limit(limit);
+
+    if (error) throw error;
+    return data || [];
   }
 
   async resolveAlert(alertId, resolvedBy) {
-    await this.db.collection(this.collections.alerts).doc(alertId).update({
-      resolved: true,
-      resolvedAt: FieldValue.serverTimestamp(),
-      resolvedBy,
-    });
+    const { error } = await supabase
+      .from('ai_alerts')
+      .update({
+        resolved: true,
+        resolved_at: new Date().toISOString(),
+        resolved_by: resolvedBy,
+      })
+      .eq('id', alertId);
+
+    if (error) throw error;
   }
 
-  // ─── UTILITIES ──────────────────────────────────────────────────────────────
+  // ─── UTIL ────────────────────────────────────────────────────────────────
 
-  _ttlTimestamp(days) {
+  _ttlDate(days) {
     const d = new Date();
     d.setDate(d.getDate() + days);
-    return Timestamp.fromDate(d);
-  }
-
-  _chunk(array, size) {
-    const chunks = [];
-    for (let i = 0; i < array.length; i += size) {
-      chunks.push(array.slice(i, i + size));
-    }
-    return chunks;
+    return d.toISOString();
   }
 }
 
 module.exports = new AIObservabilityRepository();
+
+
+
+
+
