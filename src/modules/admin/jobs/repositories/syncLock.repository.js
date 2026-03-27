@@ -18,8 +18,11 @@ class SyncLockRepository {
     const supabase = getSupabase();
 
     // Read current lock
-    const { data: current } = await supabase
-      .from('sync_locks').select('*').eq('lock_id', LOCK_ID).single();
+    // HARDENING T2: .single() → .maybeSingle() — no lock row on first run
+    // HARDENING T7: destructure error
+    const { data: current, error: readError } = await supabase
+      .from('sync_locks').select('*').eq('lock_id', LOCK_ID).maybeSingle();
+    if (readError) return { acquired: false, reason: readError.message };
 
     const now = new Date();
 
@@ -48,28 +51,25 @@ class SyncLockRepository {
 
   async releaseLock(lockedBy) {
     const supabase = getSupabase();
-    await supabase.from('sync_locks').update({
+    // HARDENING T7: destructure and throw on error
+    const { error } = await supabase.from('sync_locks').update({
       status:       'idle',
       locked_by:    null,
       locked_at:    null,
       released_at:  new Date().toISOString(),
     }).eq('lock_id', LOCK_ID);
+    if (error) throw error;
     logger.info('[SyncLock] Lock released', { lockedBy });
   }
 
   async getStatus() {
     const supabase = getSupabase();
-    const { data } = await supabase.from('sync_locks').select('*').eq('lock_id', LOCK_ID).single();
+    // HARDENING T2: .single() → .maybeSingle() — no lock row on fresh deploy
+    // HARDENING T7: destructure and handle error
+    const { data, error } = await supabase.from('sync_locks').select('*').eq('lock_id', LOCK_ID).maybeSingle();
+    if (error) throw error;
     return data || { lock_id: LOCK_ID, status: 'idle' };
   }
 }
 
 module.exports = new SyncLockRepository();
-
-
-
-
-
-
-
-

@@ -31,12 +31,12 @@ async function loadStudentContext(studentId) {
       simulationRes,
       cognitiveRes,
     ] = await Promise.all([
-      supabase.from(COLLECTIONS.STUDENTS).select('*').eq('id', studentId).single(),
-      supabase.from(COLLECTIONS.STREAM_SCORES).select('*').eq('id', studentId).single(),
-      supabase.from(COLLECTIONS.CAREER_PREDICTIONS).select('*').eq('id', studentId).single(),
-      supabase.from(COLLECTIONS.EDUCATION_ROI).select('*').eq('id', studentId).single(),
-      supabase.from(COLLECTIONS.CAREER_SIMULATIONS).select('*').eq('id', studentId).single(),
-      supabase.from(COLLECTIONS.COGNITIVE).select('*').eq('id', studentId).single(),
+      supabase.from(COLLECTIONS.STUDENTS).select('*').eq('id', studentId).maybeSingle(),
+      supabase.from(COLLECTIONS.STREAM_SCORES).select('*').eq('id', studentId).maybeSingle(),
+      supabase.from(COLLECTIONS.CAREER_PREDICTIONS).select('*').eq('id', studentId).maybeSingle(),
+      supabase.from(COLLECTIONS.EDUCATION_ROI).select('*').eq('id', studentId).maybeSingle(),
+      supabase.from(COLLECTIONS.CAREER_SIMULATIONS).select('*').eq('id', studentId).maybeSingle(),
+      supabase.from(COLLECTIONS.COGNITIVE).select('*').eq('id', studentId).maybeSingle(),
     ]);
 
     const student          = studentRes.data || null;
@@ -179,11 +179,15 @@ async function chat(studentId, userMessage) {
 // ─── Welcome endpoint ───────────────────────────────────
 
 async function getWelcome(studentId) {
-  const { data } = await supabase
+  // HARDENING T2: .single() → .maybeSingle() — student may not exist
+  // HARDENING T7: destructure error and throw on failure
+  const { data, error } = await supabase
     .from(COLLECTIONS.STUDENTS)
     .select('*')
     .eq('id', studentId)
-    .single();
+    .maybeSingle();
+
+  if (error) throw error;
 
   return {
     message: buildWelcomeMessage(data),

@@ -154,12 +154,15 @@ class AIObservabilityRepository {
   }
 
   async getCostByDateRange(from, to) {
+    // HARDENING T3: added .limit(1000) — date-range queries must be bounded
+    // (date strings are YYYY-MM-DD; 1000 covers ~3yrs of per-user-per-feature-per-day rows)
     const { data, error } = await supabase
       .from('ai_cost_tracking')
       .select('*')
       .gte('date', from)
       .lte('date', to)
-      .eq('is_deleted', false);
+      .eq('is_deleted', false)
+      .limit(1000);
 
     if (error) throw error;
     return data || [];
@@ -222,8 +225,3 @@ class AIObservabilityRepository {
 }
 
 module.exports = new AIObservabilityRepository();
-
-
-
-
-

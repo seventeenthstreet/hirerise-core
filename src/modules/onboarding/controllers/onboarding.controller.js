@@ -7,6 +7,10 @@
  *   saveQuickStart      — P1-01: minimal 4-field save → provisional CHI
  *   suggestRoles        — P1-05: role suggestions from job title
  *   getTeaserChi        — P1-06: industry-average CHI snapshot
+ *
+ * MIGRATED: All Firestore db.collection() calls replaced with supabase.from()
+ * FieldValue.serverTimestamp() → new Date().toISOString()
+ * batch()                      → Promise.all([...])
  */
 
 const onboardingService = require('../onboarding.service');
@@ -61,9 +65,9 @@ async function saveDraft(req, res, next) {
 // POST /api/v1/onboarding/career-report
 async function generateCareerReport(req, res, next) {
   try {
-    const userId          = _safeUserId(req);
-    const idempotencyKey  = req.headers['idempotency-key'] || null;
-    const userTier        = req.user?.normalizedTier ?? req.user?.plan ?? 'free';
+    const userId         = _safeUserId(req);
+    const idempotencyKey = req.headers['idempotency-key'] || null;
+    const userTier       = req.user?.normalizedTier ?? req.user?.plan ?? 'free';
     if (!userId) return res.status(401).json({ success: false, message: 'Unauthorized' });
     const result = await onboardingService.generateCareerReport(userId, req.creditCost, idempotencyKey, userTier);
     return res.status(200).json({ success: true, data: result });
@@ -180,7 +184,7 @@ async function _extractCvPersonalDetails(resumeText, userId) {
   let parsed;
   let onboardingShape;
   try {
-    parsed         = parseResumeText(resumeText);
+    parsed          = parseResumeText(resumeText);
     onboardingShape = mapParsedToOnboardingShape(parsed);
 
     logger.info('[OnboardingController] Local CV parser complete', {
@@ -249,7 +253,6 @@ async function _extractCvPersonalDetails(resumeText, userId) {
         professionalSummary: pd.professionalSummary || aiParsed.professionalSummary || null,
       };
 
-      // Merge career fields if AI found something local parser missed
       if (!parsed.yearsExperience && aiParsed.yearsOfExperience) {
         onboardingShape.parsedResume.yearsExperience = aiParsed.yearsOfExperience;
       }
@@ -281,9 +284,9 @@ async function _extractCvPersonalDetails(resumeText, userId) {
     currentCompany:      null,
     yearsOfExperience:   parsed.yearsExperience || onboardingShape.parsedResume.yearsExperience || null,
     // Career fields for Step 2 pre-fill
-    industry:            parsed.industry        || null,
-    educationLevel:      parsed.educationLevel  || null,
-    // Extra fields stored in Firestore for CHI and analytics
+    industry:            parsed.industry       || null,
+    educationLevel:      parsed.educationLevel || null,
+    // Extra fields stored in Supabase for CHI and analytics
     _parsedResume:       onboardingShape.parsedResume,
   };
 }
@@ -324,7 +327,7 @@ async function validateCvFileEndpoint(req, res, next) {
           is_cv:             false,
           confidence:        80,
           document_type:     'other',
-          reason:            "Could not extract text from this file. It may be a scanned image PDF.",
+          reason:            'Could not extract text from this file. It may be a scanned image PDF.',
           detected_sections: [],
         },
       });
@@ -337,7 +340,7 @@ async function validateCvFileEndpoint(req, res, next) {
           is_cv:             false,
           confidence:        85,
           document_type:     'other',
-          reason:            "File contains no readable text. Please upload a text-based resume.",
+          reason:            'File contains no readable text. Please upload a text-based resume.',
           detected_sections: [],
         },
       });
@@ -367,8 +370,6 @@ async function uploadCvDuringOnboarding(req, res, next) {
     if (!req.file) return res.status(400).json({ success: false, message: 'No file uploaded.' });
 
     // ── CV classifier gate: reject non-CV documents before storing ─────────
-    // Extract text first (same logic as validate-cv endpoint), then classify.
-    // If classifier confidence is high enough and is_cv=false → reject early.
     try {
       const { classifyDocument } = require('../../services/cvClassifier.service');
       const logger = require('../../../utils/logger');
@@ -420,25 +421,58 @@ async function uploadCvDuringOnboarding(req, res, next) {
     const { uploadResume } = require('../../resume/resume.service');
     const uploadResult = await uploadResume(userId, req.file);
 
-    const { db } = require('../../../config/supabase');
-    const { appendStepHistory, persistCompletionIfReady } = require('../onboarding.service');
+    const supabase = require('../../../config/supabase');
+    const { appendStepHistory, mergeStepHistory, persistCompletionIfReady } = require('../onboarding.service');
 
     // ── FIX: Extract personal details from the uploaded CV text ───────────────
-    // Fetch the resume doc we just stored — it has resumeText already extracted
-    // by uploadResume() (via pdf-parse / mammoth).
     let extractedDetails = null;
     let extractedSkills  = [];
 
     try {
-      const resumeDoc = await db.collection('resumes').doc(uploadResult.resumeId).get();
-      const docData   = resumeDoc.exists ? resumeDoc.data() : null;
-
       // Primary: use resumeText returned directly by uploadResume() — no DB roundtrip needed
-      // Fallback: read from the stored doc (works if resume_text column exists in Supabase)
-      const resumeText = uploadResult.resumeText
-        || docData?.resumeText
-        || docData?.content?.resumeText
-        || null;
+      // Fallback: read from the stored Supabase row if resume_text column exists
+      let resumeText = uploadResult.resumeText || null;
+
+      if (!resumeText) {
+        const { data: resumeRow, error: resumeErr } = await supabase
+          .from('resumes')
+          .select('resumeText, content, parsedData')
+          .eq('id', uploadResult.resumeId)
+          .maybeSingle();
+        if (resumeErr && resumeErr.code !== 'PGRST116') {
+          require('../../../utils/logger').warn('[OnboardingController] Resume fetch error', { userId, error: resumeErr.message });
+        }
+        resumeText = resumeRow?.resumeText
+          || resumeRow?.content?.resumeText
+          || null;
+
+        if (!resumeText || resumeText.trim().length <= 50) {
+          // Fallback: use parsedData already stored by uploadResume()
+          const pd = resumeRow?.parsedData || resumeRow?.content?.parsedData;
+          if (pd) {
+            require('../../../utils/logger').info('[OnboardingController] Using stored parsedData as fallback', { userId });
+            if (pd.skills?.length) extractedSkills = pd.skills.slice(0, 20).map(s => ({ name: String(s).trim(), proficiency: 'intermediate' }));
+            extractedDetails = {
+              fullName:    pd.name  || null,
+              email:       pd.email || null,
+              phone:       pd.phone || null,
+              city:        pd.location?.city    || null,
+              country:     pd.location?.country || null,
+              linkedInUrl: pd.linkedInUrl  || null,
+              portfolioUrl:pd.portfolioUrl || null,
+              languages:   [],
+              professionalSummary: null,
+              skills:      pd.skills || [],
+              currentJobTitle:    pd.detectedRoles?.[0] || null,
+              currentCompany:     null,
+              yearsOfExperience:  pd.yearsExperience || null,
+              industry:           null,
+              educationLevel:     null,
+              _parsedResume: pd,
+            };
+          }
+        }
+      }
 
       if (resumeText && resumeText.trim().length > 50) {
         extractedDetails = await _extractCvPersonalDetails(resumeText, userId);
@@ -447,32 +481,6 @@ async function uploadCvDuringOnboarding(req, res, next) {
             name:        String(name).trim(),
             proficiency: 'intermediate',
           })).filter(s => s.name).slice(0, 20);
-        }
-      } else {
-        // Fallback: use parsedData already stored by uploadResume() if available
-        const pd = docData?.parsedData || docData?.content?.parsedData;
-        if (pd) {
-          const logger = require('../../../utils/logger');
-          logger.info('[OnboardingController] Using stored parsedData as fallback', { userId });
-          if (pd.skills?.length)  extractedSkills = pd.skills.slice(0, 20).map(s => ({ name: String(s).trim(), proficiency: 'intermediate' }));
-          extractedDetails = {
-            fullName:    pd.name  || null,
-            email:       pd.email || null,
-            phone:       pd.phone || null,
-            city:        pd.location?.city    || null,
-            country:     pd.location?.country || null,
-            linkedInUrl: pd.linkedInUrl  || null,
-            portfolioUrl:pd.portfolioUrl || null,
-            languages:   [],
-            professionalSummary: null,
-            skills:      pd.skills || [],
-            currentJobTitle:    pd.detectedRoles?.[0] || null,
-            currentCompany:     null,
-            yearsOfExperience:  pd.yearsExperience || null,
-            industry:           null,
-            educationLevel:     null,
-            _parsedResume: pd,
-          };
         }
       }
     } catch (extractErr) {
@@ -483,7 +491,6 @@ async function uploadCvDuringOnboarding(req, res, next) {
     }
 
     // ── Build the pre-populated personal details object ───────────────────────
-    // Only set fields that were actually extracted. Email seed comes from auth if not found in CV.
     const preFilledPersonalDetails = extractedDetails ? {
       fullName:            extractedDetails.fullName    || null,
       email:               extractedDetails.email       || null,
@@ -496,13 +503,16 @@ async function uploadCvDuringOnboarding(req, res, next) {
       professionalSummary: extractedDetails.professionalSummary || null,
     } : {};
 
-    // ── Save to Firestore ─────────────────────────────────────────────────────
+    const nowISO = new Date().toISOString();
+    const stepHistory = await mergeStepHistory(userId, 'cv_uploaded');
+
     const progressUpdate = {
+      id:         userId,
       step:       'cv_uploaded',
       cvResumeId: uploadResult.resumeId,
       wantsCv:    true,
-      ...appendStepHistory('cv_uploaded'),
-      updatedAt:  new Date(),
+      stepHistory,
+      updatedAt:  nowISO,
     };
 
     // Only write personalDetails if we successfully extracted something
@@ -515,23 +525,29 @@ async function uploadCvDuringOnboarding(req, res, next) {
       progressUpdate.skills = extractedSkills;
     }
 
-    // Write extracted career info to userProfiles for CHI pre-seeding
+    // Write extracted career info to userProfiles for CHI pre-seeding (fire-and-forget)
     if (extractedDetails?.currentJobTitle || extractedDetails?.yearsOfExperience) {
-      db.collection('userProfiles').doc(userId).set({
+      supabase.from('userProfiles').upsert({
+        id:         userId,
         ...(extractedDetails.currentJobTitle    ? { currentJobTitle:    extractedDetails.currentJobTitle }    : {}),
         ...(extractedDetails.currentCompany     ? { currentCompany:     extractedDetails.currentCompany }     : {}),
         ...(extractedDetails.yearsOfExperience  ? { yearsOfExperience:  extractedDetails.yearsOfExperience }  : {}),
-        updatedAt: new Date(),
-      }, { merge: true }).catch(() => {}); // fire-and-forget, non-fatal
+        updatedAt:  nowISO,
+      }).then(({ error }) => {
+        if (error) require('../../../utils/logger').warn('[OnboardingController] userProfiles career pre-seed failed', { userId, error: error.message });
+      });
     }
 
-    await db.collection('onboardingProgress').doc(userId).set(progressUpdate, { merge: true });
+    const { error: progressErr } = await supabase.from('onboardingProgress').upsert(progressUpdate);
+    if (progressErr) {
+      require('../../../utils/logger').error('[DB] onboardingProgress.upsert (upload-cv) failed', { userId, error: progressErr.message });
+    }
 
-    const [progressSnap, profileSnap] = await Promise.all([
-      db.collection('onboardingProgress').doc(userId).get(),
-      db.collection('userProfiles').doc(userId).get(),
+    const [{ data: progressRow }, { data: profileRow }] = await Promise.all([
+      supabase.from('onboardingProgress').select('*').eq('id', userId).maybeSingle(),
+      supabase.from('userProfiles').select('*').eq('id', userId).maybeSingle(),
     ]);
-    await persistCompletionIfReady(userId, progressSnap.data() || {}, profileSnap.data() || {});
+    await persistCompletionIfReady(userId, progressRow || {}, profileRow || {});
 
     return res.status(201).json({
       success: true,
@@ -591,7 +607,6 @@ async function importLinkedIn(req, res, next) {
 // GET /api/v1/onboarding/suggest-roles  (P1-05)
 // Query: ?q=<jobTitle>&limit=<max>
 // Returns role suggestions with confidence scores for Quick Start pre-fill.
-// Delegates to roles.service.suggestRolesForOnboarding (separate module).
 async function suggestRoles(req, res, next) {
   try {
     const { q, limit } = req.query;
@@ -612,8 +627,6 @@ async function suggestRoles(req, res, next) {
 
 // GET /api/v1/onboarding/teaser-chi  (P1-06)
 // Query: ?jobFamilyId=<id>  (optional — defaults to 'general')
-// Returns an industry-average CHI snapshot. No auth context needed for the data,
-// but authenticate middleware still runs (user must be logged in to reach onboarding).
 async function getTeaserChi(req, res, next) {
   try {
     const { jobFamilyId } = req.query;
@@ -623,9 +636,6 @@ async function getTeaserChi(req, res, next) {
 }
 
 // GET /api/v1/onboarding/chi-ready  (P2-05)
-// Returns whether a real CHI score is ready to display, plus enrichment nudges.
-// Frontend polls this after POST /quick-start or POST /career-report to know
-// when to transition from loading state to score card.
 async function getChiReady(req, res, next) {
   try {
     const userId = _safeUserId(req);
@@ -646,8 +656,6 @@ async function getCareerReportStatus(req, res, next) {
 }
 
 // POST /api/v1/onboarding/import-linkedin/confirm  (P3-02)
-// Promotes importedProfile to live education[], experience[], skills[] fields.
-// Must be called after POST /import-linkedin and before POST /career-report.
 async function confirmLinkedInImport(req, res, next) {
   try {
     const userId = _safeUserId(req);
@@ -658,7 +666,6 @@ async function confirmLinkedInImport(req, res, next) {
 }
 
 // GET /api/v1/onboarding/draft  (P3-04)
-// Returns the current saved draft for pre-populating the form on return visits.
 async function getDraft(req, res, next) {
   try {
     const userId = _safeUserId(req);
@@ -669,7 +676,6 @@ async function getDraft(req, res, next) {
 }
 
 // PATCH /api/v1/onboarding/cv-draft  (P3-07)
-// Stores CV editable-field overrides (summary, skills, experience) before PDF generation.
 async function saveCvDraft(req, res, next) {
   try {
     const userId = _safeUserId(req);
@@ -682,7 +688,6 @@ async function saveCvDraft(req, res, next) {
 // GET /api/v1/onboarding/analytics/funnel  (P4-04)
 // Admin-only: onboarding funnel conversion rates + drop-off by step.
 // B-06 FIX: mandatory date range params (from + to) prevents full-collection scan at scale.
-// Usage: GET /analytics/funnel?from=2025-01-01&to=2025-03-31&limit=500
 async function getFunnelAnalytics(req, res, next) {
   try {
     const { from, to, after } = req.query;
@@ -723,40 +728,42 @@ async function getFunnelAnalytics(req, res, next) {
 // Explicitly marks onboarding complete for the CV-upload (Track A) path.
 // The manual path uses generateCareerReport → persistCompletionIfReady.
 // The upload path has no career report step in the 2-step UI, so we need
-// this direct endpoint to write onboardingCompleted to the users collection
+// this direct endpoint to write onboardingCompleted to the users table
 // that GET /users/me reads from.
 async function completeOnboarding(req, res, next) {
   try {
     const userId = _safeUserId(req);
     if (!userId) return res.status(401).json({ success: false, message: 'Unauthorized' });
 
-    const { db } = require('../../../config/supabase');
-    const { FieldValue } = require('../../../config/supabase');
-    const logger = require('../../../utils/logger');
+    const supabase = require('../../../config/supabase');
+    const logger   = require('../../../utils/logger');
+    const { mergeStepHistory } = require('../onboarding.helpers');
 
-    const now = FieldValue.serverTimestamp();
-    const batch = db.batch();
+    const now = new Date().toISOString();
+    const stepHistory = await mergeStepHistory(userId, 'onboarding_completed');
 
-    // Write to BOTH collections — users is read by /users/me, userProfiles by services
-    batch.set(db.collection('users').doc(userId), {
-      onboardingCompleted: true,
-      onboardingCompletedAt: now,
-      updatedAt: now,
-    }, { merge: true });
-
-    batch.set(db.collection('userProfiles').doc(userId), {
-      onboardingCompleted: true,
-      onboardingCompletedAt: now,
-      updatedAt: now,
-    }, { merge: true });
-
-    batch.set(db.collection('onboardingProgress').doc(userId), {
-      step: 'completed',
-      completedAt: now,
-      updatedAt: now,
-    }, { merge: true });
-
-    await batch.commit();
+    // Write to BOTH tables — users is read by /users/me, userProfiles by services
+    await Promise.all([
+      supabase.from('users').upsert({
+        id:                    userId,
+        onboardingCompleted:   true,
+        onboardingCompletedAt: now,
+        updatedAt:             now,
+      }),
+      supabase.from('userProfiles').upsert({
+        id:                    userId,
+        onboardingCompleted:   true,
+        onboardingCompletedAt: now,
+        updatedAt:             now,
+      }),
+      supabase.from('onboardingProgress').upsert({
+        id:          userId,
+        step:        'completed',
+        completedAt: now,
+        stepHistory,
+        updatedAt:   now,
+      }),
+    ]);
 
     logger.info('[OnboardingController] completeOnboarding — marked complete', { userId });
 
@@ -796,12 +803,3 @@ module.exports = {
   getFunnelAnalytics,          // P4-04
   completeOnboarding,
 };
-
-
-
-
-
-
-
-
-

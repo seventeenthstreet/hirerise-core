@@ -27,82 +27,87 @@
 
 // File is at: src/modules/admin/cms/import/
 // ../../../../ goes up to: src/
-const { normalizeText, normalizeForComposite } = require('../../../../shared/utils/normalizeText');
-const { AppError, ErrorCodes }                 = require('../../../../middleware/errorHandler');
-const logger                                   = require('../../../../utils/logger');
+const {
+  normalizeText,
+  normalizeForComposite
+} = require('../../../../shared/utils/normalizeText');
+const {
+  AppError,
+  ErrorCodes
+} = require('../../../../middleware/errorHandler');
+const logger = require('../../../../utils/logger');
 
 // Lazy requires — avoid circular deps at startup
 // From src/modules/admin/cms/import/, one level up (../) reaches src/modules/admin/cms/
-const getSkillsRepo   = () => require('../skills/adminCmsSkills.repository');
-const getRolesRepo    = () => require('../roles/adminCmsRoles.repository');
-const getGenericRepos        = () => require('../adminCmsGeneric.factory');
+const getSkillsRepo = () => require('../skills/adminCmsSkills.repository');
+const getRolesRepo = () => require('../roles/adminCmsRoles.repository');
+const getGenericRepos = () => require('../adminCmsGeneric.factory');
 const getCareerDomainsModule = () => require('../career-domains/adminCmsCareerDomains.module');
 const getSkillClustersModule = () => require('../skill-clusters/adminCmsSkillClusters.module');
-const getDb           = () => require('../../../../config/supabase').db;
+const getDb = () => require('../../../../config/supabase').db;
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
 const MAX_IMPORT_ROWS = 1000;
-
-const SUPPORTED_TYPES = [
-  'skills', 'roles', 'jobFamilies', 'educationLevels', 'salaryBenchmarks',
-  'careerDomains', 'skillClusters',  // ← taxonomy extension
+const SUPPORTED_TYPES = ['skills', 'roles', 'jobFamilies', 'educationLevels', 'salaryBenchmarks', 'careerDomains', 'skillClusters' // ← taxonomy extension
 ];
-
-const BLOCKED_CSV_FIELDS = new Set([
-  'adminId', 'createdByAdminId', 'updatedByAdminId',
-  'sourceAgency', 'createdBy', 'updatedBy',
-]);
+const BLOCKED_CSV_FIELDS = new Set(['adminId', 'createdByAdminId', 'updatedByAdminId', 'sourceAgency', 'createdBy', 'updatedBy']);
 
 // ── Main Export ───────────────────────────────────────────────────────────────
 
-async function processImport({ datasetType, rows, adminId, agency = null }) {
+async function processImport({
+  datasetType,
+  rows,
+  adminId,
+  agency = null
+}) {
   if (!SUPPORTED_TYPES.includes(datasetType)) {
-    throw new AppError(
-      `Unsupported datasetType: ${datasetType}. Supported: ${SUPPORTED_TYPES.join(', ')}`,
-      400, { datasetType }, ErrorCodes.VALIDATION_ERROR
-    );
+    throw new AppError(`Unsupported datasetType: ${datasetType}. Supported: ${SUPPORTED_TYPES.join(', ')}`, 400, {
+      datasetType
+    }, ErrorCodes.VALIDATION_ERROR);
   }
-
   if (!Array.isArray(rows)) {
     throw new AppError('rows must be an array', 400, {}, ErrorCodes.VALIDATION_ERROR);
   }
-
   if (rows.length > MAX_IMPORT_ROWS) {
-    throw new AppError(
-      `Import limit exceeded. Maximum ${MAX_IMPORT_ROWS} rows per batch.`,
-      400, { provided: rows.length, limit: MAX_IMPORT_ROWS }, ErrorCodes.VALIDATION_ERROR
-    );
+    throw new AppError(`Import limit exceeded. Maximum ${MAX_IMPORT_ROWS} rows per batch.`, 400, {
+      provided: rows.length,
+      limit: MAX_IMPORT_ROWS
+    }, ErrorCodes.VALIDATION_ERROR);
   }
 
   // For roles: resolve job family names → doc IDs before validation
-  const resolvedRows = datasetType === 'roles'
-    ? await _resolveJobFamilyIds(rows)
-    : rows;
-
-  const { cleanRows, errors: validationErrors } = _sanitizeAndValidateRows(resolvedRows, datasetType);
-  const normalizedRows                          = _normalizeRows(cleanRows, datasetType);
-  const { withInternalDupes, internalDuplicates } = _detectInternalDuplicates(normalizedRows, datasetType);
-  const { cleanForInsert, dbDuplicates }        = await _detectDatabaseDuplicates(withInternalDupes, datasetType);
-  const insertedIds                             = await _insertRows(cleanForInsert, datasetType, adminId, agency);
-  const duplicates                              = [...internalDuplicates, ...dbDuplicates];
-
+  const resolvedRows = datasetType === 'roles' ? await _resolveJobFamilyIds(rows) : rows;
+  const {
+    cleanRows,
+    errors: validationErrors
+  } = _sanitizeAndValidateRows(resolvedRows, datasetType);
+  const normalizedRows = _normalizeRows(cleanRows, datasetType);
+  const {
+    withInternalDupes,
+    internalDuplicates
+  } = _detectInternalDuplicates(normalizedRows, datasetType);
+  const {
+    cleanForInsert,
+    dbDuplicates
+  } = await _detectDatabaseDuplicates(withInternalDupes, datasetType);
+  const insertedIds = await _insertRows(cleanForInsert, datasetType, adminId, agency);
+  const duplicates = [...internalDuplicates, ...dbDuplicates];
   logger.info('[AdminCmsImport] Import complete', {
     datasetType,
-    total:    rows.length,
+    total: rows.length,
     inserted: insertedIds.length,
-    skipped:  duplicates.length,
-    errors:   validationErrors.length,
-    admin_id: adminId,
+    skipped: duplicates.length,
+    errors: validationErrors.length,
+    admin_id: adminId
   });
-
   return {
-    total:      rows.length,
-    inserted:   insertedIds.length,
-    skipped:    duplicates.length + validationErrors.length,
+    total: rows.length,
+    inserted: insertedIds.length,
+    skipped: duplicates.length + validationErrors.length,
     duplicates,
-    errors:     validationErrors,
-    insertedIds,
+    errors: validationErrors,
+    insertedIds
   };
 }
 
@@ -141,25 +146,23 @@ async function _resolveJobFamilyIds(rows) {
   for (const row of rows) {
     if (!row.jobFamilyId && row.jobfamilyid) row.jobFamilyId = row.jobfamilyid;
   }
-
   if (nameSet.size === 0) return rows; // all values already look like doc IDs
 
   // Batch lookup — normalizeText() matches the same function used when writing
-  const { normalizeText: nt } = require('../../../../shared/utils/normalizeText');
+  const {
+    normalizeText: nt
+  } = require('../../../../shared/utils/normalizeText');
   const normalizedToName = new Map();
   for (const name of nameSet) normalizedToName.set(nt(name), name);
-
   const normalizedNames = [...normalizedToName.keys()];
-  const nameToDocId     = new Map();
+  const nameToDocId = new Map();
 
   // Firestore 'in' limit is 30 per query
   const CHUNK = 30;
   for (let i = 0; i < normalizedNames.length; i += CHUNK) {
     const chunk = normalizedNames.slice(i, i + CHUNK);
-    const snap  = await db.collection('cms_job_families')
-      .where('normalizedName', 'in', chunk)
-      .where('softDeleted', '==', false)
-      .get();
+    // TODO: MANUAL MIGRATION REQUIRED — multiple .where() chains
+    const snap = await db.collection('cms_job_families').where('normalizedName', 'in', chunk).where('softDeleted', '==', false).get();
     for (const doc of snap.docs) {
       const data = doc.data();
       nameToDocId.set(data.normalizedName, doc.id);
@@ -168,10 +171,9 @@ async function _resolveJobFamilyIds(rows) {
       if (origName) nameToDocId.set(origName, doc.id);
     }
   }
-
   logger.info('[AdminCmsImport] Resolved jobFamily names to IDs', {
     requested: nameSet.size,
-    resolved:  nameToDocId.size,
+    resolved: nameToDocId.size
   });
 
   // Rewrite rows
@@ -183,49 +185,66 @@ async function _resolveJobFamilyIds(rows) {
 
     const docId = nameToDocId.get(val.trim()) || nameToDocId.get(nt(val.trim()));
     if (docId) {
-      return { ...row, jobFamilyId: docId };
+      return {
+        ...row,
+        jobFamilyId: docId
+      };
     }
     // Could not resolve — mark so _sanitizeAndValidateRows can report a clear error
-    return { ...row, _jobFamilyError: `Job family "${val}" not found. Import job families first, then retry.` };
+    return {
+      ...row,
+      _jobFamilyError: `Job family "${val}" not found. Import job families first, then retry.`
+    };
   });
 }
-
 function _sanitizeAndValidateRows(rows, datasetType) {
   const cleanRows = [];
-  const errors    = [];
-
+  const errors = [];
   for (let i = 0; i < rows.length; i++) {
     const rowNum = i + 2;
-    const raw    = rows[i];
-
+    const raw = rows[i];
     const row = {};
     for (const [key, value] of Object.entries(raw)) {
       if (!BLOCKED_CSV_FIELDS.has(key)) row[key] = value;
     }
-
     if (!row.name || typeof row.name !== 'string' || !row.name.trim()) {
-      errors.push({ row: rowNum, field: 'name', message: 'name is required and must be a non-empty string' });
+      errors.push({
+        row: rowNum,
+        field: 'name',
+        message: 'name is required and must be a non-empty string'
+      });
       continue;
     }
 
     // Support jobfamilyid (lowercase, as CSV parser lowercases all headers)
     if (!row.jobFamilyId && row.jobfamilyid) row.jobFamilyId = row.jobfamilyid;
-
     if (datasetType === 'roles') {
       if (row._jobFamilyError) {
-        errors.push({ row: rowNum, field: 'jobFamilyId', message: row._jobFamilyError });
+        errors.push({
+          row: rowNum,
+          field: 'jobFamilyId',
+          message: row._jobFamilyError
+        });
         continue;
       }
       if (!row.jobFamilyId) {
-        errors.push({ row: rowNum, field: 'jobFamilyId', message: 'jobFamilyId is required for roles. Provide the job family name (e.g. "Finance & Accounting") or its Firestore doc ID.' });
+        errors.push({
+          row: rowNum,
+          field: 'jobFamilyId',
+          message: 'jobFamilyId is required for roles. Provide the job family name (e.g. "Finance & Accounting") or its Firestore doc ID.'
+        });
         continue;
       }
     }
-
-    cleanRows.push({ ...row, _rowNum: rowNum });
+    cleanRows.push({
+      ...row,
+      _rowNum: rowNum
+    });
   }
-
-  return { cleanRows, errors };
+  return {
+    cleanRows,
+    errors
+  };
 }
 
 // Parse a semicolon-separated string into a trimmed array of non-empty strings.
@@ -236,21 +255,20 @@ function _parseDelimitedArray(value, delimiter = ';') {
   if (!value || typeof value !== 'string') return [];
   return value.split(delimiter).map(s => s.trim()).filter(Boolean);
 }
-
 function _normalizeRows(rows, datasetType) {
   return rows.map(row => {
-    const normalized          = { ...row };
+    const normalized = {
+      ...row
+    };
     normalized.normalizedName = normalizeText(row.name);
 
     // Parse array fields that CSV delivers as delimited strings
     if (datasetType === 'skills') {
-      normalized.aliases           = _parseDelimitedArray(row.aliases);
-      normalized.demandScore       = row.demandscore !== undefined ? Number(row.demandscore) || null
-                                   : row.demandScore !== undefined ? Number(row.demandScore) || null
-                                   : null;
+      normalized.aliases = _parseDelimitedArray(row.aliases);
+      normalized.demandScore = row.demandscore !== undefined ? Number(row.demandscore) || null : row.demandScore !== undefined ? Number(row.demandScore) || null : null;
     }
     if (datasetType === 'roles') {
-      normalized.alternativeTitles      = _parseDelimitedArray(row.alternativetitles || row.alternativeTitles);
+      normalized.alternativeTitles = _parseDelimitedArray(row.alternativetitles || row.alternativeTitles);
       normalized.normalizedCompositeKey = normalizeForComposite(row.name, row.jobFamilyId);
     }
     if (datasetType === 'educationLevels') {
@@ -262,58 +280,68 @@ function _normalizeRows(rows, datasetType) {
         const v = row[k1] ?? row[k2];
         return v !== undefined && v !== '' ? Number(v) || null : null;
       };
-      normalized.minSalary    = toNum('minsalary',    'minSalary');
-      normalized.maxSalary    = toNum('maxsalary',    'maxSalary');
+      normalized.minSalary = toNum('minsalary', 'minSalary');
+      normalized.maxSalary = toNum('maxsalary', 'maxSalary');
       normalized.medianSalary = toNum('mediansalary', 'medianSalary');
-      normalized.year         = toNum('year',         'year');
+      normalized.year = toNum('year', 'year');
     }
     if (datasetType === 'skillClusters') {
       // Normalise domainId field — CSV may use either casing
       normalized.domainId = row.domainid ?? row.domain_id ?? row.domainId ?? null;
     }
-
     return normalized;
   });
 }
-
 function _detectInternalDuplicates(rows, datasetType) {
-  const seen               = new Set();
-  const withInternalDupes  = [];
+  const seen = new Set();
+  const withInternalDupes = [];
   const internalDuplicates = [];
-
   for (const row of rows) {
     const key = datasetType === 'roles' ? row.normalizedCompositeKey : row.normalizedName;
-
     if (seen.has(key)) {
       internalDuplicates.push({
-        row: row._rowNum, value: row.name, reason: 'file', existingId: null,
-        message: `Duplicate within the uploaded file — "${row.name}" appears more than once.`,
+        row: row._rowNum,
+        value: row.name,
+        reason: 'file',
+        existingId: null,
+        message: `Duplicate within the uploaded file — "${row.name}" appears more than once.`
       });
-      withInternalDupes.push({ ...row, _isDuplicate: true });
+      withInternalDupes.push({
+        ...row,
+        _isDuplicate: true
+      });
     } else {
       seen.add(key);
-      withInternalDupes.push({ ...row, _isDuplicate: false });
+      withInternalDupes.push({
+        ...row,
+        _isDuplicate: false
+      });
     }
   }
-
-  return { withInternalDupes, internalDuplicates };
+  return {
+    withInternalDupes,
+    internalDuplicates
+  };
 }
-
 async function _detectDatabaseDuplicates(rows, datasetType) {
   const cleanForInsert = [];
-  const dbDuplicates   = [];
-  const rowsToCheck    = rows.filter(r => !r._isDuplicate);
-
-  if (rowsToCheck.length === 0) return { cleanForInsert, dbDuplicates };
-
+  const dbDuplicates = [];
+  const rowsToCheck = rows.filter(r => !r._isDuplicate);
+  if (rowsToCheck.length === 0) return {
+    cleanForInsert,
+    dbDuplicates
+  };
   let existingMap;
-
   if (datasetType === 'skills') {
     existingMap = await getSkillsRepo().findManyByNormalizedName(rowsToCheck.map(r => r.normalizedName));
   } else if (datasetType === 'roles') {
     existingMap = await getRolesRepo().findManyByCompositeKey(rowsToCheck.map(r => r.normalizedCompositeKey));
   } else {
-    const { jobFamiliesModule, educationLevelsModule, salaryBenchmarksModule } = getGenericRepos();
+    const {
+      jobFamiliesModule,
+      educationLevelsModule,
+      salaryBenchmarksModule
+    } = getGenericRepos();
     let repo;
     if (datasetType === 'jobFamilies') {
       repo = jobFamiliesModule.repository;
@@ -328,34 +356,37 @@ async function _detectDatabaseDuplicates(rows, datasetType) {
     }
     existingMap = await repo.findManyByNormalizedName(rowsToCheck.map(r => r.normalizedName));
   }
-
   for (const row of rows) {
     if (row._isDuplicate) continue;
-
     const lookupKey = datasetType === 'roles' ? row.normalizedCompositeKey : row.normalizedName;
-    const existing  = existingMap.get(lookupKey);
-
+    const existing = existingMap.get(lookupKey);
     if (existing) {
       logger.warn('[AdminCmsImport] Database duplicate detected', {
-        event: 'duplicate_attempt', dataset_type: datasetType,
-        dataset_value: row.name, row: row._rowNum,
-        existing_id: existing.id, timestamp: new Date().toISOString(),
+        event: 'duplicate_attempt',
+        dataset_type: datasetType,
+        dataset_value: row.name,
+        row: row._rowNum,
+        existing_id: existing.id,
+        timestamp: new Date().toISOString()
       });
       dbDuplicates.push({
-        row: row._rowNum, value: row.name, reason: 'database',
-        existingId: existing.id, message: `"${row.name}" already exists in the database.`,
+        row: row._rowNum,
+        value: row.name,
+        reason: 'database',
+        existingId: existing.id,
+        message: `"${row.name}" already exists in the database.`
       });
     } else {
       cleanForInsert.push(row);
     }
   }
-
-  return { cleanForInsert, dbDuplicates };
+  return {
+    cleanForInsert,
+    dbDuplicates
+  };
 }
-
 async function _insertRows(rows, datasetType, adminId, agency) {
   const insertedIds = [];
-
   for (const row of rows) {
     try {
       let created;
@@ -364,7 +395,11 @@ async function _insertRows(rows, datasetType, adminId, agency) {
       } else if (datasetType === 'roles') {
         created = await getRolesRepo().createRole(row, adminId, agency);
       } else {
-        const { jobFamiliesModule, educationLevelsModule, salaryBenchmarksModule } = getGenericRepos();
+        const {
+          jobFamiliesModule,
+          educationLevelsModule,
+          salaryBenchmarksModule
+        } = getGenericRepos();
         let repo;
         if (datasetType === 'jobFamilies') {
           repo = jobFamiliesModule.repository;
@@ -381,20 +416,17 @@ async function _insertRows(rows, datasetType, adminId, agency) {
       }
       insertedIds.push(created.id);
     } catch (err) {
-      logger.error('[AdminCmsImport] Row insert failed', { row: row._rowNum, name: row.name, error: err.message });
+      logger.error('[AdminCmsImport] Row insert failed', {
+        row: row._rowNum,
+        name: row.name,
+        error: err.message
+      });
     }
   }
-
   return insertedIds;
 }
-
-module.exports = { processImport, SUPPORTED_TYPES, MAX_IMPORT_ROWS };
-
-
-
-
-
-
-
-
-
+module.exports = {
+  processImport,
+  SUPPORTED_TYPES,
+  MAX_IMPORT_ROWS
+};

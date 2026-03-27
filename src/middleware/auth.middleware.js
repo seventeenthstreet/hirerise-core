@@ -111,11 +111,12 @@ async function resolvePlan(user) {
   if (metaPlan && metaPlan !== 'free') return metaPlan;
 
   try {
+    // HARDENING T2: .single() → .maybeSingle() — user row may not exist yet
     const { data, error } = await getSupabaseAdmin()
       .from('users')
       .select('plan, tier')
       .eq('id', user.id)
-      .single();
+      .maybeSingle();
 
     if (!error && data) {
       const supabasePlan = data.tier ?? data.plan ?? null;

@@ -12,6 +12,7 @@ function loadAllRoles() {
   families.forEach((family) => {
     const familyPath = path.join(BASE_PATH, family);
 
+    // Skip non-directories
     if (!fs.statSync(familyPath).isDirectory()) {
       console.log("Skipping non-directory:", familyPath);
       return;
@@ -23,19 +24,38 @@ function loadAllRoles() {
 
     files.forEach((file) => {
       const filePath = path.join(familyPath, file);
-      console.log("Loading file:", filePath);
 
-      const data = JSON.parse(fs.readFileSync(filePath, "utf-8"));
+      // Optional: skip non-JSON files (extra safety)
+      if (!file.endsWith(".json")) {
+        console.log("Skipping non-JSON file:", filePath);
+        return;
+      }
 
-      console.log("Loaded role_id:", data.role_id);
+      try {
+        console.log("Loading file:", filePath);
 
-      roles[data.role_id] = data;
+        const data = JSON.parse(fs.readFileSync(filePath, "utf-8"));
+
+        if (!data.role_id) {
+          console.warn("⚠️ Missing role_id in:", filePath);
+          return;
+        }
+
+        console.log("Loaded role_id:", data.role_id);
+
+        roles[data.role_id] = data;
+      } catch (err) {
+        console.error("❌ Error reading file:", filePath, err.message);
+      }
     });
   });
+
+  console.log("✅ Career graph fully loaded");
 
   return roles;
 }
 
+// Load once at startup
 const roleCache = loadAllRoles();
 
 function getRole(roleId) {
@@ -44,20 +64,14 @@ function getRole(roleId) {
 
 function getNextRoles(roleId) {
   const role = getRole(roleId);
-  if (!role) return [];
+  if (!role || !Array.isArray(role.next_roles)) return [];
 
-  return role.next_roles.map((id) => getRole(id));
+  return role.next_roles
+    .map((id) => getRole(id))
+    .filter(Boolean); // remove nulls
 }
 
 module.exports = {
   getRole,
-  getNextRoles
+  getNextRoles,
 };
-
-
-
-
-
-
-
-

@@ -8,12 +8,17 @@
  *
  * Do NOT import this from outside the onboarding module — these are internals.
  * External callers should use the specific sub-service (cv, intake, etc.).
+ *
+ * MIGRATED: All Firestore db.collection() calls replaced with supabase.from()
+ * FieldValue.serverTimestamp() → new Date().toISOString()
+ * FieldValue.arrayUnion()     → array spread merge (handled at write site)
+ * batch()                     → Promise.all([...])
+ * Transactions                → sequential awaits (best-effort)
  */
 
 const crypto    = require('crypto');
-const { db, storage } = require('../../config/supabase');
+const supabase  = require('../../config/supabase');
 const { AppError, ErrorCodes } = require('../../middleware/errorHandler');
-const { FieldValue } = require('../../config/supabase');
 const logger          = require('../../utils/logger');
 const { getQualificationById } = require('../qualification/qualification.service');
 const { logAIInteraction }     = require('../../infrastructure/aiLogger');
@@ -242,12 +247,18 @@ function validateAndSanitiseResponsibilities(responsibilities, label) {
 async function checkIdempotencyKey(userId, operation, key) {
   if (!key) return null;
   try {
-    const ref  = db.collection('idempotencyKeys').doc(`${userId}:${operation}:${key}`);
-    const snap = await ref.get();
-    if (!snap.exists) return null;
-    const data = snap.data();
+    const docId = `${userId}:${operation}:${key}`;
+    const { data, error } = await supabase
+      .from('idempotencyKeys')
+      .select('*')
+      .eq('id', docId)
+      .maybeSingle();
+    if (error && error.code !== 'PGRST116') {
+      logger.warn('[DB] idempotencyKeys.get error', { error: error.message });
+    }
+    if (!data) return null;
     if (Date.now() - new Date(data.createdAt).getTime() > IDEMPOTENCY_TTL_MS) {
-      await ref.delete().catch(() => {});
+      await supabase.from('idempotencyKeys').delete().eq('id', docId);
       return null;
     }
     return data.result;
@@ -257,8 +268,13 @@ async function checkIdempotencyKey(userId, operation, key) {
 async function saveIdempotencyKey(userId, operation, key, result) {
   if (!key) return;
   try {
-    await db.collection('idempotencyKeys').doc(`${userId}:${operation}:${key}`)
-      .set({ userId, operation, key, result, createdAt: new Date().toISOString() });
+    const docId = `${userId}:${operation}:${key}`;
+    const { error } = await supabase
+      .from('idempotencyKeys')
+      .upsert({ id: docId, userId, operation, key, result, createdAt: new Date().toISOString() });
+    if (error) {
+      logger.warn('[OnboardingService] Idempotency key save failed', { userId, operation, error: error.message });
+    }
   } catch (err) {
     logger.warn('[OnboardingService] Idempotency key save failed', { userId, operation, error: err.message });
   }
@@ -328,17 +344,24 @@ async function scheduleReengagementJob(userId) {
 
   // 1. Write durable job record — survives process restarts
   try {
-    await db.collection(NOTIFICATION_JOBS_COLLECTION).doc(jobId).set({
-      jobId,
-      userId,
-      type:        'ONBOARDING_DRAFT_REENGAGEMENT',
-      status:      'pending',
-      scheduledAt: scheduledAt.toISOString(),
-      createdAt:   new Date().toISOString(),
-    });
+    const { error } = await supabase
+      .from(NOTIFICATION_JOBS_COLLECTION)
+      .upsert({
+        id:          jobId,
+        jobId,
+        userId,
+        type:        'ONBOARDING_DRAFT_REENGAGEMENT',
+        status:      'pending',
+        scheduledAt: scheduledAt.toISOString(),
+        createdAt:   new Date().toISOString(),
+      });
+    if (error) {
+      logger.warn('[OnboardingService] Failed to write notificationJobs record — re-engagement not scheduled', { userId, error: error.message });
+      return; // do not enqueue if the record write failed — avoids orphaned tasks
+    }
   } catch (err) {
     logger.warn('[OnboardingService] Failed to write notificationJobs record — re-engagement not scheduled', { userId, error: err.message });
-    return; // do not enqueue if the record write failed — avoids orphaned tasks
+    return;
   }
 
   // 2a. Cloud Tasks path — production
@@ -380,15 +403,24 @@ async function scheduleReengagementJob(userId) {
   logger.debug('[OnboardingService] CLOUD_TASKS_QUEUE_PATH not set — using setTimeout fallback (dev only)', { userId });
   setTimeout(async () => {
     try {
-      const snap = await db.collection('onboardingProgress').doc(userId).get();
-      if (!snap.exists) return;
+      const { data: progressRow, error: progressErr } = await supabase
+        .from('onboardingProgress')
+        .select('*')
+        .eq('id', userId)
+        .maybeSingle();
+      if (progressErr && progressErr.code !== 'PGRST116') {
+        logger.error('[DB] onboardingProgress.get:', progressErr.message);
+      }
+      if (!progressRow) return;
 
       const progressedSteps = ['education_experience_saved', 'career_report_generated',
         'personal_details_saved', 'cv_generated', 'cv_uploaded', 'completed_without_cv'];
-      const hasProgressed = (snap.data().stepHistory || []).some(h => progressedSteps.includes(h.step));
+      const hasProgressed = (progressRow.stepHistory || []).some(h => progressedSteps.includes(h.step));
 
       if (hasProgressed) {
-        await db.collection(NOTIFICATION_JOBS_COLLECTION).doc(jobId).set({ status: 'skipped', resolvedAt: new Date().toISOString() }, { merge: true });
+        await supabase
+          .from(NOTIFICATION_JOBS_COLLECTION)
+          .upsert({ id: jobId, status: 'skipped', resolvedAt: new Date().toISOString() });
         return;
       }
 
@@ -398,7 +430,9 @@ async function scheduleReengagementJob(userId) {
         data: { actionUrl: '/onboarding', message: 'You left your profile unfinished. Complete it to unlock your Career Health Score.' },
       });
 
-      await db.collection(NOTIFICATION_JOBS_COLLECTION).doc(jobId).set({ status: 'delivered', resolvedAt: new Date().toISOString() }, { merge: true });
+      await supabase
+        .from(NOTIFICATION_JOBS_COLLECTION)
+        .upsert({ id: jobId, status: 'delivered', resolvedAt: new Date().toISOString() });
       logger.info('[OnboardingService] Draft re-engagement sent (setTimeout fallback)', { userId });
     } catch (err) {
       logger.warn('[OnboardingService] Draft re-engagement failed (setTimeout fallback)', { userId, error: err.message });
@@ -503,7 +537,9 @@ async function _runProvisionalChiInProcess(userId, onboardingData, profileData, 
 // ─── Step history + events ────────────────────────────────────────────────────
 
 function appendStepHistory(step) {
-  return { stepHistory: FieldValue.arrayUnion({ step, at: new Date().toISOString() }) };
+  // Returns a partial object; callers must read existing stepHistory, append, and write back.
+  // Since Supabase has no arrayUnion equivalent in a single upsert, the caller handles merging.
+  return { _appendStep: { step, at: new Date().toISOString() } };
 }
 
 async function emitOnboardingEvent(userId, eventName, metadata = {}) {
@@ -515,6 +551,27 @@ async function emitOnboardingEvent(userId, eventName, metadata = {}) {
     );
   } catch (err) {
     logger.warn('[OnboardingService] Event emission failed (non-fatal)', { userId, eventName, error: err.message });
+  }
+}
+
+// ─── Step history merge helper ────────────────────────────────────────────────
+// Reads existing stepHistory from DB, appends new step, returns merged array.
+// Used by callers that need to persist stepHistory correctly without arrayUnion.
+async function mergeStepHistory(userId, newStep) {
+  try {
+    const { data, error } = await supabase
+      .from('onboardingProgress')
+      .select('stepHistory')
+      .eq('id', userId)
+      .maybeSingle();
+    if (error && error.code !== 'PGRST116') {
+      logger.warn('[DB] mergeStepHistory read error', { userId, error: error.message });
+    }
+    const existing = data?.stepHistory || [];
+    return [...existing, { step: newStep, at: new Date().toISOString() }];
+  } catch (err) {
+    logger.warn('[OnboardingService] mergeStepHistory failed — returning single-entry array', { userId, error: err.message });
+    return [{ step: newStep, at: new Date().toISOString() }];
   }
 }
 
@@ -539,36 +596,45 @@ async function emitOnboardingEvent(userId, eventName, metadata = {}) {
 async function deductCredits(userId, amount, operationKey = null) {
   if (!amount || amount <= 0) return;
   try {
-    await db.runTransaction(async (txn) => {
-      const ref = db.collection('users').doc(userId);
-      const doc = await txn.get(ref);
-      if (!doc.exists) return;
-      const data = doc.data();
+    const { data: userData, error: fetchErr } = await supabase
+      .from('users')
+      .select('aiCreditsRemaining, creditDeductionLog')
+      .eq('id', userId)
+      .maybeSingle();
+    if (fetchErr && fetchErr.code !== 'PGRST116') {
+      logger.error('[OnboardingService] deductCredits fetch failed', { userId, error: fetchErr.message });
+      return;
+    }
+    if (!userData) return;
 
-      // P4-05: idempotency guard — skip if this operation was already deducted
-      if (operationKey) {
-        const deductedOps = data.creditDeductionLog || [];
-        if (deductedOps.includes(operationKey)) {
-          logger.info('[OnboardingService] Credit deduction skipped — already deducted', { userId, operationKey });
-          return;
-        }
+    // P4-05: idempotency guard — skip if this operation was already deducted
+    if (operationKey) {
+      const deductedOps = userData.creditDeductionLog || [];
+      if (deductedOps.includes(operationKey)) {
+        logger.info('[OnboardingService] Credit deduction skipped — already deducted', { userId, operationKey });
+        return;
       }
+    }
 
-      const current = data.aiCreditsRemaining ?? 0;
-      const update = {
-        aiCreditsRemaining: Math.max(0, current - amount),
-        updatedAt:          FieldValue.serverTimestamp(),
-      };
+    const current = userData.aiCreditsRemaining ?? 0;
+    const updatePayload = {
+      aiCreditsRemaining: Math.max(0, current - amount),
+      updatedAt:          new Date().toISOString(),
+    };
 
-      // P4-05: record this operation so retries are idempotent
-      // Keep log capped at 50 entries to avoid unbounded growth
-      if (operationKey) {
-        const existing = data.creditDeductionLog || [];
-        update.creditDeductionLog = [...existing.slice(-49), operationKey];
-      }
+    // P4-05: record this operation so retries are idempotent
+    // Keep log capped at 50 entries to avoid unbounded growth
+    if (operationKey) {
+      const existing = userData.creditDeductionLog || [];
+      updatePayload.creditDeductionLog = [...existing.slice(-49), operationKey];
+    }
 
-      txn.update(ref, update);
-    });
+    const { error: updateErr } = await supabase
+      .from('users')
+      .upsert({ id: userId, ...updatePayload });
+    if (updateErr) {
+      logger.error('[OnboardingService] Credit deduction update failed', { userId, amount, error: updateErr.message });
+    }
   } catch (err) {
     logger.error('[OnboardingService] Credit deduction failed', { userId, amount, error: err.message });
   }
@@ -736,14 +802,20 @@ async function mergeCanonicalSkills(userId, progressData, profileData) {
     }));
 
     // Source 2: AI-extracted topSkills from latest scored resume
-    const resumeSnap = await db.collection('resumes')
-      .where('userId',          '==', userId)
-      .where('analysisStatus',  '==', 'completed')
-      .where('softDeleted',     '==', false)
-      .orderBy('scoredAt', 'desc').limit(1).get();
+    const { data: resumeRows, error: resumeErr } = await supabase
+      .from('resumes')
+      .select('topSkills')
+      .eq('userId', userId)
+      .eq('analysisStatus', 'completed')
+      .eq('softDeleted', false)
+      .order('scoredAt', { ascending: false })
+      .limit(1);
+    if (resumeErr) {
+      logger.warn('[OnboardingService] mergeCanonicalSkills resume fetch error', { userId, error: resumeErr.message });
+    }
 
-    const topSkills = resumeSnap.empty ? [] :
-      (resumeSnap.docs[0].data().topSkills || []).map(name => ({
+    const topSkills = (!resumeRows || resumeRows.length === 0) ? [] :
+      (resumeRows[0].topSkills || []).map(name => ({
         name, proficiency: 'intermediate', source: 'inferred',
       }));
 
@@ -766,11 +838,18 @@ async function mergeCanonicalSkills(userId, progressData, profileData) {
     }
 
     const canonicalSkills = [...seen.values()];
-    await db.collection('userProfiles').doc(userId).set(
-      { canonicalSkills, canonicalSkillsUpdatedAt: FieldValue.serverTimestamp() },
-      { merge: true }
-    );
-    logger.info('[OnboardingService] canonicalSkills merged', { userId, count: canonicalSkills.length });
+    const { error: upsertErr } = await supabase
+      .from('userProfiles')
+      .upsert({
+        id: userId,
+        canonicalSkills,
+        canonicalSkillsUpdatedAt: new Date().toISOString(),
+      });
+    if (upsertErr) {
+      logger.warn('[OnboardingService] canonicalSkills upsert failed', { userId, error: upsertErr.message });
+    } else {
+      logger.info('[OnboardingService] canonicalSkills merged', { userId, count: canonicalSkills.length });
+    }
   } catch (err) {
     logger.warn('[OnboardingService] canonicalSkills merge failed (non-fatal)', { userId, error: err.message });
   }
@@ -780,34 +859,46 @@ async function persistCompletionIfReady(userId, progressData, profileData) {
   if (profileData.onboardingCompleted === true) return;
   const { isComplete } = evaluateCompletion(progressData, profileData);
   if (!isComplete) return;
-  const batch = db.batch();
+
+  const now = new Date().toISOString();
+  const cvResumeId = progressData.cvResumeId ?? null;
 
   // FIX: Write onboardingCompleted to BOTH collections:
   //   - userProfiles/{userId} — used by onboarding services internally
   //   - users/{userId}        — read by GET /users/me → frontend AuthProvider
   // Previously it was only written to userProfiles, so /users/me always
   // returned onboardingCompleted: false, causing an infinite redirect loop.
-  batch.set(db.collection('userProfiles').doc(userId), {
-    onboardingCompleted: true, onboardingCompletedAt: FieldValue.serverTimestamp(), updatedAt: FieldValue.serverTimestamp(),
-  }, { merge: true });
+  const [progressStepHistory, profileStepHistory] = await Promise.all([
+    mergeStepHistory(userId, 'onboarding_completed'),
+    Promise.resolve(null), // profiles don't track stepHistory
+  ]);
 
-  // FIX: If the user generated a CV during onboarding (Track A), mark resumeUploaded
-  // on the users doc so the dashboard Resume Status card shows correctly.
-  // progressData.cvResumeId is set by generateCV in onboarding.cv.service.js.
-  const cvResumeId = progressData.cvResumeId ?? null;
-  batch.set(db.collection('users').doc(userId), {
-    onboardingCompleted: true,
-    onboardingCompletedAt: FieldValue.serverTimestamp(),
-    updatedAt: FieldValue.serverTimestamp(),
-    ...(cvResumeId ? {
-      resumeUploaded:  true,
-      latestResumeId:  cvResumeId,
-    } : {}),
-  }, { merge: true });
-  batch.set(db.collection('onboardingProgress').doc(userId), {
-    completedAt: FieldValue.serverTimestamp(), ...appendStepHistory('onboarding_completed'),
-  }, { merge: true });
-  await batch.commit();
+  await Promise.all([
+    supabase.from('userProfiles').upsert({
+      id:                    userId,
+      onboardingCompleted:   true,
+      onboardingCompletedAt: now,
+      updatedAt:             now,
+    }),
+    supabase.from('users').upsert({
+      id:                    userId,
+      onboardingCompleted:   true,
+      onboardingCompletedAt: now,
+      updatedAt:             now,
+      // FIX: If the user generated a CV during onboarding (Track A), mark resumeUploaded
+      // on the users doc so the dashboard Resume Status card shows correctly.
+      // progressData.cvResumeId is set by generateCV in onboarding.cv.service.js.
+      ...(cvResumeId ? {
+        resumeUploaded:  true,
+        latestResumeId:  cvResumeId,
+      } : {}),
+    }),
+    supabase.from('onboardingProgress').upsert({
+      id:           userId,
+      completedAt:  now,
+      stepHistory:  progressStepHistory,
+    }),
+  ]);
 
   // GAP-06: reconcile Track A (date ranges) vs Track B (durationMonths) — take the max
   const trackBMonths = (profileData.careerHistory || [])
@@ -815,10 +906,13 @@ async function persistCompletionIfReady(userId, progressData, profileData) {
   const totalMonths = Math.max(progressData.totalExperienceMonths || 0, trackBMonths);
   if (totalMonths > 0) {
     // Fire-and-forget — non-blocking
-    db.collection('userProfiles').doc(userId).set(
-      { totalExperienceYears: +(totalMonths / 12).toFixed(1), updatedAt: FieldValue.serverTimestamp() },
-      { merge: true }
-    ).catch(err => logger.warn('[OnboardingService] totalExperienceYears write failed', { userId, error: err.message }));
+    supabase.from('userProfiles').upsert({
+      id:                   userId,
+      totalExperienceYears: +(totalMonths / 12).toFixed(1),
+      updatedAt:            new Date().toISOString(),
+    }).then(({ error }) => {
+      if (error) logger.warn('[OnboardingService] totalExperienceYears write failed', { userId, error: error.message });
+    });
   }
 
   // GAP-04: merge canonicalSkills fire-and-forget
@@ -890,6 +984,7 @@ module.exports = {
   triggerProvisionalChi,
   _runProvisionalChiInProcess,
   appendStepHistory,
+  mergeStepHistory,
   emitOnboardingEvent,
   deductCredits,
   calculateCareerWeights,
@@ -906,12 +1001,3 @@ module.exports = {
   EXPERIENCE_TYPE_WEIGHTS,
   VALID_EXPERIENCE_TYPES,
 };
-
-
-
-
-
-
-
-
-

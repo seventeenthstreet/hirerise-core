@@ -173,7 +173,6 @@ router.post('/generate-cv',
 // Skip CV
 router.post('/skip-cv', skipCv);
 
-// Upload existing CV — alternative to AI generation (GAP-11)
 // POST /api/v1/onboarding/validate-cv
 // Accepts a multipart file upload, extracts text, runs the CV classifier,
 // and returns { is_cv, confidence, document_type, reason, detected_sections }.
@@ -234,11 +233,3 @@ router.get('/analytics/funnel', verifyAdmin, getFunnelAnalytics);
 router.post('/complete', completeOnboarding);
 
 module.exports = router;
-
-
-
-
-
-
-
-

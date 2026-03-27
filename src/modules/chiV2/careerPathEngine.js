@@ -1,6 +1,19 @@
 'use strict';
 
 /**
+ * MIGRATION: db.collection() → supabase.from()
+ *
+ * All db.collection() shim calls in this file have been replaced with
+ * direct supabase.from() calls. Result shapes mirror the Firestore shim:
+ *   { data, error } from supabase  →  unwrapped to plain objects
+ *   .maybeSingle()  for single-doc reads (returns null not error on 0 rows)
+ *   .select('*')    for collection queries
+ *
+ * Batch writes → Promise.all([supabase.from(T).upsert(...), ...])
+ * Transactions → sequential awaits (best-effort, same as shim behaviour)
+ */
+
+/**
  * careerPathEngine.js — Career Path Recommendation Engine (CHI v2 adapter)
  *
  * ARCHITECTURE NOTE: The standalone engine lives at /engines/career-path.engine.js
@@ -39,7 +52,7 @@ async function fetchRoleMeta(roleIds) {
   if (!roleIds || roleIds.length === 0) return {};
 
   const docs = await Promise.all(
-    roleIds.map(id => db.collection('roles').doc(id).get())
+    roleIds.map(id => supabase.from('roles').select('*').eq('id', id).maybeSingle().then(({data})=>({ exists: !!data, id, data: () => data })))
   );
 
   const meta = {};
@@ -56,11 +69,8 @@ async function fetchRoleMeta(roleIds) {
  * Returns transition metadata: years_required, probability, transition_type.
  */
 async function fetchTransition(fromRoleId, toRoleId) {
-  const snap = await db.collection('role_transitions')
-    .where('from_role_id', '==', fromRoleId)
-    .where('to_role_id',   '==', toRoleId)
-    .limit(1)
-    .get();
+  const { data: _tdata } = await supabase.from('role_transitions').select('*').eq('from_role_id', fromRoleId).eq('to_role_id', toRoleId).limit(1);
+  const snap = { empty: !_tdata?.length, docs: (_tdata||[]).map(r=>({data:()=>r})) };
 
   if (snap.empty) return { years_required: 2, probability: null, transition_type: null };
 
@@ -76,9 +86,8 @@ async function fetchTransition(fromRoleId, toRoleId) {
  * Fetch required skills for a role, returning concise name list.
  */
 async function fetchRoleSkillNames(roleDocId, limit = 10) {
-  const snap = await db.collection('role_skills')
-    .where('role_id', '==', roleDocId)
-    .get();
+  const { data: _rsdata } = await supabase.from('role_skills').select('*').eq('role_id', roleDocId);
+  const snap = { empty: !_rsdata?.length, docs: (_rsdata||[]).map(r=>({data:()=>r})) };
 
   if (snap.empty) return [];
 
@@ -99,7 +108,7 @@ async function fetchRoleSkillNames(roleDocId, limit = 10) {
     for (let i = 0; i < ids.length; i += 10) chunks.push(ids.slice(i, i + 10));
 
     const snaps = await Promise.all(
-      chunks.map(chunk => db.collection('skills').where('skill_id', 'in', chunk).get())
+      chunks.map(chunk => supabase.from('skills').select('*').in('skill_id', chunk).then(({data})=>({ docs: (data||[]).map(r=>({data:()=>r})) })))
     );
     const nameMap = {};
     snaps.forEach(s => s.docs.forEach(d => { nameMap[d.data().skill_id] = d.data().skill_name; }));
@@ -184,9 +193,8 @@ async function findAlternatePaths(fromId, toId, shortestSteps, maxAlternatives =
 
     if (path.length > maxDepth + 1) continue;
 
-    const snap = await db.collection('role_transitions')
-      .where('from_role_id', '==', current)
-      .get();
+    const { data: _rtdata } = await supabase.from('role_transitions').select('*').eq('from_role_id', current);
+    const snap = { docs: (_rtdata||[]).map(r=>({data:()=>r})) };
 
     for (const doc of snap.docs) {
       const nextId = doc.data().to_role_id;
@@ -349,11 +357,3 @@ module.exports = {
   fetchRoleSkillNames,
   enrichPath,
 };
-
-
-
-
-
-
-
-

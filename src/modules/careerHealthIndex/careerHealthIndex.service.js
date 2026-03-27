@@ -1,6 +1,19 @@
 'use strict';
 
 /**
+ * MIGRATION: db.collection() → supabase.from()
+ *
+ * All db.collection() shim calls in this file have been replaced with
+ * direct supabase.from() calls. Result shapes mirror the Firestore shim:
+ *   { data, error } from supabase  →  unwrapped to plain objects
+ *   .maybeSingle()  for single-doc reads (returns null not error on 0 rows)
+ *   .select('*')    for collection queries
+ *
+ * Batch writes → Promise.all([supabase.from(T).upsert(...), ...])
+ * Transactions → sequential awaits (best-effort, same as shim behaviour)
+ */
+
+/**
  * careerHealthIndex.service.js — UPDATED
  *
  * GAP S2:  calculateProvisionalChi() — runs after /career-report without a
@@ -23,7 +36,7 @@
  */
 
 const crypto = require('crypto');
-const { db } = require('../../config/supabase');
+const supabase = require('../../config/supabase');
 const { AppError, ErrorCodes } = require('../../middleware/errorHandler');
 const logger = require('../../utils/logger');
 // PROMPT-3: import canonical weights from config — single source of truth
@@ -111,52 +124,36 @@ ${weightLines}`;
 
 async function fetchResumeData(userId, resumeId) {
   if (resumeId) {
-    const doc = await db.collection('resumes').doc(resumeId).get();
-    if (doc.exists && doc.data().userId === userId) return { ...doc.data(), resumeId };
+    const { data: _rdoc } = await supabase.from('resumes').select('*').eq('id', resumeId).maybeSingle();
+    if (_rdoc && _rdoc.userId === userId) return { ..._rdoc, resumeId };
   }
 
   // Primary: find a fully-scored resume
-  const scoredSnap = await db.collection('resumes')
-    .where('userId', '==', userId)
-    .where('analysisStatus', '==', 'completed')
-    .where('softDeleted', '==', false)
-    .orderBy('scoredAt', 'desc')
-    .limit(1)
-    .get();
-  if (!scoredSnap.empty) return { ...scoredSnap.docs[0].data(), resumeId: scoredSnap.docs[0].id };
+  const { data: _sdocs } = await supabase.from('resumes').select('*').eq('userId', userId).eq('analysisStatus', 'completed').eq('softDeleted', false).order('scoredAt', {ascending:false}).limit(1);
+  if (_sdocs?.length) return { ..._sdocs[0], resumeId: _sdocs[0].id };
 
   // Fallback: use any non-deleted resume even if scoring is still pending.
   // This handles onboarding-path users whose CV was generated but not yet scored.
   // The CHI AI prompt can still run against cvContentStructured / resumeText.
-  const anySnap = await db.collection('resumes')
-    .where('userId', '==', userId)
-    .where('softDeleted', '==', false)
-    .orderBy('createdAt', 'desc')
-    .limit(1)
-    .get();
-  if (!anySnap.empty) return { ...anySnap.docs[0].data(), resumeId: anySnap.docs[0].id };
+  const { data: _adocs } = await supabase.from('resumes').select('*').eq('userId', userId).eq('softDeleted', false).order('createdAt', {ascending:false}).limit(1);
+  if (_adocs?.length) return { ..._adocs[0], resumeId: _adocs[0].id };
 
   return null;
 }
 
 async function fetchPreviousSnapshot(userId) {
   try {
-    const snap = await db.collection('careerHealthIndex')
-      .where('userId', '==', userId)
-      .where('softDeleted', '==', false)
-      .orderBy('generatedAt', 'desc')
-      .limit(1)
-      .get();
-    if (snap.empty) return null;
-    return snap.docs[0].data();
+    const { data: _chiSnap } = await supabase.from('careerHealthIndex').select('*').eq('userId', userId).eq('softDeleted', false).order('generatedAt', {ascending:false}).limit(1);
+    if (!_chiSnap?.length) return null;
+    return _chiSnap[0];
   } catch { return null; }
 }
 
 async function fetchSalaryContext(targetRole) {
   if (!targetRole) return null;
   try {
-    const doc = await db.collection('salaryBands').doc(targetRole).get();
-    return doc.exists ? doc.data() : null;
+    const { data: _sb } = await supabase.from('salaryBands').select('*').eq('id', targetRole).maybeSingle();
+    return _sb || null;
   } catch { return null; }
 }
 
@@ -164,18 +161,8 @@ async function fetchSalaryContext(targetRole) {
 async function fetchJobDemandCount(targetRole) {
   if (!targetRole) return null;
   try {
-    const snap = await db.collection('jobs')
-      .where('roleId', '==', targetRole)
-      .where('isActive', '==', true)
-      .limit(1)
-      .get();
-    // Use count() if supported, otherwise estimate from snapshot
-    if (!snap.empty) {
-      // Full count query
-      const countSnap = await db.collection('jobs').where('roleId', '==', targetRole).where('isActive', '==', true).count().get();
-      return countSnap.data().count;
-    }
-    return 0;
+    const { count: _jcount, error: _je } = await supabase.from('jobs').select('*', {count:'exact',head:true}).eq('roleId', targetRole).eq('isActive', true);
+    return _jcount || 0;
   } catch { return null; }
 }
 
@@ -439,7 +426,7 @@ async function calculateChi(userId, resumeId) {
     const [previousSnapshot, salaryContext, userProfile, jobDemandCount] = await Promise.all([
       fetchPreviousSnapshot(userId),
       fetchSalaryContext(resumeData.targetRole),
-      db.collection('userProfiles').doc(userId).get().then(s => s.exists ? s.data() : {}),
+      supabase.from('userProfiles').select('*').eq('id', userId).maybeSingle().then(({data})=>data||{}),
       fetchJobDemandCount(resumeData.targetRole),
     ]);
 
@@ -530,7 +517,7 @@ async function calculateChi(userId, resumeId) {
     };
 
     try {
-      await db.collection('careerHealthIndex').doc(snapshotId).set(snapshot);
+      await supabase.from('careerHealthIndex').upsert({id: snapshotId, ...snapshot}, {onConflict: 'id'});
     } catch (persistErr) {
       logger.warn('[CHIService] Failed to persist CHI snapshot', { userId, error: persistErr.message });
     }
@@ -592,15 +579,9 @@ async function calculateProvisionalChi(userId, onboardingData, profileData, care
   const newRank   = ANALYSIS_SOURCE_RANK[newSource] ?? 0;
 
   try {
-    const latestSnap = await db.collection('careerHealthIndex')
-      .where('userId', '==', userId)
-      .where('softDeleted', '==', false)
-      .orderBy('generatedAt', 'desc')
-      .limit(1)
-      .get();
-
-    if (!latestSnap.empty) {
-      const existing      = latestSnap.docs[0].data();
+    const { data: _latestDocs } = await supabase.from('careerHealthIndex').select('*').eq('userId', userId).eq('softDeleted', false).order('generatedAt', {ascending:false}).limit(1);
+    if (_latestDocs?.length) {
+      const existing      = _latestDocs[0];
       const existingRank  = ANALYSIS_SOURCE_RANK[existing.analysisSource] ?? 0;
 
       // A-01 FIX (corrected): use strict > so the === branch below is reachable.
@@ -756,7 +737,8 @@ async function calculateProvisionalChi(userId, onboardingData, profileData, care
   };
 
   try {
-    await db.collection('careerHealthIndex').doc(snapshotId).set(snapshot);
+    const { error: _chiErr } = await supabase.from('careerHealthIndex').upsert({id: snapshotId, ...snapshot}, {onConflict: 'id'});
+    if (_chiErr) logger.warn('[CHIService] Failed to persist CHI snapshot', { userId, error: _chiErr.message });
     logger.info('[CHIService] Provisional CHI saved', { userId, snapshotId, chiScore: analysis.chiScore });
   } catch (err) {
     logger.warn('[CHIService] Failed to persist provisional CHI snapshot', { userId, error: err.message });
@@ -845,17 +827,10 @@ function _inferRegion(country, city) {
 async function getLatestChi(userId) {
   if (!userId) throw new AppError('userId is required', 400, {}, ErrorCodes.VALIDATION_ERROR);
 
-  const snap = await db.collection('careerHealthIndex')
-    .where('userId', '==', userId)
-    .where('softDeleted', '==', false)
-    .orderBy('generatedAt', 'desc')
-    .limit(1)
-    .get();
-
-  if (snap.empty) throw new AppError('No Career Health Index found. Please score a resume first.', 404, { userId }, ErrorCodes.NOT_FOUND);
-
-  const data = snap.docs[0].data();
-  return { ...data, generatedAt: data.generatedAt?.toDate?.()?.toISOString() ?? data.generatedAt };
+  const { data: _chiDocs } = await supabase.from('careerHealthIndex').select('*').eq('userId', userId).eq('softDeleted', false).order('generatedAt', {ascending:false}).limit(1);
+  if (!_chiDocs?.length) throw new AppError('No Career Health Index found. Please score a resume first.', 404, { userId }, ErrorCodes.NOT_FOUND);
+  const data = _chiDocs[0];
+  return { ...data, generatedAt: data.generatedAt instanceof Date ? data.generatedAt.toISOString() : data.generatedAt };
 }
 
 // ─── GET CHI HISTORY ──────────────────────────────────────────────────────────
@@ -863,17 +838,9 @@ async function getLatestChi(userId) {
 async function getChiHistory(userId, limit = 6) {
   if (!userId) throw new AppError('userId is required', 400, {}, ErrorCodes.VALIDATION_ERROR);
 
-  const snap = await db.collection('careerHealthIndex')
-    .where('userId', '==', userId)
-    .where('softDeleted', '==', false)
-    .orderBy('generatedAt', 'desc')
-    .limit(limit)
-    .get();
-
-  if (snap.empty) return { userId, history: [], totalSnapshots: 0 };
-
-  const history = snap.docs.map(doc => {
-    const d = doc.data();
+  const { data: _histDocs } = await supabase.from('careerHealthIndex').select('*').eq('userId', userId).eq('softDeleted', false).order('generatedAt', {ascending:false}).limit(limit);
+  if (!_histDocs?.length) return { userId, history: [], totalSnapshots: 0 };
+  const history = (_histDocs).map(d => {
     return {
       snapshotId:     d.snapshotId,
       chiScore:       d.chiScore,
@@ -885,7 +852,7 @@ async function getChiHistory(userId, limit = 6) {
     };
   });
 
-  return { userId, history, totalSnapshots: snap.size };
+  return { userId, history, totalSnapshots: history.length };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -896,11 +863,3 @@ module.exports = {
   getChiHistory,
   ANALYSIS_SOURCE_RANK,   // P2-04: state machine rank table
 };
-
-
-
-
-
-
-
-

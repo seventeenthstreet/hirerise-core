@@ -10,14 +10,14 @@
  *   features.salaryGap.locked
  *   features.advancedInsights.locked
  *
- * Tier NEVER read from Firestore — received as param from route.
+ * Tier NEVER read from database — received as param from route.
  *
  * PHASE-4 UPDATE — Redis Snapshot Cache:
  *
  *   PROBLEM:
- *     Every GET /api/v1/dashboard triggered two Firestore queries
+ *     Every GET /api/v1/dashboard triggered two database queries
  *     (latest CHI + latest job-match) regardless of how recently the data
- *     changed. At 1000 DAU × 3 dashboard loads per session = 6000 Firestore
+ *     changed. At 1000 DAU × 3 dashboard loads per session = 6000 database
  *     reads per day just from dashboard calls.
  *
  *   SOLUTION:
@@ -33,12 +33,14 @@
  *       - CHI recalculation completion handlers
  *
  *   GRACEFUL DEGRADATION:
- *     If Redis is unavailable, getDashboardData falls through to Firestore
+ *     If Redis is unavailable, getDashboardData falls through to Supabase
  *     as before. Caching is never a blocking dependency.
  */
-
-const { db }                             = require('../../config/supabase');
-const { CREDIT_COSTS, getRemainingUses } = require('../analysis/analysis.constants');
+const supabase = require('../../config/supabase');
+const {
+  CREDIT_COSTS,
+  getRemainingUses
+} = require('../analysis/analysis.constants');
 
 // ─── Redis client (lazy, same pattern as tokenCache / aiResultCache) ──────────
 
@@ -46,7 +48,7 @@ let _redis = null;
 function getRedis() {
   if (_redis) return _redis;
   try {
-    const mgr    = require('../../core/cache/cache.manager');
+    const mgr = require('../../core/cache/cache.manager');
     const client = mgr.getClient();
     // Prefer the raw ioredis client for direct set/get/del operations
     if (client?.client?.get) {
@@ -63,8 +65,8 @@ function getRedis() {
 // ─── Cache configuration ─────────────────────────────────────────────────────
 
 const CACHE_KEY_PREFIX = 'dashboard:snap:';
-const CACHE_TTL_BASE   = 120; // seconds
-const CACHE_JITTER_MAX = 30;  // jitter 0–30 s to prevent stampede
+const CACHE_TTL_BASE = 120; // seconds
+const CACHE_JITTER_MAX = 30; // jitter 0–30 s to prevent stampede
 const logger = require('../../utils/logger');
 
 // ─── Cache helpers ────────────────────────────────────────────────────────────
@@ -81,7 +83,10 @@ async function getCachedSnapshot(userId) {
     if (!raw) return null;
     return JSON.parse(raw);
   } catch (err) {
-    logger.warn('[DashboardService] Cache read error', { userId, error: err.message });
+    logger.warn('[DashboardService] Cache read error', {
+      userId,
+      error: err.message
+    });
     return null;
   }
 }
@@ -91,12 +96,18 @@ async function setCachedSnapshot(userId, snapshot) {
   if (!redis) return;
   try {
     const jitter = Math.floor(Math.random() * CACHE_JITTER_MAX);
-    const ttl    = CACHE_TTL_BASE + jitter;
+    const ttl = CACHE_TTL_BASE + jitter;
     await redis.set(dashboardCacheKey(userId), JSON.stringify(snapshot), 'EX', ttl);
-    logger.debug('[DashboardService] Snapshot cached', { userId, ttlS: ttl });
+    logger.debug('[DashboardService] Snapshot cached', {
+      userId,
+      ttlS: ttl
+    });
   } catch (err) {
-    // Non-fatal — dashboard still returned from Firestore
-    logger.warn('[DashboardService] Cache write error', { userId, error: err.message });
+    // Non-fatal — dashboard still returned from Supabase
+    logger.warn('[DashboardService] Cache write error', {
+      userId,
+      error: err.message
+    });
   }
 }
 
@@ -105,7 +116,7 @@ async function setCachedSnapshot(userId, snapshot) {
  *
  * Exported for use by resume, profile, and CHI handlers.
  * Deletes the cached snapshot so the next dashboard request re-fetches
- * from Firestore with fresh data.
+ * from Supabase with fresh data.
  *
  * Call this after:
  *   - POST   /api/v1/resumes          (resume uploaded)
@@ -122,97 +133,114 @@ async function invalidateDashboardCache(userId) {
     await redis.del(dashboardCacheKey(userId));
     logger.debug('[DashboardService] Cache invalidated', { userId });
   } catch (err) {
-    logger.warn('[DashboardService] Cache invalidation error', { userId, error: err.message });
+    logger.warn('[DashboardService] Cache invalidation error', {
+      userId,
+      error: err.message
+    });
   }
 }
 
-// ─── Firestore fetchers (unchanged) ──────────────────────────────────────────
+// ─── Supabase fetchers ────────────────────────────────────────────────────────
 
 async function fetchLatestCHI(userId) {
   try {
-    const snap = await db
-      .collection('careerHealthIndex')
-      .where('userId',      '==', userId)
-      .where('softDeleted', '==', false)
-      .orderBy('generatedAt', 'desc')
+    const { data, error } = await supabase
+      .from('careerHealthIndex')
+      .select('*')
+      .eq('userId', userId)
+      .eq('softDeleted', false)
+      .order('generatedAt', { ascending: false })
       .limit(1)
-      .get();
+      .maybeSingle();
 
-    if (snap.empty) return null;
+    if (error || !data) return null;
 
-    const d = snap.docs[0].data();
     return {
-      chiScore:      d.chiScore                        ?? null,
-      skillCoverage: d.dimensions?.skillVelocity?.score ?? null,
-      growthSummary: d.criticalGap                     ?? null,
-      salaryPreview: d.currentEstimatedSalaryLPA
+      chiScore: data.chiScore ?? null,
+      skillCoverage: data.dimensions?.skillVelocity?.score ?? null,
+      growthSummary: data.criticalGap ?? null,
+      salaryPreview: data.currentEstimatedSalaryLPA
         ? {
-            min:      Math.round(d.currentEstimatedSalaryLPA * 0.9),
-            max:      Math.round(d.nextLevelEstimatedSalaryLPA ?? d.currentEstimatedSalaryLPA * 1.3),
-            currency: 'INR',
+            min: Math.round(data.currentEstimatedSalaryLPA * 0.9),
+            max: Math.round(data.nextLevelEstimatedSalaryLPA ?? data.currentEstimatedSalaryLPA * 1.3),
+            currency: 'INR'
           }
-        : null,
+        : null
     };
-  } catch { return null; }
+  } catch {
+    return null;
+  }
 }
 
 async function fetchLatestJobMatch(userId) {
   try {
-    const snap = await db
-      .collection('jobMatchAnalyses')
-      .where('userId', '==', userId)
-      .orderBy('analyzedAt', 'desc')
+    const { data, error } = await supabase
+      .from('jobMatchAnalyses')
+      .select('*')
+      .eq('userId', userId)
+      .order('analyzedAt', { ascending: false })
       .limit(1)
-      .get();
+      .maybeSingle();
 
-    if (snap.empty) {
-      return { hasAnalyzedBefore: false, lastMatchScore: null, lastJobTitle: null, lastAnalyzedAt: null };
+    if (error || !data) {
+      return {
+        hasAnalyzedBefore: false,
+        lastMatchScore: null,
+        lastJobTitle: null,
+        lastAnalyzedAt: null
+      };
     }
 
-    const d = snap.docs[0].data();
     return {
       hasAnalyzedBefore: true,
-      lastMatchScore:    d.matchScore ?? null,
-      lastJobTitle:      d.jobTitle   ?? null,
-      lastAnalyzedAt:    d.analyzedAt?.toDate?.()?.toISOString?.() ?? null,
+      lastMatchScore: data.matchScore ?? null,
+      lastJobTitle: data.jobTitle ?? null,
+      lastAnalyzedAt: data.analyzedAt ?? null
     };
   } catch {
-    return { hasAnalyzedBefore: false, lastMatchScore: null, lastJobTitle: null, lastAnalyzedAt: null };
+    return {
+      hasAnalyzedBefore: false,
+      lastMatchScore: null,
+      lastJobTitle: null,
+      lastAnalyzedAt: null
+    };
   }
 }
 
 function computeCanRunFlags(tier, credits) {
   if (tier === 'free') {
-    return { canRunJobMatch: true, canGenerateJobSpecificCV: false };
+    return {
+      canRunJobMatch: true,
+      canGenerateJobSpecificCV: false
+    };
   }
   return {
-    canRunJobMatch:           credits >= CREDIT_COSTS.jobMatchAnalysis,
-    canGenerateJobSpecificCV: credits >= CREDIT_COSTS.jobSpecificCV,
+    canRunJobMatch: credits >= CREDIT_COSTS.jobMatchAnalysis,
+    canGenerateJobSpecificCV: credits >= CREDIT_COSTS.jobSpecificCV
   };
 }
 
 function buildFeatures(tier, chiData) {
   const isPremium = tier !== 'free';
-
   return {
     basicAnalysis: {
-      locked:        false,
-      jobMatchScore: chiData?.chiScore ?? null,
+      locked: false,
+      jobMatchScore: chiData?.chiScore ?? null
     },
     careerHealth: {
-      locked:        false,
-      chiScore:      chiData?.chiScore      ?? null,
+      locked: false,
+      chiScore: chiData?.chiScore ?? null,
       skillCoverage: chiData?.skillCoverage ?? null,
-      growthSummary: chiData?.growthSummary ?? null,
+      growthSummary: chiData?.growthSummary ?? null
     },
     salaryGap: {
-      locked:        !isPremium,
-      salaryPreview: isPremium ? (chiData?.salaryPreview ?? null) : null,
+      locked: !isPremium,
+      salaryPreview: isPremium ? chiData?.salaryPreview ?? null : null
     },
     advancedInsights: {
       locked: !isPremium,
-      data:   null,
-    },
+      data: null
+    }
   };
 }
 
@@ -222,10 +250,10 @@ function buildFeatures(tier, chiData) {
  * getDashboardData(userId, tier)
  *
  * Returns the dashboard payload. Checks Redis cache first; falls back to
- * Firestore if cache is cold or Redis is unavailable.
+ * Supabase if cache is cold or Redis is unavailable.
  *
  * @param {string} userId
- * @param {string} tier — normalized tier from custom claim (never from Firestore)
+ * @param {string} tier — normalized tier from custom claim (never from database)
  */
 async function getDashboardData(userId, tier) {
   // ── 1. Cache check ───────────────────────────────────────────────────────
@@ -235,57 +263,61 @@ async function getDashboardData(userId, tier) {
     return cached;
   }
 
-  // ── 2. Firestore fetch ───────────────────────────────────────────────────
+  // ── 2. Supabase fetch ────────────────────────────────────────────────────
   let credits = 0;
   if (tier !== 'free') {
     try {
-      const userSnap = await db.collection('users').doc(userId).get();
-      credits = userSnap.exists ? (userSnap.data().aiCreditsRemaining ?? 0) : 0;
-    } catch { credits = 0; }
+      const { data: userData } = await supabase
+        .from('users')
+        .select('aiCreditsRemaining')
+        .eq('id', userId)
+        .maybeSingle();
+      credits = userData?.aiCreditsRemaining ?? 0;
+    } catch {
+      credits = 0;
+    }
   }
 
   const [chiData, jobMatchData] = await Promise.all([
     fetchLatestCHI(userId),
-    fetchLatestJobMatch(userId),
+    fetchLatestJobMatch(userId)
   ]);
 
-  const remainingUses = tier !== 'free'
-    ? getRemainingUses(credits)
-    : Object.fromEntries(Object.keys(CREDIT_COSTS).map(op => [op, 0]));
+  const remainingUses =
+    tier !== 'free'
+      ? getRemainingUses(credits)
+      : Object.fromEntries(Object.keys(CREDIT_COSTS).map(op => [op, 0]));
 
   const canRunFlags = computeCanRunFlags(tier, credits);
-  const features    = buildFeatures(tier, chiData);
+  const features = buildFeatures(tier, chiData);
 
   const snapshot = {
     tier,
     features,
     user: {
       tier,
-      aiCreditsRemaining: credits,
+      aiCreditsRemaining: credits
     },
     careerIntelligence: chiData ?? {
-      chiScore: null, skillCoverage: null, growthSummary: null, salaryPreview: null,
+      chiScore: null,
+      skillCoverage: null,
+      growthSummary: null,
+      salaryPreview: null
     },
     applySmarter: jobMatchData,
     credits: {
-      remaining:    credits,
+      remaining: credits,
       remainingUses,
-      ...canRunFlags,
-    },
+      ...canRunFlags
+    }
   };
 
   // ── 3. Cache the result ──────────────────────────────────────────────────
   await setCachedSnapshot(userId, snapshot);
-
   return snapshot;
 }
 
-module.exports = { getDashboardData, invalidateDashboardCache };
-
-
-
-
-
-
-
-
+module.exports = {
+  getDashboardData,
+  invalidateDashboardCache
+};

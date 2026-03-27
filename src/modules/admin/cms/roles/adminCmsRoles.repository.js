@@ -16,11 +16,14 @@ class AdminCmsRolesRepository {
   async findByCompositeKey(compositeKey) {
     if (!compositeKey) return null;
     const supabase = getSupabase();
-    const { data } = await supabase
+    // HARDENING T2: .single() → .maybeSingle() — key may not exist
+    // HARDENING T7: destructure and throw on error
+    const { data, error } = await supabase
       .from(TABLE).select('*')
       .eq('normalized_composite_key', compositeKey)
       .eq('soft_deleted', false)
-      .single();
+      .maybeSingle();
+    if (error) throw error;
     return data ? this._toCamel(data) : null;
   }
 
@@ -28,10 +31,12 @@ class AdminCmsRolesRepository {
     const map = new Map();
     if (!compositeKeys?.length) return map;
     const supabase = getSupabase();
-    const { data } = await supabase
+    // HARDENING T7: destructure and throw on error
+    const { data, error } = await supabase
       .from(TABLE).select('*')
       .in('normalized_composite_key', compositeKeys)
       .eq('soft_deleted', false);
+    if (error) throw error;
     for (const row of (data || [])) map.set(row.normalized_composite_key, this._toCamel(row));
     return map;
   }
@@ -93,9 +98,11 @@ class AdminCmsRolesRepository {
 
   async softDelete(id, adminId, force = false) {
     const supabase = getSupabase();
-    await supabase.from(TABLE)
+    // HARDENING T7: destructure and throw on error
+    const { error } = await supabase.from(TABLE)
       .update({ soft_deleted: true, updated_by_admin_id: adminId })
       .eq('id', id);
+    if (error) throw error;
   }
 
   async list({ jobFamilyId, status, limit = 50, offset = 0 } = {}) {
@@ -104,21 +111,28 @@ class AdminCmsRolesRepository {
       .order('name').range(offset, offset + limit - 1);
     if (jobFamilyId) q = q.eq('job_family_id', jobFamilyId);
     if (status)      q = q.eq('status', status);
-    const { data } = await q;
+    // HARDENING T7: destructure and throw on error
+    const { data, error } = await q;
+    if (error) throw error;
     return (data || []).map(r => this._toCamel(r));
   }
 
   async findById(id) {
     const supabase = getSupabase();
-    const { data } = await supabase.from(TABLE).select('*').eq('id', id).single();
+    // HARDENING T2: .single() → .maybeSingle() — role may not exist
+    // HARDENING T7: destructure and throw on error
+    const { data, error } = await supabase.from(TABLE).select('*').eq('id', id).maybeSingle();
+    if (error) throw error;
     return data ? this._toCamel(data) : null;
   }
 
   async searchByTitle(titleFragment, limit = 20) {
     const supabase = getSupabase();
-    const { data } = await supabase.from(TABLE).select('*')
+    // HARDENING T7: destructure and throw on error
+    const { data, error } = await supabase.from(TABLE).select('*')
       .ilike('name', `%${titleFragment}%`)
       .eq('soft_deleted', false).limit(limit);
+    if (error) throw error;
     return (data || []).map(r => this._toCamel(r));
   }
 
@@ -147,11 +161,3 @@ class AdminCmsRolesRepository {
 
 module.exports = new AdminCmsRolesRepository();
 module.exports.AdminCmsRolesRepository = AdminCmsRolesRepository;
-
-
-
-
-
-
-
-

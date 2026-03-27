@@ -34,10 +34,9 @@
 
 const express = require('express');
 const { body, param, query } = require('express-validator');
-const { validate }           = require('../middleware/requestValidator');
-const { requireAdmin }       = require('../middleware/auth.middleware');
-const skillsController       = require('../controllers/skills.controller');
-
+const { validate } = require('../middleware/requestValidator');
+const { requireAdmin } = require('../middleware/auth.middleware');
+const skillsController = require('../controllers/skills.controller');
 const router = express.Router();
 
 // ─────────────────────────────────────────────────────────────
@@ -48,14 +47,11 @@ router.get(
   '/',
   validate([
     query('limit')
-      .optional()
-      .isInt({ min: 1, max: 500 })
+      .optional().isInt({ min: 1, max: 500 })
       .withMessage('limit must be an integer between 1 and 500'),
-
     query('category')
-      .optional()
-      .isIn(['technical', 'soft', 'domain', 'tool', 'language', 'framework'])
-      .withMessage('category must be: technical, soft, domain, tool, language, or framework'),
+      .optional().isIn(['technical', 'soft', 'domain', 'tool', 'language', 'framework'])
+      .withMessage('category must be: technical, soft, domain, tool, language, or framework')
   ]),
   skillsController.listSkills
 );
@@ -69,32 +65,21 @@ router.post(
   requireAdmin,
   validate([
     body('name')
-      .isString().trim().notEmpty()
-      .isLength({ min: 1, max: 150 })
+      .isString().trim().notEmpty().isLength({ min: 1, max: 150 })
       .withMessage('name is required and must be 1-150 characters'),
-
     body('category')
-      .optional()
-      .isIn(['technical', 'soft', 'domain', 'tool', 'language', 'framework'])
+      .optional().isIn(['technical', 'soft', 'domain', 'tool', 'language', 'framework'])
       .withMessage('category must be: technical, soft, domain, tool, language, or framework'),
-
     body('aliases')
-      .optional()
-      .isArray({ max: 20 })
+      .optional().isArray({ max: 20 })
       .withMessage('aliases must be an array of max 20 items'),
-
     body('aliases.*')
-      .optional()
-      .isString().trim().isLength({ max: 100 }),
-
+      .optional().isString().trim().isLength({ max: 100 }),
     body('description')
-      .optional()
-      .isString().trim().isLength({ max: 500 }),
-
+      .optional().isString().trim().isLength({ max: 500 }),
     body('demandScore')
-      .optional()
-      .isInt({ min: 0, max: 100 })
-      .withMessage('demandScore must be 0-100'),
+      .optional().isInt({ min: 0, max: 100 })
+      .withMessage('demandScore must be 0-100')
   ]),
   skillsController.createSkill
 );
@@ -107,32 +92,23 @@ router.post(
   '/gap-analysis',
   validate([
     body('targetRoleId')
-      .isString().trim().notEmpty()
-      .isLength({ max: 100 })
+      .isString().trim().notEmpty().isLength({ max: 100 })
       .withMessage('targetRoleId is required'),
-
     body('userSkills')
       .isArray({ min: 0, max: 200 })
       .withMessage('userSkills must be an array (max 200 skills)'),
-
     body('userSkills.*.name')
       .isString().trim().notEmpty()
       .withMessage('Each skill must have a non-empty name'),
-
     body('userSkills.*.proficiencyLevel')
-      .optional()
-      .isIn(['beginner', 'intermediate', 'advanced', 'expert'])
+      .optional().isIn(['beginner', 'intermediate', 'advanced', 'expert'])
       .withMessage('proficiencyLevel must be: beginner, intermediate, advanced, or expert'),
-
     body('userSkills.*.yearsOfExperience')
-      .optional()
-      .isFloat({ min: 0, max: 50 }).toFloat()
+      .optional().isFloat({ min: 0, max: 50 }).toFloat()
       .withMessage('yearsOfExperience must be between 0 and 50'),
-
     body('includeRecommendations')
-      .optional()
-      .isBoolean().toBoolean()
-      .withMessage('includeRecommendations must be a boolean'),
+      .optional().isBoolean().toBoolean()
+      .withMessage('includeRecommendations must be a boolean')
   ]),
   skillsController.analyzeGap
 );
@@ -146,19 +122,15 @@ router.post(
     body('targetRoleIds')
       .isArray({ min: 1, max: 10 })
       .withMessage('targetRoleIds must be an array of 1-10 role IDs'),
-
     body('targetRoleIds.*')
-      .isString().trim().notEmpty()
-      .isLength({ max: 100 })
+      .isString().trim().notEmpty().isLength({ max: 100 })
       .withMessage('Each targetRoleId must be a non-empty string'),
-
     body('userSkills')
       .isArray({ min: 0, max: 200 })
       .withMessage('userSkills must be an array (max 200 skills)'),
-
     body('userSkills.*.name')
       .isString().trim().notEmpty()
-      .withMessage('Each skill must have a non-empty name'),
+      .withMessage('Each skill must have a non-empty name')
   ]),
   skillsController.bulkGapAnalysis
 );
@@ -170,14 +142,11 @@ router.get(
   '/search',
   validate([
     query('q')
-      .isString().trim()
-      .isLength({ min: 2, max: 50 })
+      .isString().trim().isLength({ min: 2, max: 50 })
       .withMessage('Query must be between 2 and 50 characters'),
-
     query('category')
-      .optional()
-      .isIn(['technical', 'soft', 'domain', 'tool', 'language', 'framework'])
-      .withMessage('Invalid skill category'),
+      .optional().isIn(['technical', 'soft', 'domain', 'tool', 'language', 'framework'])
+      .withMessage('Invalid skill category')
   ]),
   skillsController.searchSkills
 );
@@ -189,9 +158,8 @@ router.get(
   '/role/:roleId',
   validate([
     param('roleId')
-      .isString().trim().notEmpty()
-      .isLength({ max: 100 })
-      .withMessage('roleId is required'),
+      .isString().trim().notEmpty().isLength({ max: 100 })
+      .withMessage('roleId is required')
   ]),
   skillsController.getRoleSkills
 );
@@ -222,10 +190,11 @@ router.post(
   '/add',
   require('../middleware/requestValidator').validate([
     require('express-validator').body('skills')
-      .isArray({ min: 1, max: 50 }).withMessage('skills must be a non-empty array (max 50)'),
+      .isArray({ min: 1, max: 50 })
+      .withMessage('skills must be a non-empty array (max 50)'),
     require('express-validator').body('skills.*')
       .isString().trim().notEmpty().isLength({ max: 100 })
-      .withMessage('Each skill must be a non-empty string under 100 chars'),
+      .withMessage('Each skill must be a non-empty string under 100 chars')
   ]),
   require('../utils/helpers').asyncHandler(async (req, res) => {
     const userId = req.user?.uid;
@@ -238,7 +207,6 @@ router.post(
   })
 );
 
-
 // ─────────────────────────────────────────────────────────────
 // POST /api/v1/skills/remove
 // Removes one or more skills from the current user's profile.
@@ -248,43 +216,66 @@ router.post(
   '/remove',
   require('../middleware/requestValidator').validate([
     require('express-validator').body('skills')
-      .isArray({ min: 1, max: 50 }).withMessage('skills must be a non-empty array (max 50)'),
+      .isArray({ min: 1, max: 50 })
+      .withMessage('skills must be a non-empty array (max 50)'),
     require('express-validator').body('skills.*')
       .isString().trim().notEmpty().isLength({ max: 100 })
-      .withMessage('Each skill must be a non-empty string under 100 chars'),
+      .withMessage('Each skill must be a non-empty string under 100 chars')
   ]),
   require('../utils/helpers').asyncHandler(async (req, res) => {
     const userId = req.user?.uid;
     if (!userId) {
       return res.status(401).json({ success: false, error: 'Unauthorized' });
     }
-
-    const { db } = require('../config/supabase');
+    const { supabase } = require('../config/supabase');
     const toRemove = new Set(req.body.skills.map(s => String(s).trim().toLowerCase()));
 
-    const userSnap = await db.collection('users').doc(userId).get();
-    const existing = (userSnap.exists ? userSnap.data()?.skills ?? [] : []);
+    // Fetch current skills from users table
+    const { data: userRow } = await supabase
+      .from('users')
+      .select('skills')
+      .eq('id', userId)
+      .maybeSingle();
+    const existing = userRow?.skills ?? [];
 
-    // Filter from both string-format (users collection) and object-format
+    // Filter from both string-format (users table) and object-format
     const updatedFlat = existing.filter(s => {
       const name = (typeof s === 'string' ? s : s?.name ?? '').toLowerCase();
       return !toRemove.has(name);
     });
 
-    const profileSnap  = await db.collection('userProfiles').doc(userId).get();
-    const profileSkills = (profileSnap.exists ? profileSnap.data()?.skills ?? [] : []);
+    // Fetch current skills from user_profiles table
+    const { data: profileRow } = await supabase
+      .from('user_profiles')
+      .select('skills')
+      .eq('id', userId)
+      .maybeSingle();
+    const profileSkills = profileRow?.skills ?? [];
+
     const updatedProfile = profileSkills.filter(s => {
       const name = (typeof s === 'string' ? s : s?.name ?? '').toLowerCase();
       return !toRemove.has(name);
     });
 
-    const batch = db.batch();
-    const now   = new Date();
-    batch.set(db.collection('users').doc(userId),        { skills: updatedFlat,    updatedAt: now }, { merge: true });
-    batch.set(db.collection('userProfiles').doc(userId), { skills: updatedProfile, updatedAt: now }, { merge: true });
-    await batch.commit();
+    const now = new Date().toISOString();
 
-    return res.json({ success: true, data: { removed: toRemove.size, skills: updatedFlat } });
+    // Update both tables in parallel
+    const [usersResult, profilesResult] = await Promise.all([
+      supabase
+        .from('users')
+        .upsert([{ id: userId, skills: updatedFlat, updatedAt: now }]),
+      supabase
+        .from('user_profiles')
+        .upsert([{ id: userId, skills: updatedProfile, updatedAt: now }])
+    ]);
+
+    if (usersResult.error) throw usersResult.error;
+    if (profilesResult.error) throw profilesResult.error;
+
+    return res.json({
+      success: true,
+      data: { removed: toRemove.size, skills: updatedFlat }
+    });
   })
 );
 
@@ -296,9 +287,8 @@ router.get(
   '/:id',
   validate([
     param('id')
-      .isString().trim().notEmpty()
-      .isLength({ max: 128 })
-      .withMessage('id is required'),
+      .isString().trim().notEmpty().isLength({ max: 128 })
+      .withMessage('id is required')
   ]),
   skillsController.getSkillById
 );
@@ -312,29 +302,18 @@ router.put(
   requireAdmin,
   validate([
     param('id')
-      .isString().trim().notEmpty()
-      .isLength({ max: 128 })
+      .isString().trim().notEmpty().isLength({ max: 128 })
       .withMessage('id is required'),
-
     body('name')
-      .optional()
-      .isString().trim().isLength({ min: 1, max: 150 }),
-
+      .optional().isString().trim().isLength({ min: 1, max: 150 }),
     body('category')
-      .optional()
-      .isIn(['technical', 'soft', 'domain', 'tool', 'language', 'framework']),
-
+      .optional().isIn(['technical', 'soft', 'domain', 'tool', 'language', 'framework']),
     body('aliases')
-      .optional()
-      .isArray({ max: 20 }),
-
+      .optional().isArray({ max: 20 }),
     body('description')
-      .optional()
-      .isString().trim().isLength({ max: 500 }),
-
+      .optional().isString().trim().isLength({ max: 500 }),
     body('demandScore')
-      .optional()
-      .isInt({ min: 0, max: 100 }),
+      .optional().isInt({ min: 0, max: 100 })
   ]),
   skillsController.updateSkill
 );
@@ -348,19 +327,10 @@ router.delete(
   requireAdmin,
   validate([
     param('id')
-      .isString().trim().notEmpty()
-      .isLength({ max: 128 })
-      .withMessage('id is required'),
+      .isString().trim().notEmpty().isLength({ max: 128 })
+      .withMessage('id is required')
   ]),
   skillsController.deleteSkill
 );
 
 module.exports = router;
-
-
-
-
-
-
-
-

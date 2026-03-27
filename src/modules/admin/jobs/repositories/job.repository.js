@@ -84,8 +84,10 @@ class JobRepository {
     try {
       const supabase = getSupabase();
       const normalized = this._normalizeJobCode(jobCode);
-      const { data } = await supabase
-        .from('jobs').select('job_code').eq('job_code', normalized).single();
+      // HARDENING T2: .single() → .maybeSingle() — job may not exist
+      const { data, error } = await supabase
+        .from('jobs').select('job_code').eq('job_code', normalized).maybeSingle();
+      if (error) throw error;
       return !!data;
     } catch (err) {
       logger.error('[JobRepository.exists]', { jobCode, error: err.message });
@@ -97,8 +99,10 @@ class JobRepository {
     try {
       const supabase = getSupabase();
       const normalized = this._normalizeJobCode(jobCode);
-      const { data } = await supabase
-        .from('jobs').select('*').eq('job_code', normalized).single();
+      // HARDENING T2: .single() → .maybeSingle() — job may not exist
+      const { data, error } = await supabase
+        .from('jobs').select('*').eq('job_code', normalized).maybeSingle();
+      if (error) throw error;
       return data || null;
     } catch (err) {
       logger.error('[JobRepository.findByJobCode]', { jobCode, error: err.message });
@@ -108,11 +112,3 @@ class JobRepository {
 }
 
 module.exports = new JobRepository();
-
-
-
-
-
-
-
-

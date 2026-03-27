@@ -24,8 +24,10 @@ const logger = require('../utils/logger');
  * Returns a shallow clone with PII fields redacted.
  */
 function sanitizePayload(payload = {}) {
-  const clone = { ...payload };
-  if (clone.resume_text)   clone.resume_text   = '[REDACTED]';
+  const clone = {
+    ...payload
+  };
+  if (clone.resume_text) clone.resume_text = '[REDACTED]';
   if (clone.personal_info) clone.personal_info = '[REDACTED]';
   return clone;
 }
@@ -56,59 +58,55 @@ function generateLogId() {
  * @returns {Promise<string|null>}     - logId, or null if logging failed
  */
 async function logAIInteraction({
-  module    = 'unknown',
-  model     = 'unknown',
-  prompt    = {},
-  response  = {},
-  usage     = {},
+  module = 'unknown',
+  model = 'unknown',
+  prompt = {},
+  response = {},
+  usage = {},
   latencyMs = 0,
-  status    = 'success',
-  error     = null,
-  userId    = null,
+  status = 'success',
+  error = null,
+  userId = null
 } = {}) {
   try {
-    const logId    = generateLogId();
-    const ENV      = process.env.NODE_ENV || 'development';
+    const logId = generateLogId();
+    const ENV = process.env.NODE_ENV || 'development';
 
     // Lazy-require Firestore to avoid import-time failures in test mode
-    const { db, FieldValue } = require('../config/supabase');
-
-    await db.collection('ai_usage_logs').add({
+    const {
+      db,
+      FieldValue
+    } = require('../config/supabase');
+    await supabase.from('ai_usage_logs').insert({
       logId,
-      user_id:     userId   ?? null,
+      user_id: userId ?? null,
       module,
       model,
       status,
       latencyMs,
       usage: {
-        promptTokens:     usage.prompt_tokens      ?? null,
-        completionTokens: usage.completion_tokens  ?? null,
-        totalTokens:      usage.total_tokens       ?? null,
+        promptTokens: usage.prompt_tokens ?? null,
+        completionTokens: usage.completion_tokens ?? null,
+        totalTokens: usage.total_tokens ?? null
       },
       // Redact PII; in production also hide full prompt text
-      prompt:   ENV === 'production' ? '[REDACTED]' : sanitizePayload(prompt),
+      prompt: ENV === 'production' ? '[REDACTED]' : sanitizePayload(prompt),
       response: sanitizePayload(response),
-      error:    error ? (error.message ?? String(error)) : null,
-      feature:  module,  // alias for aiUsage.service compatibility
-      success:  status === 'success',
-      createdAt: FieldValue.serverTimestamp(),
+      error: error ? error.message ?? String(error) : null,
+      feature: module,
+      // alias for aiUsage.service compatibility
+      success: status === 'success',
+      createdAt: FieldValue.serverTimestamp()
     });
-
     return logId;
   } catch (loggingError) {
     // Fail silently — never break main scoring flow
-    logger.error('[aiLogger] Firestore write failed', { error: loggingError.message });
+    logger.error('[aiLogger] Firestore write failed', {
+      error: loggingError.message
+    });
     return null;
   }
 }
-
-module.exports = { logAIInteraction };
-
-
-
-
-
-
-
-
-
+module.exports = {
+  logAIInteraction
+};

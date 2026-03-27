@@ -161,11 +161,13 @@ class AdminPrincipalRepository {
    */
   async listActive() {
     const supabase = getSupabase();
+    // HARDENING T3: added .limit(200) — admin count is bounded but must not be unbounded
     const { data, error } = await supabase
       .from(TABLE)
       .select('*')
       .eq('is_active', true)
-      .order('granted_at', { ascending: false });
+      .order('granted_at', { ascending: false })
+      .limit(200);
 
     if (error) return [];
     return data || [];
@@ -173,12 +175,3 @@ class AdminPrincipalRepository {
 }
 
 module.exports = new AdminPrincipalRepository();
-
-
-
-
-
-
-
-
-

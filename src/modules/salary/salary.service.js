@@ -14,16 +14,23 @@
  *
  * @module modules/salary/salary.service
  */
-
-const salaryRepository      = require('./salary.repository');
-const { aggregateSalaries } = require('./salaryAggregation.service');
-const { AppError, ErrorCodes } = require('../../middleware/errorHandler');
-const { logAdminAction }    = require('../../utils/adminAuditLogger');
+const salaryRepository = require('./salary.repository');
+const {
+  aggregateSalaries
+} = require('./salaryAggregation.service');
+const {
+  AppError,
+  ErrorCodes
+} = require('../../middleware/errorHandler');
+const {
+  logAdminAction
+} = require('../../utils/adminAuditLogger');
 const logger = require('../../utils/logger');
-const { db } = require('../../config/supabase');
-
+const {
+  db
+} = require('../../config/supabase');
 const IMPORT_LOGS_COLLECTION = 'import_logs';
-const VALID_SOURCE_TYPES     = ['ADMIN', 'CSV', 'API', 'SCRAPER'];
+const VALID_SOURCE_TYPES = ['ADMIN', 'CSV', 'API', 'SCRAPER'];
 
 /**
  * Validate a salary record object.
@@ -33,42 +40,37 @@ const VALID_SOURCE_TYPES     = ['ADMIN', 'CSV', 'API', 'SCRAPER'];
  * @param {object} record
  */
 function validateSalaryRecord(record) {
-  const { minSalary, medianSalary, maxSalary, sourceType } = record;
-
-  if (
-    typeof minSalary    !== 'number' || isNaN(minSalary)    ||
-    typeof medianSalary !== 'number' || isNaN(medianSalary) ||
-    typeof maxSalary    !== 'number' || isNaN(maxSalary)
-  ) {
-    throw new AppError(
-      'minSalary, medianSalary, and maxSalary must be numeric values',
-      400, { minSalary, medianSalary, maxSalary },
-      ErrorCodes.VALIDATION_ERROR
-    );
+  const {
+    minSalary,
+    medianSalary,
+    maxSalary,
+    sourceType
+  } = record;
+  if (typeof minSalary !== 'number' || isNaN(minSalary) || typeof medianSalary !== 'number' || isNaN(medianSalary) || typeof maxSalary !== 'number' || isNaN(maxSalary)) {
+    throw new AppError('minSalary, medianSalary, and maxSalary must be numeric values', 400, {
+      minSalary,
+      medianSalary,
+      maxSalary
+    }, ErrorCodes.VALIDATION_ERROR);
   }
-
   if (minSalary < 0 || medianSalary < 0 || maxSalary < 0) {
-    throw new AppError(
-      'Salary values cannot be negative',
-      400, { minSalary, medianSalary, maxSalary },
-      ErrorCodes.VALIDATION_ERROR
-    );
+    throw new AppError('Salary values cannot be negative', 400, {
+      minSalary,
+      medianSalary,
+      maxSalary
+    }, ErrorCodes.VALIDATION_ERROR);
   }
-
   if (!(minSalary < medianSalary && medianSalary < maxSalary)) {
-    throw new AppError(
-      'Salary values must satisfy: minSalary < medianSalary < maxSalary',
-      400, { minSalary, medianSalary, maxSalary },
-      ErrorCodes.VALIDATION_ERROR
-    );
+    throw new AppError('Salary values must satisfy: minSalary < medianSalary < maxSalary', 400, {
+      minSalary,
+      medianSalary,
+      maxSalary
+    }, ErrorCodes.VALIDATION_ERROR);
   }
-
   if (sourceType && !VALID_SOURCE_TYPES.includes(sourceType)) {
-    throw new AppError(
-      `Invalid sourceType. Must be one of: ${VALID_SOURCE_TYPES.join(', ')}`,
-      400, { sourceType },
-      ErrorCodes.VALIDATION_ERROR
-    );
+    throw new AppError(`Invalid sourceType. Must be one of: ${VALID_SOURCE_TYPES.join(', ')}`, 400, {
+      sourceType
+    }, ErrorCodes.VALIDATION_ERROR);
   }
 }
 
@@ -83,46 +85,42 @@ function validateSalaryRecord(record) {
  */
 async function createSalaryRecord(record, adminId, ipAddress = null) {
   validateSalaryRecord(record);
-
   const payload = {
-    roleId:          record.roleId,
-    location:        record.location        || '',
+    roleId: record.roleId,
+    location: record.location || '',
     experienceLevel: record.experienceLevel || '',
-    industry:        record.industry        || '',
-    minSalary:       record.minSalary,
-    medianSalary:    record.medianSalary,
-    maxSalary:       record.maxSalary,
-    sourceType:      record.sourceType      || 'ADMIN',
-    sourceName:      record.sourceName      || 'admin-manual',
-    confidenceScore: record.confidenceScore ?? 1.0,
+    industry: record.industry || '',
+    minSalary: record.minSalary,
+    medianSalary: record.medianSalary,
+    maxSalary: record.maxSalary,
+    sourceType: record.sourceType || 'ADMIN',
+    sourceName: record.sourceName || 'admin-manual',
+    confidenceScore: record.confidenceScore ?? 1.0
   };
-
   const created = await salaryRepository.insertSalaryRecord(payload, adminId);
-
   logger.info('[SalaryService] Salary record created', {
-    id:     created.id,
+    id: created.id,
     roleId: created.roleId,
-    source: created.sourceType,
+    source: created.sourceType
   });
 
   // Audit log — fire-and-forget
   await logAdminAction({
     adminId,
-    action:     'MANUAL_SALARY_ENTRY',
+    action: 'MANUAL_SALARY_ENTRY',
     entityType: 'salary_data',
-    entityId:   created.id,
+    entityId: created.id,
     metadata: {
-      roleId:          created.roleId,
+      roleId: created.roleId,
       experienceLevel: created.experienceLevel,
-      location:        created.location,
-      minSalary:       created.minSalary,
-      medianSalary:    created.medianSalary,
-      maxSalary:       created.maxSalary,
-      sourceType:      created.sourceType,
+      location: created.location,
+      minSalary: created.minSalary,
+      medianSalary: created.medianSalary,
+      maxSalary: created.maxSalary,
+      sourceType: created.sourceType
     },
-    ipAddress,
+    ipAddress
   });
-
   return created;
 }
 
@@ -145,34 +143,31 @@ async function listSalaryRecords(roleId) {
 /**
  * Write an import log entry to Firestore.
  */
-async function logImport({ datasetType, processed, created, failed }) {
+async function logImport({
+  datasetType,
+  processed,
+  created,
+  failed
+}) {
   if (!db) return;
-
   try {
-    await db.collection(IMPORT_LOGS_COLLECTION).add({
+    await supabase.from(IMPORT_LOGS_COLLECTION).insert({
       datasetType,
       recordsProcessed: processed,
-      recordsInserted:  created,
-      recordsFailed:    failed,
-      timestamp:        new Date(),
+      recordsInserted: created,
+      recordsFailed: failed,
+      timestamp: new Date()
     });
   } catch (err) {
-    logger.warn('[SalaryService] Failed to write import log', { err: err.message });
+    logger.warn('[SalaryService] Failed to write import log', {
+      err: err.message
+    });
   }
 }
-
 module.exports = {
   createSalaryRecord,
   getAggregatedSalary,
   listSalaryRecords,
   validateSalaryRecord,
-  logImport,
+  logImport
 };
-
-
-
-
-
-
-
-

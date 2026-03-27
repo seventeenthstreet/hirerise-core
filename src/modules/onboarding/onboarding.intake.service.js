@@ -6,11 +6,15 @@
  * Extracted from onboarding.service.js (god-object decomposition).
  * Owns: saveConsent, saveQuickStart, saveEducationAndExperience,
  *       saveDraft, getDraft, savePersonalDetails, saveCareerIntent
+ *
+ * MIGRATED: All Firestore db.collection() calls replaced with supabase.from()
+ * FieldValue.serverTimestamp() → new Date().toISOString()
+ * FieldValue.arrayUnion()     → mergeStepHistory() helper
+ * batch()                     → Promise.all([...])
  */
 
-const { db } = require('../../config/supabase');
+const supabase = require('../../config/supabase');
 const { AppError, ErrorCodes } = require('../../middleware/errorHandler');
-const { FieldValue } = require('../../config/supabase');
 const logger          = require('../../utils/logger');
 const { getQualificationById } = require('../qualification/qualification.service');
 const { validateRolesExist } = require('../roles/roles.service');
@@ -21,7 +25,7 @@ const {
   sanitiseInput, validateUrl, validateYearOfGraduation,
   validateAndSanitiseResponsibilities, validateAchievements,
   validateExperienceDates, computeExperienceMonths, mergeSkills,
-  emitOnboardingEvent, appendStepHistory, scheduleReengagementJob,
+  emitOnboardingEvent, appendStepHistory, mergeStepHistory, scheduleReengagementJob,
   mergeCanonicalSkills, persistCompletionIfReady, buildAIContext,
   triggerProvisionalChi, inferRegion,
   VALID_SENIORITY, EXPERIENCE_TYPE_WEIGHTS, VALID_EXPERIENCE_TYPES,
@@ -37,7 +41,7 @@ async function saveConsent(userId, payload) {
           // Stored at consent time (the earliest reliable moment in the funnel) so the
           // product team can compute onboarding completion rates and CHI quality by
           // acquisition channel (e.g. organic vs paid vs referral vs App Store).
-          // Validated against a controlled enum so Firestore queries don't fragment on typos.
+          // Validated against a controlled enum so queries don't fragment on typos.
           referralSource = null,
         } = payload;
 
@@ -68,8 +72,16 @@ async function saveConsent(userId, payload) {
   // The collection is seeded by ops/release scripts whenever T&C are updated.
   // If the collection is empty or the doc is missing, we fall through rather than
   // blocking consent — this prevents a missing seed from bricking onboarding.
-  const consentVersionSnap = await db.collection('consentVersions').doc(version).get();
-  if (consentVersionSnap.exists && consentVersionSnap.data()?.deprecated === true) {
+  const { data: consentVersionRow, error: consentVersionErr } = await supabase
+    .from('consentVersions')
+    .select('*')
+    .eq('id', version)
+    .maybeSingle();
+  if (consentVersionErr && consentVersionErr.code !== 'PGRST116') {
+    logger.error('[DB] consentVersions.get:', consentVersionErr.message);
+  }
+
+  if (consentVersionRow?.deprecated === true) {
     throw new AppError(
       `consentVersion "${version}" is no longer valid. Please use the current version.`,
       400,
@@ -80,30 +92,38 @@ async function saveConsent(userId, payload) {
   }
   // If the doc doesn't exist at all in consentVersions, we allow it through
   // (graceful degradation) but log a warning for ops to investigate.
-  if (!consentVersionSnap.exists) {
+  if (!consentVersionRow) {
     logger.warn('[OnboardingService] consentVersion not found in consentVersions collection — allowing through', { userId, version });
   }
 
   const now = new Date();
+  const nowISO = now.toISOString();
 
   // ── Idempotency: if same version already stored, return existing record ────
-  const progressSnap = await db.collection('onboardingProgress').doc(userId).get();
-  if (progressSnap.exists) {
-    const existing = progressSnap.data();
-    if (existing.consentVersion === version && existing.consentGrantedAt) {
+  const { data: existingProgress, error: progressErr } = await supabase
+    .from('onboardingProgress')
+    .select('*')
+    .eq('id', userId)
+    .maybeSingle();
+  if (progressErr && progressErr.code !== 'PGRST116') {
+    logger.error('[DB] onboardingProgress.get:', progressErr.message);
+  }
+
+  if (existingProgress) {
+    if (existingProgress.consentVersion === version && existingProgress.consentGrantedAt) {
       logger.debug('[OnboardingService] Consent already recorded for this version — skipping', { userId, version });
       return {
         userId,
         step:             'consent_saved',
         consentVersion:   version,
-        consentGrantedAt: existing.consentGrantedAt,
+        consentGrantedAt: existingProgress.consentGrantedAt,
         alreadyRecorded:  true,
       };
     }
   }
 
   const consentPayload = {
-    consentGrantedAt: now.toISOString(),
+    consentGrantedAt: nowISO,
     consentVersion:   version,
     consentSource,
     // GAP-M8: referralSource — stored in all three collections so the CHI pipeline
@@ -111,32 +131,33 @@ async function saveConsent(userId, payload) {
     ...(sanitisedReferralSource ? { referralSource: sanitisedReferralSource } : {}),
   };
 
-  // Write atomically to all three collections
-  const batch = db.batch();
+  const stepHistory = await mergeStepHistory(userId, 'consent_saved');
 
-  batch.set(db.collection('users').doc(userId), {
-    ...consentPayload,
-    updatedAt: FieldValue.serverTimestamp(),
-  }, { merge: true });
-
-  batch.set(db.collection('userProfiles').doc(userId), {
-    ...consentPayload,
-    updatedAt: FieldValue.serverTimestamp(),
-  }, { merge: true });
-
-  batch.set(db.collection('onboardingProgress').doc(userId), {
-    userId,
-    step: 'consent_saved',
-    ...consentPayload,
-    ...appendStepHistory('consent_saved'),
-    // SPRINT-4A H12: track last active step for drop-off cohort analysis
-    lastActiveStep: 'consent_saved',
-    lastActiveAt:   FieldValue.serverTimestamp(),
-    onboardingStartedAt: now,
-    updatedAt: now,
-  }, { merge: true });
-
-  await batch.commit();
+  // Write atomically to all three collections via Promise.all
+  await Promise.all([
+    supabase.from('users').upsert({
+      id: userId,
+      ...consentPayload,
+      updatedAt: nowISO,
+    }),
+    supabase.from('userProfiles').upsert({
+      id: userId,
+      ...consentPayload,
+      updatedAt: nowISO,
+    }),
+    supabase.from('onboardingProgress').upsert({
+      id:                  userId,
+      userId,
+      step:                'consent_saved',
+      ...consentPayload,
+      stepHistory,
+      // SPRINT-4A H12: track last active step for drop-off cohort analysis
+      lastActiveStep:      'consent_saved',
+      lastActiveAt:        nowISO,
+      onboardingStartedAt: nowISO,
+      updatedAt:           nowISO,
+    }),
+  ]);
 
   logger.info('[OnboardingService] Consent recorded', { userId, version, consentSource });
   emitOnboardingEvent(userId, 'onboarding_step_completed', { step: 'consent_saved' });
@@ -145,7 +166,7 @@ async function saveConsent(userId, payload) {
     userId,
     step:             'consent_saved',
     consentVersion:   version,
-    consentGrantedAt: now.toISOString(),
+    consentGrantedAt: nowISO,
     referralSource:   sanitisedReferralSource,
     alreadyRecorded:  false,
   };
@@ -201,7 +222,7 @@ async function saveQuickStart(userId, payload) {
         'Please select the role you\'re targeting, or type it in if you don\'t see it in the list.'
       );
     }
-    // Free-text path: store as-is without Firestore validation, no CHI marketAlignment seeding
+    // Free-text path: store as-is without validation, no CHI marketAlignment seeding
   } else {
     // Validate all expectedRoleIds exist in parallel (P0-02 verified this uses Promise.all)
     await validateRolesExist(expectedRoleIds.map(id => String(id).trim()));
@@ -230,48 +251,50 @@ async function saveQuickStart(userId, payload) {
   }];
 
   const now         = new Date();
+  const nowISO      = now.toISOString();
   const cleanRoleIds = expectedRoleIds.map(id => String(id).trim());
   const userTier    = 'free'; // tier not available in service — controller must pass if needed
 
-  // ── Writes ────────────────────────────────────────────────────────────────
-  const batch = db.batch();
+  const stepHistory = await mergeStepHistory(userId, 'quick_start_saved');
 
+  // ── Writes via Promise.all ────────────────────────────────────────────────
   // onboardingProgress — quick-start fields stored under top-level keys so
   // generateCareerReport() can read them directly without a separate lookup
-  batch.set(db.collection('onboardingProgress').doc(userId), {
-    userId,
-    step:               'quick_start_saved',
-    quickStartCompleted: true,
-    experience:         quickExperience,
-    skills:             sanitisedSkills,
-    expectedRoleIds:    cleanRoleIds,
-    targetRoleFreeText: targetRoleFreeText ? String(targetRoleFreeText).trim().slice(0, 120) : null,
-    importSource:       'manual',
-    ...appendStepHistory('quick_start_saved'),
-    lastActiveStep:     'quick_start_saved',
-    lastActiveAt:       FieldValue.serverTimestamp(),
-    onboardingStartedAt: FieldValue.serverTimestamp(),
-    updatedAt:          FieldValue.serverTimestamp(),
-  }, { merge: true });
-
-  // userProfiles — mirror expectedRoleIds + skills so CHI service reads work immediately
-  batch.set(db.collection('userProfiles').doc(userId), {
-    expectedRoleIds: cleanRoleIds,
-    skills:          sanitisedSkills,
-    updatedAt:       FieldValue.serverTimestamp(),
-  }, { merge: true });
-
-  await batch.commit();
+  await Promise.all([
+    supabase.from('onboardingProgress').upsert({
+      id:                  userId,
+      userId,
+      step:                'quick_start_saved',
+      quickStartCompleted: true,
+      experience:          quickExperience,
+      skills:              sanitisedSkills,
+      expectedRoleIds:     cleanRoleIds,
+      targetRoleFreeText:  targetRoleFreeText ? String(targetRoleFreeText).trim().slice(0, 120) : null,
+      importSource:        'manual',
+      stepHistory,
+      lastActiveStep:      'quick_start_saved',
+      lastActiveAt:        nowISO,
+      onboardingStartedAt: nowISO,
+      updatedAt:           nowISO,
+    }),
+    // userProfiles — mirror expectedRoleIds + skills so CHI service reads work immediately
+    supabase.from('userProfiles').upsert({
+      id:              userId,
+      expectedRoleIds: cleanRoleIds,
+      skills:          sanitisedSkills,
+      updatedAt:       nowISO,
+    }),
+  ]);
 
   // ── Trigger provisional CHI asynchronously ───────────────────────────────
   // Fire-and-forget: quick provisional CHI uses the same triggerProvisionalChi()
   // path but with analysisSource 'quick_provisional'. Non-fatal if it fails.
-  const [progressSnap, profileSnap] = await Promise.all([
-    db.collection('onboardingProgress').doc(userId).get(),
-    db.collection('userProfiles').doc(userId).get(),
+  const [{ data: progressRow }, { data: profileRow }] = await Promise.all([
+    supabase.from('onboardingProgress').select('*').eq('id', userId).maybeSingle(),
+    supabase.from('userProfiles').select('*').eq('id', userId).maybeSingle(),
   ]);
-  const progressData = progressSnap.data() || {};
-  const profileData  = profileSnap.data()  || {};
+  const progressData = progressRow || {};
+  const profileData  = profileRow  || {};
 
   // Pass null as careerReport — provisional CHI handles this gracefully
   triggerProvisionalChi(userId, progressData, profileData, null, userTier);
@@ -302,28 +325,23 @@ async function saveEducationAndExperience(userId, payload) {
 
   logger.info('[Onboarding] saveEducationAndExperience start', { userId });
 
-  const { 
-    education = [], 
-    experience = [], 
-    skills = [], 
+  const {
+    education = [],
+    experience = [],
+    skills = [],
     // SPRINT-1 C1: replaced free-text targetRole with validated targetRoleId + required expectedRoleIds[].
-    // The old targetRole string was used directly as a Firestore doc ID in the salary band lookup
-    // (db.collection('salaryBands').doc(targetRole)), so "Senior Product Manager" never matched
-    // the doc ID "senior_product_manager" — silently breaking salaryTrajectory (15% of CHI) and
-    // marketAlignment (25% of CHI) for every user. targetRoleId is now validated against the
-    // roles collection. expectedRoleIds is now required before this step can complete.
+    // The old targetRole string was used directly as a doc ID in the salary band lookup,
+    // so "Senior Product Manager" never matched the doc ID "senior_product_manager" — silently
+    // breaking salaryTrajectory (15% of CHI) and marketAlignment (25% of CHI) for every user.
+    // targetRoleId is now validated against the roles collection. expectedRoleIds is now required.
     targetRoleId      = null,
     expectedRoleIds   = [],
     careerGaps = [],
     currentSalaryLPA  = null,   // CHI salaryTrajectory signal
     expectedSalaryLPA = null,   // CHI salaryTrajectory signal
     // SPRINT-1 C5: self-declared seniority for CHI peerComparison accuracy.
-    // Without this, two users with 5 years experience — one IC, one Director — receive
-    // the same peer group. A single enum field fixes this with minimal friction.
     selfDeclaredSeniority = null,
     // SPRINT-2 C6: preferred work location for CHI region inference.
-    // A user in Bangalore targeting Dubai must be benchmarked against Gulf salary bands.
-    // preferredWorkLocation takes priority over currentCity in inferRegion().
     preferredWorkLocation = null,
     workMode              = null,  // remote | hybrid | onsite
   } = payload;
@@ -337,22 +355,15 @@ async function saveEducationAndExperience(userId, payload) {
   }
 
   // ── SPRINT-1 C1: Validate targetRoleId against the roles collection ─────────
-  // Replaces the old free-text targetRole field. If provided, the roleId must
-  // exist and be active in the roles collection.
   if (targetRoleId !== null) {
     if (typeof targetRoleId !== 'string' || !targetRoleId.trim()) {
       throw new AppError('targetRoleId must be a non-empty string.', 400, {}, ErrorCodes.VALIDATION_ERROR,
         'The selected target role appears to be invalid. Please choose a role from the list.');
     }
-    // validateRolesExist throws descriptively if the role does not exist or is inactive
     await validateRolesExist([targetRoleId.trim()]);
   }
 
   // ── SPRINT-1 C1: Validate expectedRoleIds[] ──────────────────────────────────
-  // expectedRoleIds is required here so all CHI dimensions are seeded before the
-  // career report runs. Previously this was only collected in Track B (career-intent),
-  // which is enrichment-only and could be skipped entirely — leaving marketAlignment
-  // and salaryTrajectory (40% of CHI combined) unscored at first session.
   if (!Array.isArray(expectedRoleIds) || expectedRoleIds.length === 0) {
     throw new AppError(
       'Please select at least one target role. This is required for an accurate Career Health score.',
@@ -362,21 +373,9 @@ async function saveEducationAndExperience(userId, payload) {
       'Please select at least one role you\'re targeting — this is how we personalise your Career Health score.'
     );
   }
-  // Validate all expectedRoleIds exist and are active in one parallel fan-out
   await validateRolesExist(expectedRoleIds.map(id => String(id).trim()));
 
   // ── P1-02 / P1-03: Salary — now fully optional ───────────────────────────
-  // CHANGED FROM: currentSalaryLPA was required when hasExperience.
-  // CHANGED TO:   currentSalaryLPA is optional at all times.
-  //
-  // Rationale: salary-first forms have 30-40% higher abandonment (Glassdoor/LinkedIn research).
-  // When absent, salaryTrajectory CHI dimension defaults to score 40 ("insufficient data —
-  // market average assumed"). The frontend should surface a nudge post-CHI:
-  // "Add your salary for a more accurate score (+15 pts)".
-  //
-  // P1-03: Replace integer sentinel -1 with explicit boolean flag salaryDeclined: true.
-  // The -1 sentinel required frontend developers to know the magic number; a named boolean
-  // is self-documenting and removes the risk of numeric comparison bugs.
   const salaryDeclined = payload.salaryDeclined === true;
 
   if (salaryDeclined) {
@@ -392,7 +391,6 @@ async function saveEducationAndExperience(userId, payload) {
       );
     }
   }
-  // No error if currentSalaryLPA is null/undefined — salary is now optional
 
   if (expectedSalaryLPA !== null && expectedSalaryLPA !== undefined && expectedSalaryLPA !== -1 &&
       (typeof expectedSalaryLPA !== 'number' || expectedSalaryLPA < 0)) {
@@ -404,10 +402,6 @@ async function saveEducationAndExperience(userId, payload) {
   }
 
   // ── SPRINT-1 C5: Validate selfDeclaredSeniority ───────────────────────────────
-  // The CHI peerComparison field requires a declared seniority level.
-  // Without it, the prompt infers level from totalExperienceYears alone — a Director
-  // and an IC with the same tenure get the same peer group, making peerComparison
-  // and projectedLevelUpMonths unreliable for ~50% of users.
   if (selfDeclaredSeniority !== null) {
     if (!VALID_SENIORITY.has(selfDeclaredSeniority)) {
       throw new AppError(
@@ -459,8 +453,6 @@ async function saveEducationAndExperience(userId, payload) {
         ? edu.certifications.filter(c => typeof c === 'string' && c.trim()).map(c => c.trim())
         : [],
       // SPRINT-2 H3: degree grade/classification — required by UK (2:1, First), US (GPA≥3.5), India (CGPA).
-      // Omitting this makes the CV non-standard for these markets.
-      // gradeType enum: gpa | percentage | classification | cgpa
       gradeType:  ['gpa', 'percentage', 'classification', 'cgpa'].includes(edu.gradeType) ? edu.gradeType : null,
       gradeValue: edu.gradeValue ? stripHtml(String(edu.gradeValue)).trim().slice(0, 30) : null,
     });
@@ -485,39 +477,32 @@ async function saveEducationAndExperience(userId, payload) {
     const industryId   = INDUSTRY_SECTORS[e.industryId] ? e.industryId : (e.industryId ? 'other' : null);
     const industryText = e.industryText || e.industry || null;
 
-    // SPRINT-2 C4: jobFunction controlled enum — separates sector from function so
-    // CHI marketAlignment uses the correct peer group (e.g. an engineer at a bank is
-    // Engineering function, not Finance function).
+    // SPRINT-2 C4: jobFunction controlled enum
     const VALID_JOB_FUNCTIONS = new Set([
       'engineering', 'product', 'design', 'data', 'sales', 'marketing',
       'finance', 'operations', 'hr', 'legal', 'customer_success', 'other',
     ]);
     const jobFunction = VALID_JOB_FUNCTIONS.has(e.jobFunction) ? e.jobFunction : (e.jobFunction ? 'other' : null);
 
-    // SPRINT-2 C7: experienceType — allows volunteer/open-source work to contribute to
-    // CHI experienceDepth without being equal-weighted to full-time employment.
+    // SPRINT-2 C7: experienceType
     const experienceType = VALID_EXPERIENCE_TYPES.has(e.experienceType) ? e.experienceType : 'full_time';
 
     return {
       jobTitle:         stripHtml(e.jobTitle || ''),
       company:          stripHtml(e.company  || ''),
-      industryId,                                        // GAP-07: controlled enum key
-      industryText,                                      // GAP-07: raw text fallback
-      jobFunction,                                       // SPRINT-2 C4: Engineering / Product / etc.
-      experienceType,                                    // SPRINT-2 C7: full_time / volunteer / etc.
+      industryId,
+      industryText,
+      jobFunction,
+      experienceType,
       startDate:        e.startDate  || null,
       endDate:          e.endDate    || null,
       isCurrent:        e.isCurrent  || false,
-      responsibilities: validateAndSanitiseResponsibilities(e.responsibilities, label), // GAP S3/T3
-      // SPRINT-2 C2: structured achievements — fed directly to AI CV writer for quantified bullets.
-      // Replaces binary impactSignal (0|1) — impactScore is now a 0-5 count of quantified achievements.
-      achievements: validateAchievements(e.achievements, label),
+      responsibilities: validateAndSanitiseResponsibilities(e.responsibilities, label),
+      achievements:     validateAchievements(e.achievements, label),
     };
   });
 
   // SPRINT-2 C2: derive impactScore from structured achievements (0–5 count)
-  // The old binary impactSignal is replaced here — it could not distinguish between
-  // one vague metric and five strong quantified results.
   const impactScore = sanitisedExperience.reduce(
     (sum, e) => sum + (e.achievements?.length || 0), 0
   );
@@ -533,7 +518,7 @@ async function saveEducationAndExperience(userId, payload) {
       startDate:   gap.startDate,
       endDate:     gap.endDate,
       reason:      VALID_GAP_REASONS.has(gap.reason) ? gap.reason : 'other',
-      description: gap.description ? stripHtml(String(gap.description)).slice(0, 600) : null, // was 300 — GAP-M2
+      description: gap.description ? stripHtml(String(gap.description)).slice(0, 600) : null,
     };
   });
 
@@ -546,40 +531,42 @@ async function saveEducationAndExperience(userId, payload) {
     return { name, proficiency: VALID_PROF.has(s?.proficiency) ? s.proficiency : 'intermediate' };
   });
 
+  const nowISO = new Date().toISOString();
+  const stepHistory = await mergeStepHistory(userId, 'education_experience_saved');
+
   const doc = {
+    id:         userId,
     userId,
     step:       'education_experience_saved',
     education:  resolvedEducation,
     experience: sanitisedExperience,
-    skills:     sanitisedSkills,         // GAP S1
-    // SPRINT-1 C1: structured roleId replaces free-text targetRole
+    skills:     sanitisedSkills,
     targetRoleId:     targetRoleId ? targetRoleId.trim() : null,
     expectedRoleIds:  expectedRoleIds.map(id => String(id).trim()),
-    careerGaps: sanitisedCareerGaps,     // GAP C4
-    totalExperienceMonths,               // GAP-06: verified tenure from date ranges
-    currentSalaryLPA:     currentSalaryLPA  ?? null,  // CHI salaryTrajectory — now optional (P1-02)
-    expectedSalaryLPA:    expectedSalaryLPA ?? null,  // CHI salaryTrajectory
-    salaryDeclined:       salaryDeclined,              // P1-03: explicit boolean replaces -1 sentinel
-    selfDeclaredSeniority: selfDeclaredSeniority ?? null, // SPRINT-1 C5: CHI peerComparison
-    // SPRINT-2 C2: 0-5 count score replaces binary impactSignal — distinguishes 1 vague metric from 5 strong ones
+    careerGaps: sanitisedCareerGaps,
+    totalExperienceMonths,
+    currentSalaryLPA:     currentSalaryLPA  ?? null,
+    expectedSalaryLPA:    expectedSalaryLPA ?? null,
+    salaryDeclined:       salaryDeclined,
+    selfDeclaredSeniority: selfDeclaredSeniority ?? null,
     impactScore,
-    // SPRINT-2 C6: preferred work target for CHI region inference
     preferredWorkLocation: preferredWorkLocation ? String(preferredWorkLocation).trim().slice(0, 100) : null,
     workMode:              ['remote', 'hybrid', 'onsite'].includes(workMode) ? workMode : null,
-    ...appendStepHistory('education_experience_saved'),
+    stepHistory,
     // SPRINT-4A H12: track last active step for drop-off cohort analysis
     lastActiveStep: 'education_experience_saved',
-    lastActiveAt:   FieldValue.serverTimestamp(),
-    onboardingStartedAt: FieldValue.serverTimestamp(),
-    updatedAt:   FieldValue.serverTimestamp(),
+    lastActiveAt:   nowISO,
+    onboardingStartedAt: nowISO,
+    updatedAt:   nowISO,
   };
 
-  await db.collection('onboardingProgress').doc(userId).set(doc, { merge: true });
+  const { error: progressErr } = await supabase.from('onboardingProgress').upsert(doc);
+  if (progressErr) {
+    logger.error('[DB] onboardingProgress.upsert failed', { userId, error: progressErr.message });
+    throw progressErr;
+  }
 
   // G-02: Derive dominant industry from experience array and mirror to userProfiles.
-  // Uses the most frequently occurring industryId across all roles — if tied,
-  // the most recent role's industry wins (last entry in the sorted array).
-  // Stored as industryId (enum key) + industryText (human label) for CHI market alignment.
   const industryCounts = {};
   for (const exp of sanitisedExperience) {
     if (exp.industryId) industryCounts[exp.industryId] = (industryCounts[exp.industryId] || 0) + 1;
@@ -589,10 +576,7 @@ async function saveEducationAndExperience(userId, payload) {
     : null;
   const dominantIndustryText = dominantIndustryId ? (INDUSTRY_SECTORS[dominantIndustryId] || null) : null;
 
-  // SPRINT-2 C4: Derive dominant jobFunction — mirrors the same pattern as industryId above.
-  // LinkedIn separates industry from function: a Software Engineer at a bank is Finance industry
-  // but Engineering function. Without this, CHI marketAlignment benchmarks career transitioners
-  // against the wrong peer group.
+  // SPRINT-2 C4: Derive dominant jobFunction
   const fnCounts = {};
   for (const exp of sanitisedExperience) {
     if (exp.jobFunction) fnCounts[exp.jobFunction] = (fnCounts[exp.jobFunction] || 0) + 1;
@@ -602,35 +586,30 @@ async function saveEducationAndExperience(userId, payload) {
     : null;
 
   // Mirror skills + salary + industry + Sprint-1 fields to userProfiles
-  // so Track B / CHI can see them immediately without a separate read.
-  await db.collection('userProfiles').doc(userId).set(
-    {
-      skills:              sanitisedSkills.length > 0 ? sanitisedSkills : undefined,
-      currentSalaryLPA:    currentSalaryLPA  ?? null,
-      expectedSalaryLPA:   expectedSalaryLPA ?? null,
-      // G-02: aggregated sector — enables CHI marketAlignment salary band lookup
-      industryId:          dominantIndustryId   ?? null,
-      industryText:        dominantIndustryText  ?? null,
-      // SPRINT-2 C4: dominant function — enables correct peer group for CHI marketAlignment
-      jobFunction:         dominantJobFunction   ?? null,
-      // SPRINT-2 C6: preferred target market for CHI region inference — overrides currentCity
-      preferredWorkLocation: preferredWorkLocation ? String(preferredWorkLocation).trim().slice(0, 100) : null,
-      workMode:              ['remote', 'hybrid', 'onsite'].includes(workMode) ? workMode : null,
-      // SPRINT-1 C1: structured role IDs — CHI salary band lookup now resolves correctly
-      targetRoleId:        targetRoleId ? targetRoleId.trim() : null,
-      expectedRoleIds:     expectedRoleIds.map(id => String(id).trim()),
-      // SPRINT-1 C5: seniority for CHI peerComparison — stored on profile so CHI service reads it directly
-      selfDeclaredSeniority: selfDeclaredSeniority ?? null,
-      updatedAt:           FieldValue.serverTimestamp(),
-    },
-    { merge: true }
-  );
+  const { error: profileErr } = await supabase.from('userProfiles').upsert({
+    id:                    userId,
+    skills:                sanitisedSkills.length > 0 ? sanitisedSkills : undefined,
+    currentSalaryLPA:      currentSalaryLPA  ?? null,
+    expectedSalaryLPA:     expectedSalaryLPA ?? null,
+    industryId:            dominantIndustryId   ?? null,
+    industryText:          dominantIndustryText  ?? null,
+    jobFunction:           dominantJobFunction   ?? null,
+    preferredWorkLocation: preferredWorkLocation ? String(preferredWorkLocation).trim().slice(0, 100) : null,
+    workMode:              ['remote', 'hybrid', 'onsite'].includes(workMode) ? workMode : null,
+    targetRoleId:          targetRoleId ? targetRoleId.trim() : null,
+    expectedRoleIds:       expectedRoleIds.map(id => String(id).trim()),
+    selfDeclaredSeniority: selfDeclaredSeniority ?? null,
+    updatedAt:             nowISO,
+  });
+  if (profileErr) {
+    logger.error('[DB] userProfiles.upsert failed', { userId, error: profileErr.message });
+  }
 
-  const [progressSnap, profileSnap] = await Promise.all([
-    db.collection('onboardingProgress').doc(userId).get(),
-    db.collection('userProfiles').doc(userId).get(),
+  const [{ data: progressRow }, { data: profileRow }] = await Promise.all([
+    supabase.from('onboardingProgress').select('*').eq('id', userId).maybeSingle(),
+    supabase.from('userProfiles').select('*').eq('id', userId).maybeSingle(),
   ]);
-  await persistCompletionIfReady(userId, progressSnap.data() || {}, profileSnap.data() || {});
+  await persistCompletionIfReady(userId, progressRow || {}, profileRow || {});
   emitOnboardingEvent(userId, 'onboarding_step_completed', { step: 'education_experience_saved', trackA: true });
 
   logger.info('[Onboarding] saveEducationAndExperience complete', { userId });
@@ -643,16 +622,21 @@ async function saveDraft(userId, payload) {
   logger.debug('[Onboarding] saveDraft start', { userId });
 
   // P3-03: Optimistic concurrency — if client sends draftVersion, reject if it doesn't match.
-  // Prevents silent overwrites when two tabs are open or a retry races with a live save.
-  // draftVersion is optional — clients that don't send it get the old behaviour (last-write-wins).
   const clientVersion = payload._draftVersion !== undefined ? Number(payload._draftVersion) : null;
-  const { _draftVersion, ...cleanPayload } = payload; // strip meta field before storing
+  const { _draftVersion, ...cleanPayload } = payload;
 
   if (clientVersion !== null) {
-    const existing = await db.collection('onboardingProgress').doc(userId).get();
-    if (existing.exists) {
+    const { data: existing, error: existErr } = await supabase
+      .from('onboardingProgress')
+      .select('draftVersion')
+      .eq('id', userId)
+      .maybeSingle();
+    if (existErr && existErr.code !== 'PGRST116') {
+      logger.error('[DB] onboardingProgress.get:', existErr.message);
+    }
+    if (existing) {
       // P3-03: treat missing draftVersion as 0 (first save on an existing doc)
-      const serverVersion = existing.data().draftVersion ?? 0;
+      const serverVersion = existing.draftVersion ?? 0;
       if (serverVersion !== clientVersion) {
         throw new AppError(
           `Draft version conflict: server is at v${serverVersion}, client sent v${clientVersion}.`,
@@ -667,19 +651,26 @@ async function saveDraft(userId, payload) {
 
   // Increment version on every successful save
   const newVersion = (clientVersion ?? 0) + 1;
+  const nowISO = new Date().toISOString();
+  const stepHistory = await mergeStepHistory(userId, 'draft_saved');
 
-  await db.collection('onboardingProgress').doc(userId).set({
+  const { error: upsertErr } = await supabase.from('onboardingProgress').upsert({
+    id:           userId,
     userId,
-    step:            'draft',
-    draft:           cleanPayload,
-    draftVersion:    newVersion,       // P3-03: monotonically incrementing version
-    draftSavedAt:    new Date().toISOString(),
-    lastActiveStep:  'draft',
-    lastActiveAt:    FieldValue.serverTimestamp(),
-    ...appendStepHistory('draft_saved'),
-    onboardingStartedAt: FieldValue.serverTimestamp(),
-    updatedAt:       FieldValue.serverTimestamp(),
-  }, { merge: true });
+    step:         'draft',
+    draft:        cleanPayload,
+    draftVersion: newVersion,
+    draftSavedAt: nowISO,
+    lastActiveStep: 'draft',
+    lastActiveAt:   nowISO,
+    stepHistory,
+    onboardingStartedAt: nowISO,
+    updatedAt:    nowISO,
+  });
+  if (upsertErr) {
+    logger.error('[DB] onboardingProgress.upsert (draft) failed', { userId, error: upsertErr.message });
+    throw upsertErr;
+  }
 
   scheduleReengagementJob(userId);
 
@@ -690,13 +681,19 @@ async function saveDraft(userId, payload) {
 async function getDraft(userId) {
   if (!userId) throw new AppError('userId is required', 400, {}, ErrorCodes.VALIDATION_ERROR);
 
-  const snap = await db.collection('onboardingProgress').doc(userId).get();
+  const { data, error } = await supabase
+    .from('onboardingProgress')
+    .select('draft, draftVersion, draftSavedAt')
+    .eq('id', userId)
+    .maybeSingle();
+  if (error && error.code !== 'PGRST116') {
+    logger.error('[DB] onboardingProgress.get (draft):', error.message);
+  }
 
-  if (!snap.exists || !snap.data().draft) {
+  if (!data || !data.draft) {
     return { userId, draft: null, draftVersion: 0, draftSavedAt: null };
   }
 
-  const data = snap.data();
   return {
     userId,
     draft:        data.draft,
@@ -714,8 +711,7 @@ async function savePersonalDetails(userId, payload, authEmail = null) {
           languages, projects, awards,
           profilePhotoUrl,       // PROMPT-4: profile photo for Gulf/Europe/Asia CV markets
           professionalSummary,   // SPRINT-2 H2: user-edited summary — passed verbatim to CV generation
-        } = payload; // GAP-03: international CV fields
-  // GAP S9: careerObjective is intentionally not read — AI writes professionalSummary
+        } = payload;
 
   if (!fullName || !email) throw new AppError(
     'Full name and email are required to generate a CV.',
@@ -724,31 +720,24 @@ async function savePersonalDetails(userId, payload, authEmail = null) {
   );
 
   // SPRINT-4A H5: Duplicate email / account-split detection.
-  // Compare the submitted personal-details email against the Firebase auth token email.
-  // A mismatch means the user has authenticated with one account but is filling in CV
-  // details for a different email address — creating split CHI history across two UIDs.
-  // We log a warning (not a hard error) to avoid blocking legitimate use cases (e.g.
-  // user authenticated with Google but wants their work email on the CV), but the
-  // warning is written to Firestore so the support team can investigate duplicate UIDs.
   if (authEmail) {
     const submittedEmail = String(email).trim().toLowerCase();
     const tokenEmail     = String(authEmail).trim().toLowerCase();
     if (submittedEmail !== tokenEmail) {
-      logger.warn('[OnboardingService] H5: Email mismatch — submitted email differs from Firebase auth token', {
+      logger.warn('[OnboardingService] H5: Email mismatch — submitted email differs from auth token', {
         userId,
         submittedEmail,
         tokenEmail,
-        // Avoid logging full emails in prod — log domain suffix only for pattern analysis
         submittedDomain: submittedEmail.split('@')[1] || 'unknown',
         tokenDomain:     tokenEmail.split('@')[1]     || 'unknown',
       });
-      // Write a non-blocking audit flag to Firestore for ops visibility
-      // (fire-and-forget — do not let this delay the save)
-      db.collection('onboardingProgress').doc(userId).set({
-        emailMismatchDetectedAt: FieldValue.serverTimestamp(),
-        emailMismatchNote: 'Submitted email differs from Firebase auth email — possible duplicate account risk.',
-      }, { merge: true }).catch(err => {
-        logger.warn('[OnboardingService] H5: Failed to write emailMismatch flag (non-fatal)', { userId, error: err.message });
+      // Write a non-blocking audit flag for ops visibility (fire-and-forget — do not delay the save)
+      supabase.from('onboardingProgress').upsert({
+        id:     userId,
+        emailMismatchDetectedAt: new Date().toISOString(),
+        emailMismatchNote: 'Submitted email differs from auth email — possible duplicate account risk.',
+      }).then(({ error }) => {
+        if (error) logger.warn('[OnboardingService] H5: Failed to write emailMismatch flag (non-fatal)', { userId, error: error.message });
       });
     }
   }
@@ -756,9 +745,6 @@ async function savePersonalDetails(userId, payload, authEmail = null) {
   const VALID_WORK_AUTH = new Set(['citizen', 'permanent_resident', 'work_permit', 'require_sponsorship']);
 
   // SPRINT-2 C8: E.164-compatible phone validation.
-  // ATS systems (Workday, Greenhouse, iCIMS) reject CVs where phone contains non-numeric characters.
-  // Accepts: +971501234567, 07911123456, 971 50 123 4567 (stripping spaces/dashes/brackets).
-  // Rejects: "my phone", "N/A", random text — all currently accepted by the raw passthrough.
   function validatePhone(rawPhone) {
     if (!rawPhone) return null;
     const cleaned = String(rawPhone).replace(/[\s\-().+]/g, '');
@@ -771,40 +757,31 @@ async function savePersonalDetails(userId, payload, authEmail = null) {
         ErrorCodes.VALIDATION_ERROR
       );
     }
-    return String(rawPhone).trim(); // store original formatting, cleaned form validated
+    return String(rawPhone).trim();
   }
 
   const personalDetails = {
     fullName:          String(fullName).trim(),
     email:             String(email).trim().toLowerCase(),
-    phone:             validatePhone(phone),  // SPRINT-2 C8: E.164-compatible validation — was raw passthrough
+    phone:             validatePhone(phone),
     city:              city    || null,
     country:           country || null,
     skills:            Array.isArray(skills) ? skills : [],
-    workAuthorisation: VALID_WORK_AUTH.has(workAuthorisation) ? workAuthorisation : null, // GAP S7
-    linkedInUrl:       validateUrl(linkedInUrl,  'linkedInUrl'),   // GAP S8
-    portfolioUrl:      validateUrl(portfolioUrl, 'portfolioUrl'),  // GAP S8
-    // PROMPT-4: profile photo — validated URL, stored as-is (frontend handles upload to Storage)
+    workAuthorisation: VALID_WORK_AUTH.has(workAuthorisation) ? workAuthorisation : null,
+    linkedInUrl:       validateUrl(linkedInUrl,  'linkedInUrl'),
+    portfolioUrl:      validateUrl(portfolioUrl, 'portfolioUrl'),
     profilePhotoUrl:   validateUrl(profilePhotoUrl, 'profilePhotoUrl'),
-    // GAP-03: international CV fields — all optional, omitted from PDF when absent
     languages: Array.isArray(languages) ? languages.filter(l => typeof l === 'string' && l.trim()).map(l => l.trim()) : [],
     projects:  Array.isArray(projects)  ? projects.filter(p => p?.title) : [],
     // GAP-M7: structured award objects { title, issuer, year } replace plain strings.
-    // Plain strings cannot express "Employee of the Year — Accenture — 2022" in a machine-readable
-    // way; the CV builder was rendering them as flat <li> bullets with no issuer or year grouping.
-    // Structured objects allow the CV to render: "Employee of the Year | Accenture | 2022"
-    // The old plain-string format is still accepted (migrated to { title: string } internally)
-    // so existing clients don't break.
     awards: Array.isArray(awards)
       ? awards
           .map(a => {
             if (!a) return null;
-            // Accept legacy plain string — normalise to { title }
             if (typeof a === 'string') {
               const t = a.trim();
               return t ? { title: t, issuer: null, year: null } : null;
             }
-            // Accept structured object { title, issuer?, year? }
             const title = stripHtml(String(a.title || '')).trim();
             if (!title) return null;
             const year = a.year ? parseInt(a.year, 10) : null;
@@ -816,27 +793,41 @@ async function savePersonalDetails(userId, payload, authEmail = null) {
           })
           .filter(Boolean)
       : [],
-    // SPRINT-2 H2: user-approved professional summary — passed verbatim to CV generation prompt.
-    // Without this, the AI writes a generic summary in one shot with no user review.
-    // Storing it here means getCvPreview can return it as an editable field, and
-    // buildCvContentPrompt receives "use this verbatim" when present.
+    // SPRINT-2 H2: user-approved professional summary
     professionalSummary: professionalSummary
       ? stripHtml(String(professionalSummary)).trim().slice(0, 800)
       : null,
   };
 
-  await db.collection('onboardingProgress').doc(userId).set({
-    step: 'personal_details_saved', wantsCv: true, personalDetails,
-    ...appendStepHistory('personal_details_saved'),
+  const nowISO = new Date().toISOString();
+  const stepHistory = await mergeStepHistory(userId, 'personal_details_saved');
+
+  const { error: upsertErr } = await supabase.from('onboardingProgress').upsert({
+    id:             userId,
+    step:           'personal_details_saved',
+    wantsCv:        true,
+    personalDetails,
+    stepHistory,
     // SPRINT-4A H12: track last active step for drop-off cohort analysis
     lastActiveStep: 'personal_details_saved',
-    lastActiveAt:   FieldValue.serverTimestamp(),
-    updatedAt: FieldValue.serverTimestamp(),
-  }, { merge: true });
+    lastActiveAt:   nowISO,
+    updatedAt:      nowISO,
+  });
+  if (upsertErr) {
+    logger.error('[DB] onboardingProgress.upsert (personalDetails) failed', { userId, error: upsertErr.message });
+    throw upsertErr;
+  }
 
   // GAP C2: store country for region inference
   if (country) {
-    await db.collection('userProfiles').doc(userId).set({ currentCountry: country, updatedAt: FieldValue.serverTimestamp() }, { merge: true });
+    const { error: profileErr } = await supabase.from('userProfiles').upsert({
+      id:             userId,
+      currentCountry: country,
+      updatedAt:      nowISO,
+    });
+    if (profileErr) {
+      logger.warn('[DB] userProfiles.upsert (country) failed', { userId, error: profileErr.message });
+    }
   }
 
   logger.info('[Onboarding] savePersonalDetails complete', { userId });
@@ -849,11 +840,10 @@ async function saveCareerIntent(userId, payload) {
   logger.info('[Onboarding] saveCareerIntent start', { userId });
 
   const { careerHistory, expectedRoleIds, currentCity, currentSalaryLPA, expectedSalaryLPA, jobSearchTimeline, skills,
-          noticePeriodDays, workMode, availableFrom } = payload; // GAP-08: recruiter-critical fields
+          noticePeriodDays, workMode, availableFrom } = payload;
 
   // GAP-09: careerHistory is now optional — allows a lightweight Step 0 call with just
   // expectedRoleIds + optional salary/city, before the full Track B form is completed.
-  // Full careerHistory can be provided later in the complete Track B submission.
   if (!expectedRoleIds?.length) {
     throw new AppError('expectedRoleIds is required.', 400, {}, ErrorCodes.VALIDATION_ERROR,
       'Please select at least one target role to save your career intent.');
@@ -876,9 +866,6 @@ async function saveCareerIntent(userId, payload) {
       if (typeof entry.durationMonths !== 'number' || entry.durationMonths < 0) throw new AppError(`careerHistory[${i}]: durationMonths must be a non-negative number.`, 400, { index: i }, ErrorCodes.VALIDATION_ERROR);
 
       // SPRINT-3 H4: optional startDate/endDate for gap detection in careerMomentum scoring.
-      // durationMonths remains the primary signal (Track B users may not remember exact dates).
-      // When dates are present, they are used to compute precise gap detection; otherwise
-      // durationMonths is used as before. Format: YYYY-MM (same as Track A).
       const datePattern = /^\d{4}-(0[1-9]|1[0-2])$/;
       if (entry.startDate && !datePattern.test(entry.startDate)) {
         throw new AppError(`careerHistory[${i}]: startDate must be YYYY-MM format.`, 400, { index: i }, ErrorCodes.VALIDATION_ERROR);
@@ -904,22 +891,23 @@ async function saveCareerIntent(userId, payload) {
     }
   }
 
+  const nowISO = new Date().toISOString();
+
   const profileUpdate = {
+    id:              userId,
     expectedRoleIds: expectedRoleIds.map(id => String(id).trim()).filter(Boolean),
-    updatedAt: FieldValue.serverTimestamp(),
+    updatedAt:       nowISO,
   };
 
   // GAP-09: only write careerHistory when provided (mini Step 0 omits it)
   if (Array.isArray(careerHistory) && careerHistory.length > 0) {
     profileUpdate.careerHistory = careerHistory.map(r => ({
-      roleId:        r.roleId.trim(),
+      roleId:         r.roleId.trim(),
       durationMonths: r.durationMonths,
-      description:   r.description || null,
-      isCurrent:     r.isCurrent   || false,
-      // SPRINT-3 H4: optional date fields for precise gap detection in careerMomentum scoring.
-      // When present, CHI uses actual dates; otherwise falls back to durationMonths estimation.
-      startDate:     r.startDate   || null,
-      endDate:       r.endDate     || null,
+      description:    r.description || null,
+      isCurrent:      r.isCurrent   || false,
+      startDate:      r.startDate   || null,
+      endDate:        r.endDate     || null,
     }));
   }
 
@@ -933,26 +921,30 @@ async function saveCareerIntent(userId, payload) {
   if (workMode         !== undefined) profileUpdate.workMode         = workMode         || null;
   if (availableFrom    !== undefined) profileUpdate.availableFrom    = availableFrom    || null;
 
+  const stepHistory = await mergeStepHistory(userId, 'career_intent_saved');
+
   await Promise.all([
-    db.collection('userProfiles').doc(userId).set(profileUpdate, { merge: true }),
-    db.collection('onboardingProgress').doc(userId).set({
-      ...appendStepHistory('career_intent_saved'), step: 'career_intent_saved',
+    supabase.from('userProfiles').upsert(profileUpdate),
+    supabase.from('onboardingProgress').upsert({
+      id:             userId,
+      step:           'career_intent_saved',
+      stepHistory,
       // SPRINT-4A H12: track last active step for drop-off cohort analysis
       lastActiveStep: 'career_intent_saved',
-      lastActiveAt:   FieldValue.serverTimestamp(),
-      updatedAt: FieldValue.serverTimestamp(),
-    }, { merge: true }),
+      lastActiveAt:   nowISO,
+      updatedAt:      nowISO,
+    }),
   ]);
 
-  const [progressSnap, profileSnap] = await Promise.all([
-    db.collection('onboardingProgress').doc(userId).get(),
-    db.collection('userProfiles').doc(userId).get(),
+  const [{ data: progressRow }, { data: profileRow }] = await Promise.all([
+    supabase.from('onboardingProgress').select('*').eq('id', userId).maybeSingle(),
+    supabase.from('userProfiles').select('*').eq('id', userId).maybeSingle(),
   ]);
-  await persistCompletionIfReady(userId, progressSnap.data() || {}, profileSnap.data() || {});
+  await persistCompletionIfReady(userId, progressRow || {}, profileRow || {});
   emitOnboardingEvent(userId, 'onboarding_step_completed', { step: 'career_intent_saved', trackB: true });
 
   // GAP S6: log role cross-reference (non-blocking)
-  const expTitles = (progressSnap.data()?.experience || []).map(e => e.jobTitle).filter(Boolean);
+  const expTitles = (progressRow?.experience || []).map(e => e.jobTitle).filter(Boolean);
   if (expTitles.length && profileUpdate.expectedRoleIds.length) {
     logger.debug('[OnboardingService] Role cross-reference', { userId, experienceTitles: expTitles, expectedRoleIds: profileUpdate.expectedRoleIds });
   }

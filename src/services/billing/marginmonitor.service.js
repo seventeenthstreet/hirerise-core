@@ -1,6 +1,19 @@
 'use strict';
 
 /**
+ * MIGRATION: db.collection() → supabase.from()
+ *
+ * All db.collection() shim calls in this file have been replaced with
+ * direct supabase.from() calls. Result shapes mirror the Firestore shim:
+ *   { data, error } from supabase  →  unwrapped to plain objects
+ *   .maybeSingle()  for single-doc reads (returns null not error on 0 rows)
+ *   .select('*')    for collection queries
+ *
+ * Batch writes → Promise.all([supabase.from(T).upsert(...), ...])
+ * Transactions → sequential awaits (best-effort, same as shim behaviour)
+ */
+
+/**
  * marginMonitor.service.js — Margin Health & Cost Anomaly Detection
  * =================================================================
  * PRODUCTION HARDENED — Phase 7
@@ -34,7 +47,8 @@
  *   DAILY_SPIKE_MULTIPLIER:      3×   — today's cost > 3× 7-day avg = spike
  */
 
-const { db, Timestamp } = require('../../config/supabase');
+const supabase = require('../../config/supabase');
+const { Timestamp } = require('../../config/supabase');
 const logger = require('../../utils/logger');
 
 // ─── Thresholds ───────────────────────────────────────────────────────────────
@@ -61,11 +75,9 @@ async function fetchDayCostSummary(dateStr) {
   const start = new Date(`${dateStr}T00:00:00.000Z`);
   const end   = new Date(`${dateStr}T23:59:59.999Z`);
 
-  const snap = await db
-    .collection('usageLogs')
-    .where('createdAt', '>=', Timestamp.fromDate(start))
-    .where('createdAt', '<=', Timestamp.fromDate(end))
-    .get();
+  const { data: _logs, error: _le } = await supabase.from('usageLogs').select('*').gte('createdAt', start.toISOString()).lte('createdAt', end.toISOString());
+  if (_le) logger.error('[MarginMonitor] usageLogs fetch error:', _le.message);
+  const snap = { size: (_logs||[]).length, docs: (_logs||[]).map(r=>({data:()=>r})) };
 
   let totalCostUSD    = 0;
   let totalRevenueUSD = 0;
@@ -105,13 +117,8 @@ async function fetch7DayAvgCost(endDateStr) {
   start7.setDate(start7.getDate() - 7);
 
   // Read from pre-aggregated daily snapshots (faster than scanning usageLogs)
-  const snap = await db
-    .collection('metrics')
-    .doc('daily')
-    .collection('snapshots')
-    .where('date', '>=', start7.toISOString().split('T')[0])
-    .where('date', '<',  endDateStr)
-    .get();
+  const { data: _snaps } = await supabase.from('metrics_daily_snapshots').select('totalCostUSD, date').gte('date', start7.toISOString().split('T')[0]).lt('date', endDateStr);
+  const snap = { empty: !_snaps?.length, docs: (_snaps||[]).map(r=>({data:()=>r})) };
 
   if (snap.empty) return null;
 
@@ -125,18 +132,14 @@ async function fetch7DayAvgCost(endDateStr) {
 async function writeAlert(alert) {
   
   try {
-    const ref = db.collection('ai_alerts').doc();
-    await ref.set({
+    const { error: _alertErr } = await supabase.from('ai_alerts').insert({
       ...alert,
       resolved:  false,
       isDeleted: false,
-      createdAt: Timestamp.now(),
-      expiresAt: (() => {
-        const d = new Date();
-        d.setDate(d.getDate() + 180);
-        return Timestamp.fromDate(d);
-      })(),
+      createdAt: new Date().toISOString(),
+      expiresAt: (() => { const d = new Date(); d.setDate(d.getDate() + 180); return d.toISOString(); })(),
     });
+    if (_alertErr) logger.error('[MarginMonitor] Failed to write alert', { error: _alertErr.message });
     logger.warn('[MarginMonitor] Alert written', { type: alert.type, severity: alert.severity });
   } catch (err) {
     logger.error('[MarginMonitor] Failed to write alert', { error: err.message });
@@ -330,12 +333,3 @@ async function runDailyChecks(dateStr) {
 }
 
 module.exports = { runDailyChecks, THRESHOLDS };
-
-
-
-
-
-
-
-
-

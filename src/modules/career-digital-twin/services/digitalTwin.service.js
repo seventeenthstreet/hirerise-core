@@ -10,7 +10,7 @@
  *   2. Check Redis / in-memory cache for a warm simulation result.
  *   3. If cache miss → call CareerDigitalTwinEngine.simulateCareerPaths().
  *   4. Optionally enrich with AI-generated narrative (includeNarrative flag).
- *   5. Persist result to Firestore (career_simulations collection).
+ *   5. Persist result to Supabase (career_simulations table).
  *   6. Write result to cache with 30-minute TTL.
  *   7. Return shaped response to the controller.
  *
@@ -19,9 +19,9 @@
  *   TTL:  1800 seconds (30 minutes)
  *   Store: Redis when CACHE_PROVIDER=redis, else in-memory
  *
- * Firestore persistence:
- *   Collection: career_simulations
- *   One document per (userId, simulation run). Old runs are not deleted —
+ * Supabase persistence:
+ *   Table: career_simulations
+ *   One row per (userId, simulation run). Old runs are not deleted —
  *   history is preserved for the career timeline feature.
  *
  * @module modules/career-digital-twin/services/digitalTwin.service
@@ -29,20 +29,19 @@
 
 'use strict';
 
-const logger      = require('../../../utils/logger');
-const anthropic   = require('../../../config/anthropic.client');
-const { db }      = require('../../../config/supabase');
+const logger = require('../../../utils/logger');
+const anthropic = require('../../../config/anthropic.client');
+const supabase = require('../../../core/supabaseClient');
 const cacheManager = require('../../../core/cache/cache.manager');
-
-const engine      = require('../../../engines/career-digital-twin.engine');
+const engine = require('../../../engines/career-digital-twin.engine');
 const { buildSimulationDoc } = require('../models/simulation.model');
 const { buildNarrativeMessages } = require('../prompts/twinPrompt.builder');
 
 // ─── Config ───────────────────────────────────────────────────────────────────
 
-const COLLECTION      = 'career_simulations';
-const CACHE_TTL_SEC   = parseInt(process.env.DIGITAL_TWIN_CACHE_TTL_SEC || '1800', 10); // 30 min
-const AI_MAX_TOKENS   = 1500;
+const COLLECTION = 'career_simulations';
+const CACHE_TTL_SEC = parseInt(process.env.DIGITAL_TWIN_CACHE_TTL_SEC || '1800', 10); // 30 min
+const AI_MAX_TOKENS = 1500;
 const NARRATIVE_MODEL = 'claude-sonnet-4-20250514';
 
 // ─── Cache helpers ────────────────────────────────────────────────────────────
@@ -56,7 +55,10 @@ const NARRATIVE_MODEL = 'claude-sonnet-4-20250514';
  * @returns {string}
  */
 function _cacheKey(userId, role) {
-  const slug = (role || 'unknown').toLowerCase().replace(/[^a-z0-9]/g, '_').slice(0, 60);
+  const slug = (role || 'unknown')
+    .toLowerCase()
+    .replace(/[^a-z0-9]/g, '_')
+    .slice(0, 60);
   return `digital_twin:${userId}:${slug}`;
 }
 
@@ -69,15 +71,18 @@ function _cacheKey(userId, role) {
  */
 async function _cacheGet(key) {
   try {
-    const cache  = cacheManager.getClient();
-    const raw    = await cache.get(key);
+    const cache = cacheManager.getClient();
+    const raw = await cache.get(key);
     if (raw) {
       const parsed = typeof raw === 'string' ? JSON.parse(raw) : raw;
       logger.debug('[DigitalTwinService] Cache HIT', { key });
       return parsed;
     }
   } catch (err) {
-    logger.warn('[DigitalTwinService] Cache GET error (non-fatal)', { key, err: err.message });
+    logger.warn('[DigitalTwinService] Cache GET error (non-fatal)', {
+      key,
+      err: err.message
+    });
   }
   return null;
 }
@@ -96,7 +101,10 @@ async function _cacheSet(key, value) {
     await cache.set(key, JSON.stringify(value), CACHE_TTL_SEC);
     logger.debug('[DigitalTwinService] Cache SET', { key, ttl: CACHE_TTL_SEC });
   } catch (err) {
-    logger.warn('[DigitalTwinService] Cache SET error (non-fatal)', { key, err: err.message });
+    logger.warn('[DigitalTwinService] Cache SET error (non-fatal)', {
+      key,
+      err: err.message
+    });
   }
 }
 
@@ -115,60 +123,68 @@ async function _enrichWithNarratives(userProfile, careerPaths) {
     logger.warn('[DigitalTwinService] AI client unavailable, skipping narratives');
     return careerPaths;
   }
-
   try {
     const { system, messages } = buildNarrativeMessages(userProfile, careerPaths);
-
     const response = await anthropic.messages.create({
-      model:       NARRATIVE_MODEL,
-      max_tokens:  AI_MAX_TOKENS,
+      model: NARRATIVE_MODEL,
+      max_tokens: AI_MAX_TOKENS,
       temperature: 0.4,
       system,
-      messages,
+      messages
     });
-
     const raw = response.content?.[0]?.text || '';
     // Strip possible markdown fences before parsing
-    const clean  = raw.replace(/```json|```/g, '').trim();
+    const clean = raw.replace(/```json|```/g, '').trim();
     const parsed = JSON.parse(clean);
-
     const narrativeMap = new Map(
       (parsed.narratives || []).map(n => [n.strategy_id, n])
     );
-
     return careerPaths.map(p => {
       const n = narrativeMap.get(p.strategy_id);
       if (!n) return p;
       return {
         ...p,
-        narrative:      n.summary       || null,
-        key_milestone:  n.key_milestone || null,
+        narrative: n.summary || null,
+        key_milestone: n.key_milestone || null
       };
     });
   } catch (err) {
-    logger.warn('[DigitalTwinService] Narrative enrichment failed (non-fatal)', { err: err.message });
+    logger.warn('[DigitalTwinService] Narrative enrichment failed (non-fatal)', {
+      err: err.message
+    });
     return careerPaths; // graceful degradation
   }
 }
 
-// ─── Firestore persistence ────────────────────────────────────────────────────
+// ─── Supabase persistence ─────────────────────────────────────────────────────
 
 /**
- * Persist a simulation result to Firestore.
+ * Persist a simulation result to Supabase.
  * Non-blocking — awaited but errors are swallowed so they never block the API.
  *
  * @param {string} userId
  * @param {Object} simulationResult
- * @returns {Promise<string|null>}  Firestore document ID or null on failure
+ * @returns {Promise<string|null>}  Inserted row ID or null on failure
  */
 async function _persist(userId, simulationResult) {
   try {
     const doc = buildSimulationDoc(userId, simulationResult);
-    const ref = await db.collection(COLLECTION).add(doc);
-    logger.info('[DigitalTwinService] Simulation persisted', { userId, docId: ref.id });
-    return ref.id;
+    const { data, error } = await supabase
+      .from(COLLECTION)
+      .insert(doc)
+      .select('id')
+      .single();
+    if (error) throw error;
+    logger.info('[DigitalTwinService] Simulation persisted', {
+      userId,
+      docId: data?.id
+    });
+    return data?.id || null;
   } catch (err) {
-    logger.warn('[DigitalTwinService] Firestore persist failed (non-fatal)', { userId, err: err.message });
+    logger.warn('[DigitalTwinService] Supabase persist failed (non-fatal)', {
+      userId,
+      err: err.message
+    });
     return null;
   }
 }
@@ -179,7 +195,7 @@ async function _persist(userId, simulationResult) {
  * runSimulation({ userId, userProfile, marketData, includeNarrative, forceRefresh })
  *
  * Main entry point. Checks cache, runs engine, optionally adds AI narratives,
- * persists to Firestore, writes to cache, and returns the simulation result.
+ * persists to Supabase, writes to cache, and returns the simulation result.
  *
  * @param {Object}  params
  * @param {string}  params.userId              — user ID
@@ -194,9 +210,9 @@ async function _persist(userId, simulationResult) {
 async function runSimulation({
   userId,
   userProfile,
-  marketData     = {},
+  marketData = {},
   includeNarrative = false,
-  forceRefresh   = false,
+  forceRefresh = false
 }) {
   const key = _cacheKey(userId, userProfile.role);
 
@@ -211,9 +227,8 @@ async function runSimulation({
   // ── Engine run ────────────────────────────────────────────────────────────
   logger.info('[DigitalTwinService] Running simulation (cache miss)', {
     userId,
-    role: userProfile.role,
+    role: userProfile.role
   });
-
   const simulationResult = await engine.simulateCareerPaths(userProfile, marketData);
 
   // ── Optional AI narrative enrichment ──────────────────────────────────────
@@ -224,24 +239,23 @@ async function runSimulation({
     );
   }
 
-  // ── Persist to Firestore (non-blocking intent, awaited for doc ID) ─────────
+  // ── Persist to Supabase (non-blocking intent, awaited for row ID) ──────────
   const simulationId = await _persist(userId, simulationResult);
 
   // ── Cache write ───────────────────────────────────────────────────────────
   const response = {
     ...simulationResult,
     simulation_id: simulationId,
-    cached:        false,
+    cached: false
   };
   await _cacheSet(key, response);
-
   return response;
 }
 
 /**
  * getStoredSimulations(userId, limit?)
  *
- * Fetch past simulation records for a user from Firestore.
+ * Fetch past simulation records for a user from Supabase.
  * Used by GET /api/career/simulations.
  *
  * @param {string} userId
@@ -250,20 +264,23 @@ async function runSimulation({
  */
 async function getStoredSimulations(userId, limit = 10) {
   try {
-    const snapshot = await db
-      .collection(COLLECTION)
-      .where('user_id', '==', userId)
-      .orderBy('created_at', 'desc')
-      .limit(limit)
-      .get();
+    const { data, error } = await supabase
+      .from(COLLECTION)
+      .select('*')
+      .eq('user_id', userId)
+      .order('created_at', { ascending: false })
+      .limit(limit);
 
-    return snapshot.docs.map(doc => ({
-      id: doc.id,
-      ...doc.data(),
-      created_at: doc.data().created_at?.toDate?.()?.toISOString() || null,
+    if (error) throw error;
+    return (data || []).map(row => ({
+      ...row,
+      created_at: row.created_at || null
     }));
   } catch (err) {
-    logger.error('[DigitalTwinService] getStoredSimulations failed', { userId, err: err.message });
+    logger.error('[DigitalTwinService] getStoredSimulations failed', {
+      userId,
+      err: err.message
+    });
     throw err;
   }
 }
@@ -287,22 +304,14 @@ async function invalidateUserCache(userId, role) {
     await cache.delete(key);
     logger.info('[DigitalTwinService] User cache invalidated', { userId, key });
   } catch (err) {
-    logger.warn('[DigitalTwinService] Cache invalidation failed (non-fatal)', { err: err.message });
+    logger.warn('[DigitalTwinService] Cache invalidation failed (non-fatal)', {
+      err: err.message
+    });
   }
 }
 
 module.exports = {
   runSimulation,
   getStoredSimulations,
-  invalidateUserCache,
+  invalidateUserCache
 };
-
-
-
-
-
-
-
-
-
-

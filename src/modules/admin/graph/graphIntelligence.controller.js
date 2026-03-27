@@ -24,7 +24,10 @@ async function fetchWhere(table, col, val, select = '*') {
 }
 
 async function fetchById(table, idCol, id) {
-  const { data } = await getSupabase().from(table).select('*').eq(idCol, id).single();
+  // HARDENING T2: .single() → .maybeSingle() — record may not exist
+  // HARDENING T7: destructure and surface error
+  const { data, error } = await getSupabase().from(table).select('*').eq(idCol, id).maybeSingle();
+  if (error) throw error;
   return data;
 }
 
@@ -283,11 +286,3 @@ const getMarketIntelligence = asyncHandler(async (req, res) => {
 
 module.exports = { getCareerGraph, getRoleDetail, getSkillGraph, getSkillDetail,
   simulatePath, searchRoles, getRoleImpact, getMarketIntelligence };
-
-
-
-
-
-
-
-

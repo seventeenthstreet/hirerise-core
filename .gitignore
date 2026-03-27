@@ -9,6 +9,9 @@ secrets/
 *.json.json
 serviceAccountKey*
 firebase-admin.json
+firebase-admin*.json
+gcp-service-account*.json
+*-adminsdk-*.json
 
 # ==============================
 # 📦 Node
@@ -42,7 +45,10 @@ firestore-debug.log
 # ==============================
 # 🔧 Build / Runtime
 # ==============================
+build/
+dist/
 build/Release
+.next/
 pids
 *.pid
 *.seed
@@ -56,8 +62,9 @@ pids
 .dataconnect
 .DS_Store
 Thumbs.db
+
 # ==============================
-# 🧪 Test fixtures & debug scripts (C-04)
+# 🧪 Test fixtures & debug scripts
 # ==============================
 personal.json
 chi.json
@@ -67,19 +74,9 @@ gencv.json
 growth.json
 score.json
 test.json
+
 get-token.js
-get-firebase-token.mjs
-test-tier-integration.js
-"Get test token · JS"
-==============================
-# 🧪 Fire Base related
-# ==============================
-firebase-admin*.json
-gcp-service-account*.json
-.firebase/
 get-firebase-token.js
 get-firebase-token.mjs
-serviceAccountKey*.json
-*-adminsdk-*.json
+test-tier-integration.js
 firestore-backup.json
-firestore-debug.log

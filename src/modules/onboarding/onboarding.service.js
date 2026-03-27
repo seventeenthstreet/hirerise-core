@@ -66,17 +66,10 @@ module.exports = {
   // ── Shared helpers re-exported for controllers that reference them directly ────
   sanitiseInput:              helpers.sanitiseInput,
   appendStepHistory:          helpers.appendStepHistory,
+  mergeStepHistory:           helpers.mergeStepHistory,
   persistCompletionIfReady:   helpers.persistCompletionIfReady,
   calculateCareerWeights:     helpers.calculateCareerWeights,
   buildAIContext:             helpers.buildAIContext,
   mergeSkills:                helpers.mergeSkills,
   CHI_TREND_THRESHOLD:        helpers.CHI_TREND_THRESHOLD,
 };
-
-
-
-
-
-
-
-

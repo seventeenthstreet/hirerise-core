@@ -6,32 +6,40 @@
  * Extracted from onboarding.service.js (god-object decomposition).
  * Owns: getProgress, getChiReady, getTeaserChi, getChiExplainer,
  *       computeChiCompleteness, getFunnelAnalytics
+ *
+ * MIGRATED: All Firestore db.collection() calls replaced with supabase.from()
+ * FieldValue.serverTimestamp() → new Date().toISOString()
+ * snap.exists / snap.data()   → Supabase { data, error } destructuring
+ * snap.docs / snap.empty      → plain data arrays
  */
 
-const { db } = require('../../config/supabase');
+const supabase = require('../../config/supabase');
 const { AppError, ErrorCodes } = require('../../middleware/errorHandler');
 const logger = require('../../utils/logger');
 const {
-  buildAIContext, evaluateCompletion, inferRegion,
+  buildAIContext,
+  evaluateCompletion,
+  inferRegion,
   CHI_TREND_THRESHOLD,
 } = require('./onboarding.helpers');
 
 async function getChiReady(userId) {
   if (!userId) throw new AppError('userId is required', 400, {}, ErrorCodes.VALIDATION_ERROR);
 
-  const [progressSnap, profileSnap, chiSnap] = await Promise.all([
-    db.collection('onboardingProgress').doc(userId).get(),
-    db.collection('userProfiles').doc(userId).get(),
-    db.collection('careerHealthIndex')
-      .where('userId', '==', userId)
-      .where('softDeleted', '==', false)
-      .orderBy('generatedAt', 'desc')
-      .limit(1)
-      .get(),
+  const [progressRes, profileRes, chiRes] = await Promise.all([
+    supabase.from('onboardingProgress').select('*').eq('id', userId).maybeSingle(),
+    supabase.from('userProfiles').select('*').eq('id', userId).maybeSingle(),
+    supabase
+      .from('careerHealthIndex')
+      .select('*')
+      .eq('userId', userId)
+      .eq('softDeleted', false)
+      .order('generatedAt', { ascending: false })
+      .limit(1),
   ]);
 
-  const progress = progressSnap.exists  ? progressSnap.data()  : {};
-  const profile  = profileSnap.exists   ? profileSnap.data()   : {};
+  const progress = progressRes.data || {};
+  const profile  = profileRes.data  || {};
 
   // CHI completeness nudges — sorted by impact, capped at 3
   const { score: dataCompleteness, missing } = computeChiCompleteness(progress, profile);
@@ -39,12 +47,14 @@ async function getChiReady(userId) {
     .sort((a, b) => (b.improvementPts || 0) - (a.improvementPts || 0))
     .slice(0, 3);
 
+  const chiRows = chiRes.data || [];
+
   // No CHI at all
-  if (chiSnap.empty) {
+  if (chiRows.length === 0) {
     return { userId, isReady: false, latestChi: null, nudges, dataCompleteness };
   }
 
-  const chiData = chiSnap.docs[0].data();
+  const chiData = chiRows[0];
 
   // Teaser source is never the user's own score
   if (chiData.analysisSource === 'teaser') {
@@ -55,14 +65,14 @@ async function getChiReady(userId) {
     userId,
     isReady: true,
     latestChi: {
-      chiScore:       chiData.chiScore,
-      analysisSource: chiData.analysisSource,
-      confidence:     chiData.confidence || 'moderate',  // P2-03 label
-      chiConfidence:  chiData.chiConfidence,
-      generatedAt:    chiData.generatedAt?.toDate?.()?.toISOString() ?? chiData.generatedAt,
-      topStrength:    chiData.topStrength    || null,
-      criticalGap:    chiData.criticalGap    || null,
-      marketPosition: chiData.marketPosition || null,
+      chiScore:        chiData.chiScore,
+      analysisSource:  chiData.analysisSource,
+      confidence:      chiData.confidence || 'moderate',
+      chiConfidence:   chiData.chiConfidence,
+      generatedAt:     chiData.generatedAt ?? null,
+      topStrength:     chiData.topStrength  || null,
+      criticalGap:     chiData.criticalGap  || null,
+      marketPosition:  chiData.marketPosition || null,
     },
     nudges,
     dataCompleteness,
@@ -72,14 +82,32 @@ async function getChiReady(userId) {
 async function getTeaserChi(jobFamilyId = null) {
   try {
     const targetFamily = jobFamilyId ? String(jobFamilyId).trim() : 'general';
-    const snap = await db.collection('teaserChi').doc(targetFamily).get();
-    if (snap.exists) {
-      return { ...snap.data(), analysisSource: 'teaser' };
+
+    const { data: teaserRow, error: teaserErr } = await supabase
+      .from('teaserChi')
+      .select('*')
+      .eq('id', targetFamily)
+      .maybeSingle();
+    if (teaserErr && teaserErr.code !== 'PGRST116') {
+      logger.error('[DB] teaserChi.get:', teaserErr.message);
     }
+
+    if (teaserRow) {
+      return { ...teaserRow, analysisSource: 'teaser' };
+    }
+
     if (targetFamily !== 'general') {
-      const generalSnap = await db.collection('teaserChi').doc('general').get();
-      if (generalSnap.exists) return { ...generalSnap.data(), analysisSource: 'teaser' };
+      const { data: generalRow, error: generalErr } = await supabase
+        .from('teaserChi')
+        .select('*')
+        .eq('id', 'general')
+        .maybeSingle();
+      if (generalErr && generalErr.code !== 'PGRST116') {
+        logger.error('[DB] teaserChi.get:', generalErr.message);
+      }
+      if (generalRow) return { ...generalRow, analysisSource: 'teaser' };
     }
+
     logger.warn('[OnboardingService] teaserChi collection not seeded — returning fallback');
     return TEASER_CHI_FALLBACK;
   } catch (err) {
@@ -91,13 +119,13 @@ async function getTeaserChi(jobFamilyId = null) {
 async function getChiExplainer(userId) {
   if (!userId) throw new AppError('userId is required', 400, {}, ErrorCodes.VALIDATION_ERROR);
 
-  const [progressSnap, profileSnap] = await Promise.all([
-    db.collection('onboardingProgress').doc(userId).get(),
-    db.collection('userProfiles').doc(userId).get(),
+  const [progressRes, profileRes] = await Promise.all([
+    supabase.from('onboardingProgress').select('*').eq('id', userId).maybeSingle(),
+    supabase.from('userProfiles').select('*').eq('id', userId).maybeSingle(),
   ]);
 
-  const progress = progressSnap.exists  ? progressSnap.data() : {};
-  const profile  = profileSnap.exists   ? profileSnap.data()  : {};
+  const progress = progressRes.data || {};
+  const profile  = profileRes.data  || {};
 
   // Reuse the existing completeness scorer so nudges are always in sync
   const { score, missing } = computeChiCompleteness(progress, profile);
@@ -105,19 +133,21 @@ async function getChiExplainer(userId) {
   // Surface any existing CHI score so the frontend can show "your last score was X"
   let lastScore = null;
   try {
-    const chiSnap = await db.collection('careerHealthIndex')
-      .where('userId', '==', userId)
-      .where('softDeleted', '==', false)
-      .orderBy('generatedAt', 'desc')
-      .limit(1)
-      .get();
-    if (!chiSnap.empty) {
-      const d = chiSnap.docs[0].data();
+    const { data: chiRows, error: chiErr } = await supabase
+      .from('careerHealthIndex')
+      .select('chiScore, analysisSource, marketPosition, generatedAt')
+      .eq('userId', userId)
+      .eq('softDeleted', false)
+      .order('generatedAt', { ascending: false })
+      .limit(1);
+
+    if (!chiErr && chiRows && chiRows.length > 0) {
+      const d = chiRows[0];
       lastScore = {
         chiScore:       d.chiScore,
         analysisSource: d.analysisSource,
         marketPosition: d.marketPosition,
-        generatedAt:    d.generatedAt?.toDate?.()?.toISOString() ?? d.generatedAt,
+        generatedAt:    d.generatedAt ?? null,
       };
     }
   } catch {
@@ -126,10 +156,10 @@ async function getChiExplainer(userId) {
 
   return {
     userId,
-    dimensions:          CHI_DIMENSION_DESCRIPTIONS,
+    dimensions: CHI_DIMENSION_DESCRIPTIONS,
     scoringModel: {
       totalDimensions: 5,
-      scoreRange:      '0–100',
+      scoreRange: '0–100',
       bands: [
         { min: 85, label: 'Highly Ready' },
         { min: 70, label: 'Ready' },
@@ -142,7 +172,7 @@ async function getChiExplainer(userId) {
       completenessScore: score,
       missingFields:     missing,
       isReadyForChi:     score >= 60,
-      message:           score >= 60
+      message: score >= 60
         ? 'Your profile has enough data for a reliable Career Health Score.'
         : `Complete ${missing.length} more field${missing.length !== 1 ? 's' : ''} to unlock a reliable score.`,
     },
@@ -153,64 +183,66 @@ async function getChiExplainer(userId) {
 function computeChiCompleteness(progress, profile) {
   const checks = [
     // [field present?, weight, label, nudge message]
-    // Weights now mirror the actual CHI scoring weights so the nudge correctly
-    // prioritises the fields that matter most to the score.
-    // SPRINT-1 C1: targetRoleId replaces free-text targetRole — now checks the structured ID field
-    [!!(profile.expectedRoleIds?.length || profile.targetRoleId), 25, 'Target Roles',    'Add your target role — required for market alignment and salary benchmarking'],
-    // P1-03: salary is now optional. Mark present if: value exists, OR salaryDeclined=true (explicit decline), OR legacy -1 sentinel
-    [
-      (profile.currentSalaryLPA !== null && profile.currentSalaryLPA !== undefined)
-        || profile.salaryDeclined === true
-        || profile.currentSalaryLPA === -1,
-      15, 'Current Salary',
-      'Add your current salary for salary benchmarking (+15 pts) — or select "prefer not to say"'
-    ],
-    [!!profile.currentCity,              7,  'Location',        'Add your current city'],
-    [!!profile.skills?.length,           25, 'Skills',          'Add your skills with proficiency levels'],
-    [!!(progress.education?.length),      8, 'Education',       'Add education history'],
-    [!!(progress.experience?.length),    15, 'Work Experience', 'Add work experience'],
-    [!!profile.totalExperienceYears,      5, 'Tenure',          'Add dates to your experience entries'],
-    // SPRINT-1 C5: seniority nudge — improves peerComparison accuracy
-    [!!profile.selfDeclaredSeniority,    -0, 'Seniority Level', 'Add your seniority level for accurate peer benchmarking'],
-    // Note: seniority has 0 weight here as it is captured in the same Step 1 call —
-    // if experience is present, seniority should also be present. The nudge fires
-    // only when experience is present but seniority is missing (migration gap).
+    // Weights mirror the actual CHI scoring weights.
+    // SPRINT-1 C1: targetRoleId replaces free-text targetRole
+    [!!(profile.expectedRoleIds?.length || profile.targetRoleId), 25, 'Target Roles',
+      'Add your target role — required for market alignment and salary benchmarking'],
+    // P1-03: salary is optional; mark present if value exists, salaryDeclined=true, or legacy -1 sentinel
+    [profile.currentSalaryLPA !== null && profile.currentSalaryLPA !== undefined ||
+     profile.salaryDeclined === true ||
+     profile.currentSalaryLPA === -1,
+     15, 'Current Salary',
+     'Add your current salary for salary benchmarking (+15 pts) — or select "prefer not to say"'],
+    [!!profile.currentCity,          7,  'Location',        'Add your current city'],
+    [!!profile.skills?.length,       25, 'Skills',          'Add your skills with proficiency levels'],
+    [!!progress.education?.length,   8,  'Education',       'Add education history'],
+    [!!progress.experience?.length,  15, 'Work Experience', 'Add work experience'],
+    [!!profile.totalExperienceYears, 5,  'Tenure',          'Add dates to your experience entries'],
+    // SPRINT-1 C5: seniority nudge — improves peerComparison accuracy (weight=0, informational)
+    [!!profile.selfDeclaredSeniority, -0, 'Seniority Level',
+      'Add your seniority level for accurate peer benchmarking'],
   ];
-  // Re-weight: seniority nudge entry is informational only — strip weight=0 entries from score
+
   let score = 0;
   const missing = [];
+
   for (const [present, weight, label, nudge] of checks) {
     if (weight > 0) {
-      if (present) score += weight;
-      else missing.push({
-        field:          label,
-        nudge,
-        improvementPts: weight,
-        impact:         weight >= 20 ? 'HIGH' : weight >= 10 ? 'MEDIUM' : 'LOW', // P3-05: label tier
-      });
+      if (present) {
+        score += weight;
+      } else {
+        missing.push({
+          field:          label,
+          nudge,
+          improvementPts: weight,
+          impact: weight >= 20 ? 'HIGH' : weight >= 10 ? 'MEDIUM' : 'LOW',
+        });
+      }
     } else if (!present && progress.experience?.length) {
       missing.push({ field: label, nudge, improvementPts: 0, impact: 'LOW' });
     }
   }
-  // P1-11: Sort by improvementPts descending — frontend always shows highest-impact nudge first.
-  // Cap at 3 items — more than 3 feels like a nagging checklist and reduces action rate.
+
+  // P1-11: Sort by improvementPts descending — cap at 3
   missing.sort((a, b) => b.improvementPts - a.improvementPts);
   const topMissing = missing.slice(0, 3);
+
   return { score: Math.min(100, score), missing: topMissing };
 }
 
 async function getProgress(userId, tier) {
   if (!userId) throw new AppError('userId is required', 400, {}, ErrorCodes.VALIDATION_ERROR);
 
-  const [progressSnap, profileSnap, remainingQuota] = await Promise.all([
-    db.collection('onboardingProgress').doc(userId).get(),
-    db.collection('userProfiles').doc(userId).get(),
-    tier === 'free' ? getRemainingQuota(userId, 'free').catch(() => null) : Promise.resolve(null),
+  const [progressRes, profileRes, remainingQuota] = await Promise.all([
+    supabase.from('onboardingProgress').select('*').eq('id', userId).maybeSingle(),
+    supabase.from('userProfiles').select('*').eq('id', userId).maybeSingle(),
+    tier === 'free'
+      ? getRemainingQuota(userId, 'free').catch(() => null)
+      : Promise.resolve(null),
   ]);
 
-  const upgradeUrl   = process.env.UPGRADE_URL ?? '/pricing';
+  const upgradeUrl = process.env.UPGRADE_URL ?? '/pricing';
   let quotaExhausted = null;
-
   if (tier === 'free' && remainingQuota) {
     quotaExhausted = {
       careerReport: (remainingQuota.careerReport ?? 1) <= 0,
@@ -219,197 +251,223 @@ async function getProgress(userId, tier) {
     };
   }
 
-  if (!progressSnap.exists) {
-    return { userId, step: 'not_started', nextRequiredStep: 'education_experience', data: null, remainingQuota, quotaExhausted, progressPercent: 0, totalSteps: 4, completedSteps: 0 };
+  if (!progressRes.data) {
+    return {
+      userId,
+      step:             'not_started',
+      nextRequiredStep: 'education_experience',
+      data:             null,
+      remainingQuota,
+      quotaExhausted,
+      progressPercent:  0,
+      totalSteps:       4,
+      completedSteps:   0,
+    };
   }
 
-  const progress = progressSnap.data();
-  const profile  = profileSnap.data() || {};
+  const progress = progressRes.data;
+  const profile  = profileRes.data || {};
+
   const { isComplete, trackA, trackB } = evaluateCompletion(progress, profile);
 
   // GAP-05: CHI data completeness nudge signal
   const chiCompleteness = computeChiCompleteness(progress, profile);
 
   // GAP F2 / P1-08: next required step — updated for two-phase model
-let nextRequiredStep = null;
-
-if (!progress.quickStartCompleted && !progress.education?.length && !progress.experience?.length) {
-  nextRequiredStep = 'quick_start';
-}
-else if (!progress.careerReport) {
-  nextRequiredStep = 'career_report';
-}
-// career_intent is enrichment-only and does NOT gate completion
+  let nextRequiredStep = null;
+  if (!progress.quickStartCompleted && !progress.education?.length && !progress.experience?.length) {
+    nextRequiredStep = 'quick_start';
+  } else if (!progress.careerReport) {
+    nextRequiredStep = 'career_report';
+  }
 
   // GAP F7: progress percentage
   let completedSteps = 0;
-
-if (progress.education?.length || progress.experience?.length) completedSteps++;
-if (progress.careerReport)   completedSteps++;
-if (isComplete)              completedSteps++;
-
-const totalSteps = 3;
-const progressPercent =
-  Math.round((Math.min(completedSteps, totalSteps) / totalSteps) * 100);
+  if (progress.education?.length || progress.experience?.length) completedSteps++;
+  if (progress.careerReport) completedSteps++;
+  if (isComplete) completedSteps++;
+  const totalSteps     = 3;
+  const progressPercent = Math.round((Math.min(completedSteps, totalSteps) / totalSteps) * 100);
 
   // GAP-H10 / P1-08: Structured steps array — updated for two-phase onboarding model.
-  const hasQuickStart            = !!progress.quickStartCompleted;
-  const hasEducationOrExperience = !!(progress.education?.length || progress.experience?.length);
-  const hasCareerReport          = !!progress.careerReport;
-  const hasPersonalDetails       = !!progress.personalDetails?.fullName;
-  const hasCv                    = !!(progress.cvResumeId || progress.step === 'completed_without_cv');
+  const hasQuickStart              = !!progress.quickStartCompleted;
+  const hasEducationOrExperience   = !!(progress.education?.length || progress.experience?.length);
+  const hasCareerReport            = !!progress.careerReport;
+  const hasPersonalDetails         = !!progress.personalDetails?.fullName;
+  const hasCv                      = !!(progress.cvResumeId || progress.step === 'completed_without_cv');
 
   const steps = [
     {
-      stepId:               'quick_start',
-      label:                'Quick Start',
-      isRequired:           true,
-      isComplete:           hasQuickStart || hasEducationOrExperience,
-      isCurrent:            !hasQuickStart && !hasEducationOrExperience,
-      estimatedTimeMinutes: 2,
-      description:          'Job title, target role, and a few skills — takes 2 minutes',
+      stepId:                 'quick_start',
+      label:                  'Quick Start',
+      isRequired:             true,
+      isComplete:             hasQuickStart || hasEducationOrExperience,
+      isCurrent:              !hasQuickStart && !hasEducationOrExperience,
+      estimatedTimeMinutes:   2,
+      description:            'Job title, target role, and a few skills — takes 2 minutes',
     },
     {
-      stepId:               'career_report',
-      label:                'Career Report',
-      isRequired:           true,
-      isComplete:           hasCareerReport,
-      isCurrent:            (hasQuickStart || hasEducationOrExperience) && !hasCareerReport,
-      estimatedTimeMinutes: 1,
-      description:          'AI generates your personalised career intelligence report',
+      stepId:                 'career_report',
+      label:                  'Career Report',
+      isRequired:             true,
+      isComplete:             hasCareerReport,
+      isCurrent:              (hasQuickStart || hasEducationOrExperience) && !hasCareerReport,
+      estimatedTimeMinutes:   1,
+      description:            'AI generates your personalised career intelligence report',
     },
     {
-      stepId:               'enrich_profile',
-      label:                'Enrich Profile',
-      isRequired:           false,
-      isComplete:           hasEducationOrExperience,
-      isCurrent:            hasCareerReport && !hasEducationOrExperience,
-      estimatedTimeMinutes: 5,
-      description:          'Add full experience, education, and salary for a more accurate score',
+      stepId:                 'enrich_profile',
+      label:                  'Enrich Profile',
+      isRequired:             false,
+      isComplete:             hasEducationOrExperience,
+      isCurrent:              hasCareerReport && !hasEducationOrExperience,
+      estimatedTimeMinutes:   5,
+      description:            'Add full experience, education, and salary for a more accurate score',
     },
     {
-      stepId:               'personal_details',
-      label:                'Personal Details',
-      isRequired:           false,
-      isComplete:           hasPersonalDetails,
-      isCurrent:            hasCareerReport && hasEducationOrExperience && !hasPersonalDetails,
-      estimatedTimeMinutes: 2,
-      description:          'Name, contact info, and location for your CV',
+      stepId:                 'personal_details',
+      label:                  'Personal Details',
+      isRequired:             false,
+      isComplete:             hasPersonalDetails,
+      isCurrent:              hasCareerReport && hasEducationOrExperience && !hasPersonalDetails,
+      estimatedTimeMinutes:   2,
+      description:            'Name, contact info, and location for your CV',
     },
     {
-      stepId:               'generate_cv',
-      label:                'Generate CV',
-      isRequired:           false,
-      isComplete:           hasCv,
-      isCurrent:            hasPersonalDetails && !hasCv,
-      estimatedTimeMinutes: 1,
-      description:          'AI builds your professional CV from your profile',
+      stepId:                 'generate_cv',
+      label:                  'Generate CV',
+      isRequired:             false,
+      isComplete:             hasCv,
+      isCurrent:              hasPersonalDetails && !hasCv,
+      estimatedTimeMinutes:   1,
+      description:            'AI builds your professional CV from your profile',
     },
   ];
 
   return {
     userId,
-    step:                progress.step,
+    step:               progress.step,
     onboardingCompleted: profile.onboardingCompleted === true,
-    tracks:              { trackA, trackB, isComplete },
-    steps,                // GAP-H10: structured steps array — decouples frontend from backend naming
-    stepHistory:         progress.stepHistory || [],
-    onboardingStartedAt:   progress.onboardingStartedAt   || null,
-    onboardingCompletedAt: profile.onboardingCompletedAt  || null,
+    tracks:             { trackA, trackB, isComplete },
+    steps,
+    stepHistory:        progress.stepHistory || [],
+    onboardingStartedAt:    progress.onboardingStartedAt    || null,
+    onboardingCompletedAt:  profile.onboardingCompletedAt   || null,
     remainingQuota,
     quotaExhausted,
-    previousCvIds:       progress.previousCvIds || [],
-    nextRequiredStep,     // GAP F2
-    progressPercent,      // GAP F7
+    previousCvIds:      progress.previousCvIds || [],
+    nextRequiredStep,
+    progressPercent,
     totalSteps,
     completedSteps,
-    chiDataCompleteness: chiCompleteness.score,   // GAP-05: 0-100 enrichment score
-    chiDataMissing:      chiCompleteness.missing, // GAP-05: nudge array for frontend
-    draft:               progress.draft || null,  // GAP F5: expose saved draft
-    draftVersion:        progress.draftVersion ?? 0, // P3-03: optimistic concurrency version
-    // P3-08: stepData — structured context for the CURRENT incomplete step.
-    // Frontend uses this to pre-fill the active form without a second API call.
-    // Only populated for the step where isCurrent=true; null for completed steps.
+    chiDataCompleteness: chiCompleteness.score,
+    chiDataMissing:      chiCompleteness.missing,
+    draft:               progress.draft        || null,
+    draftVersion:        progress.draftVersion ?? 0,
     stepData: (() => {
       if (!hasQuickStart && !hasEducationOrExperience) {
-        // Quick Start is current — return importedProfile if available (LinkedIn import done)
         return progress.importedProfile
           ? { source: 'linkedin_import', importedProfile: progress.importedProfile, importSource: progress.importSource || null }
           : { source: 'empty', importSource: progress.importSource || null };
       }
       if (!hasCareerReport) {
-        // Career Report is current — return education/experience summary for confirmation UI
         return {
           source:          'onboarding_data',
           educationCount:  (progress.education  || []).length,
           experienceCount: (progress.experience || []).length,
-          skillsCount:     (profile.skills || []).length,
+          skillsCount:     (profile.skills      || []).length,
           quickStartCompleted: !!progress.quickStartCompleted,
         };
       }
       if (!hasPersonalDetails && hasCareerReport) {
-        // Personal Details is current — return any partial data already saved
         return {
-          source:          'partial',
-          fullName:        progress.personalDetails?.fullName  || null,
-          email:           progress.personalDetails?.email     || null,
-          phone:           progress.personalDetails?.phone     || null,
+          source:   'partial',
+          fullName: progress.personalDetails?.fullName || null,
+          email:    progress.personalDetails?.email    || null,
+          phone:    progress.personalDetails?.phone    || null,
         };
       }
       if (!hasCv && hasPersonalDetails) {
-        // CV step is current — return editableFields preview
         return {
-          source:          'cv_step',
-          hasCvDraft:      !!progress.cvDraft,
-          cvDraftSavedAt:  progress.cvDraft?.savedAt || null,
+          source:        'cv_step',
+          hasCvDraft:    !!progress.cvDraft,
+          cvDraftSavedAt: progress.cvDraft?.savedAt || null,
         };
       }
-      return null; // all steps complete
+      return null;
     })(),
-    importSource:        progress.importSource || null, // P3-09
-    data:                progress,
+    importSource: progress.importSource || null,
+    data:         progress,
   };
 }
 
-async function getFunnelAnalytics({ limit = 500, after = null, fromDate = null, toDate = null } = {}) {
+async function getFunnelAnalytics({
+  limit    = 500,
+  after    = null,
+  fromDate = null,
+  toDate   = null,
+} = {}) {
   // B-06 FIX: bounded date-range query prevents full-collection scan at >10k users.
-  // The composite index on onboardingStartedAt (DESCENDING) covers this query — see firestore.indexes.json.
-  let query = db.collection('onboardingProgress')
-    .orderBy('onboardingStartedAt', 'desc')
+  let query = supabase
+    .from('onboardingProgress')
+    .select('*')
+    .order('onboardingStartedAt', { ascending: false })
     .limit(limit);
 
-  if (fromDate) query = query.where('onboardingStartedAt', '>=', fromDate);
-  if (toDate)   query = query.where('onboardingStartedAt', '<=', toDate);
+  if (fromDate) query = query.gte('onboardingStartedAt', fromDate);
+  if (toDate)   query = query.lte('onboardingStartedAt', toDate);
 
+  // Cursor-based pagination: if `after` is supplied, use keyset pagination
+  // by fetching the cursor row's onboardingStartedAt and filtering lt/lte.
+  // Supabase does not support Firestore-style startAfter(doc), so we use
+  // the sort column value from the cursor document as the pagination boundary.
   if (after) {
-    const cursorDoc = await db.collection('onboardingProgress').doc(after).get();
-    if (cursorDoc.exists) query = query.startAfter(cursorDoc);
+    const { data: cursorRow } = await supabase
+      .from('onboardingProgress')
+      .select('onboardingStartedAt')
+      .eq('id', after)
+      .maybeSingle();
+    if (cursorRow?.onboardingStartedAt) {
+      query = query.lt('onboardingStartedAt', cursorRow.onboardingStartedAt);
+    }
   }
 
-  const snap = await query.get();
-  if (snap.empty) {
-    return { total: 0, steps: {}, dropOffByStep: {}, importSourceBreakdown: {}, scannedAt: new Date().toISOString() };
+  const { data: rows, error } = await query;
+  if (error) {
+    logger.error('[DB] getFunnelAnalytics query failed', { error: error.message });
+    throw error;
+  }
+
+  const docs = rows || [];
+
+  if (docs.length === 0) {
+    return {
+      total:                  0,
+      steps:                  {},
+      dropOffByStep:          {},
+      importSourceBreakdown:  {},
+      scannedAt:              new Date().toISOString(),
+    };
   }
 
   // ── Aggregate counters ────────────────────────────────────────────────────
   let total = 0;
   const stepCounts = {
-    consent_saved:                0,
-    quick_start_completed:        0,
-    education_experience_saved:   0,
-    career_report_generated:      0,
-    personal_details_saved:       0,
-    cv_generated:                 0,
-    completed:                    0,
-    linkedin_imported:            0,
-    linkedin_confirmed:           0,
+    consent_saved:              0,
+    quick_start_completed:      0,
+    education_experience_saved: 0,
+    career_report_generated:    0,
+    personal_details_saved:     0,
+    cv_generated:               0,
+    completed:                  0,
+    linkedin_imported:          0,
+    linkedin_confirmed:         0,
   };
-  const dropOffCounts  = {};
-  const importSources  = {};
+  const dropOffCounts = {};
+  const importSources = {};
   const timesToComplete = []; // ms from start to completion
 
-  for (const doc of snap.docs) {
-    const d = doc.data();
+  for (const d of docs) {
     total++;
 
     // Consent
@@ -456,8 +514,8 @@ async function getFunnelAnalytics({ limit = 500, after = null, fromDate = null, 
 
     // Time to complete
     if (d.onboardingStartedAt && d.step === 'completed') {
-      const startedAt = d.onboardingStartedAt?.toDate?.() ?? new Date(d.onboardingStartedAt);
-      const completedAt = d.updatedAt?.toDate?.() ?? new Date(d.updatedAt);
+      const startedAt   = new Date(d.onboardingStartedAt);
+      const completedAt = new Date(d.updatedAt);
       const ms = completedAt - startedAt;
       if (ms > 0 && ms < 7 * 24 * 60 * 60 * 1000) timesToComplete.push(ms); // cap at 7 days
     }
@@ -489,7 +547,7 @@ async function getFunnelAnalytics({ limit = 500, after = null, fromDate = null, 
   return {
     total,
     steps:                stepCounts,
-    conversionRates,      // pct of total that reached each step
+    conversionRates,
     dropOffByStep:        dropOffCounts,
     biggestDropOffs:      biggestDropOff,
     importSourceBreakdown: importSources,
@@ -497,8 +555,8 @@ async function getFunnelAnalytics({ limit = 500, after = null, fromDate = null, 
     medianCompletionMinutes: medianCompletionMs ? Math.round(medianCompletionMs / 60000) : null,
     scannedDocuments:     total,
     limit,
-    hasMore:              snap.size === limit,
-    lastDocId:            snap.docs[snap.docs.length - 1]?.id || null,
+    hasMore:              docs.length === limit,
+    lastDocId:            docs[docs.length - 1]?.id || null,
     scannedAt:            new Date().toISOString(),
   };
 }
@@ -511,11 +569,3 @@ module.exports = {
   getProgress,
   getFunnelAnalytics,
 };
-
-
-
-
-
-
-
-

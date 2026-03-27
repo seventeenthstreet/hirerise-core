@@ -11,17 +11,21 @@
  *   - domain  is always a non-null string ('general' for cross-domain qualifications)
  *   - category is always one of: 'degree' | 'professional' | 'diploma' | 'certificate'
  */
-
-const { db }                   = require('../../config/supabase');
-const { AppError, ErrorCodes } = require('../../middleware/errorHandler');
+const {
+  db
+} = require('../../config/supabase');
+const {
+  AppError,
+  ErrorCodes
+} = require('../../middleware/errorHandler');
 
 // Level sort order — controls the sort for listActiveQualifications.
 const LEVEL_ORDER = {
-  certificate:   0,
-  diploma:       1,
+  certificate: 0,
+  diploma: 1,
   undergraduate: 2,
-  postgraduate:  3,
-  doctorate:     4,
+  postgraduate: 3,
+  doctorate: 4
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -43,27 +47,21 @@ const LEVEL_ORDER = {
  * }>>}
  */
 async function listActiveQualifications() {
-  const snap = await db
-    .collection('qualifications')
-    .where('isActive', '==', true)
-    .get();
-
-  const results = snap.docs.map((doc) => {
+  const snap = await supabase.from('qualifications').select("*").eq('isActive', true);
+  const results = snap.docs.map(doc => {
     const data = doc.data();
     return {
-      id:        doc.id,
-      name:      data.name,
+      id: doc.id,
+      name: data.name,
       shortName: data.shortName ?? null,
-      level:     data.level,
-      domain:    typeof data.domain === 'string' && data.domain ? data.domain : 'general',
-      category:  data.category,
-      country:   data.country,
+      level: data.level,
+      domain: typeof data.domain === 'string' && data.domain ? data.domain : 'general',
+      category: data.category,
+      country: data.country
     };
   });
-
   return results.sort((a, b) => {
-    const levelDiff =
-      (LEVEL_ORDER[a.level] ?? 99) - (LEVEL_ORDER[b.level] ?? 99);
+    const levelDiff = (LEVEL_ORDER[a.level] ?? 99) - (LEVEL_ORDER[b.level] ?? 99);
     if (levelDiff !== 0) return levelDiff;
     return a.name.localeCompare(b.name, 'en');
   });
@@ -95,60 +93,34 @@ async function listActiveQualifications() {
  */
 async function getQualificationById(qualificationId) {
   if (!qualificationId || typeof qualificationId !== 'string') {
-    throw new AppError(
-      'qualificationId must be a non-empty string.',
-      400,
-      { qualificationId },
-      ErrorCodes.VALIDATION_ERROR
-    );
+    throw new AppError('qualificationId must be a non-empty string.', 400, {
+      qualificationId
+    }, ErrorCodes.VALIDATION_ERROR);
   }
-
-  const snap = await db
-    .collection('qualifications')
-    .doc(qualificationId.trim())
-    .get();
-
+  const snap = await supabase.from('qualifications').select("*").eq("id", qualificationId.trim()).single();
   if (!snap.exists) {
-    throw new AppError(
-      'Invalid qualification selected.',
-      400,
-      { qualificationId },
-      ErrorCodes.VALIDATION_ERROR
-    );
+    throw new AppError('Invalid qualification selected.', 400, {
+      qualificationId
+    }, ErrorCodes.VALIDATION_ERROR);
   }
-
   const data = snap.data();
-
   if (!data.isActive) {
-    throw new AppError(
-      'The selected qualification is no longer available.',
-      400,
-      { qualificationId },
-      ErrorCodes.VALIDATION_ERROR
-    );
+    throw new AppError('The selected qualification is no longer available.', 400, {
+      qualificationId
+    }, ErrorCodes.VALIDATION_ERROR);
   }
-
   return {
-    id:        snap.id,
-    name:      data.name,
+    id: snap.id,
+    name: data.name,
     shortName: data.shortName ?? null,
-    level:     data.level,
-    domain:    typeof data.domain === 'string' && data.domain ? data.domain : 'general',
-    category:  data.category,
-    country:   data.country,
-    isActive:  data.isActive,
+    level: data.level,
+    domain: typeof data.domain === 'string' && data.domain ? data.domain : 'general',
+    category: data.category,
+    country: data.country,
+    isActive: data.isActive
   };
 }
-
 module.exports = {
   listActiveQualifications,
-  getQualificationById,
+  getQualificationById
 };
-
-
-
-
-
-
-
-

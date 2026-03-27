@@ -18,11 +18,14 @@ class AdminCmsSkillsRepository {
   async findByNormalizedName(normalizedName) {
     if (!normalizedName) return null;
     const supabase = getSupabase();
-    const { data } = await supabase
+    // HARDENING T2: .single() → .maybeSingle() — name may not exist
+    // HARDENING T7: destructure error
+    const { data, error } = await supabase
       .from(TABLE).select('*')
       .eq('normalized_name', normalizedName.trim())
       .eq('soft_deleted', false)
-      .single();
+      .maybeSingle();
+    if (error) throw error;
     return data ? this._toCamel(data) : null;
   }
 
@@ -30,10 +33,12 @@ class AdminCmsSkillsRepository {
     const map = new Map();
     if (!normalizedNames?.length) return map;
     const supabase = getSupabase();
-    const { data } = await supabase
+    // HARDENING T7: destructure and throw on error
+    const { data, error } = await supabase
       .from(TABLE).select('*')
       .in('normalized_name', normalizedNames)
       .eq('soft_deleted', false);
+    if (error) throw error;
     for (const row of (data || [])) map.set(row.normalized_name, this._toCamel(row));
     return map;
   }
@@ -90,13 +95,18 @@ class AdminCmsSkillsRepository {
       .order('name').range(offset, offset + limit - 1);
     if (category) q = q.eq('category', category);
     if (status)   q = q.eq('status', status);
-    const { data } = await q;
+    // HARDENING T7: destructure and throw on error
+    const { data, error } = await q;
+    if (error) throw error;
     return (data || []).map(r => this._toCamel(r));
   }
 
   async findById(id) {
     const supabase = getSupabase();
-    const { data } = await supabase.from(TABLE).select('*').eq('id', id).single();
+    // HARDENING T2: .single() → .maybeSingle() — skill may not exist
+    // HARDENING T7: destructure and throw on error
+    const { data, error } = await supabase.from(TABLE).select('*').eq('id', id).maybeSingle();
+    if (error) throw error;
     return data ? this._toCamel(data) : null;
   }
 
@@ -136,11 +146,3 @@ class AdminCmsSkillsRepository {
 
 module.exports = new AdminCmsSkillsRepository();
 module.exports.AdminCmsSkillsRepository = AdminCmsSkillsRepository;
-
-
-
-
-
-
-
-

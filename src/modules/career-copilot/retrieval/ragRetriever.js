@@ -7,7 +7,7 @@
  * before any LLM call. This is the "R" in RAG.
  *
  * Sources retrieved (all parallel, all graceful-fail):
- *   1. user_profile          — Firestore userProfiles (skills, experience, role)
+ *   1. user_profile          — Supabase userProfiles (skills, experience, role)
  *   2. chi_score             — Career Health Index
  *   3. skill_gaps            — SkillGraphEngine.detectSkillGap / getUserSkillGraph
  *   4. job_matches           — JobMatchingEngine top results
@@ -32,62 +32,63 @@
  *
  * @module src/modules/career-copilot/retrieval/ragRetriever
  */
-
-const supabase       = require('../../../core/supabaseClient');
-const cacheManager   = require('../../../core/cache/cache.manager');
-const logger         = require('../../../utils/logger');
-const { db }         = require('../../../config/supabase');
+const supabase = require('../../../core/supabaseClient');
+const cacheManager = require('../../../core/cache/cache.manager');
+const logger = require('../../../utils/logger');
 
 // ─── Config ───────────────────────────────────────────────────────────────────
 
-const CONTEXT_CACHE_TTL = 300;   // 5 minutes — context refreshes periodically
+const CONTEXT_CACHE_TTL = 300; // 5 minutes — context refreshes periodically
 
 // Minimum fraction of sources that must be populated for the Copilot
 // to attempt a grounded response. Below this → polite refusal.
-const MIN_COMPLETENESS_THRESHOLD = 0.25;   // at least 2 of 8 sources
+const MIN_COMPLETENESS_THRESHOLD = 0.25; // at least 2 of 8 sources
 
 // Source weights for confidence calculation
 // (sources with richer, more specific data get higher weight)
 const SOURCE_WEIGHTS = Object.freeze({
-  user_profile:          0.20,   // always available after onboarding
-  chi_score:             0.15,   // computed after CV upload
-  skill_gaps:            0.15,   // from skill graph engine
-  job_matches:           0.15,   // from job matching engine
-  opportunity_radar:     0.12,   // from opportunity radar engine
-  risk_analysis:         0.10,   // from risk predictor
-  salary_benchmarks:     0.08,   // from salary service
-  personalization_profile: 0.05, // from personalization engine
+  user_profile: 0.20,       // always available after onboarding
+  chi_score: 0.15,          // computed after CV upload
+  skill_gaps: 0.15,         // from skill graph engine
+  job_matches: 0.15,        // from job matching engine
+  opportunity_radar: 0.12,  // from opportunity radar engine
+  risk_analysis: 0.10,      // from risk predictor
+  salary_benchmarks: 0.08,  // from salary service
+  personalization_profile: 0.05 // from personalization engine
 });
-
 const ALL_SOURCES = Object.keys(SOURCE_WEIGHTS);
-
 const cache = cacheManager.getClient();
 
 // ─── Lazy engine loaders ──────────────────────────────────────────────────────
 
 function _load(path) {
-  try { return require(path); } catch (_) { return null; }
+  try {
+    return require(path);
+  } catch (_) {
+    return null;
+  }
 }
 
 // ─── Individual source fetchers ───────────────────────────────────────────────
 
 /**
- * Fetch user profile from Firestore.
+ * Fetch user profile from Supabase.
  */
 async function _fetchUserProfile(userId) {
-  const [profileSnap, progressSnap] = await Promise.all([
-    db.collection('userProfiles').doc(userId).get(),
-    db.collection('onboardingProgress').doc(userId).get(),
+  const [profileRes, progressRes] = await Promise.all([
+    supabase.from('userProfiles').select('*').eq('id', userId).maybeSingle(),
+    supabase.from('onboardingProgress').select('*').eq('id', userId).maybeSingle()
   ]);
 
-  const profile  = profileSnap.exists  ? profileSnap.data()  : {};
-  const progress = progressSnap.exists ? progressSnap.data() : {};
+  const profile = profileRes.data || {};
+  const progress = progressRes.data || {};
 
   const rawSkills =
-    (Array.isArray(profile.skills) && profile.skills.length > 0)
+    Array.isArray(profile.skills) && profile.skills.length > 0
       ? profile.skills
-      : (Array.isArray(progress.skills) ? progress.skills : []);
-
+      : Array.isArray(progress.skills)
+      ? progress.skills
+      : [];
   const skills = rawSkills
     .map(s => (typeof s === 'string' ? s : s?.name))
     .filter(Boolean);
@@ -96,68 +97,60 @@ async function _fetchUserProfile(userId) {
 
   return {
     skills,
-    target_role:      profile.targetRole || profile.currentJobTitle || null,
-    current_role:     profile.currentRole || null,
-    industry:         profile.industry || null,
+    target_role: profile.targetRole || profile.currentJobTitle || null,
+    current_role: profile.currentRole || null,
+    industry: profile.industry || null,
     years_experience: profile.experienceYears || profile.yearsExperience || 0,
-    education_level:  profile.educationLevel || null,
-    current_salary:   profile.currentSalary || null,
-    location:         profile.location || null,
+    education_level: profile.educationLevel || null,
+    current_salary: profile.currentSalary || null,
+    location: profile.location || null
   };
 }
 
 /**
- * Fetch CHI score from Firestore (existing chi snapshots).
+ * Fetch CHI score from Supabase.
+ *
+ * Queries chiSnapshots for the latest non-soft-deleted snapshot for this user,
+ * then falls back to the legacy careerHealthIndex flat table.
  */
 async function _fetchCHIScore(userId) {
-  // FIX: ragRetriever was querying a top-level 'chiSnapshots' collection that
-  // does not exist and has no Firestore composite index — causing:
-  //   "9 FAILED_PRECONDITION: The query requires an index"
-  //
-  // The actual data lives in two places (written by chiSnapshot.repository.js):
-  //   1. users/{userId}/chiSnapshots/{id}  — primary subcollection (fast path)
-  //   2. chiSnapshots_index/{id}           — lightweight flat index
-  //   3. careerHealthIndex/{id}            — legacy flat collection (fallback)
-  //
-  // No composite index is needed for the subcollection query (scoped by userId).
-
-  // Fast path: per-user subcollection (no composite index needed)
+  // Fast path: per-user chiSnapshots (scoped by user_id, no composite index needed)
   try {
-    const snap = await db
-      .collection('users').doc(userId)
-      .collection('chiSnapshots')
-      .where('softDeleted', '==', false)
-      .orderBy('generatedAt', 'desc')
-      .limit(1)
-      .get();
+    const { data } = await supabase
+      .from('chiSnapshots')
+      .select('chiScore, chi_score, dimensions, analysisSource, generatedAt')
+      .eq('userId', userId)
+      .eq('softDeleted', false)
+      .order('generatedAt', { ascending: false })
+      .limit(1);
 
-    if (!snap.empty) {
-      const data = snap.docs[0].data();
+    if (data && data.length > 0) {
+      const row = data[0];
       return {
-        chi_score:       data.chiScore || data.chi_score || null,
-        dimensions:      data.dimensions || null,
-        analysis_source: data.analysisSource || 'unknown',
-        calculated_at:   data.generatedAt?.toDate?.()?.toISOString() || null,
+        chi_score: row.chiScore || row.chi_score || null,
+        dimensions: row.dimensions || null,
+        analysis_source: row.analysisSource || 'unknown',
+        calculated_at: row.generatedAt || null
       };
     }
   } catch (_) { /* fall through to legacy */ }
 
-  // Fallback: legacy careerHealthIndex flat collection
+  // Fallback: legacy careerHealthIndex flat table
   try {
-    const snap = await db
-      .collection('careerHealthIndex')
-      .where('userId', '==', userId)
-      .orderBy('generatedAt', 'desc')
-      .limit(1)
-      .get();
+    const { data } = await supabase
+      .from('careerHealthIndex')
+      .select('chiScore, chi_score, dimensions, analysisSource, generatedAt')
+      .eq('userId', userId)
+      .order('generatedAt', { ascending: false })
+      .limit(1);
 
-    if (!snap.empty) {
-      const data = snap.docs[0].data();
+    if (data && data.length > 0) {
+      const row = data[0];
       return {
-        chi_score:       data.chiScore || data.chi_score || null,
-        dimensions:      data.dimensions || null,
-        analysis_source: data.analysisSource || 'unknown',
-        calculated_at:   data.generatedAt?.toDate?.()?.toISOString() || null,
+        chi_score: row.chiScore || row.chi_score || null,
+        dimensions: row.dimensions || null,
+        analysis_source: row.analysisSource || 'unknown',
+        calculated_at: row.generatedAt || null
       };
     }
   } catch (_) { /* non-fatal */ }
@@ -171,16 +164,14 @@ async function _fetchCHIScore(userId) {
 async function _fetchSkillGaps(userId) {
   const svc = _load('../../../modules/jobSeeker/skillGraphEngine.service');
   if (!svc) return null;
-
   const result = await (svc.detectSkillGap || svc.getUserSkillGraph).call(svc, userId);
   if (!result) return null;
-
   return {
-    existing_skills:     result.existing_skills     || [],
+    existing_skills: result.existing_skills || [],
     missing_high_demand: (result.missing_high_demand || []).slice(0, 8),
-    adjacent_skills:     (result.adjacent_skills     || []).slice(0, 6),
-    role_gap:            result.role_gap             || null,
-    target_role:         result.target_role          || null,
+    adjacent_skills: (result.adjacent_skills || []).slice(0, 6),
+    role_gap: result.role_gap || null,
+    target_role: result.target_role || null
   };
 }
 
@@ -190,19 +181,17 @@ async function _fetchSkillGaps(userId) {
 async function _fetchJobMatches(userId) {
   const svc = _load('../../../modules/jobSeeker/jobMatchingEngine.service');
   if (!svc) return null;
-
   const result = await svc.getJobMatches(userId, { limit: 5 });
   if (!result || !result.recommended_jobs?.length) return null;
-
   return {
-    top_matches:    result.recommended_jobs.slice(0, 5).map(j => ({
-      title:          j.title,
-      match_score:    j.match_score,
+    top_matches: result.recommended_jobs.slice(0, 5).map(j => ({
+      title: j.title,
+      match_score: j.match_score,
       missing_skills: (j.missing_skills || []).slice(0, 4),
-      salary:         j.salary || null,
-      company:        j.company || null,
+      salary: j.salary || null,
+      company: j.company || null
     })),
-    total_evaluated: result.total_roles_evaluated || 0,
+    total_evaluated: result.total_roles_evaluated || 0
   };
 }
 
@@ -221,23 +210,24 @@ async function _fetchOpportunityRadar(userId) {
   if (stored?.emerging_opportunities?.length > 0) {
     return {
       emerging_opportunities: (stored.emerging_opportunities || []).slice(0, 5),
-      total_evaluated:        stored.total_signals_evaluated,
-      source:                 'precomputed',
-      computed_at:            stored.computed_at,
+      total_evaluated: stored.total_signals_evaluated,
+      source: 'precomputed',
+      computed_at: stored.computed_at
     };
   }
 
   // Fallback: try live engine
   const engine = _load('../../../engines/opportunityRadar.engine');
   if (!engine) return null;
-
-  const result = await engine.getOpportunityRadar(userId, { topN: 5, minOpportunityScore: 40 });
+  const result = await engine.getOpportunityRadar(userId, {
+    topN: 5,
+    minOpportunityScore: 40
+  });
   if (!result?.emerging_opportunities?.length) return null;
-
   return {
     emerging_opportunities: result.emerging_opportunities.slice(0, 5),
-    total_evaluated:        result.total_signals_evaluated || 0,
-    source:                 'live',
+    total_evaluated: result.total_signals_evaluated || 0,
+    source: 'live'
   };
 }
 
@@ -252,13 +242,12 @@ async function _fetchRiskAnalysis(userId) {
     .maybeSingle();
 
   if (!data || data.overall_risk_score === null) return null;
-
   return {
     overall_risk_score: data.overall_risk_score,
-    risk_level:         data.risk_level,
-    risk_factors:       (data.risk_factors || []).slice(0, 4),
-    recommendations:    (data.recommendations || []).slice(0, 3),
-    computed_at:        data.computed_at,
+    risk_level: data.risk_level,
+    risk_factors: (data.risk_factors || []).slice(0, 4),
+    recommendations: (data.recommendations || []).slice(0, 3),
+    computed_at: data.computed_at
   };
 }
 
@@ -267,7 +256,6 @@ async function _fetchRiskAnalysis(userId) {
  */
 async function _fetchSalaryBenchmarks(userId, targetRole) {
   if (!targetRole) return null;
-
   try {
     const svc = _load('../../../modules/salary/salaryAggregation.service');
     if (!svc) {
@@ -283,20 +271,17 @@ async function _fetchSalaryBenchmarks(userId, targetRole) {
       }
       return null;
     }
-
-    const result = await svc.aggregateSalaries
+    const result = (await svc.aggregateSalaries)
       ? svc.aggregateSalaries(targetRole)
       : svc.getAggregatedSalary?.(targetRole);
-
     if (!result) return null;
-
     return {
-      role:           targetRole,
-      median_salary:  result.medianSalary || result.median_salary || null,
-      min_salary:     result.minSalary    || result.min_salary    || null,
-      max_salary:     result.maxSalary    || result.max_salary    || null,
-      currency:       'INR',
-      source:         'salary_service',
+      role: targetRole,
+      median_salary: result.medianSalary || result.median_salary || null,
+      min_salary: result.minSalary || result.min_salary || null,
+      max_salary: result.maxSalary || result.max_salary || null,
+      currency: 'INR',
+      source: 'salary_service'
     };
   } catch (_) {
     return null;
@@ -314,13 +299,12 @@ async function _fetchPersonalizationProfile(userId) {
     .maybeSingle();
 
   if (!data || data.total_events === 0) return null;
-
   return {
-    preferred_roles:  (data.preferred_roles  || []).slice(0, 5),
+    preferred_roles: (data.preferred_roles || []).slice(0, 5),
     preferred_skills: (data.preferred_skills || []).slice(0, 5),
     career_interests: (data.career_interests || []).slice(0, 3),
     engagement_score: data.engagement_score,
-    total_events:     data.total_events,
+    total_events: data.total_events
   };
 }
 
@@ -336,7 +320,6 @@ async function _fetchPersonalizationProfile(userId) {
  */
 function _calculateConfidence(context) {
   let score = 0;
-
   for (const [source, weight] of Object.entries(SOURCE_WEIGHTS)) {
     if (context[source] !== null && context[source] !== undefined) {
       score += weight;
@@ -348,7 +331,6 @@ function _calculateConfidence(context) {
   if (profile?.skills?.length > 0 && profile?.target_role) {
     score = Math.min(1.0, score + 0.05);
   }
-
   return Math.round(score * 1000) / 1000;
 }
 
@@ -401,8 +383,8 @@ async function retrieveContext(userId, opts = {}) {
     jobMatchRes,
     opportunityRes,
     riskRes,
-    salaryRes,
-    personalizationRes,
+    ,  // salary is fetched after profile (needs target_role)
+    personalizationRes
   ] = await Promise.allSettled([
     _fetchUserProfile(userId),
     _fetchCHIScore(userId),
@@ -410,17 +392,17 @@ async function retrieveContext(userId, opts = {}) {
     _fetchJobMatches(userId),
     _fetchOpportunityRadar(userId),
     _fetchRiskAnalysis(userId),
-    null,   // salary is fetched after profile (needs target_role)
-    _fetchPersonalizationProfile(userId),
+    Promise.resolve(null),
+    _fetchPersonalizationProfile(userId)
   ]);
 
   // Unwrap settled results
-  const userProfile       = profileRes.status   === 'fulfilled' ? profileRes.value       : null;
-  const chiScore          = chiRes.status        === 'fulfilled' ? chiRes.value           : null;
-  const skillGaps         = skillGapRes.status   === 'fulfilled' ? skillGapRes.value      : null;
-  const jobMatches        = jobMatchRes.status   === 'fulfilled' ? jobMatchRes.value      : null;
-  const opportunityRadar  = opportunityRes.status=== 'fulfilled' ? opportunityRes.value   : null;
-  const riskAnalysis      = riskRes.status       === 'fulfilled' ? riskRes.value          : null;
+  const userProfile       = profileRes.status === 'fulfilled' ? profileRes.value : null;
+  const chiScore          = chiRes.status === 'fulfilled' ? chiRes.value : null;
+  const skillGaps         = skillGapRes.status === 'fulfilled' ? skillGapRes.value : null;
+  const jobMatches        = jobMatchRes.status === 'fulfilled' ? jobMatchRes.value : null;
+  const opportunityRadar  = opportunityRes.status === 'fulfilled' ? opportunityRes.value : null;
+  const riskAnalysis      = riskRes.status === 'fulfilled' ? riskRes.value : null;
   const personalization   = personalizationRes.status === 'fulfilled' ? personalizationRes.value : null;
 
   // Fetch salary separately — needs target_role from profile
@@ -433,28 +415,27 @@ async function retrieveContext(userId, opts = {}) {
   }
 
   // Log any retrieval failures
-  const failures = [
-    profileRes, chiRes, skillGapRes, jobMatchRes,
-    opportunityRes, riskRes, personalizationRes,
-  ].filter(r => r.status === 'rejected');
-
+  const failures = [profileRes, chiRes, skillGapRes, jobMatchRes, opportunityRes, riskRes, personalizationRes].filter(
+    r => r.status === 'rejected'
+  );
   if (failures.length > 0) {
     logger.warn('[RAGRetriever] Some sources failed', {
-      userId, failed: failures.length,
-      errors: failures.map(f => f.reason?.message).filter(Boolean),
+      userId,
+      failed: failures.length,
+      errors: failures.map(f => f.reason?.message).filter(Boolean)
     });
   }
 
   // Assemble context
   const context = {
-    user_profile:            userProfile,
-    chi_score:               chiScore,
-    skill_gaps:              skillGaps,
-    job_matches:             jobMatches,
-    opportunity_radar:       opportunityRadar,
-    risk_analysis:           riskAnalysis,
-    salary_benchmarks:       salaryBenchmarks,
-    personalization_profile: personalization,
+    user_profile: userProfile,
+    chi_score: chiScore,
+    skill_gaps: skillGaps,
+    job_matches: jobMatches,
+    opportunity_radar: opportunityRadar,
+    risk_analysis: riskAnalysis,
+    salary_benchmarks: salaryBenchmarks,
+    personalization_profile: personalization
   };
 
   // Compute quality metrics
@@ -464,20 +445,20 @@ async function retrieveContext(userId, opts = {}) {
 
   const ragContext = {
     ...context,
-    data_sources_used:  dataSourcesUsed,
-    data_completeness:  dataCompleteness,
-    confidence_score:   confidenceScore,
-    is_sufficient:      dataCompleteness >= MIN_COMPLETENESS_THRESHOLD,
-    retrieval_ms:       Date.now() - startMs,
-    retrieved_at:       new Date().toISOString(),
+    data_sources_used: dataSourcesUsed,
+    data_completeness: dataCompleteness,
+    confidence_score: confidenceScore,
+    is_sufficient: dataCompleteness >= MIN_COMPLETENESS_THRESHOLD,
+    retrieval_ms: Date.now() - startMs,
+    retrieved_at: new Date().toISOString()
   };
 
   logger.info('[RAGRetriever] Context assembled', {
     userId,
-    sources:      dataSourcesUsed.length,
+    sources: dataSourcesUsed.length,
     completeness: dataCompleteness,
-    confidence:   confidenceScore,
-    ms:           ragContext.retrieval_ms,
+    confidence: confidenceScore,
+    ms: ragContext.retrieval_ms
   });
 
   // Cache context
@@ -494,14 +475,5 @@ module.exports = {
   retrieveContext,
   MIN_COMPLETENESS_THRESHOLD,
   SOURCE_WEIGHTS,
-  ALL_SOURCES,
+  ALL_SOURCES
 };
-
-
-
-
-
-
-
-
-

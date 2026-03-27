@@ -10,103 +10,123 @@
  *   FIX-8b: Applied toPublicJob() in listJobFamilies, listRoles, and getRoleById.
  *   FIX-8c: listRoles meta now includes hasMore boolean so frontend can
  *            determine if there are more pages without knowing total count.
- *   FIX-8d: listJobFamilies now caps results at 200 to prevent unbounded Firestore reads.
+ *   FIX-8d: listJobFamilies now caps results at 200 to prevent unbounded reads.
  */
 
 'use strict';
 
-const { db }                   = require('../config/supabase');
+const supabase = require('../config/supabase');
 const { AppError, ErrorCodes } = require('../middleware/errorHandler');
 
 const COLLECTIONS = {
-  ROLES:        'roles',
+  ROLES: 'roles',
   JOB_FAMILIES: 'jobFamilies',
 };
 
 const PAGE_SIZE_DEFAULT = 20;
-const JOB_FAMILIES_MAX  = 200; // FIX-8d: safety cap on unbounded collection reads
+const JOB_FAMILIES_MAX = 200; // FIX-8d: safety cap on unbounded collection reads
 
 /**
  * FIX-8a: Allowlist-based field filter for public job/role responses.
  * Only fields in this list are returned to API consumers.
- * Internal Firestore housekeeping fields are excluded by default.
+ * Internal housekeeping fields are excluded by default.
  */
-const toPublicJob = (doc) => {
-  const data = doc.data ? doc.data() : doc; // support both Firestore doc and plain object
+const toPublicJob = (row) => {
   return {
-    id:          doc.id || data.id,
-    title:       data.title,
-    level:       data.level,
-    track:       data.track,
-    jobFamilyId: data.jobFamilyId,
-    description: data.description,
-    skills:      data.skills,
+    id: row.id,
+    title: row.title,
+    level: row.level,
+    track: row.track,
+    jobFamilyId: row.jobFamilyId,
+    description: row.description,
+    skills: row.skills,
     // Add other public fields here as the schema evolves
     // DO NOT spread data — always use an allowlist
   };
 };
 
-const toPublicFamily = (doc) => {
-  const data = doc.data();
+const toPublicFamily = (row) => {
   return {
-    id:          doc.id,
-    name:        data.name,
-    description: data.description,
-    trackCount:  data.trackCount,
+    id: row.id,
+    name: row.name,
+    description: row.description,
+    trackCount: row.trackCount,
   };
 };
 
 const listJobFamilies = async () => {
-  const snap = await db.collection(COLLECTIONS.JOB_FAMILIES)
-    .orderBy('name')
-    .limit(JOB_FAMILIES_MAX) // FIX-8d: cap results
-    .get();
+  const { data, error } = await supabase
+    .from(COLLECTIONS.JOB_FAMILIES)
+    .select('*')
+    .order('name', { ascending: true })
+    .limit(JOB_FAMILIES_MAX); // FIX-8d: cap results
 
-  return snap.docs.map(toPublicFamily); // FIX-8b: strip internal fields
+  if (error) throw new AppError(error.message, 500, {}, ErrorCodes.INTERNAL_ERROR);
+
+  return (data || []).map(toPublicFamily); // FIX-8b: strip internal fields
 };
 
-const listRoles = async ({ familyId, level, track, limit = PAGE_SIZE_DEFAULT, page = 1 }) => {
+const listRoles = async ({
+  familyId,
+  level,
+  track,
+  limit = PAGE_SIZE_DEFAULT,
+  page = 1,
+}) => {
   const parsedLimit = Math.min(parseInt(limit, 10) || PAGE_SIZE_DEFAULT, 100); // max 100 per page
 
-  let query = db.collection(COLLECTIONS.ROLES);
+  let query = supabase
+    .from(COLLECTIONS.ROLES)
+    .select('*');
 
-  if (familyId) query = query.where('jobFamilyId', '==', familyId);
-  if (level)    query = query.where('level',       '==', level);
-  if (track)    query = query.where('track',       '==', track);
+  if (familyId) query = query.eq('jobFamilyId', familyId);
+  if (level)    query = query.eq('level', level);
+  if (track)    query = query.eq('track', track);
 
-  query = query.orderBy('title').limit(parsedLimit);
+  query = query
+    .order('title', { ascending: true })
+    .limit(parsedLimit);
 
-  // Firestore does not support offset-based pagination natively at scale.
-  // Phase 2: use cursor-based pagination with startAfter(lastDoc).
-  const snap  = await query.get();
-  const roles = snap.docs.map(toPublicJob); // FIX-8b: strip internal fields
+  // Supabase does not support offset-based pagination natively at scale.
+  // Phase 2: use cursor-based pagination with range() or keyset pagination.
+  const { data, error } = await query;
+
+  if (error) throw new AppError(error.message, 500, {}, ErrorCodes.INTERNAL_ERROR);
+
+  const roles = (data || []).map(toPublicJob); // FIX-8b: strip internal fields
 
   return {
     roles,
-    page:    parseInt(page, 10),
-    limit:   parsedLimit,
-    count:   roles.length,
+    page: parseInt(page, 10),
+    limit: parsedLimit,
+    count: roles.length,
     hasMore: roles.length === parsedLimit, // FIX-8c: lets frontend know if more pages exist
   };
 };
 
 const getRoleById = async (roleId) => {
-  const snap = await db.collection(COLLECTIONS.ROLES).doc(roleId).get();
+  const { data, error } = await supabase
+    .from(COLLECTIONS.ROLES)
+    .select('*')
+    .eq('id', roleId)
+    .maybeSingle();
 
-  if (!snap.exists) {
-    throw new AppError(`Role '${roleId}' not found`, 404, { roleId }, ErrorCodes.ROLE_NOT_FOUND);
+  if (error) throw new AppError(error.message, 500, {}, ErrorCodes.INTERNAL_ERROR);
+
+  if (!data) {
+    throw new AppError(
+      `Role '${roleId}' not found`,
+      404,
+      { roleId },
+      ErrorCodes.ROLE_NOT_FOUND
+    );
   }
 
-  return toPublicJob(snap); // FIX-8b: strip internal fields
+  return toPublicJob(data); // FIX-8b: strip internal fields
 };
 
-module.exports = { listJobFamilies, listRoles, getRoleById };
-
-
-
-
-
-
-
-
-
+module.exports = {
+  listJobFamilies,
+  listRoles,
+  getRoleById,
+};

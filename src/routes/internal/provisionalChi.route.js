@@ -32,90 +32,92 @@
  *   would be a security risk (task payloads are stored by Google) and would
  *   break if data changed between enqueue and execution.
  */
-
 const express = require('express');
-const { db }  = require('../../config/supabase');
-const { calculateProvisionalChi } = require('../../modules/careerHealthIndex/careerHealthIndex.service');
-const logger  = require('../../utils/logger');
-
+const {
+  db
+} = require('../../config/supabase');
+const {
+  calculateProvisionalChi
+} = require('../../modules/careerHealthIndex/careerHealthIndex.service');
+const logger = require('../../utils/logger');
 const router = express.Router();
-
 router.post('/', async (req, res) => {
-  const { userId, userTier = 'free', source } = req.body || {};
+  const {
+    userId,
+    userTier = 'free',
+    source
+  } = req.body || {};
 
   // ── Input validation ──────────────────────────────────────────────────────
   if (!userId || typeof userId !== 'string') {
-    logger.warn('[ProvisionalChi] Missing or invalid userId in task payload', { body: req.body });
+    logger.warn('[ProvisionalChi] Missing or invalid userId in task payload', {
+      body: req.body
+    });
     // Return 400 — non-retryable, bad task payload
     return res.status(400).json({
-      success:   false,
+      success: false,
       errorCode: 'VALIDATION_ERROR',
-      message:   'userId is required and must be a string.',
+      message: 'userId is required and must be a string.'
     });
   }
-
-  logger.info('[ProvisionalChi] Task received', { userId, userTier, source });
-
+  logger.info('[ProvisionalChi] Task received', {
+    userId,
+    userTier,
+    source
+  });
   try {
     // ── Fetch latest onboarding data from Firestore ───────────────────────
     // We fetch fresh data here rather than passing it through the task payload
     // to avoid stale data and to keep the payload small.
-    const [progressSnap, profileSnap] = await Promise.all([
-      db.collection('onboardingProgress').doc(userId).get(),
-      db.collection('userProfiles').doc(userId).get(),
-    ]);
-
+    const [progressSnap, profileSnap] = await Promise.all([supabase.from('onboardingProgress').select("*").eq("id", userId).single(), supabase.from('userProfiles').select("*").eq("id", userId).single()]);
     if (!progressSnap.exists) {
-      logger.warn('[ProvisionalChi] onboardingProgress not found — skipping', { userId });
+      logger.warn('[ProvisionalChi] onboardingProgress not found — skipping', {
+        userId
+      });
       // Return 200 — user may have been deleted, no point retrying
-      return res.status(200).json({ success: true, skipped: true, reason: 'no_progress_doc' });
+      return res.status(200).json({
+        success: true,
+        skipped: true,
+        reason: 'no_progress_doc'
+      });
     }
-
     const onboardingData = progressSnap.data();
-    const profileData    = profileSnap.exists ? profileSnap.data() : {};
-    const careerReport   = onboardingData.careerReport ?? null;
+    const profileData = profileSnap.exists ? profileSnap.data() : {};
+    const careerReport = onboardingData.careerReport ?? null;
 
     // ── Run CHI calculation ───────────────────────────────────────────────
     // The rank guard inside calculateProvisionalChi handles idempotency —
     // if a higher-quality snapshot already exists it returns early.
-    const result = await calculateProvisionalChi(
-      userId,
-      onboardingData,
-      profileData,
-      careerReport,
-      userTier,
-    );
-
+    const result = await calculateProvisionalChi(userId, onboardingData, profileData, careerReport, userTier);
     if (result) {
       logger.info('[ProvisionalChi] CHI calculated successfully', {
         userId,
-        chiScore:       result.chiScore,
-        analysisSource: result.analysisSource,
+        chiScore: result.chiScore,
+        analysisSource: result.analysisSource
       });
     } else {
-      logger.info('[ProvisionalChi] CHI skipped by rank guard (higher quality snapshot exists)', { userId });
+      logger.info('[ProvisionalChi] CHI skipped by rank guard (higher quality snapshot exists)', {
+        userId
+      });
     }
 
     // Always return 200 on success or graceful skip — prevents Cloud Tasks retry
-    return res.status(200).json({ success: true, skipped: !result });
-
+    return res.status(200).json({
+      success: true,
+      skipped: !result
+    });
   } catch (err) {
-    logger.error('[ProvisionalChi] Unexpected error', { userId, error: err.message, stack: err.stack });
+    logger.error('[ProvisionalChi] Unexpected error', {
+      userId,
+      error: err.message,
+      stack: err.stack
+    });
     // Return 500 — Cloud Tasks will retry with exponential backoff
     return res.status(500).json({
-      success:   false,
+      success: false,
       errorCode: 'INTERNAL_ERROR',
-      message:   'Provisional CHI calculation failed.',
+      message: 'Provisional CHI calculation failed.'
     });
   }
 });
-
 module.exports = router;
-
-
-
-
-
-
-
-

@@ -12,8 +12,8 @@
  *
  * Features:
  *   - 24-hour TTL cache (Redis/Memory via cacheManager)
- *   - Stores results in Firestore job_listings/{userId}__{cacheKey}
- *   - Falls back to Firestore cache if Adzuna is unavailable
+ *   - Stores results in Supabase job_listings table (id = userId__cacheKey)
+ *   - Falls back to Supabase cache if Adzuna is unavailable
  *   - Country detection from user's parsedData
  *   - Skill-filtered queries (top 5 skills from profile)
  *
@@ -29,19 +29,19 @@
  *   const jobs = await fetchJobsForUser({ userId, parsedData, targetRole, skills });
  */
 
-const { db }          = require('../config/supabase');
-const cacheManager    = require('../core/cache/cache.manager');
-const logger          = require('../utils/logger');
+const supabase = require('../config/supabase');
+const cacheManager = require('../core/cache/cache.manager');
+const logger = require('../utils/logger');
 const { detectUserCountry } = require('./salary.service');
 
 const cache = cacheManager.getClient();
 
 // ── Configuration ────────────────────────────────────────────────────────────
 
-const ADZUNA_BASE_URL    = 'https://api.adzuna.com/v1/api/jobs';
-const CACHE_TTL_SECONDS  = 24 * 60 * 60;    // 24 hours
-const RESULTS_PER_PAGE   = 10;
-const COLLECTION         = 'job_listings';
+const ADZUNA_BASE_URL = 'https://api.adzuna.com/v1/api/jobs';
+const CACHE_TTL_SECONDS = 24 * 60 * 60; // 24 hours
+const RESULTS_PER_PAGE = 10;
+const COLLECTION = 'job_listings';
 
 // Adzuna uses 2-letter country codes (ISO 3166-1 alpha-2)
 // Maps our detected country codes to Adzuna-supported country routes
@@ -55,14 +55,12 @@ const ADZUNA_COUNTRY_MAP = {
   AE: 'ae',  // UAE (limited support — falls back to us)
   SG: 'sg',  // Singapore (limited — falls back to gb)
 };
-
 const ADZUNA_FALLBACK_COUNTRY = 'in';
 
 // ── Credential loader ─────────────────────────────────────────────────────────
 
 async function _getAdzunaCredentials() {
   const { getSecret } = require('../modules/secrets');
-
   try {
     const [appId, appKey] = await Promise.all([
       getSecret('ADZUNA_APP_ID'),
@@ -71,11 +69,13 @@ async function _getAdzunaCredentials() {
     return { appId, appKey };
   } catch (err) {
     // Fall back to env vars for local dev
-    const appId  = process.env.ADZUNA_APP_ID;
+    const appId = process.env.ADZUNA_APP_ID;
     const appKey = process.env.ADZUNA_APP_KEY;
     if (appId && appKey) return { appId, appKey };
     throw Object.assign(
-      new Error('Adzuna credentials not configured. Set ADZUNA_APP_ID and ADZUNA_APP_KEY in Secret Manager or .env'),
+      new Error(
+        'Adzuna credentials not configured. Set ADZUNA_APP_ID and ADZUNA_APP_KEY in Secret Manager or .env'
+      ),
       { code: 'ADZUNA_NOT_CONFIGURED', statusCode: 503 }
     );
   }
@@ -102,52 +102,50 @@ async function _fetchFromAdzuna({ appId, appKey, role, skills, country, resultsP
 
   // Build search query: role + top 3 skills for relevance
   const topSkills = (skills || []).slice(0, 3).join(' ');
-  const query     = [role, topSkills].filter(Boolean).join(' ');
+  const query = [role, topSkills].filter(Boolean).join(' ');
 
   const url = new URL(`${ADZUNA_BASE_URL}/${adzunaCountry}/search/1`);
-  url.searchParams.set('app_id',          appId);
-  url.searchParams.set('app_key',         appKey);
+  url.searchParams.set('app_id', appId);
+  url.searchParams.set('app_key', appKey);
   url.searchParams.set('results_per_page', String(resultsPerPage));
-  url.searchParams.set('what',            query);
-  url.searchParams.set('content-type',    'application/json');
-  url.searchParams.set('sort_by',         'relevance');
+  url.searchParams.set('what', query);
+  url.searchParams.set('content-type', 'application/json');
+  url.searchParams.set('sort_by', 'relevance');
 
-  logger.debug('[JobFetcher] Calling Adzuna', {
-    country: adzunaCountry, query, resultsPerPage,
-  });
+  logger.debug('[JobFetcher] Calling Adzuna', { country: adzunaCountry, query, resultsPerPage });
 
   const res = await fetch(url.toString(), {
     headers: { Accept: 'application/json' },
-    signal:  AbortSignal.timeout(15_000),
+    signal: AbortSignal.timeout(15_000),
   });
 
   if (!res.ok) {
     const body = await res.text().catch(() => '');
-    throw Object.assign(
-      new Error(`Adzuna API error ${res.status}: ${body.slice(0, 200)}`),
-      { statusCode: res.status, code: 'ADZUNA_API_ERROR' }
-    );
+    throw Object.assign(new Error(`Adzuna API error ${res.status}: ${body.slice(0, 200)}`), {
+      statusCode: res.status,
+      code: 'ADZUNA_API_ERROR',
+    });
   }
 
   const data = await res.json();
 
   // Normalise Adzuna results to our internal job shape
-  const jobs = (data.results || []).map(job => ({
-    id:             job.id            || null,
-    title:          job.title         || 'Untitled',
-    company:        job.company?.display_name || 'Unknown Company',
-    location:       job.location?.display_name || adzunaCountry.toUpperCase(),
-    description:    (job.description || '').slice(0, 500),
+  const jobs = (data.results || []).map((job) => ({
+    id: job.id || null,
+    title: job.title || 'Untitled',
+    company: job.company?.display_name || 'Unknown Company',
+    location: job.location?.display_name || adzunaCountry.toUpperCase(),
+    description: (job.description || '').slice(0, 500),
     salary: {
-      min:      job.salary_min     || null,
-      max:      job.salary_max     || null,
+      min: job.salary_min || null,
+      max: job.salary_max || null,
       currency: job.salary_currency || 'GBP', // Adzuna default
     },
-    postedAt:     job.created || new Date().toISOString(),
-    redirectUrl:  job.redirect_url || null,
-    category:     job.category?.label || null,
-    contractType: job.contract_type  || null,
-    source:       'adzuna',
+    postedAt: job.created || new Date().toISOString(),
+    redirectUrl: job.redirect_url || null,
+    category: job.category?.label || null,
+    contractType: job.contract_type || null,
+    source: 'adzuna',
   }));
 
   return {
@@ -159,52 +157,69 @@ async function _fetchFromAdzuna({ appId, appKey, role, skills, country, resultsP
   };
 }
 
-// ── Store results in Firestore ────────────────────────────────────────────────
+// ── Store results in Supabase ─────────────────────────────────────────────────
 
 async function _storeJobListings(userId, cacheKey, result) {
   try {
     const docId = `${userId}__${cacheKey.replace(/[:/]/g, '_')}`;
-    await db.collection(COLLECTION).doc(docId).set({
-      userId,
-      cacheKey,
-      ...result,
-      storedAt: new Date(),
-      expiresAt: new Date(Date.now() + CACHE_TTL_SECONDS * 1000),
-    });
+    const now = new Date();
+
+    const { error } = await supabase
+      .from(COLLECTION)
+      .upsert([{
+        id: docId,
+        userId,
+        cacheKey,
+        ...result,
+        storedAt: now.toISOString(),
+        expiresAt: new Date(Date.now() + CACHE_TTL_SECONDS * 1000).toISOString(),
+      }]);
+
+    if (error) {
+      logger.warn('[JobFetcher] Failed to store job listings in Supabase (non-fatal)', {
+        userId,
+        error: error.message,
+      });
+    }
   } catch (err) {
-    logger.warn('[JobFetcher] Failed to store job listings in Firestore (non-fatal)', {
-      userId, error: err.message,
+    logger.warn('[JobFetcher] Failed to store job listings in Supabase (non-fatal)', {
+      userId,
+      error: err.message,
     });
   }
 }
 
-// ── Read cached results from Firestore ────────────────────────────────────────
+// ── Read cached results from Supabase ─────────────────────────────────────────
 
-async function _readCachedFromFirestore(userId, cacheKey) {
+async function _readCachedFromSupabase(userId, cacheKey) {
   try {
     const docId = `${userId}__${cacheKey.replace(/[:/]/g, '_')}`;
-    const snap  = await db.collection(COLLECTION).doc(docId).get();
-    if (!snap.exists) return null;
 
-    const data = snap.data();
+    const { data, error } = await supabase
+      .from(COLLECTION)
+      .select('*')
+      .eq('id', docId)
+      .maybeSingle();
 
-    // Check if the Firestore cache is still fresh
-    const expiresAt = data.expiresAt?.toDate?.() || new Date(data.expiresAt);
+    if (error || !data) return null;
+
+    // Check if the Supabase cache is still fresh
+    const expiresAt = new Date(data.expiresAt);
     if (expiresAt < new Date()) {
-      logger.debug('[JobFetcher] Firestore cache expired', { userId, cacheKey });
+      logger.debug('[JobFetcher] Supabase cache expired', { userId, cacheKey });
       return null;
     }
 
     return {
-      jobs:         data.jobs,
+      jobs: data.jobs,
       totalResults: data.totalResults,
-      query:        data.query,
-      country:      data.country,
-      fetchedAt:    data.fetchedAt,
-      source:       'firestore_cache',
+      query: data.query,
+      country: data.country,
+      fetchedAt: data.fetchedAt,
+      source: 'supabase_cache',
     };
   } catch (err) {
-    logger.debug('[JobFetcher] Firestore cache read failed', { error: err.message });
+    logger.debug('[JobFetcher] Supabase cache read failed', { error: err.message });
     return null;
   }
 }
@@ -220,19 +235,19 @@ async function _readCachedFromFirestore(userId, cacheKey) {
  *
  * Cache strategy (3 layers):
  *   1. Redis/Memory cache (TTL: 24h) — fastest
- *   2. Firestore (TTL: 24h) — survives server restarts
+ *   2. Supabase (TTL: 24h) — survives server restarts
  *   3. Adzuna live API — populates both caches on miss
  *
- * @param {{ user_id: string, parsedData?: object, targetRole?: string, skills?: string[], forceRefresh?: boolean }}
+ * @param {{ userId: string, parsedData?: object, targetRole?: string, skills?: string[], forceRefresh?: boolean }}
  * @returns {Promise<{ jobs: object[], totalResults: number, fetchedAt: string, source: string }>}
  */
 async function fetchJobsForUser({ userId, parsedData, targetRole, skills, forceRefresh = false }) {
   if (!userId) throw new Error('[JobFetcher] userId is required');
 
   // Detect country from resume location
-  const country   = detectUserCountry(parsedData);
-  const role      = targetRole || 'software engineer'; // safe default
-  const cacheKey  = _buildCacheKey(userId, role, country);
+  const country = detectUserCountry(parsedData);
+  const role = targetRole || 'software engineer'; // safe default
+  const cacheKey = _buildCacheKey(userId, role, country);
 
   // ── Layer 1: Redis/Memory cache ───────────────────────────────────────────
   if (!forceRefresh) {
@@ -245,15 +260,15 @@ async function fetchJobsForUser({ userId, parsedData, targetRole, skills, forceR
     } catch (_) { /* cache miss is safe */ }
   }
 
-  // ── Layer 2: Firestore cache ──────────────────────────────────────────────
+  // ── Layer 2: Supabase cache ───────────────────────────────────────────────
   if (!forceRefresh) {
-    const firestoreCached = await _readCachedFromFirestore(userId, cacheKey);
-    if (firestoreCached) {
-      // Warm the memory cache from Firestore
+    const supabaseCached = await _readCachedFromSupabase(userId, cacheKey);
+    if (supabaseCached) {
+      // Warm the memory cache from Supabase
       try {
-        await cache.set(cacheKey, JSON.stringify(firestoreCached), CACHE_TTL_SECONDS);
+        await cache.set(cacheKey, JSON.stringify(supabaseCached), CACHE_TTL_SECONDS);
       } catch (_) {}
-      return firestoreCached;
+      return supabaseCached;
     }
   }
 
@@ -263,46 +278,52 @@ async function fetchJobsForUser({ userId, parsedData, targetRole, skills, forceR
     credentials = await _getAdzunaCredentials();
   } catch (err) {
     logger.warn('[JobFetcher] Adzuna not configured — returning empty job list', {
-      userId, error: err.message,
+      userId,
+      error: err.message,
     });
     // Return empty result rather than crashing the dashboard
-    return { jobs: [], totalResults: 0, fetchedAt: new Date().toISOString(), source: 'unavailable', reason: err.message };
+    return {
+      jobs: [],
+      totalResults: 0,
+      fetchedAt: new Date().toISOString(),
+      source: 'unavailable',
+      reason: err.message,
+    };
   }
 
   try {
     const result = await _fetchFromAdzuna({
-      appId:  credentials.appId,
+      appId: credentials.appId,
       appKey: credentials.appKey,
       role,
       skills: skills || [],
       country,
     });
-
     result.source = 'adzuna_live';
 
     // Populate both caches
     try {
       await cache.set(cacheKey, JSON.stringify(result), CACHE_TTL_SECONDS);
     } catch (_) {}
-
     await _storeJobListings(userId, cacheKey, result);
 
     logger.info('[JobFetcher] Jobs fetched from Adzuna', {
-      userId, role, country, count: result.jobs.length,
+      userId,
+      role,
+      country,
+      count: result.jobs.length,
     });
-
     return result;
-
   } catch (err) {
     logger.error('[JobFetcher] Adzuna API call failed', { userId, error: err.message });
 
     // Return empty rather than crashing — job matches are non-critical
     return {
-      jobs:         [],
+      jobs: [],
       totalResults: 0,
-      fetchedAt:    new Date().toISOString(),
-      source:       'error',
-      reason:       err.message,
+      fetchedAt: new Date().toISOString(),
+      source: 'error',
+      reason: err.message,
     };
   }
 }
@@ -324,11 +345,3 @@ module.exports = {
   fetchJobsForUser,
   invalidateJobCache,
 };
-
-
-
-
-
-
-
-

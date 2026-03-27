@@ -12,9 +12,9 @@
  *   Provider-agnostic: Razorpay and Stripe webhooks both call activateProUser().
  */
 
-const { db }      = require('../../config/supabase');
+const supabase = require('../../config/supabase');
 const { AppError, ErrorCodes } = require('../../middleware/errorHandler');
-const logger      = require('../../utils/logger');
+const logger = require('../../utils/logger');
 const { getCreditsForPlan } = require('../analysis/analysis.constants');
 
 /**
@@ -28,29 +28,57 @@ const { getCreditsForPlan } = require('../analysis/analysis.constants');
 async function activateProUser({ userId, planAmount, subscriptionId, provider }) {
   const credits = getCreditsForPlan(planAmount);
 
-  const ref = db.collection('users').doc(userId);
+  // ── Verify user exists before applying activation ─────────────────────────
+  const { data: existingUser, error: fetchError } = await supabase
+    .from('users')
+    .select('id')
+    .eq('id', userId)
+    .maybeSingle();
 
-  await db.runTransaction(async (txn) => {
-    const doc = await txn.get(ref);
+  if (fetchError) {
+    throw new AppError(
+      fetchError.message,
+      500,
+      { userId },
+      ErrorCodes.INTERNAL_ERROR
+    );
+  }
 
-    if (!doc.exists) {
-      throw new AppError('User not found during activation', 404, { userId }, ErrorCodes.NOT_FOUND);
-    }
+  if (!existingUser) {
+    throw new AppError(
+      'User not found during activation',
+      404,
+      { userId },
+      ErrorCodes.NOT_FOUND
+    );
+  }
 
-    txn.update(ref, {
-      tier:                  'pro',
+  // ── Apply pro activation atomically ──────────────────────────────────────
+  const { error: updateError } = await supabase
+    .from('users')
+    .update({
+      tier: 'pro',
       planAmount,
-      aiCreditsRemaining:    credits,
-      reportUnlocked:        true,
+      aiCreditsRemaining: credits,
+      reportUnlocked: true,
       subscriptionId,
-      subscriptionProvider:  provider,
-      subscriptionStatus:    'active',
-      subscriptionStart:     new Date(),
+      subscriptionProvider: provider,
+      subscriptionStatus: 'active',
+      subscriptionStart: new Date().toISOString(),
       // V1: one-time plan, no end date
-      subscriptionEnd:       null,
-      updatedAt:             new Date(),
-    });
-  });
+      subscriptionEnd: null,
+      updatedAt: new Date().toISOString(),
+    })
+    .eq('id', userId);
+
+  if (updateError) {
+    throw new AppError(
+      updateError.message,
+      500,
+      { userId },
+      ErrorCodes.INTERNAL_ERROR
+    );
+  }
 
   logger.info('[PaymentActivation] Pro activated', {
     userId,
@@ -60,7 +88,11 @@ async function activateProUser({ userId, planAmount, subscriptionId, provider })
     subscriptionId,
   });
 
-  return { userId, planAmount, creditsGranted: credits };
+  return {
+    userId,
+    planAmount,
+    creditsGranted: credits,
+  };
 }
 
 /**
@@ -69,32 +101,51 @@ async function activateProUser({ userId, planAmount, subscriptionId, provider })
  * Reverts to free tier. Zeroes out credits.
  */
 async function downgradeUser(userId) {
-  const ref = db.collection('users').doc(userId);
+  // ── Verify user exists (idempotent — if not found, skip silently) ─────────
+  const { data: existingUser, error: fetchError } = await supabase
+    .from('users')
+    .select('id')
+    .eq('id', userId)
+    .maybeSingle();
 
-  await db.runTransaction(async (txn) => {
-    const doc = await txn.get(ref);
-    if (!doc.exists) return; // idempotent
+  if (fetchError) {
+    throw new AppError(
+      fetchError.message,
+      500,
+      { userId },
+      ErrorCodes.INTERNAL_ERROR
+    );
+  }
 
-    txn.update(ref, {
-      tier:                 'free',
-      planAmount:           null,
-      aiCreditsRemaining:   0,
-      reportUnlocked:       false,
-      subscriptionStatus:   'cancelled',
-      subscriptionEnd:      new Date(),
-      updatedAt:            new Date(),
-    });
-  });
+  // idempotent: if user doesn't exist, nothing to downgrade
+  if (!existingUser) return;
+
+  const { error: updateError } = await supabase
+    .from('users')
+    .update({
+      tier: 'free',
+      planAmount: null,
+      aiCreditsRemaining: 0,
+      reportUnlocked: false,
+      subscriptionStatus: 'cancelled',
+      subscriptionEnd: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    })
+    .eq('id', userId);
+
+  if (updateError) {
+    throw new AppError(
+      updateError.message,
+      500,
+      { userId },
+      ErrorCodes.INTERNAL_ERROR
+    );
+  }
 
   logger.info('[PaymentActivation] User downgraded to free', { userId });
 }
 
-module.exports = { activateProUser, downgradeUser };
-
-
-
-
-
-
-
-
+module.exports = {
+  activateProUser,
+  downgradeUser,
+};

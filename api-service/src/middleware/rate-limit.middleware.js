@@ -1,16 +1,36 @@
 /**
  * api-service/src/middleware/rate-limit.middleware.js
  *
- * Per-User API Rate Limiting & Abuse Prevention
+ * FIXED: Converted from Firestore shim to native Supabase.
  *
- * Supports sharded job structure:
- *   automationJobs/{shard}/jobs/{jobId}
+ * Removed:
+ *   - db.collection() / collection.doc() references
+ *   - db.runTransaction() / tx.get() / tx.set() / tx.update()
+ *   - snap.exists / snap.data()
+ *   - FieldValue.serverTimestamp() / FieldValue.increment()
+ *   - Timestamp.fromDate()
+ *   - db.collectionGroup()
  *
- * Uses collectionGroup('jobs') for cross-shard queries.
+ * Replaced with:
+ *   - supabase.from() queries with { data, error } destructuring
+ *   - Optimistic upsert-based counter increment (replaces transaction)
+ *   - ISO strings for all timestamps
+ *   - COUNT aggregate query for pending jobs
+ *
+ * NOTE: module uses `export` (ESM) syntax — preserved as-is.
  */
 
-const { db, FieldValue, Timestamp } = require('../../../../src/core/supabaseDbShim');
+import { createClient } from '@supabase/supabase-js';
 import { logger } from '../../../shared/logger/index.js';
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Supabase client (ESM-compatible singleton)
+// ─────────────────────────────────────────────────────────────────────────────
+
+const supabase = createClient(
+  process.env.SUPABASE_URL,
+  process.env.SUPABASE_SERVICE_ROLE_KEY
+);
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Configuration
@@ -24,7 +44,7 @@ const LIMITS = Object.freeze({
   dailyCareerRequests: 20,
 });
 
-const COLLECTION = 'rateLimitCounters';
+const RATE_LIMIT_TABLE = 'rate_limit_counters';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Rate Limit Middleware Factory
@@ -37,8 +57,8 @@ export function rateLimit({ counterKey, limit, window = 'minute' }) {
 
     try {
       const windowKey = getWindowKey(window);
-      const docId = `${userId}_${counterKey}_${windowKey}`;
-      const allowed = await checkAndIncrement(docId, limit, window);
+      const docId     = `${userId}_${counterKey}_${windowKey}`;
+      const allowed   = await checkAndIncrement(docId, limit, window);
 
       if (!allowed) {
         logger.warn('Rate limit exceeded', {
@@ -50,8 +70,8 @@ export function rateLimit({ counterKey, limit, window = 'minute' }) {
         });
 
         return res.status(429).json({
-          error: 'RATE_LIMIT_EXCEEDED',
-          message: `Too many requests. Limit: ${limit} per ${window}.`,
+          error:      'RATE_LIMIT_EXCEEDED',
+          message:    `Too many requests. Limit: ${limit} per ${window}.`,
           retryAfter: window === 'minute' ? 60 : 86400,
         });
       }
@@ -70,32 +90,35 @@ export function rateLimit({ counterKey, limit, window = 'minute' }) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Pending Job Limit (SHARDED STRUCTURE COMPATIBLE)
+// Pending Job Limit
 // ─────────────────────────────────────────────────────────────────────────────
 
 export async function checkPendingJobLimit(userId) {
-  
+  const { count, error } = await supabase
+    .from('jobs')
+    .select('id', { count: 'exact', head: true })
+    .eq('user_id', userId)
+    .in('status', ['pending', 'processing'])
+    .is('deleted_at', null);
 
-  const snap = await db
-    .collectionGroup('jobs') // 🔥 Updated for sharded structure
-    .where('userId', '==', userId)
-    .where('status', 'in', ['pending', 'processing'])
-    .where('deletedAt', '==', null)
-    .count()
-    .get();
+  if (error) {
+    logger.error('checkPendingJobLimit query failed', { userId, error: error.message });
+    // Fail open — don't block user on DB error
+    return { allowed: true, count: 0 };
+  }
 
-  const count = snap?.data()?.count ?? 0;
+  const jobCount = count ?? 0;
 
-  if (count >= LIMITS.maxPendingJobs) {
+  if (jobCount >= LIMITS.maxPendingJobs) {
     return {
       allowed: false,
-      count,
-      limit: LIMITS.maxPendingJobs,
-      message: `You have ${count} pending jobs. Maximum is ${LIMITS.maxPendingJobs}.`,
+      count:   jobCount,
+      limit:   LIMITS.maxPendingJobs,
+      message: `You have ${jobCount} pending jobs. Maximum is ${LIMITS.maxPendingJobs}.`,
     };
   }
 
-  return { allowed: true, count };
+  return { allowed: true, count: jobCount };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -104,26 +127,26 @@ export async function checkPendingJobLimit(userId) {
 
 export const resumeSubmitRateLimit = rateLimit({
   counterKey: 'resume_submit',
-  limit: LIMITS.dailyResumeSubmits,
-  window: 'day',
+  limit:      LIMITS.dailyResumeSubmits,
+  window:     'day',
 });
 
 export const salaryRequestRateLimit = rateLimit({
   counterKey: 'salary_request',
-  limit: LIMITS.dailySalaryRequests,
-  window: 'day',
+  limit:      LIMITS.dailySalaryRequests,
+  window:     'day',
 });
 
 export const careerRequestRateLimit = rateLimit({
   counterKey: 'career_request',
-  limit: LIMITS.dailyCareerRequests,
-  window: 'day',
+  limit:      LIMITS.dailyCareerRequests,
+  window:     'day',
 });
 
 export const globalRequestRateLimit = rateLimit({
   counterKey: 'global',
-  limit: LIMITS.requestsPerMinute,
-  window: 'minute',
+  limit:      LIMITS.requestsPerMinute,
+  window:     'minute',
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -147,7 +170,7 @@ export async function pendingJobLimitMiddleware(req, res, next) {
       });
 
       return res.status(429).json({
-        error: 'PENDING_JOB_LIMIT_EXCEEDED',
+        error:       'PENDING_JOB_LIMIT_EXCEEDED',
         message,
         pendingJobs: count,
         limit,
@@ -156,11 +179,7 @@ export async function pendingJobLimitMiddleware(req, res, next) {
 
     next();
   } catch (err) {
-    logger.error('Pending job check failed — allowing request', {
-      err,
-      userId,
-    });
-
+    logger.error('Pending job check failed — allowing request', { err, userId });
     next(); // Fail open
   }
 }
@@ -169,34 +188,60 @@ export async function pendingJobLimitMiddleware(req, res, next) {
 // Internal Helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
+/**
+ * Atomically check and increment a rate-limit counter.
+ *
+ * Strategy: read-then-upsert with an ISO expiry.
+ * Supabase lacks server-side increment without an RPC, so we:
+ *   1. Read the current row.
+ *   2. If count >= limit → reject (return false).
+ *   3. Upsert with count + 1.
+ *
+ * This is slightly optimistic (two round-trips) but safe at normal traffic
+ * levels. For high-throughput services, replace with a Postgres RPC:
+ *   SELECT rate_limit_increment($1, $2, $3)
+ *
+ * @returns {Promise<boolean>} true if the request is allowed
+ */
 async function checkAndIncrement(docId, limit, window) {
-  
-  const ref = db.collection(COLLECTION).doc(docId);
-  const expiresAt = getWindowExpiry(window);
+  const expiresAt = getWindowExpiry(window).toISOString();
+  const now       = new Date().toISOString();
 
-  const result = await db.runTransaction(async (tx) => {
-    const snap = await tx.get(ref);
+  // 1. Fetch existing counter
+  const { data: existing, error: readError } = await supabase
+    .from(RATE_LIMIT_TABLE)
+    .select('count')
+    .eq('id', docId)
+    .maybeSingle();
 
-    if (!snap.exists) {
-      tx.set(ref, {
-        count: 1,
-        createdAt: FieldValue.serverTimestamp(),
-        expiresAt,
-      });
-      return 1;
-    }
+  if (readError) {
+    logger.error('[rateLimit] Counter read failed', { docId, error: readError.message });
+    return true; // Fail open
+  }
 
-    const current = snap.data().count ?? 0;
-    if (current >= limit) return null;
+  const current = existing?.count ?? 0;
 
-    tx.update(ref, {
-      count: FieldValue.increment(1),
-    });
+  if (current >= limit) return false;
 
-    return current + 1;
-  });
+  // 2. Upsert with incremented count
+  const { error: writeError } = await supabase
+    .from(RATE_LIMIT_TABLE)
+    .upsert(
+      {
+        id:         docId,
+        count:      current + 1,
+        created_at: existing ? undefined : now,
+        expires_at: expiresAt,
+      },
+      { onConflict: 'id' }
+    );
 
-  return result !== null;
+  if (writeError) {
+    logger.error('[rateLimit] Counter write failed', { docId, error: writeError.message });
+    return true; // Fail open
+  }
+
+  return true;
 }
 
 function getWindowKey(window) {
@@ -220,5 +265,5 @@ function getWindowExpiry(window) {
     now.setDate(now.getDate() + 2);
   }
 
-  return Timestamp.fromDate(now);
+  return now;
 }

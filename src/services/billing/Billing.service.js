@@ -24,7 +24,7 @@
  *      All state mutations check subscriptionId to prevent double-processing
  *      webhook events (both Stripe and Razorpay can deliver events >1 time).
  *
- *   3. Audit trail via subscriptionEvents collection.
+ *   3. Audit trail via subscriptionEvents table.
  *      Every state change is appended — never overwritten. This is required
  *      for dispute resolution, refund audits, and compliance.
  *
@@ -32,49 +32,79 @@
  *      User data is preserved. Only tier and credits are revoked.
  *      Allows win-back campaigns and easy reactivation.
  *
- * COLLECTIONS:
+ * TABLES:
  *
- *   subscriptions/{userId}
- *     Current subscription state (single doc, upserted on each event)
+ *   subscriptions
+ *     Current subscription state per userId (upserted on each event)
  *
- *   subscriptionEvents/{eventId}
+ *   subscriptionEvents
  *     Immutable audit log of all billing events (append-only)
  *
- * FIRESTORE INDEXES NEEDED:
+ * SUPABASE INDEXES NEEDED:
  *   subscriptions: [status ASC, expiresAt ASC]    (for expiry job)
  *   subscriptions: [userId ASC, status ASC]
  *   subscriptionEvents: [userId ASC, createdAt DESC]
  *   subscriptionEvents: [provider ASC, externalEventId ASC]  (idempotency)
  */
-
-const { db, FieldValue, Timestamp } = require('../../config/supabase');
-const { AppError, ErrorCodes } = require('../../middleware/errorHandler');
+const supabase = require('../../config/supabase');
+const {
+  AppError,
+  ErrorCodes
+} = require('../../middleware/errorHandler');
 const logger = require('../../utils/logger');
-const { getCreditsForPlan } = require('../../modules/analysis/analysis.constants');
+const {
+  getCreditsForPlan
+} = require('../../modules/analysis/analysis.constants');
 
 // ─── Plan configuration ───────────────────────────────────────────────────────
 
 const PLAN_CONFIG = {
   // INR plans
-  499:  { tier: 'pro',        credits: 16, currency: 'INR', durationDays: 30 },
-  699:  { tier: 'pro',        credits: 23, currency: 'INR', durationDays: 30 },
-  999:  { tier: 'pro',        credits: 33, currency: 'INR', durationDays: 30 },
+  499: {
+    tier: 'pro',
+    credits: 16,
+    currency: 'INR',
+    durationDays: 30
+  },
+  699: {
+    tier: 'pro',
+    credits: 23,
+    currency: 'INR',
+    durationDays: 30
+  },
+  999: {
+    tier: 'pro',
+    credits: 33,
+    currency: 'INR',
+    durationDays: 30
+  },
   // USD plans (for international expansion)
-  9:    { tier: 'pro',        credits: 20, currency: 'USD', durationDays: 30 },
-  29:   { tier: 'enterprise', credits: 100, currency: 'USD', durationDays: 30 },
+  9: {
+    tier: 'pro',
+    credits: 20,
+    currency: 'USD',
+    durationDays: 30
+  },
+  29: {
+    tier: 'enterprise',
+    credits: 100,
+    currency: 'USD',
+    durationDays: 30
+  }
 };
 
 function getPlanConfig(amount, currency = 'INR') {
-  // Find by amount
   const config = PLAN_CONFIG[amount];
-  if (!config) throw new AppError(`Unknown plan amount: ${amount}`, 400, { amount }, ErrorCodes.VALIDATION_ERROR);
+  if (!config) throw new AppError(`Unknown plan amount: ${amount}`, 400, {
+    amount
+  }, ErrorCodes.VALIDATION_ERROR);
   return config;
 }
 
 // ─── Subscription schema (for documentation — not runtime schema enforcement) ─
 
 /*
-  subscriptions/{userId}: {
+  subscriptions row: {
     user_id:               string
     tier:                 'free' | 'pro' | 'enterprise'
     status:               'active' | 'cancelled' | 'expired' | 'paused' | 'trialing'
@@ -84,17 +114,17 @@ function getPlanConfig(amount, currency = 'INR') {
     aiCreditsRemaining:   number
     subscriptionId:       string         (provider's subscription/payment ID)
     provider:             'razorpay' | 'stripe' | 'manual'
-    activatedAt:          Timestamp
-    expiresAt:            Timestamp | null
-    cancelledAt:          Timestamp | null
-    currentPeriodStart:   Timestamp
-    currentPeriodEnd:     Timestamp
+    activatedAt:          timestamptz
+    expiresAt:            timestamptz | null
+    cancelledAt:          timestamptz | null
+    currentPeriodStart:   timestamptz
+    currentPeriodEnd:     timestamptz
     autoRenew:            boolean
-    trialEndsAt:          Timestamp | null
-    updatedAt:            Timestamp
+    trialEndsAt:          timestamptz | null
+    updatedAt:            timestamptz
   }
 
-  subscriptionEvents/{eventId}: {
+  subscriptionEvents row: {
     user_id:           string
     eventType:        'activated' | 'renewed' | 'cancelled' | 'downgraded' | 'refunded' | 'expired' | 'paused'
     provider:         string
@@ -106,20 +136,21 @@ function getPlanConfig(amount, currency = 'INR') {
     newTier:          string
     metadata:         object
     idempotencyKey:   string         (prevent duplicate processing)
-    createdAt:        Timestamp
+    createdAt:        timestamptz
   }
 */
 
 // ─── Idempotency check ────────────────────────────────────────────────────────
 
 async function isEventAlreadyProcessed(idempotencyKey) {
-  
-  const snap = await db
-    .collection('subscriptionEvents')
-    .where('idempotencyKey', '==', idempotencyKey)
-    .limit(1)
-    .get();
-  return !snap.empty;
+  const { data: _ev, error } = await supabase
+    .from('subscriptionEvents')
+    .select('id')
+    .eq('idempotencyKey', idempotencyKey)
+    .limit(1);
+
+  if (error) throw error;
+  return !!_ev?.length;
 }
 
 // ─── Core: activate subscription ─────────────────────────────────────────────
@@ -134,102 +165,129 @@ async function isEventAlreadyProcessed(idempotencyKey) {
  *   1. Idempotency check (skip if already processed)
  *   2. Look up plan config
  *   3. Update users/{userId} — tier, credits, subscription fields
- *   4. Upsert subscriptions/{userId}
- *   5. Append to subscriptionEvents/{eventId}
+ *   4. Upsert subscriptions row for userId
+ *   5. Append to subscriptionEvents
  */
-async function activateSubscription({ userId, planAmount, subscriptionId, provider, externalEventId, currency = 'INR' }) {
+async function activateSubscription({
+  userId,
+  planAmount,
+  subscriptionId,
+  provider,
+  externalEventId,
+  currency = 'INR'
+}) {
   const idempotencyKey = `activate:${subscriptionId}`;
-
   if (await isEventAlreadyProcessed(idempotencyKey)) {
-    logger.info('[Billing] Duplicate activation event skipped', { subscriptionId, idempotencyKey });
-    return { skipped: true, reason: 'duplicate' };
+    logger.info('[Billing] Duplicate activation event skipped', {
+      subscriptionId,
+      idempotencyKey
+    });
+    return {
+      skipped: true,
+      reason: 'duplicate'
+    };
   }
 
   const plan = getPlanConfig(planAmount, currency);
-  
-  const now  = new Date();
-
+  const now = new Date();
+  const nowISO = now.toISOString();
   const expiresAt = new Date(now);
   expiresAt.setDate(expiresAt.getDate() + plan.durationDays);
+  const expiresAtISO = expiresAt.toISOString();
 
   // ── Fetch previous tier for audit log ────────────────────────────────────
-  const userDoc     = await db.collection('users').doc(userId).get();
-  const previousTier = userDoc.exists ? (userDoc.data()?.tier ?? 'free') : 'free';
+  const { data: _userRow, error: userFetchError } = await supabase
+    .from('users')
+    .select('tier, planAmount, planCurrency')
+    .eq('id', userId)
+    .maybeSingle();
 
-  // ── Batch write (atomic) ──────────────────────────────────────────────────
-  const batch = db.batch();
+  if (userFetchError) throw userFetchError;
 
-  // 1. Update users document
-  const userRef = db.collection('users').doc(userId);
-  batch.update(userRef, {
-    tier:                  plan.tier,
-    planAmount,
-    planCurrency:          currency,
-    aiCreditsRemaining:    plan.credits,
-    reportUnlocked:        true,
-    subscriptionId,
-    subscriptionProvider:  provider,
-    subscriptionStatus:    'active',
-    subscriptionStart:     Timestamp.fromDate(now),
-    subscriptionEnd:       Timestamp.fromDate(expiresAt),
-    updatedAt:             FieldValue.serverTimestamp(),
-  });
+  const previousTier = _userRow?.tier ?? 'free';
 
-  // 2. Upsert subscription document
-  const subRef = db.collection('subscriptions').doc(userId);
-  batch.set(subRef, {
-    userId,
-    tier:                 plan.tier,
-    status:               'active',
-    planAmount,
-    planCurrency:         currency,
-    aiCreditsAllocated:   plan.credits,
-    aiCreditsRemaining:   plan.credits,
-    subscriptionId,
-    provider,
-    activatedAt:          Timestamp.fromDate(now),
-    expiresAt:            Timestamp.fromDate(expiresAt),
-    cancelledAt:          null,
-    currentPeriodStart:   Timestamp.fromDate(now),
-    currentPeriodEnd:     Timestamp.fromDate(expiresAt),
-    autoRenew:            false,  // v1: one-time, set to true when recurring is ready
-    trialEndsAt:          null,
-    updatedAt:            FieldValue.serverTimestamp(),
-  }, { merge: true });
+  // ── Parallel writes (replaces batch) ──────────────────────────────────────
+  const [userUpdateResult, subscriptionUpsertResult, eventInsertResult] = await Promise.all([
+    supabase
+      .from('users')
+      .update({
+        tier: plan.tier,
+        status: 'active',
+        planAmount,
+        planCurrency: currency,
+        aiCreditsAllocated: plan.credits,
+        aiCreditsRemaining: plan.credits,
+        subscriptionId,
+        provider,
+        activatedAt: nowISO,
+        expiresAt: expiresAtISO,
+        cancelledAt: null,
+        currentPeriodStart: nowISO,
+        currentPeriodEnd: expiresAtISO,
+        autoRenew: false,
+        trialEndsAt: null,
+        updatedAt: nowISO
+      })
+      .eq('id', userId),
 
-  // 3. Append audit event
-  const eventRef = db.collection('subscriptionEvents').doc();
-  batch.set(eventRef, {
-    userId,
-    eventType:        'activated',
-    provider,
-    externalEventId:  externalEventId ?? subscriptionId,
-    planAmount,
-    planCurrency:     currency,
-    creditsGranted:   plan.credits,
-    previousTier,
-    newTier:          plan.tier,
-    metadata:         { subscriptionId },
-    idempotencyKey,
-    createdAt:        FieldValue.serverTimestamp(),
-  });
+    supabase
+      .from('subscriptions')
+      .upsert([{
+        userId,
+        tier: plan.tier,
+        status: 'active',
+        planAmount,
+        planCurrency: currency,
+        aiCreditsAllocated: plan.credits,
+        aiCreditsRemaining: plan.credits,
+        subscriptionId,
+        provider,
+        activatedAt: nowISO,
+        expiresAt: expiresAtISO,
+        cancelledAt: null,
+        currentPeriodStart: nowISO,
+        currentPeriodEnd: expiresAtISO,
+        autoRenew: false,
+        trialEndsAt: null,
+        updatedAt: nowISO
+      }]),
 
-  await batch.commit();
+    supabase
+      .from('subscriptionEvents')
+      .insert([{
+        userId,
+        eventType: 'activated',
+        provider,
+        externalEventId: externalEventId ?? subscriptionId,
+        planAmount,
+        planCurrency: currency,
+        creditsGranted: plan.credits,
+        previousTier,
+        newTier: plan.tier,
+        metadata: { subscriptionId },
+        idempotencyKey,
+        createdAt: nowISO
+      }])
+  ]);
+
+  if (userUpdateResult.error) throw userUpdateResult.error;
+  if (subscriptionUpsertResult.error) throw subscriptionUpsertResult.error;
+  if (eventInsertResult.error) throw eventInsertResult.error;
 
   logger.info('[Billing] Subscription activated', {
     userId,
     planAmount,
     tier: plan.tier,
     credits: plan.credits,
-    provider,
+    provider
   });
 
   return {
-    skipped:        false,
+    skipped: false,
     userId,
-    tier:           plan.tier,
+    tier: plan.tier,
     creditsGranted: plan.credits,
-    expiresAt:      expiresAt.toISOString(),
+    expiresAt: expiresAtISO
   };
 }
 
@@ -243,64 +301,97 @@ async function activateSubscription({ userId, planAmount, subscriptionId, provid
  *
  * Non-destructive: data preserved. Only tier + credits revoked.
  */
-async function cancelSubscription({ userId, subscriptionId, provider, reason = 'cancelled', externalEventId }) {
+async function cancelSubscription({
+  userId,
+  subscriptionId,
+  provider,
+  reason = 'cancelled',
+  externalEventId
+}) {
   const idempotencyKey = `cancel:${subscriptionId}`;
-
   if (await isEventAlreadyProcessed(idempotencyKey)) {
-    logger.info('[Billing] Duplicate cancel event skipped', { subscriptionId });
-    return { skipped: true };
+    logger.info('[Billing] Duplicate cancel event skipped', {
+      subscriptionId
+    });
+    return {
+      skipped: true
+    };
   }
 
-  
   const now = new Date();
+  const nowISO = now.toISOString();
 
-  const userDoc     = await db.collection('users').doc(userId).get();
-  const previousTier = userDoc.exists ? (userDoc.data()?.tier ?? 'pro') : 'pro';
+  const { data: userRow, error: userFetchError } = await supabase
+    .from('users')
+    .select('tier, planAmount, planCurrency')
+    .eq('id', userId)
+    .maybeSingle();
 
-  const batch = db.batch();
+  if (userFetchError) throw userFetchError;
+
+  const previousTier = userRow?.tier ?? 'pro';
+
+  // ── Parallel writes (replaces batch) ──────────────────────────────────────
 
   // 1. Revert user to free tier
-  const userRef = db.collection('users').doc(userId);
-  batch.update(userRef, {
-    tier:                 'free',
-    aiCreditsRemaining:   0,
-    reportUnlocked:       false,
-    subscriptionStatus:   'cancelled',
-    subscriptionEnd:      Timestamp.fromDate(now),
-    updatedAt:            FieldValue.serverTimestamp(),
-  });
-
   // 2. Update subscription document
-  const subRef = db.collection('subscriptions').doc(userId);
-  batch.update(subRef, {
-    status:       'cancelled',
-    tier:         'free',
-    cancelledAt:  Timestamp.fromDate(now),
-    updatedAt:    FieldValue.serverTimestamp(),
-  });
-
   // 3. Append audit event
-  const eventRef = db.collection('subscriptionEvents').doc();
-  batch.set(eventRef, {
+  const [userUpdateResult, subscriptionUpdateResult, eventInsertResult] = await Promise.all([
+    supabase
+      .from('users')
+      .update({
+        tier: 'free',
+        aiCreditsRemaining: 0,
+        reportUnlocked: false,
+        subscriptionStatus: 'cancelled',
+        subscriptionEnd: nowISO,
+        updatedAt: nowISO
+      })
+      .eq('id', userId),
+
+    supabase
+      .from('subscriptions')
+      .update({
+        status: 'cancelled',
+        tier: 'free',
+        cancelledAt: nowISO,
+        updatedAt: nowISO
+      })
+      .eq('userId', userId),
+
+    supabase
+      .from('subscriptionEvents')
+      .insert([{
+        userId,
+        eventType: 'cancelled',
+        provider,
+        externalEventId: externalEventId ?? subscriptionId,
+        planAmount: userRow?.planAmount ?? null,
+        planCurrency: userRow?.planCurrency ?? 'INR',
+        creditsGranted: 0,
+        previousTier,
+        newTier: 'free',
+        metadata: { subscriptionId, reason },
+        idempotencyKey,
+        createdAt: nowISO
+      }])
+  ]);
+
+  if (userUpdateResult.error) throw userUpdateResult.error;
+  if (subscriptionUpdateResult.error) throw subscriptionUpdateResult.error;
+  if (eventInsertResult.error) throw eventInsertResult.error;
+
+  logger.info('[Billing] Subscription cancelled', {
     userId,
-    eventType:       'cancelled',
     provider,
-    externalEventId: externalEventId ?? subscriptionId,
-    planAmount:      userDoc.data()?.planAmount ?? null,
-    planCurrency:    userDoc.data()?.planCurrency ?? 'INR',
-    creditsGranted:  0,
-    previousTier,
-    newTier:         'free',
-    metadata:        { subscriptionId, reason },
-    idempotencyKey,
-    createdAt:       FieldValue.serverTimestamp(),
+    reason
   });
 
-  await batch.commit();
-
-  logger.info('[Billing] Subscription cancelled', { userId, provider, reason });
-
-  return { skipped: false, userId, newTier: 'free' };
+  return {
+    skipped: false,
+    userId,
+    newTier: 'free'
+  };
 }
 
 // ─── Refund ───────────────────────────────────────────────────────────────────
@@ -309,13 +400,18 @@ async function cancelSubscription({ userId, subscriptionId, provider, reason = '
  * refundSubscription — same effect as cancel but different audit event type.
  * Used when the provider fires a refund webhook.
  */
-async function refundSubscription({ userId, subscriptionId, provider, externalEventId }) {
+async function refundSubscription({
+  userId,
+  subscriptionId,
+  provider,
+  externalEventId
+}) {
   return cancelSubscription({
     userId,
     subscriptionId,
     provider,
     reason: 'refund',
-    externalEventId,
+    externalEventId
   });
 }
 
@@ -328,43 +424,46 @@ async function refundSubscription({ userId, subscriptionId, provider, externalEv
  * Downgrades them to free tier.
  *
  * Called by: daily cron job (add to existing DailyAggregationWorker.runJob())
- *
- * SCALE NOTE: Firestore can't do range + equality compound query without index.
- *   Required index: subscriptions [status ASC, expiresAt ASC]
  */
 async function expireOverdueSubscriptions() {
-  
-  const now = Timestamp.now();
+  const now = new Date().toISOString();
 
-  const expired = await db
-    .collection('subscriptions')
-    .where('status', '==', 'active')
-    .where('expiresAt', '<=', now)
-    .limit(100) // process in batches of 100
-    .get();
+  const { data: expiredRows, error } = await supabase
+    .from('subscriptions')
+    .select('userId, subscriptionId, provider')
+    .eq('status', 'active')
+    .lte('expiresAt', now)
+    .limit(100); // process in batches of 100
 
-  if (expired.empty) {
+  if (error) throw error;
+
+  if (!expiredRows || expiredRows.length === 0) {
     logger.info('[Billing] No expired subscriptions found');
-    return { processed: 0 };
+    return {
+      processed: 0
+    };
   }
 
   const results = await Promise.allSettled(
-    expired.docs.map(doc =>
-      cancelSubscription({
-        user_id:         doc.id,
-        subscriptionId: doc.data().subscriptionId ?? 'expired',
-        provider:       doc.data().provider ?? 'system',
-        reason:         'expired',
-        externalEventId: `expiry:${doc.id}`,
-      })
-    )
+    expiredRows.map(row => cancelSubscription({
+      userId: row.userId,
+      subscriptionId: row.subscriptionId ?? 'expired',
+      provider: row.provider ?? 'system',
+      reason: 'expired',
+      externalEventId: `expiry:${row.userId}`
+    }))
   );
 
   const processed = results.filter(r => r.status === 'fulfilled').length;
-  const failed    = results.filter(r => r.status === 'rejected').length;
-
-  logger.info('[Billing] Expiry job complete', { processed, failed });
-  return { processed, failed };
+  const failed = results.filter(r => r.status === 'rejected').length;
+  logger.info('[Billing] Expiry job complete', {
+    processed,
+    failed
+  });
+  return {
+    processed,
+    failed
+  };
 }
 
 // ─── Webhook signature verification skeletons ─────────────────────────────────
@@ -388,61 +487,68 @@ async function expireOverdueSubscriptions() {
  */
 async function handleRazorpayWebhook(payload, verified = false) {
   if (!verified) throw new AppError('Webhook signature verification required', 401);
-
-  const { event, payload: eventPayload } = payload;
-
+  const {
+    event,
+    payload: eventPayload
+  } = payload;
   switch (event) {
-    case 'payment.captured': {
-      const payment = eventPayload.payment?.entity;
-      if (!payment) break;
-
-      const userId = payment.notes?.userId;
-      if (!userId) {
-        logger.warn('[Billing] Razorpay payment.captured missing userId in notes', { paymentId: payment.id });
-        break;
+    case 'payment.captured':
+      {
+        const payment = eventPayload.payment?.entity;
+        if (!payment) break;
+        const userId = payment.notes?.userId;
+        if (!userId) {
+          logger.warn('[Billing] Razorpay payment.captured missing userId in notes', {
+            paymentId: payment.id
+          });
+          break;
+        }
+        return activateSubscription({
+          userId,
+          planAmount: payment.amount / 100, // Razorpay amounts are in paise
+          subscriptionId: payment.id,
+          provider: 'razorpay',
+          externalEventId: payment.id,
+          currency: (payment.currency ?? 'INR').toUpperCase()
+        });
       }
+    case 'refund.created':
+      {
+        const refund = eventPayload.refund?.entity;
+        if (!refund) break;
 
-      return activateSubscription({
-        userId,
-        planAmount:      payment.amount / 100,  // Razorpay amounts are in paise
-        subscriptionId:  payment.id,
-        provider:        'razorpay',
-        externalEventId: payment.id,
-        currency:        (payment.currency ?? 'INR').toUpperCase(),
-      });
-    }
+        // Map refund back to subscription via payment ID
+        const { data: subRows, error: subError } = await supabase
+          .from('subscriptions')
+          .select('userId')
+          .eq('subscriptionId', refund.payment_id)
+          .limit(1);
 
-    case 'refund.created': {
-      const refund = eventPayload.refund?.entity;
-      if (!refund) break;
+        if (subError) throw subError;
 
-      // Map refund back to subscription via payment ID
-      
-      const snap = await db
-        .collection('subscriptions')
-        .where('subscriptionId', '==', refund.payment_id)
-        .limit(1)
-        .get();
-
-      if (snap.empty) {
-        logger.warn('[Billing] Razorpay refund.created: no subscription found for payment', { paymentId: refund.payment_id });
-        break;
+        if (!subRows || subRows.length === 0) {
+          logger.warn('[Billing] Razorpay refund.created: no subscription found for payment', {
+            paymentId: refund.payment_id
+          });
+          break;
+        }
+        const userId = subRows[0].userId;
+        return refundSubscription({
+          userId,
+          subscriptionId: refund.payment_id,
+          provider: 'razorpay',
+          externalEventId: refund.id
+        });
       }
-
-      const userId = snap.docs[0].id;
-      return refundSubscription({
-        userId,
-        subscriptionId:  refund.payment_id,
-        provider:        'razorpay',
-        externalEventId: refund.id,
-      });
-    }
-
     default:
-      logger.debug('[Billing] Unhandled Razorpay event', { event });
+      logger.debug('[Billing] Unhandled Razorpay event', {
+        event
+      });
   }
-
-  return { handled: false, event };
+  return {
+    handled: false,
+    event
+  };
 }
 
 /**
@@ -457,58 +563,59 @@ async function handleRazorpayWebhook(payload, verified = false) {
  */
 async function handleStripeWebhook(event, verified = false) {
   if (!verified) throw new AppError('Webhook signature verification required', 401);
-
   switch (event.type) {
-    case 'checkout.session.completed': {
-      const session = event.data.object;
-      const userId  = session.metadata?.userId;
-      if (!userId) {
-        logger.warn('[Billing] Stripe checkout.session.completed missing userId in metadata');
-        break;
+    case 'checkout.session.completed':
+      {
+        const session = event.data.object;
+        const userId = session.metadata?.userId;
+        if (!userId) {
+          logger.warn('[Billing] Stripe checkout.session.completed missing userId in metadata');
+          break;
+        }
+        const amountUSD = (session.amount_total ?? 0) / 100; // cents → dollars
+
+        return activateSubscription({
+          userId,
+          planAmount: amountUSD,
+          subscriptionId: session.subscription ?? session.id,
+          provider: 'stripe',
+          externalEventId: event.id,
+          currency: 'USD'
+        });
       }
-      const amountUSD = (session.amount_total ?? 0) / 100; // cents → dollars
-
-      return activateSubscription({
-        userId,
-        planAmount:      amountUSD,
-        subscriptionId:  session.subscription ?? session.id,
-        provider:        'stripe',
-        externalEventId: event.id,
-        currency:        'USD',
-      });
-    }
-
-    case 'customer.subscription.deleted': {
-      const sub    = event.data.object;
-      const userId = sub.metadata?.userId;
-      if (!userId) break;
-
-      return cancelSubscription({
-        userId,
-        subscriptionId:  sub.id,
-        provider:        'stripe',
-        externalEventId: event.id,
-      });
-    }
-
-    case 'charge.refunded': {
-      const charge  = event.data.object;
-      const userId  = charge.metadata?.userId;
-      if (!userId) break;
-
-      return refundSubscription({
-        userId,
-        subscriptionId:  charge.payment_intent ?? charge.id,
-        provider:        'stripe',
-        externalEventId: event.id,
-      });
-    }
-
+    case 'customer.subscription.deleted':
+      {
+        const sub = event.data.object;
+        const userId = sub.metadata?.userId;
+        if (!userId) break;
+        return cancelSubscription({
+          userId,
+          subscriptionId: sub.id,
+          provider: 'stripe',
+          externalEventId: event.id
+        });
+      }
+    case 'charge.refunded':
+      {
+        const charge = event.data.object;
+        const userId = charge.metadata?.userId;
+        if (!userId) break;
+        return refundSubscription({
+          userId,
+          subscriptionId: charge.payment_intent ?? charge.id,
+          provider: 'stripe',
+          externalEventId: event.id
+        });
+      }
     default:
-      logger.debug('[Billing] Unhandled Stripe event', { type: event.type });
+      logger.debug('[Billing] Unhandled Stripe event', {
+        type: event.type
+      });
   }
-
-  return { handled: false, event: event.type };
+  return {
+    handled: false,
+    event: event.type
+  };
 }
 
 // ─── Subscription status query ────────────────────────────────────────────────
@@ -518,33 +625,40 @@ async function handleStripeWebhook(event, verified = false) {
  * Returns current subscription state for /users/me and admin lookups.
  */
 async function getSubscriptionStatus(userId) {
-  
-  const doc = await db.collection('subscriptions').doc(userId).get();
+  const { data, error } = await supabase
+    .from('subscriptions')
+    .select('*')
+    .eq('userId', userId)
+    .maybeSingle();
 
-  if (!doc.exists) {
+  if (error) throw error;
+
+  if (!data) {
     return {
       userId,
-      tier:   'free',
+      tier: 'free',
       status: 'inactive',
-      credits: { allocated: 0, remaining: 0 },
+      credits: {
+        allocated: 0,
+        remaining: 0
+      }
     };
   }
 
-  const data = doc.data();
   return {
     userId,
-    tier:         data.tier,
-    status:       data.status,
-    planAmount:   data.planAmount,
+    tier: data.tier,
+    status: data.status,
+    planAmount: data.planAmount,
     planCurrency: data.planCurrency,
-    provider:     data.provider,
-    activatedAt:  data.activatedAt?.toDate?.()?.toISOString?.() ?? null,
-    expiresAt:    data.expiresAt?.toDate?.()?.toISOString?.() ?? null,
-    autoRenew:    data.autoRenew,
+    provider: data.provider,
+    activatedAt: data.activatedAt ?? null,
+    expiresAt: data.expiresAt ?? null,
+    autoRenew: data.autoRenew,
     credits: {
-      allocated:  data.aiCreditsAllocated,
-      remaining:  data.aiCreditsRemaining,
-    },
+      allocated: data.aiCreditsAllocated,
+      remaining: data.aiCreditsRemaining
+    }
   };
 }
 
@@ -556,14 +670,5 @@ module.exports = {
   handleRazorpayWebhook,
   handleStripeWebhook,
   getSubscriptionStatus,
-  PLAN_CONFIG,
+  PLAN_CONFIG
 };
-
-
-
-
-
-
-
-
-

@@ -1,6 +1,19 @@
 'use strict';
 
 /**
+ * MIGRATION: db.collection() → supabase.from()
+ *
+ * All db.collection() shim calls in this file have been replaced with
+ * direct supabase.from() calls. Result shapes mirror the Firestore shim:
+ *   { data, error } from supabase  →  unwrapped to plain objects
+ *   .maybeSingle()  for single-doc reads (returns null not error on 0 rows)
+ *   .select('*')    for collection queries
+ *
+ * Batch writes → Promise.all([supabase.from(T).upsert(...), ...])
+ * Transactions → sequential awaits (best-effort, same as shim behaviour)
+ */
+
+/**
  * chiV2.engine.js — Career Health Index v2
  *
  * Pure deterministic scoring engine. No AI calls. No external dependencies.
@@ -24,7 +37,7 @@
  * SECURITY: Read-only Firestore access. No writes. No auth mutations.
  */
 
-const { db } = require('../../config/supabase');
+const supabase = require('../../config/supabase');
 const logger  = require('../../utils/logger');
 
 // ─── Constants ────────────────────────────────────────────────────────────────
@@ -66,22 +79,19 @@ async function resolveRoleId(identifier) {
   if (!identifier) return null;
 
   // Direct doc lookup
-  const direct = await db.collection('roles').doc(identifier).get();
+  const { data: _direct, error: _de } = await supabase.from('roles').select('*').eq('id', identifier).maybeSingle();
+  const direct = { exists: !!_direct, data: () => _direct };
   if (direct.exists) return identifier;
 
   // Field-based lookup (role_id field may differ from doc ID)
-  const snap = await db.collection('roles')
-    .where('role_id', '==', identifier)
-    .limit(1)
-    .get();
+  const { data: _rdata } = await supabase.from('roles').select('*').eq('role_id', identifier).limit(1);
+  const snap = { empty: !_rdata?.length, docs: (_rdata||[]).map(r=>({id:r.id,data:()=>r})) };
 
   if (!snap.empty) return snap.docs[0].id;
 
   // Fuzzy name match as last resort
-  const nameSnap = await db.collection('roles')
-    .where('role_name', '==', identifier)
-    .limit(1)
-    .get();
+  const { data: _ndata } = await supabase.from('roles').select('*').eq('role_name', identifier).limit(1);
+  const nameSnap = { empty: !_ndata?.length, docs: (_ndata||[]).map(r=>({id:r.id,data:()=>r})) };
 
   return nameSnap.empty ? null : nameSnap.docs[0].id;
 }
@@ -96,9 +106,9 @@ async function resolveRoleId(identifier) {
  * @returns {{ score: number, matched: string[], missing: string[], totalWeight: number }}
  */
 async function computeSkillMatch(roleDocId, userSkills) {
-  const snap = await db.collection('role_skills')
-    .where('role_id', '==', roleDocId)
-    .get();
+  const { data: _rsdata, error: _rse } = await supabase.from('role_skills').select('*').eq('role_id', roleDocId);
+  if (_rse) logger.warn('[CHIv2] role_skills query error:', _rse.message);
+  const snap = { empty: !_rsdata?.length, docs: (_rsdata||[]).map(r=>({data:()=>r})) };
 
   if (snap.empty) {
     logger.warn('[CHIv2] No role_skills found for role', { roleDocId });
@@ -206,9 +216,8 @@ async function bfsCareerPath(currentRoleId, targetRoleId) {
 
     if (path.length > BFS_MAX_DEPTH) continue;
 
-    const snap = await db.collection('role_transitions')
-      .where('from_role_id', '==', current)
-      .get();
+    const { data: _rtdata } = await supabase.from('role_transitions').select('*').eq('from_role_id', current);
+    const snap = { docs: (_rtdata||[]).map(r=>({data:()=>r})) };
 
     for (const doc of snap.docs) {
       const data   = doc.data();
@@ -266,9 +275,8 @@ const EDUCATION_RANK = Object.freeze({
  * Returns match_score if exact match (or over-qualified), else match_score * 0.6.
  */
 async function computeEducationScore(roleDocId, userEducationLevel) {
-  const snap = await db.collection('role_education')
-    .where('role_id', '==', roleDocId)
-    .get();
+  const { data: _redata } = await supabase.from('role_education').select('*').eq('role_id', roleDocId);
+  const snap = { empty: !_redata?.length, docs: (_redata||[]).map(r=>({data:()=>r})) };
 
   if (snap.empty) return 70; // no requirement = neutral score
 
@@ -304,10 +312,8 @@ async function computeEducationScore(roleDocId, userEducationLevel) {
 async function computeMarketSalaryScore(roleDocId, userSalary) {
   if (!userSalary || userSalary <= 0) return 50; // no salary data = neutral
 
-  const snap = await db.collection('role_salary_market')
-    .where('role_id', '==', roleDocId)
-    .limit(5)
-    .get();
+  const { data: _rsmdata } = await supabase.from('role_salary_market').select('*').eq('role_id', roleDocId).limit(5);
+  const snap = { empty: !_rsmdata?.length, docs: (_rsmdata||[]).map(r=>({data:()=>r})) };
 
   if (snap.empty) return 50;
 
@@ -524,11 +530,3 @@ module.exports = {
   WEIGHTS,
   SKILL_LEVEL_SCORES,
 };
-
-
-
-
-
-
-
-

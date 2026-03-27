@@ -19,19 +19,25 @@
  *   MARKET_CUSTOM_API_KEY      — Custom API key
  *   MARKET_CUSTOM_AUTH_TYPE    — bearer | apikey | basic
  *
- * Firestore collection: market_intelligence_cache/{role}_{country}
+ * Supabase tables: market_intelligence_cache, market_intelligence_sync
  */
-
-const { getSecret, upsertSecret } = require('../secrets/secrets.service');
-const { db }                       = require('../../config/supabase');
+const {
+  getSecret,
+  upsertSecret
+} = require('../secrets/secrets.service');
+const supabase = require('../../config/supabase');
 
 const CACHE_COLLECTION = 'market_intelligence_cache';
-const SYNC_COLLECTION  = 'market_intelligence_sync';
+const SYNC_COLLECTION = 'market_intelligence_sync';
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
 async function getProviderOrNull() {
-  try { return await getSecret('MARKET_API_PROVIDER'); } catch { return null; }
+  try {
+    return await getSecret('MARKET_API_PROVIDER');
+  } catch {
+    return null;
+  }
 }
 
 function cacheKey(role, country) {
@@ -46,39 +52,33 @@ function cacheKey(role, country) {
  */
 async function saveConfig(config, adminUid) {
   const { provider } = config;
-
   await upsertSecret('MARKET_API_PROVIDER', provider, adminUid);
-
   switch (provider) {
     case 'adzuna':
-      await upsertSecret('MARKET_ADZUNA_APP_ID',  config.appId,  adminUid);
+      await upsertSecret('MARKET_ADZUNA_APP_ID', config.appId, adminUid);
       await upsertSecret('MARKET_ADZUNA_APP_KEY', config.appKey, adminUid);
       break;
-
     case 'serpapi':
       await upsertSecret('MARKET_SERPAPI_KEY', config.apiKey, adminUid);
       if (config.searchEngine) {
         await upsertSecret('MARKET_SERPAPI_ENGINE', config.searchEngine, adminUid);
       }
       break;
-
     case 'custom':
-      await upsertSecret('MARKET_CUSTOM_BASE_URL',  config.baseUrl,              adminUid);
-      await upsertSecret('MARKET_CUSTOM_API_KEY',   config.apiKey,               adminUid);
+      await upsertSecret('MARKET_CUSTOM_BASE_URL', config.baseUrl, adminUid);
+      await upsertSecret('MARKET_CUSTOM_API_KEY', config.apiKey, adminUid);
       await upsertSecret('MARKET_CUSTOM_AUTH_TYPE', config.authType || 'bearer', adminUid);
       break;
-
     default:
       throw Object.assign(
         new Error(`Unsupported provider: ${provider}. Must be adzuna | serpapi | custom.`),
         { status: 400 }
       );
   }
-
   return {
     provider,
     savedAt: new Date().toISOString(),
-    message: `${provider} credentials saved to Secrets Manager.`,
+    message: `${provider} credentials saved to Secrets Manager.`
   };
 }
 
@@ -86,20 +86,20 @@ async function saveConfig(config, adminUid) {
 
 async function getStatus() {
   const provider = await getProviderOrNull();
-
   let lastSync = null;
   try {
-    const snap = await db.collection(SYNC_COLLECTION)
-      .orderBy('syncedAt', 'desc')
+    const { data } = await supabase
+      .from(SYNC_COLLECTION)
+      .select('syncedAt')
+      .order('syncedAt', { ascending: false })
       .limit(1)
-      .get();
-    if (!snap.empty) lastSync = snap.docs[0].data().syncedAt ?? null;
-  } catch { /* no sync records yet */ }
-
+      .maybeSingle();
+    if (data) lastSync = data.syncedAt ?? null;
+  } catch {/* no sync records yet */}
   return {
-    provider:     provider ?? null,
+    provider: provider ?? null,
     isConfigured: !!provider,
-    lastSync,
+    lastSync
   };
 }
 
@@ -107,34 +107,34 @@ async function getStatus() {
 
 async function getDataSources() {
   const provider = await getProviderOrNull();
-
   let recordCount = 0;
-  let lastSync    = null;
+  let lastSync = null;
 
   try {
-    const snap = await db.collection(CACHE_COLLECTION).get();
-    recordCount = snap.size;
-  } catch { /* empty */ }
+    const { count } = await supabase
+      .from(CACHE_COLLECTION)
+      .select('*', { count: 'exact', head: true });
+    recordCount = count ?? 0;
+  } catch {/* empty */}
 
   try {
-    const snap = await db.collection(SYNC_COLLECTION)
-      .orderBy('syncedAt', 'desc')
+    const { data } = await supabase
+      .from(SYNC_COLLECTION)
+      .select('syncedAt')
+      .order('syncedAt', { ascending: false })
       .limit(1)
-      .get();
-    if (!snap.empty) lastSync = snap.docs[0].data().syncedAt ?? null;
-  } catch { /* empty */ }
+      .maybeSingle();
+    if (data) lastSync = data.syncedAt ?? null;
+  } catch {/* empty */}
 
-  const sources = [
-    {
-      name:         'Market Intelligence API',
-      provider:     provider ?? null,
-      isConfigured: !!provider,
-      status:       provider ? 'connected' : 'not_configured',
-      lastSync,
-      recordCount,
-    },
-  ];
-
+  const sources = [{
+    name: 'Market Intelligence API',
+    provider: provider ?? null,
+    isConfigured: !!provider,
+    status: provider ? 'connected' : 'not_configured',
+    lastSync,
+    recordCount
+  }];
   return { sources };
 }
 
@@ -145,27 +145,26 @@ async function testConnection() {
   if (!provider) {
     return {
       connected: false,
-      message: 'No provider configured. Save a config first.',
+      message: 'No provider configured. Save a config first.'
     };
   }
-
   try {
     // Fire a minimal test query against the configured provider
     const result = await fetchDemandFromProvider('Software Engineer', 'in', provider);
     return {
-      connected:    true,
+      connected: true,
       provider,
       job_postings: result.job_postings,
       salary_median: result.salary_median,
-      message:      `Connection to ${provider} successful.`,
-      testedAt:     new Date().toISOString(),
+      message: `Connection to ${provider} successful.`,
+      testedAt: new Date().toISOString()
     };
   } catch (err) {
     return {
       connected: false,
       provider,
-      message:   `Connection test failed: ${err.message}`,
-      error:     err.message,
+      message: `Connection test failed: ${err.message}`,
+      error: err.message
     };
   }
 }
@@ -186,14 +185,27 @@ async function fetchDemand(role, country = 'in') {
   // Cache result
   const key = cacheKey(role, country);
   try {
-    await db.collection(CACHE_COLLECTION).doc(key).set(
-      { ...result, cachedAt: new Date().toISOString() },
-      { merge: true }
-    );
-    await db.collection(SYNC_COLLECTION).add({
-      role, country, provider, syncedAt: new Date().toISOString(),
-    });
-  } catch { /* cache failure is non-fatal */ }
+    const { error: cacheError } = await supabase
+      .from(CACHE_COLLECTION)
+      .upsert({
+        id: key,
+        ...result,
+        cachedAt: new Date().toISOString()
+      });
+
+    if (cacheError) throw cacheError;
+
+    const { error: syncError } = await supabase
+      .from(SYNC_COLLECTION)
+      .insert({
+        role,
+        country,
+        provider,
+        syncedAt: new Date().toISOString()
+      });
+
+    if (syncError) throw syncError;
+  } catch {/* cache failure is non-fatal */}
 
   return result;
 }
@@ -202,101 +214,91 @@ async function fetchDemand(role, country = 'in') {
 
 async function fetchDemandFromProvider(role, country, provider) {
   switch (provider) {
-    case 'adzuna':    return fetchFromAdzuna(role, country);
-    case 'serpapi':   return fetchFromSerpApi(role, country);
-    case 'custom':    return fetchFromCustom(role, country);
+    case 'adzuna':
+      return fetchFromAdzuna(role, country);
+    case 'serpapi':
+      return fetchFromSerpApi(role, country);
+    case 'custom':
+      return fetchFromCustom(role, country);
     default:
       throw new Error(`Unknown provider: ${provider}`);
   }
 }
 
 async function fetchFromAdzuna(role, country) {
-  const appId  = await getSecret('MARKET_ADZUNA_APP_ID');
+  const appId = await getSecret('MARKET_ADZUNA_APP_ID');
   const appKey = await getSecret('MARKET_ADZUNA_APP_KEY');
-
   const countryCode = country.toLowerCase().slice(0, 2);
-  const url = `https://api.adzuna.com/v1/api/jobs/${countryCode}/search/1` +
+  const url =
+    `https://api.adzuna.com/v1/api/jobs/${countryCode}/search/1` +
     `?app_id=${appId}&app_key=${appKey}` +
     `&results_per_page=1&what=${encodeURIComponent(role)}&content-type=application/json`;
-
   const res = await fetch(url);
   if (!res.ok) throw new Error(`Adzuna API error: HTTP ${res.status}`);
-
   const json = await res.json();
-
   return {
     role,
     country,
-    job_postings:  json.count        ?? 0,
-    salary_median: json.mean         ?? null,
-    growth_rate:   null,
-    remote_ratio:  0,
-    provider:      'adzuna',
-    fetchedAt:     new Date().toISOString(),
+    job_postings: json.count ?? 0,
+    salary_median: json.mean ?? null,
+    growth_rate: null,
+    remote_ratio: 0,
+    provider: 'adzuna',
+    fetchedAt: new Date().toISOString()
   };
 }
 
 async function fetchFromSerpApi(role, country) {
   const apiKey = await getSecret('MARKET_SERPAPI_KEY');
   const engine = await getSecret('MARKET_SERPAPI_ENGINE').catch(() => 'google_jobs');
-
-  const url = `https://serpapi.com/search.json` +
+  const url =
+    `https://serpapi.com/search.json` +
     `?engine=${engine}&q=${encodeURIComponent(role)}&location=${encodeURIComponent(country)}` +
     `&api_key=${apiKey}&num=10`;
-
   const res = await fetch(url);
   if (!res.ok) throw new Error(`SerpApi error: HTTP ${res.status}`);
-
   const json = await res.json();
-  const jobs  = json.jobs_results ?? [];
-
+  const jobs = json.jobs_results ?? [];
   return {
     role,
     country,
-    job_postings:  json.search_information?.total_results ?? jobs.length,
+    job_postings: json.search_information?.total_results ?? jobs.length,
     salary_median: null,
-    growth_rate:   null,
-    remote_ratio:  jobs.filter(j => j.detected_extensions?.work_from_home).length / Math.max(jobs.length, 1),
-    provider:      'serpapi',
-    fetchedAt:     new Date().toISOString(),
+    growth_rate: null,
+    remote_ratio: jobs.filter(j => j.detected_extensions?.work_from_home).length / Math.max(jobs.length, 1),
+    provider: 'serpapi',
+    fetchedAt: new Date().toISOString()
   };
 }
 
 async function fetchFromCustom(role, country) {
-  const baseUrl  = await getSecret('MARKET_CUSTOM_BASE_URL');
-  const apiKey   = await getSecret('MARKET_CUSTOM_API_KEY');
+  const baseUrl = await getSecret('MARKET_CUSTOM_BASE_URL');
+  const apiKey = await getSecret('MARKET_CUSTOM_API_KEY');
   const authType = await getSecret('MARKET_CUSTOM_AUTH_TYPE').catch(() => 'bearer');
-
   const headers = { 'Content-Type': 'application/json' };
-  if (authType === 'bearer')  headers['Authorization'] = `Bearer ${apiKey}`;
-  if (authType === 'apikey')  headers['X-API-Key']     = apiKey;
-  if (authType === 'basic')   headers['Authorization'] = `Basic ${Buffer.from(`:${apiKey}`).toString('base64')}`;
-
+  if (authType === 'bearer') headers['Authorization'] = `Bearer ${apiKey}`;
+  if (authType === 'apikey') headers['X-API-Key'] = apiKey;
+  if (authType === 'basic') headers['Authorization'] = `Basic ${Buffer.from(`:${apiKey}`).toString('base64')}`;
   const url = `${baseUrl}/demand?role=${encodeURIComponent(role)}&country=${encodeURIComponent(country)}`;
-  const res  = await fetch(url, { headers });
+  const res = await fetch(url, { headers });
   if (!res.ok) throw new Error(`Custom API error: HTTP ${res.status}`);
-
   const json = await res.json();
-
   return {
     role,
     country,
-    job_postings:  json.job_postings  ?? json.count        ?? 0,
+    job_postings: json.job_postings ?? json.count ?? 0,
     salary_median: json.salary_median ?? json.salary?.median ?? null,
-    growth_rate:   json.growth_rate   ?? null,
-    remote_ratio:  json.remote_ratio  ?? 0,
-    provider:      'custom',
-    fetchedAt:     new Date().toISOString(),
+    growth_rate: json.growth_rate ?? null,
+    remote_ratio: json.remote_ratio ?? 0,
+    provider: 'custom',
+    fetchedAt: new Date().toISOString()
   };
 }
 
-module.exports = { saveConfig, getStatus, getDataSources, testConnection, fetchDemand };
-
-
-
-
-
-
-
-
-
+module.exports = {
+  saveConfig,
+  getStatus,
+  getDataSources,
+  testConnection,
+  fetchDemand
+};

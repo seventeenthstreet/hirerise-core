@@ -63,61 +63,49 @@
  * Deploy indexes:
  *   firebase deploy --only firestore:indexes
  */
-
 require('dotenv').config();
 require('../config/supabase');
-
-const { db }         = require('../config/supabase');
-const { FieldValue } = require('../config/supabase');
-const logger         = require('../utils/logger');
-
+const {
+  db
+} = require('../config/supabase');
+const {
+  FieldValue
+} = require('../config/supabase');
+const logger = require('../utils/logger');
 const COLLECTIONS = {
-  SCHOOLS:         'sch_schools',
-  SCHOOL_USERS:    'sch_school_users',
-  SCHOOL_STUDENTS: 'sch_school_students',
+  SCHOOLS: 'sch_schools',
+  SCHOOL_USERS: 'sch_school_users',
+  SCHOOL_STUDENTS: 'sch_school_students'
 };
-
 async function initCollection(name) {
+  // TODO: MANUAL MIGRATION REQUIRED — unrecognised chain: collection.doc
   const initRef = db.collection(name).doc('_migration_init');
-  const snap    = await initRef.get();
+  const snap = await initRef.get();
   if (snap.exists) {
     logger.info(`[Migration] ${name} — already initialised, skipping`);
     return;
   }
   await initRef.set({
-    _init:      true,
-    _note:      'Migration initialisation record — safe to delete.',
-    created_at: FieldValue.serverTimestamp(),
+    _init: true,
+    _note: 'Migration initialisation record — safe to delete.',
+    created_at: FieldValue.serverTimestamp()
   });
   logger.info(`[Migration] ${name} — initialised`);
 }
-
 async function run() {
   logger.info('[Migration] add-school-platform — starting');
-
   await initCollection(COLLECTIONS.SCHOOLS);
   await initCollection(COLLECTIONS.SCHOOL_USERS);
   await initCollection(COLLECTIONS.SCHOOL_STUDENTS);
-
   logger.info('[Migration] add-school-platform — complete');
   logger.info('');
   logger.info('ACTION REQUIRED: Add the composite indexes from the comment above');
   logger.info('to firestore.indexes.json and run: firebase deploy --only firestore:indexes');
-
   process.exit(0);
 }
-
 run().catch(err => {
-  logger.error({ err: err.message }, '[Migration] Failed');
+  logger.error({
+    err: err.message
+  }, '[Migration] Failed');
   process.exit(1);
 });
-
-
-
-
-
-
-
-
-
-

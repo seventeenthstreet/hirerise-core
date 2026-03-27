@@ -16,11 +16,13 @@
  *   profile_updated       — User updated profile/onboarding
  *   course_started        — User clicked a learning recommendation
  *
- * COLLECTION STRUCTURE:
- *   users/{userId}/activityEvents/{eventId}
- *     eventType   : string
- *     createdAt   : Timestamp
- *     metadata    : object (optional — e.g. { jobTitle, chiScore })
+ * TABLE STRUCTURE (Supabase):
+ *   activity_events
+ *     id          : uuid (primary key, auto-generated)
+ *     user_id     : string (references users.id)
+ *     event_type  : string
+ *     metadata    : jsonb (optional — e.g. { jobTitle, chiScore })
+ *     created_at  : timestamptz
  *
  * STREAK LOGIC:
  *   A streak day = at least one event on that calendar day (UTC).
@@ -29,9 +31,7 @@
  *
  * @module modules/userActivity/userActivity.service
  */
-
-const { db } = require('../../config/supabase');
-const { FieldValue, Timestamp } = require('../../config/supabase');
+const { supabase } = require('../../config/supabase');
 const logger = require('../../utils/logger');
 
 // ─── Valid event types ────────────────────────────────────────────────────────
@@ -42,17 +42,17 @@ const EVENT_TYPES = new Set([
   'job_analyzed',
   'cv_generated',
   'profile_updated',
-  'course_started',
+  'course_started'
 ]);
 
 // Human-readable labels for the weekly summary
 const EVENT_LABELS = {
   resume_uploaded: 'Resume',
-  chi_calculated:  'CHI Score',
-  job_analyzed:    'Job Fit',
-  cv_generated:    'CV Built',
+  chi_calculated: 'CHI Score',
+  job_analyzed: 'Job Fit',
+  cv_generated: 'CV Built',
   profile_updated: 'Profile',
-  course_started:  'Learning',
+  course_started: 'Learning'
 };
 
 // ─── Write ────────────────────────────────────────────────────────────────────
@@ -72,15 +72,16 @@ const EVENT_LABELS = {
 async function logEvent(userId, eventType, metadata = {}) {
   if (!userId || !EVENT_TYPES.has(eventType)) return;
   try {
-    await db
-      .collection('users')
-      .doc(userId)
-      .collection('activityEvents')
-      .add({
-        eventType,
-        metadata,
-        createdAt: FieldValue.serverTimestamp(),
-      });
+    const { error } = await supabase.from('activity_events').insert([{
+      user_id: userId,
+      event_type: eventType,
+      metadata,
+      created_at: new Date().toISOString()
+    }]);
+
+    if (error) {
+      logger.warn('[UserActivity] Failed to log event', { userId, eventType, error: error.message });
+    }
   } catch (err) {
     // Non-fatal — activity tracking must never break core flows
     logger.warn('[UserActivity] Failed to log event', { userId, eventType, error: err.message });
@@ -93,39 +94,42 @@ async function logEvent(userId, eventType, metadata = {}) {
  * getActivitySummary(userId)
  *
  * Returns streak, weekly actions, and last 7 days activity map.
- * Reads the last 30 days of events — bounded query, no full-collection scan.
+ * Reads the last 30 days of events — bounded query, no full-table scan.
  *
  * @param {string} userId
  * @returns {{ streakDays, weeklyActions, dailyMap, lastActiveAt }}
  */
 async function getActivitySummary(userId) {
   if (!userId) return _emptyResponse();
-
   try {
     const thirtyDaysAgo = new Date();
     thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
 
-    const snap = await db
-      .collection('users')
-      .doc(userId)
-      .collection('activityEvents')
-      .where('createdAt', '>=', Timestamp.fromDate(thirtyDaysAgo))
-      .orderBy('createdAt', 'desc')
-      .limit(200) // max 200 events in 30 days — well within Firestore limits
-      .get();
+    const { data, error } = await supabase
+      .from('activity_events')
+      .select('event_type, created_at')
+      .eq('user_id', userId)
+      .gte('created_at', thirtyDaysAgo.toISOString())
+      .order('created_at', { ascending: false })
+      .limit(200); // max 200 events in 30 days — bounded query
 
-    if (snap.empty) return _emptyResponse();
+    if (error) {
+      logger.warn('[UserActivity] Failed to read activity summary', { userId, error: error.message });
+      return _emptyResponse();
+    }
 
-    const events = snap.docs.map(d => ({
-      eventType: d.data().eventType,
-      createdAt: d.data().createdAt?.toDate() ?? new Date(),
+    if (!data || data.length === 0) return _emptyResponse();
+
+    const events = data.map(row => ({
+      eventType: row.event_type,
+      createdAt: new Date(row.created_at)
     }));
 
     return {
-      streakDays:   _computeStreak(events),
+      streakDays: _computeStreak(events),
       weeklyActions: _computeWeeklyActions(events),
-      dailyMap:     _computeDailyMap(events),
-      lastActiveAt: events[0]?.createdAt?.toISOString() ?? null,
+      dailyMap: _computeDailyMap(events),
+      lastActiveAt: events[0]?.createdAt?.toISOString() ?? null
     };
   } catch (err) {
     logger.warn('[UserActivity] Failed to read activity summary', { userId, error: err.message });
@@ -136,7 +140,12 @@ async function getActivitySummary(userId) {
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
 function _emptyResponse() {
-  return { streakDays: 0, weeklyActions: [], dailyMap: {}, lastActiveAt: null };
+  return {
+    streakDays: 0,
+    weeklyActions: [],
+    dailyMap: {},
+    lastActiveAt: null
+  };
 }
 
 /**
@@ -149,13 +158,9 @@ function _computeStreak(events) {
   if (!events.length) return 0;
 
   // Build a Set of ISO date strings (YYYY-MM-DD) that have events
-  const activeDays = new Set(
-    events.map(e => e.createdAt.toISOString().slice(0, 10))
-  );
-
+  const activeDays = new Set(events.map(e => e.createdAt.toISOString().slice(0, 10)));
   let streak = 0;
   const today = new Date();
-
   for (let i = 0; i < 365; i++) {
     const d = new Date(today);
     d.setUTCDate(d.getUTCDate() - i);
@@ -169,7 +174,6 @@ function _computeStreak(events) {
     // i === 0 and no event today: continue checking yesterday
     // (allows streak to survive if user hasn't acted yet today)
   }
-
   return streak;
 }
 
@@ -182,11 +186,9 @@ function _computeStreak(events) {
 function _computeWeeklyActions(events) {
   const sevenDaysAgo = new Date();
   sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 7);
-
   const thisWeek = events.filter(e => e.createdAt >= sevenDaysAgo);
   const seen = new Set();
   const actions = [];
-
   for (const e of thisWeek) {
     const label = EVENT_LABELS[e.eventType];
     if (label && !seen.has(label)) {
@@ -194,7 +196,6 @@ function _computeWeeklyActions(events) {
       actions.push(label);
     }
   }
-
   return actions;
 }
 
@@ -206,10 +207,7 @@ function _computeWeeklyActions(events) {
  * e.g. { '2026-03-04': true, '2026-03-05': false, ... }
  */
 function _computeDailyMap(events) {
-  const activeDays = new Set(
-    events.map(e => e.createdAt.toISOString().slice(0, 10))
-  );
-
+  const activeDays = new Set(events.map(e => e.createdAt.toISOString().slice(0, 10)));
   const map = {};
   for (let i = 6; i >= 0; i--) {
     const d = new Date();
@@ -220,13 +218,8 @@ function _computeDailyMap(events) {
   return map;
 }
 
-module.exports = { logEvent, getActivitySummary, EVENT_TYPES };
-
-
-
-
-
-
-
-
-
+module.exports = {
+  logEvent,
+  getActivitySummary,
+  EVENT_TYPES
+};

@@ -1,0 +1,2379 @@
+{
+  "scanned": 492,
+  "converted": 113,
+  "flagged": 182,
+  "skipped": 11,
+  "filesUpdated": [
+    {
+      "file": "src\\controllers\\careerPrediction.controller.js",
+      "converted": 1,
+      "flagged": 2
+    },
+    {
+      "file": "src\\core\\aiJobQueue.js",
+      "converted": 2,
+      "flagged": 1
+    },
+    {
+      "file": "src\\engines\\aiPersonalization.engine.js",
+      "converted": 2,
+      "flagged": 0
+    },
+    {
+      "file": "src\\engines\\opportunityRadar.engine.js",
+      "converted": 2,
+      "flagged": 0
+    },
+    {
+      "file": "src\\infrastructure\\aiLogger.js",
+      "converted": 1,
+      "flagged": 0
+    },
+    {
+      "file": "src\\jobApplications\\repository\\jobApplications.repository.js",
+      "converted": 5,
+      "flagged": 2
+    },
+    {
+      "file": "src\\modules\\ai-event-bus\\workers\\index.js",
+      "converted": 1,
+      "flagged": 0
+    },
+    {
+      "file": "src\\modules\\analysis\\analysis.service.js",
+      "converted": 4,
+      "flagged": 2
+    },
+    {
+      "file": "src\\modules\\analysis\\jobMatch.service.js",
+      "converted": 4,
+      "flagged": 2
+    },
+    {
+      "file": "src\\modules\\appEntry\\appEntry.route.js",
+      "converted": 2,
+      "flagged": 0
+    },
+    {
+      "file": "src\\modules\\career-copilot\\careerCopilot.service.js",
+      "converted": 2,
+      "flagged": 1
+    },
+    {
+      "file": "src\\modules\\career-copilot\\coordinator\\careerAgentCoordinator.js",
+      "converted": 2,
+      "flagged": 0
+    },
+    {
+      "file": "src\\modules\\career-copilot\\retrieval\\ragRetriever.js",
+      "converted": 2,
+      "flagged": 2
+    },
+    {
+      "file": "src\\modules\\career-digital-twin\\services\\digitalTwin.service.js",
+      "converted": 1,
+      "flagged": 1
+    },
+    {
+      "file": "src\\modules\\chiV2\\careerOpportunityEngine.js",
+      "converted": 2,
+      "flagged": 3
+    },
+    {
+      "file": "src\\modules\\coverLetter\\coverLetter.routes.js",
+      "converted": 1,
+      "flagged": 0
+    },
+    {
+      "file": "src\\modules\\coverLetter\\coverLetter.service.js",
+      "converted": 1,
+      "flagged": 2
+    },
+    {
+      "file": "src\\modules\\dashboard\\dashboard.service.js",
+      "converted": 1,
+      "flagged": 2
+    },
+    {
+      "file": "src\\modules\\education-intelligence\\controllers\\careerPrediction.controller.js",
+      "converted": 1,
+      "flagged": 2
+    },
+    {
+      "file": "src\\modules\\education-intelligence\\controllers\\careerSimulation.controller.js",
+      "converted": 1,
+      "flagged": 2
+    },
+    {
+      "file": "src\\modules\\education-intelligence\\controllers\\roiAnalysis.controller.js",
+      "converted": 1,
+      "flagged": 2
+    },
+    {
+      "file": "src\\modules\\education-intelligence\\orchestrator\\education.orchestrator.js",
+      "converted": 2,
+      "flagged": 4
+    },
+    {
+      "file": "src\\modules\\jobSeeker\\jobMatchingEngine.service.js",
+      "converted": 4,
+      "flagged": 3
+    },
+    {
+      "file": "src\\modules\\jobSeeker\\skillGraphEngine.service.js",
+      "converted": 3,
+      "flagged": 0
+    },
+    {
+      "file": "src\\modules\\marketIntelligence\\marketIntelligence.service.js",
+      "converted": 1,
+      "flagged": 4
+    },
+    {
+      "file": "src\\modules\\onboarding\\controllers\\onboarding.controller.js",
+      "converted": 3,
+      "flagged": 5
+    },
+    {
+      "file": "src\\modules\\onboarding\\onboarding.analytics.service.js",
+      "converted": 6,
+      "flagged": 3
+    },
+    {
+      "file": "src\\modules\\onboarding\\onboarding.careerReport.service.js",
+      "converted": 4,
+      "flagged": 2
+    },
+    {
+      "file": "src\\modules\\onboarding\\onboarding.cv.service.js",
+      "converted": 6,
+      "flagged": 6
+    },
+    {
+      "file": "src\\modules\\onboarding\\onboarding.intake.service.js",
+      "converted": 6,
+      "flagged": 13
+    },
+    {
+      "file": "src\\modules\\onboarding\\onboarding.linkedin.service.js",
+      "converted": 4,
+      "flagged": 3
+    },
+    {
+      "file": "src\\modules\\qualification\\qualification.service.js",
+      "converted": 2,
+      "flagged": 0
+    },
+    {
+      "file": "src\\modules\\resume\\controllers\\resume.controller.js",
+      "converted": 1,
+      "flagged": 2
+    },
+    {
+      "file": "src\\modules\\resume\\resume.service.js",
+      "converted": 1,
+      "flagged": 0
+    },
+    {
+      "file": "src\\modules\\roles\\roles.service.js",
+      "converted": 4,
+      "flagged": 7
+    },
+    {
+      "file": "src\\modules\\salary\\salary.service.js",
+      "converted": 1,
+      "flagged": 0
+    },
+    {
+      "file": "src\\modules\\secrets\\repository\\secrets.repository.js",
+      "converted": 1,
+      "flagged": 2
+    },
+    {
+      "file": "src\\modules\\skill-evolution\\services\\skillEvolution.service.js",
+      "converted": 2,
+      "flagged": 3
+    },
+    {
+      "file": "src\\modules\\skill-prioritization\\index.js",
+      "converted": 1,
+      "flagged": 0
+    },
+    {
+      "file": "src\\modules\\skillDemand\\skillRecommendations.service.js",
+      "converted": 3,
+      "flagged": 3
+    },
+    {
+      "file": "src\\modules\\user\\user.registration.service.js",
+      "converted": 2,
+      "flagged": 4
+    },
+    {
+      "file": "src\\routes\\cvBuilder.routes.js",
+      "converted": 1,
+      "flagged": 0
+    },
+    {
+      "file": "src\\routes\\internal\\aiJob.route.js",
+      "converted": 1,
+      "flagged": 0
+    },
+    {
+      "file": "src\\routes\\internal\\provisionalChi.route.js",
+      "converted": 2,
+      "flagged": 0
+    },
+    {
+      "file": "src\\routes\\jobAnalyzer.routes.js",
+      "converted": 1,
+      "flagged": 0
+    },
+    {
+      "file": "src\\routes\\skills-priority.routes.js",
+      "converted": 3,
+      "flagged": 2
+    },
+    {
+      "file": "src\\routes\\skills.routes.js",
+      "converted": 2,
+      "flagged": 2
+    },
+    {
+      "file": "src\\routes\\student-onboarding.routes.js",
+      "converted": 2,
+      "flagged": 5
+    },
+    {
+      "file": "src\\routes\\userDirection.routes.js",
+      "converted": 1,
+      "flagged": 2
+    },
+    {
+      "file": "src\\services\\aiUsage.service.js",
+      "converted": 1,
+      "flagged": 1
+    },
+    {
+      "file": "src\\services\\job.service.js",
+      "converted": 1,
+      "flagged": 2
+    },
+    {
+      "file": "src\\services\\jobAnalyzer.service.js",
+      "converted": 1,
+      "flagged": 3
+    },
+    {
+      "file": "src\\services\\jobFetcher.service.js",
+      "converted": 1,
+      "flagged": 1
+    }
+  ],
+  "filesManual": [
+    {
+      "file": "src\\ai\\observability\\metrics.service.js",
+      "flagged": 1,
+      "converted": 0
+    },
+    {
+      "file": "src\\controllers\\careerPrediction.controller.js",
+      "flagged": 2,
+      "converted": 1
+    },
+    {
+      "file": "src\\core\\aiJobQueue.js",
+      "flagged": 1,
+      "converted": 2
+    },
+    {
+      "file": "src\\data-import\\excelImporter.js",
+      "flagged": 1,
+      "converted": 0
+    },
+    {
+      "file": "src\\jobApplications\\repository\\jobApplications.repository.js",
+      "flagged": 2,
+      "converted": 5
+    },
+    {
+      "file": "src\\migration\\add-career-conversations.migration.js",
+      "flagged": 1,
+      "converted": 0
+    },
+    {
+      "file": "src\\migration\\add-career-predictions.migration.js",
+      "flagged": 1,
+      "converted": 0
+    },
+    {
+      "file": "src\\migration\\add-career-simulations.migration.js",
+      "flagged": 2,
+      "converted": 0
+    },
+    {
+      "file": "src\\migration\\add-education-intelligence.migration.js",
+      "flagged": 1,
+      "converted": 0
+    },
+    {
+      "file": "src\\migration\\add-education-roi.migration.js",
+      "flagged": 2,
+      "converted": 0
+    },
+    {
+      "file": "src\\migration\\add-school-platform.migration.js",
+      "flagged": 1,
+      "converted": 0
+    },
+    {
+      "file": "src\\migration\\add-skill-evolution.migration.js",
+      "flagged": 2,
+      "converted": 0
+    },
+    {
+      "file": "src\\modules\\admin\\cms\\import\\adminCmsImport.service.js",
+      "flagged": 1,
+      "converted": 0
+    },
+    {
+      "file": "src\\modules\\analysis\\analysis.service.js",
+      "flagged": 2,
+      "converted": 4
+    },
+    {
+      "file": "src\\modules\\analysis\\jobMatch.service.js",
+      "flagged": 2,
+      "converted": 4
+    },
+    {
+      "file": "src\\modules\\career-copilot\\careerCopilot.service.js",
+      "flagged": 1,
+      "converted": 2
+    },
+    {
+      "file": "src\\modules\\career-copilot\\retrieval\\ragRetriever.js",
+      "flagged": 2,
+      "converted": 2
+    },
+    {
+      "file": "src\\modules\\career-digital-twin\\services\\digitalTwin.service.js",
+      "flagged": 1,
+      "converted": 1
+    },
+    {
+      "file": "src\\modules\\career-intelligence-dashboard\\services\\analytics.service.js",
+      "flagged": 4,
+      "converted": 0
+    },
+    {
+      "file": "src\\modules\\careerHealthIndex\\controllers\\careerHealthIndex.controller.js",
+      "flagged": 1,
+      "converted": 0
+    },
+    {
+      "file": "src\\modules\\chiV2\\careerOpportunityEngine.js",
+      "flagged": 3,
+      "converted": 2
+    },
+    {
+      "file": "src\\modules\\conversion\\utils\\conversionSummary.job.js",
+      "flagged": 1,
+      "converted": 0
+    },
+    {
+      "file": "src\\modules\\coverLetter\\coverLetter.service.js",
+      "flagged": 2,
+      "converted": 1
+    },
+    {
+      "file": "src\\modules\\dashboard\\dashboard.service.js",
+      "flagged": 2,
+      "converted": 1
+    },
+    {
+      "file": "src\\modules\\education-intelligence\\collectors\\jobCollector.service.js",
+      "flagged": 3,
+      "converted": 0
+    },
+    {
+      "file": "src\\modules\\education-intelligence\\controllers\\careerPrediction.controller.js",
+      "flagged": 2,
+      "converted": 1
+    },
+    {
+      "file": "src\\modules\\education-intelligence\\controllers\\careerSimulation.controller.js",
+      "flagged": 2,
+      "converted": 1
+    },
+    {
+      "file": "src\\modules\\education-intelligence\\controllers\\roiAnalysis.controller.js",
+      "flagged": 2,
+      "converted": 1
+    },
+    {
+      "file": "src\\modules\\education-intelligence\\orchestrator\\education.orchestrator.js",
+      "flagged": 4,
+      "converted": 2
+    },
+    {
+      "file": "src\\modules\\jobSeeker\\jobMatchingEngine.service.js",
+      "flagged": 3,
+      "converted": 4
+    },
+    {
+      "file": "src\\modules\\labor-market-intelligence\\collectors\\jobCollector.service.js",
+      "flagged": 3,
+      "converted": 0
+    },
+    {
+      "file": "src\\modules\\labor-market-intelligence\\processors\\demandAnalysis.service.js",
+      "flagged": 5,
+      "converted": 0
+    },
+    {
+      "file": "src\\modules\\labor-market-intelligence\\services\\marketTrend.service.js",
+      "flagged": 2,
+      "converted": 0
+    },
+    {
+      "file": "src\\modules\\marketIntelligence\\marketIntelligence.service.js",
+      "flagged": 4,
+      "converted": 1
+    },
+    {
+      "file": "src\\modules\\onboarding\\controllers\\onboarding.controller.js",
+      "flagged": 5,
+      "converted": 3
+    },
+    {
+      "file": "src\\modules\\onboarding\\onboarding.analytics.service.js",
+      "flagged": 3,
+      "converted": 6
+    },
+    {
+      "file": "src\\modules\\onboarding\\onboarding.careerReport.service.js",
+      "flagged": 2,
+      "converted": 4
+    },
+    {
+      "file": "src\\modules\\onboarding\\onboarding.cv.service.js",
+      "flagged": 6,
+      "converted": 6
+    },
+    {
+      "file": "src\\modules\\onboarding\\onboarding.helpers.js",
+      "flagged": 12,
+      "converted": 0
+    },
+    {
+      "file": "src\\modules\\onboarding\\onboarding.intake.service.js",
+      "flagged": 13,
+      "converted": 6
+    },
+    {
+      "file": "src\\modules\\onboarding\\onboarding.linkedin.service.js",
+      "flagged": 3,
+      "converted": 4
+    },
+    {
+      "file": "src\\modules\\resume\\controllers\\resume.controller.js",
+      "flagged": 2,
+      "converted": 1
+    },
+    {
+      "file": "src\\modules\\roles\\roles.service.js",
+      "flagged": 7,
+      "converted": 4
+    },
+    {
+      "file": "src\\modules\\salaryImport\\salaryImport.service.js",
+      "flagged": 1,
+      "converted": 0
+    },
+    {
+      "file": "src\\modules\\secrets\\repository\\secrets.repository.js",
+      "flagged": 2,
+      "converted": 1
+    },
+    {
+      "file": "src\\modules\\skill-evolution\\services\\skillEvolution.service.js",
+      "flagged": 3,
+      "converted": 2
+    },
+    {
+      "file": "src\\modules\\skillDemand\\skillRecommendations.service.js",
+      "flagged": 3,
+      "converted": 3
+    },
+    {
+      "file": "src\\modules\\user\\user.registration.service.js",
+      "flagged": 4,
+      "converted": 2
+    },
+    {
+      "file": "src\\modules\\userActivity\\userActivity.service.js",
+      "flagged": 2,
+      "converted": 0
+    },
+    {
+      "file": "src\\routes\\admin\\adminMetrics.routes.js",
+      "flagged": 7,
+      "converted": 0
+    },
+    {
+      "file": "src\\routes\\admin\\adminMetrics.service.js",
+      "flagged": 2,
+      "converted": 0
+    },
+    {
+      "file": "src\\routes\\career-onboarding.routes.js",
+      "flagged": 3,
+      "converted": 0
+    },
+    {
+      "file": "src\\routes\\skills-priority.routes.js",
+      "flagged": 2,
+      "converted": 3
+    },
+    {
+      "file": "src\\routes\\skills.routes.js",
+      "flagged": 2,
+      "converted": 2
+    },
+    {
+      "file": "src\\routes\\student-onboarding.routes.js",
+      "flagged": 5,
+      "converted": 2
+    },
+    {
+      "file": "src\\routes\\userDirection.routes.js",
+      "flagged": 2,
+      "converted": 1
+    },
+    {
+      "file": "src\\services\\admin\\adminMetrics.service.js",
+      "flagged": 2,
+      "converted": 0
+    },
+    {
+      "file": "src\\services\\admin\\usageLogs.repository.js",
+      "flagged": 4,
+      "converted": 0
+    },
+    {
+      "file": "src\\services\\aiUsage.service.js",
+      "flagged": 1,
+      "converted": 1
+    },
+    {
+      "file": "src\\services\\billing\\Billing.service.js",
+      "flagged": 2,
+      "converted": 0
+    },
+    {
+      "file": "src\\services\\careerMatching.service.js",
+      "flagged": 3,
+      "converted": 0
+    },
+    {
+      "file": "src\\services\\job.service.js",
+      "flagged": 2,
+      "converted": 1
+    },
+    {
+      "file": "src\\services\\jobAnalyzer.service.js",
+      "flagged": 3,
+      "converted": 1
+    },
+    {
+      "file": "src\\services\\jobFetcher.service.js",
+      "flagged": 1,
+      "converted": 1
+    },
+    {
+      "file": "src\\services\\marketDemandService.js",
+      "flagged": 2,
+      "converted": 0
+    },
+    {
+      "file": "src\\services\\paymentActivation.service.js",
+      "flagged": 2,
+      "converted": 0
+    }
+  ],
+  "conversions": [
+    {
+      "file": "src\\controllers\\careerPrediction.controller.js",
+      "line": 96,
+      "description": "collection(...).where(f,\"==\",v).get() → supabase.from(...).select(\"*\").eq(f,v)",
+      "from": "db.collection(COLLECTIONS.CAREER_PREDICTIONS).where('student_id','==',studentId).get()"
+    },
+    {
+      "file": "src\\core\\aiJobQueue.js",
+      "line": 73,
+      "description": "collection(...).doc(...).update(...) → supabase.from(...).update(...).eq(\"id\",...)",
+      "from": "db.collection(JOB_COLLECTION).doc(jobId).update({...fields,updatedAt:new Date().toISOString()})"
+    },
+    {
+      "file": "src\\core\\aiJobQueue.js",
+      "line": 149,
+      "description": "collection(...).doc(...).get() → supabase.from(...).select(\"*\").eq(\"id\",...).single()",
+      "from": "db.collection(JOB_COLLECTION).doc(jobId).get()"
+    },
+    {
+      "file": "src\\engines\\aiPersonalization.engine.js",
+      "line": 156,
+      "description": "collection(...).doc(...).get() → supabase.from(...).select(\"*\").eq(\"id\",...).single()",
+      "from": "db.collection('userProfiles').doc(userId).get()"
+    },
+    {
+      "file": "src\\engines\\aiPersonalization.engine.js",
+      "line": 157,
+      "description": "collection(...).doc(...).get() → supabase.from(...).select(\"*\").eq(\"id\",...).single()",
+      "from": "db.collection('onboardingProgress').doc(userId).get()"
+    },
+    {
+      "file": "src\\engines\\opportunityRadar.engine.js",
+      "line": 220,
+      "description": "collection(...).doc(...).get() → supabase.from(...).select(\"*\").eq(\"id\",...).single()",
+      "from": "db.collection('userProfiles').doc(userId).get()"
+    },
+    {
+      "file": "src\\engines\\opportunityRadar.engine.js",
+      "line": 221,
+      "description": "collection(...).doc(...).get() → supabase.from(...).select(\"*\").eq(\"id\",...).single()",
+      "from": "db.collection('onboardingProgress').doc(userId).get()"
+    },
+    {
+      "file": "src\\infrastructure\\aiLogger.js",
+      "line": 76,
+      "description": "collection(...).add(...) → supabase.from(...).insert(...)",
+      "from": "db.collection('ai_usage_logs').add({logId,user_id:userId??null,module,model,status,latencyMs,usage:{promptTokens:usage.p"
+    },
+    {
+      "file": "src\\jobApplications\\repository\\jobApplications.repository.js",
+      "line": 65,
+      "description": "collection(...).add(...) → supabase.from(...).insert(...)",
+      "from": "db.collection(COLLECTION).add(doc)"
+    },
+    {
+      "file": "src\\jobApplications\\repository\\jobApplications.repository.js",
+      "line": 100,
+      "description": "collection(...).doc(...).get() → supabase.from(...).select(\"*\").eq(\"id\",...).single()",
+      "from": "db.collection(COLLECTION).doc(cursor).get()"
+    },
+    {
+      "file": "src\\jobApplications\\repository\\jobApplications.repository.js",
+      "line": 130,
+      "description": "collection(...).doc(...).get() → supabase.from(...).select(\"*\").eq(\"id\",...).single()",
+      "from": "db.collection(COLLECTION).doc(applicationId).get()"
+    },
+    {
+      "file": "src\\jobApplications\\repository\\jobApplications.repository.js",
+      "line": 179,
+      "description": "collection(...).doc(...).update(...) → supabase.from(...).update(...).eq(\"id\",...)",
+      "from": "db.collection(COLLECTION).doc(applicationId).update(sanitized)"
+    },
+    {
+      "file": "src\\jobApplications\\repository\\jobApplications.repository.js",
+      "line": 197,
+      "description": "collection(...).doc(...).update(...) → supabase.from(...).update(...).eq(\"id\",...)",
+      "from": "db.collection(COLLECTION).doc(applicationId).update({deleted:true,deletedAt:new Date(),updatedAt:new Date()})"
+    },
+    {
+      "file": "src\\modules\\ai-event-bus\\workers\\index.js",
+      "line": 155,
+      "description": "collection(...).doc(...).get() → supabase.from(...).select(\"*\").eq(\"id\",...).single()",
+      "from": "db.collection('userProfiles').doc(userId).get()"
+    },
+    {
+      "file": "src\\modules\\analysis\\analysis.service.js",
+      "line": 53,
+      "description": "collection(...).doc(...).get() → supabase.from(...).select(\"*\").eq(\"id\",...).single()",
+      "from": "db.collection('userProfiles').doc(userId).get()"
+    },
+    {
+      "file": "src\\modules\\analysis\\analysis.service.js",
+      "line": 89,
+      "description": "collection(...).doc(...).get() → supabase.from(...).select(\"*\").eq(\"id\",...).single()",
+      "from": "db.collection('users').doc(userId).get()"
+    },
+    {
+      "file": "src\\modules\\analysis\\analysis.service.js",
+      "line": 139,
+      "description": "collection(...).doc(...).get() → supabase.from(...).select(\"*\").eq(\"id\",...).single()",
+      "from": "db.collection('resumes').doc(resumeId).get()"
+    },
+    {
+      "file": "src\\modules\\analysis\\analysis.service.js",
+      "line": 166,
+      "description": "collection(...).doc(...).update(...) → supabase.from(...).update(...).eq(\"id\",...)",
+      "from": "db.collection('resumes').doc(resumeId).update({analysisStatus:'completed',engine:result.engine,score:result.score??null,"
+    },
+    {
+      "file": "src\\modules\\analysis\\jobMatch.service.js",
+      "line": 53,
+      "description": "collection(...).doc(...).get() → supabase.from(...).select(\"*\").eq(\"id\",...).single()",
+      "from": "db.collection('userProfiles').doc(userId).get()"
+    },
+    {
+      "file": "src\\modules\\analysis\\jobMatch.service.js",
+      "line": 89,
+      "description": "collection(...).doc(...).get() → supabase.from(...).select(\"*\").eq(\"id\",...).single()",
+      "from": "db.collection('users').doc(userId).get()"
+    },
+    {
+      "file": "src\\modules\\analysis\\jobMatch.service.js",
+      "line": 139,
+      "description": "collection(...).doc(...).get() → supabase.from(...).select(\"*\").eq(\"id\",...).single()",
+      "from": "db.collection('resumes').doc(resumeId).get()"
+    },
+    {
+      "file": "src\\modules\\analysis\\jobMatch.service.js",
+      "line": 166,
+      "description": "collection(...).doc(...).update(...) → supabase.from(...).update(...).eq(\"id\",...)",
+      "from": "db.collection('resumes').doc(resumeId).update({analysisStatus:'completed',engine:result.engine,score:result.score??null,"
+    },
+    {
+      "file": "src\\modules\\appEntry\\appEntry.route.js",
+      "line": 83,
+      "description": "collection(...).doc(...).get() → supabase.from(...).select(\"*\").eq(\"id\",...).single()",
+      "from": "db.collection('userProfiles').doc(userId).get()"
+    },
+    {
+      "file": "src\\modules\\appEntry\\appEntry.route.js",
+      "line": 134,
+      "description": "collection(...).doc(...).get() → supabase.from(...).select(\"*\").eq(\"id\",...).single()",
+      "from": "db.collection('userProfiles').doc(userId).get()"
+    },
+    {
+      "file": "src\\modules\\career-copilot\\careerCopilot.service.js",
+      "line": 106,
+      "description": "collection(...).add(...) → supabase.from(...).insert(...)",
+      "from": "db.collection(COPILOT_CONVERSATIONS_COLLECTION).add({...turn,created_at:FieldValue.serverTimestamp()}).catch(()=>{})"
+    },
+    {
+      "file": "src\\modules\\career-copilot\\careerCopilot.service.js",
+      "line": 402,
+      "description": "collection(...).doc(...).get() → supabase.from(...).select(\"*\").eq(\"id\",...).single()",
+      "from": "db.collection('userProfiles').doc(userId).get()"
+    },
+    {
+      "file": "src\\modules\\career-copilot\\coordinator\\careerAgentCoordinator.js",
+      "line": 108,
+      "description": "collection(...).doc(...).get() → supabase.from(...).select(\"*\").eq(\"id\",...).single()",
+      "from": "db.collection('userProfiles').doc(userId).get()"
+    },
+    {
+      "file": "src\\modules\\career-copilot\\coordinator\\careerAgentCoordinator.js",
+      "line": 109,
+      "description": "collection(...).doc(...).get() → supabase.from(...).select(\"*\").eq(\"id\",...).single()",
+      "from": "db.collection('onboardingProgress').doc(userId).get()"
+    },
+    {
+      "file": "src\\modules\\career-copilot\\retrieval\\ragRetriever.js",
+      "line": 79,
+      "description": "collection(...).doc(...).get() → supabase.from(...).select(\"*\").eq(\"id\",...).single()",
+      "from": "db.collection('userProfiles').doc(userId).get()"
+    },
+    {
+      "file": "src\\modules\\career-copilot\\retrieval\\ragRetriever.js",
+      "line": 80,
+      "description": "collection(...).doc(...).get() → supabase.from(...).select(\"*\").eq(\"id\",...).single()",
+      "from": "db.collection('onboardingProgress').doc(userId).get()"
+    },
+    {
+      "file": "src\\modules\\career-digital-twin\\services\\digitalTwin.service.js",
+      "line": 167,
+      "description": "collection(...).add(...) → supabase.from(...).insert(...)",
+      "from": "db.collection(COLLECTION).add(doc)"
+    },
+    {
+      "file": "src\\modules\\chiV2\\careerOpportunityEngine.js",
+      "line": 112,
+      "description": "collection(...).where(f,\"==\",v).get() → supabase.from(...).select(\"*\").eq(f,v)",
+      "from": "db.collection('role_transitions').where('from_role_id','==',current).get()"
+    },
+    {
+      "file": "src\\modules\\chiV2\\careerOpportunityEngine.js",
+      "line": 209,
+      "description": "collection(...).doc(...).get() → supabase.from(...).select(\"*\").eq(\"id\",...).single()",
+      "from": "db.collection('roles').doc(id).get()"
+    },
+    {
+      "file": "src\\modules\\coverLetter\\coverLetter.routes.js",
+      "line": 86,
+      "description": "collection(...).doc(...).get() → supabase.from(...).select(\"*\").eq(\"id\",...).single()",
+      "from": "db.collection('users').doc(userId).get()"
+    },
+    {
+      "file": "src\\modules\\coverLetter\\coverLetter.service.js",
+      "line": 88,
+      "description": "collection(...).add(...) → supabase.from(...).insert(...)",
+      "from": "db.collection('coverLetters').add({userId,companyName:payload.companyName,jobTitle:payload.jobTitle,jobDescription:paylo"
+    },
+    {
+      "file": "src\\modules\\dashboard\\dashboard.service.js",
+      "line": 242,
+      "description": "collection(...).doc(...).get() → supabase.from(...).select(\"*\").eq(\"id\",...).single()",
+      "from": "db.collection('users').doc(userId).get()"
+    },
+    {
+      "file": "src\\modules\\education-intelligence\\controllers\\careerPrediction.controller.js",
+      "line": 96,
+      "description": "collection(...).where(f,\"==\",v).get() → supabase.from(...).select(\"*\").eq(f,v)",
+      "from": "db.collection(COLLECTIONS.CAREER_PREDICTIONS).where('student_id','==',studentId).get()"
+    },
+    {
+      "file": "src\\modules\\education-intelligence\\controllers\\careerSimulation.controller.js",
+      "line": 78,
+      "description": "collection(...).where(f,\"==\",v).get() → supabase.from(...).select(\"*\").eq(f,v)",
+      "from": "db.collection(COLLECTIONS.CAREER_SIMULATIONS).where('student_id','==',studentId).get()"
+    },
+    {
+      "file": "src\\modules\\education-intelligence\\controllers\\roiAnalysis.controller.js",
+      "line": 71,
+      "description": "collection(...).where(f,\"==\",v).get() → supabase.from(...).select(\"*\").eq(f,v)",
+      "from": "db.collection(COLLECTIONS.EDUCATION_ROI).where('student_id','==',studentId).get()"
+    },
+    {
+      "file": "src\\modules\\education-intelligence\\orchestrator\\education.orchestrator.js",
+      "line": 157,
+      "description": "collection(...).where(f,\"==\",v).get() → supabase.from(...).select(\"*\").eq(f,v)",
+      "from": "db.collection(COLLECTIONS.EDUCATION_ROI).where('student_id','==',studentId).get()"
+    },
+    {
+      "file": "src\\modules\\education-intelligence\\orchestrator\\education.orchestrator.js",
+      "line": 181,
+      "description": "collection(...).where(f,\"==\",v).get() → supabase.from(...).select(\"*\").eq(f,v)",
+      "from": "db.collection(COLLECTIONS.CAREER_SIMULATIONS).where('student_id','==',studentId).get()"
+    },
+    {
+      "file": "src\\modules\\jobSeeker\\jobMatchingEngine.service.js",
+      "line": 65,
+      "description": "collection(...).doc(...).get() → supabase.from(...).select(\"*\").eq(\"id\",...).single()",
+      "from": "db.collection('userProfiles').doc(userId).get()"
+    },
+    {
+      "file": "src\\modules\\jobSeeker\\jobMatchingEngine.service.js",
+      "line": 66,
+      "description": "collection(...).doc(...).get() → supabase.from(...).select(\"*\").eq(\"id\",...).single()",
+      "from": "db.collection('onboardingProgress').doc(userId).get()"
+    },
+    {
+      "file": "src\\modules\\jobSeeker\\jobMatchingEngine.service.js",
+      "line": 67,
+      "description": "collection(...).doc(...).get() → supabase.from(...).select(\"*\").eq(\"id\",...).single()",
+      "from": "db.collection('users').doc(userId).get()"
+    },
+    {
+      "file": "src\\modules\\jobSeeker\\jobMatchingEngine.service.js",
+      "line": 379,
+      "description": "collection(...).where(f,\"==\",v).get() → supabase.from(...).select(\"*\").eq(f,v)",
+      "from": "db.collection('role_skills').where('role_id','==',id).get()"
+    },
+    {
+      "file": "src\\modules\\jobSeeker\\skillGraphEngine.service.js",
+      "line": 40,
+      "description": "collection(...).doc(...).get() → supabase.from(...).select(\"*\").eq(\"id\",...).single()",
+      "from": "db.collection('userProfiles').doc(userId).get()"
+    },
+    {
+      "file": "src\\modules\\jobSeeker\\skillGraphEngine.service.js",
+      "line": 41,
+      "description": "collection(...).doc(...).get() → supabase.from(...).select(\"*\").eq(\"id\",...).single()",
+      "from": "db.collection('onboardingProgress').doc(userId).get()"
+    },
+    {
+      "file": "src\\modules\\jobSeeker\\skillGraphEngine.service.js",
+      "line": 42,
+      "description": "collection(...).doc(...).get() → supabase.from(...).select(\"*\").eq(\"id\",...).single()",
+      "from": "db.collection('users').doc(userId).get()"
+    },
+    {
+      "file": "src\\modules\\marketIntelligence\\marketIntelligence.service.js",
+      "line": 193,
+      "description": "collection(...).add(...) → supabase.from(...).insert(...)",
+      "from": "db.collection(SYNC_COLLECTION).add({role,country,provider,syncedAt:new Date().toISOString()})"
+    },
+    {
+      "file": "src\\modules\\onboarding\\controllers\\onboarding.controller.js",
+      "line": 433,
+      "description": "collection(...).doc(...).get() → supabase.from(...).select(\"*\").eq(\"id\",...).single()",
+      "from": "db.collection('resumes').doc(uploadResult.resumeId).get()"
+    },
+    {
+      "file": "src\\modules\\onboarding\\controllers\\onboarding.controller.js",
+      "line": 531,
+      "description": "collection(...).doc(...).get() → supabase.from(...).select(\"*\").eq(\"id\",...).single()",
+      "from": "db.collection('onboardingProgress').doc(userId).get()"
+    },
+    {
+      "file": "src\\modules\\onboarding\\controllers\\onboarding.controller.js",
+      "line": 532,
+      "description": "collection(...).doc(...).get() → supabase.from(...).select(\"*\").eq(\"id\",...).single()",
+      "from": "db.collection('userProfiles').doc(userId).get()"
+    },
+    {
+      "file": "src\\modules\\onboarding\\onboarding.analytics.service.js",
+      "line": 36,
+      "description": "collection(...).doc(...).get() → supabase.from(...).select(\"*\").eq(\"id\",...).single()",
+      "from": "/* REVIEW: migrate */db.collection('onboardingProgress').doc(userId).get()"
+    },
+    {
+      "file": "src\\modules\\onboarding\\onboarding.analytics.service.js",
+      "line": 37,
+      "description": "collection(...).doc(...).get() → supabase.from(...).select(\"*\").eq(\"id\",...).single()",
+      "from": "/* REVIEW: migrate */db.collection('userProfiles').doc(userId).get()"
+    },
+    {
+      "file": "src\\modules\\onboarding\\onboarding.analytics.service.js",
+      "line": 108,
+      "description": "collection(...).doc(...).get() → supabase.from(...).select(\"*\").eq(\"id\",...).single()",
+      "from": "/* REVIEW: migrate */db.collection('onboardingProgress').doc(userId).get()"
+    },
+    {
+      "file": "src\\modules\\onboarding\\onboarding.analytics.service.js",
+      "line": 109,
+      "description": "collection(...).doc(...).get() → supabase.from(...).select(\"*\").eq(\"id\",...).single()",
+      "from": "/* REVIEW: migrate */db.collection('userProfiles').doc(userId).get()"
+    },
+    {
+      "file": "src\\modules\\onboarding\\onboarding.analytics.service.js",
+      "line": 219,
+      "description": "collection(...).doc(...).get() → supabase.from(...).select(\"*\").eq(\"id\",...).single()",
+      "from": "/* REVIEW: migrate */db.collection('onboardingProgress').doc(userId).get()"
+    },
+    {
+      "file": "src\\modules\\onboarding\\onboarding.analytics.service.js",
+      "line": 220,
+      "description": "collection(...).doc(...).get() → supabase.from(...).select(\"*\").eq(\"id\",...).single()",
+      "from": "/* REVIEW: migrate */db.collection('userProfiles').doc(userId).get()"
+    },
+    {
+      "file": "src\\modules\\onboarding\\onboarding.careerReport.service.js",
+      "line": 78,
+      "description": "collection(...).doc(...).get() → supabase.from(...).select(\"*\").eq(\"id\",...).single()",
+      "from": "/* REVIEW: migrate */db.collection('onboardingProgress').doc(userId).get()"
+    },
+    {
+      "file": "src\\modules\\onboarding\\onboarding.careerReport.service.js",
+      "line": 79,
+      "description": "collection(...).doc(...).get() → supabase.from(...).select(\"*\").eq(\"id\",...).single()",
+      "from": "/* REVIEW: migrate */db.collection('userProfiles').doc(userId).get()"
+    },
+    {
+      "file": "src\\modules\\onboarding\\onboarding.careerReport.service.js",
+      "line": 250,
+      "description": "collection(...).doc(...).get() → supabase.from(...).select(\"*\").eq(\"id\",...).single()",
+      "from": "/* REVIEW: migrate */db.collection('onboardingProgress').doc(userId).get()"
+    },
+    {
+      "file": "src\\modules\\onboarding\\onboarding.careerReport.service.js",
+      "line": 251,
+      "description": "collection(...).doc(...).get() → supabase.from(...).select(\"*\").eq(\"id\",...).single()",
+      "from": "/* REVIEW: migrate */db.collection('userProfiles').doc(userId).get()"
+    },
+    {
+      "file": "src\\modules\\onboarding\\onboarding.cv.service.js",
+      "line": 47,
+      "description": "collection(...).doc(...).get() → supabase.from(...).select(\"*\").eq(\"id\",...).single()",
+      "from": "/* REVIEW: migrate */db.collection('onboardingProgress').doc(userId).get()"
+    },
+    {
+      "file": "src\\modules\\onboarding\\onboarding.cv.service.js",
+      "line": 48,
+      "description": "collection(...).doc(...).get() → supabase.from(...).select(\"*\").eq(\"id\",...).single()",
+      "from": "/* REVIEW: migrate */db.collection('userProfiles').doc(userId).get()"
+    },
+    {
+      "file": "src\\modules\\onboarding\\onboarding.cv.service.js",
+      "line": 336,
+      "description": "collection(...).doc(...).get() → supabase.from(...).select(\"*\").eq(\"id\",...).single()",
+      "from": "/* REVIEW: migrate */db.collection('onboardingProgress').doc(userId).get()"
+    },
+    {
+      "file": "src\\modules\\onboarding\\onboarding.cv.service.js",
+      "line": 337,
+      "description": "collection(...).doc(...).get() → supabase.from(...).select(\"*\").eq(\"id\",...).single()",
+      "from": "/* REVIEW: migrate */db.collection('userProfiles').doc(userId).get()"
+    },
+    {
+      "file": "src\\modules\\onboarding\\onboarding.cv.service.js",
+      "line": 646,
+      "description": "collection(...).doc(...).get() → supabase.from(...).select(\"*\").eq(\"id\",...).single()",
+      "from": "/* REVIEW: migrate */db.collection('onboardingProgress').doc(userId).get()"
+    },
+    {
+      "file": "src\\modules\\onboarding\\onboarding.cv.service.js",
+      "line": 647,
+      "description": "collection(...).doc(...).get() → supabase.from(...).select(\"*\").eq(\"id\",...).single()",
+      "from": "/* REVIEW: migrate */db.collection('userProfiles').doc(userId).get()"
+    },
+    {
+      "file": "src\\modules\\onboarding\\onboarding.intake.service.js",
+      "line": 282,
+      "description": "collection(...).doc(...).get() → supabase.from(...).select(\"*\").eq(\"id\",...).single()",
+      "from": "/* REVIEW: migrate */db.collection('onboardingProgress').doc(userId).get()"
+    },
+    {
+      "file": "src\\modules\\onboarding\\onboarding.intake.service.js",
+      "line": 283,
+      "description": "collection(...).doc(...).get() → supabase.from(...).select(\"*\").eq(\"id\",...).single()",
+      "from": "/* REVIEW: migrate */db.collection('userProfiles').doc(userId).get()"
+    },
+    {
+      "file": "src\\modules\\onboarding\\onboarding.intake.service.js",
+      "line": 642,
+      "description": "collection(...).doc(...).get() → supabase.from(...).select(\"*\").eq(\"id\",...).single()",
+      "from": "/* REVIEW: migrate */db.collection('onboardingProgress').doc(userId).get()"
+    },
+    {
+      "file": "src\\modules\\onboarding\\onboarding.intake.service.js",
+      "line": 643,
+      "description": "collection(...).doc(...).get() → supabase.from(...).select(\"*\").eq(\"id\",...).single()",
+      "from": "/* REVIEW: migrate */db.collection('userProfiles').doc(userId).get()"
+    },
+    {
+      "file": "src\\modules\\onboarding\\onboarding.intake.service.js",
+      "line": 960,
+      "description": "collection(...).doc(...).get() → supabase.from(...).select(\"*\").eq(\"id\",...).single()",
+      "from": "/* REVIEW: migrate */db.collection('onboardingProgress').doc(userId).get()"
+    },
+    {
+      "file": "src\\modules\\onboarding\\onboarding.intake.service.js",
+      "line": 961,
+      "description": "collection(...).doc(...).get() → supabase.from(...).select(\"*\").eq(\"id\",...).single()",
+      "from": "/* REVIEW: migrate */db.collection('userProfiles').doc(userId).get()"
+    },
+    {
+      "file": "src\\modules\\onboarding\\onboarding.linkedin.service.js",
+      "line": 185,
+      "description": "collection(...).doc(...).get() → supabase.from(...).select(\"*\").eq(\"id\",...).single()",
+      "from": "db.collection('onboardingProgress').doc(userId).get()"
+    },
+    {
+      "file": "src\\modules\\onboarding\\onboarding.linkedin.service.js",
+      "line": 186,
+      "description": "collection(...).doc(...).get() → supabase.from(...).select(\"*\").eq(\"id\",...).single()",
+      "from": "db.collection('userProfiles').doc(userId).get()"
+    },
+    {
+      "file": "src\\modules\\onboarding\\onboarding.linkedin.service.js",
+      "line": 261,
+      "description": "collection(...).doc(...).get() → supabase.from(...).select(\"*\").eq(\"id\",...).single()",
+      "from": "db.collection('onboardingProgress').doc(userId).get()"
+    },
+    {
+      "file": "src\\modules\\onboarding\\onboarding.linkedin.service.js",
+      "line": 262,
+      "description": "collection(...).doc(...).get() → supabase.from(...).select(\"*\").eq(\"id\",...).single()",
+      "from": "db.collection('userProfiles').doc(userId).get()"
+    },
+    {
+      "file": "src\\modules\\qualification\\qualification.service.js",
+      "line": 46,
+      "description": "collection(...).where(f,\"==\",v).get() → supabase.from(...).select(\"*\").eq(f,v)",
+      "from": "db.collection('qualifications').where('isActive','==',true).get()"
+    },
+    {
+      "file": "src\\modules\\qualification\\qualification.service.js",
+      "line": 106,
+      "description": "collection(...).doc(...).get() → supabase.from(...).select(\"*\").eq(\"id\",...).single()",
+      "from": "db.collection('qualifications').doc(qualificationId.trim()).get()"
+    },
+    {
+      "file": "src\\modules\\resume\\controllers\\resume.controller.js",
+      "line": 290,
+      "description": "collection(...).doc(...).get() → supabase.from(...).select(\"*\").eq(\"id\",...).single()",
+      "from": "db.collection('resumes').doc(resumeId).get()"
+    },
+    {
+      "file": "src\\modules\\resume\\resume.service.js",
+      "line": 1007,
+      "description": "collection(...).doc(...).update(...) → supabase.from(...).update(...).eq(\"id\",...)",
+      "from": "db.collection('resumes').doc(resumeId).update({softDeleted:true,deletedAt:new Date()})"
+    },
+    {
+      "file": "src\\modules\\roles\\roles.service.js",
+      "line": 82,
+      "description": "collection(...).doc(...).get() → supabase.from(...).select(\"*\").eq(\"id\",...).single()",
+      "from": "db.collection(ROLES_COLLECTION).doc(id).get().then(snap=>({id,snap}))"
+    },
+    {
+      "file": "src\\modules\\roles\\roles.service.js",
+      "line": 85,
+      "description": "collection(...).doc(...).get() → supabase.from(...).select(\"*\").eq(\"id\",...).single()",
+      "from": "db.collection(CMS_ROLES_COLLECTION).doc(id).get().then(snap=>({id,snap}))"
+    },
+    {
+      "file": "src\\modules\\roles\\roles.service.js",
+      "line": 210,
+      "description": "collection(...).doc(...).get() → supabase.from(...).select(\"*\").eq(\"id\",...).single()",
+      "from": "db.collection(ROLES_COLLECTION).doc(roleId.trim()).get()"
+    },
+    {
+      "file": "src\\modules\\roles\\roles.service.js",
+      "line": 416,
+      "description": "collection(...).doc(...).get() → supabase.from(...).select(\"*\").eq(\"id\",...).single()",
+      "from": "db.collection(PROFILES_COLLECTION).doc(userId).get()"
+    },
+    {
+      "file": "src\\modules\\salary\\salary.service.js",
+      "line": 152,
+      "description": "collection(...).add(...) → supabase.from(...).insert(...)",
+      "from": "db.collection(IMPORT_LOGS_COLLECTION).add({datasetType,recordsProcessed:processed,recordsInserted:created,recordsFailed:"
+    },
+    {
+      "file": "src\\modules\\secrets\\repository\\secrets.repository.js",
+      "line": 195,
+      "description": "collection(...).add(...) → supabase.from(...).insert(...)",
+      "from": "this.db.collection('secrets_rotation_log').add({...entry,createdAt:new Date()})"
+    },
+    {
+      "file": "src\\modules\\skill-evolution\\services\\skillEvolution.service.js",
+      "line": 69,
+      "description": "collection(...).where(f,\"==\",v).get() → supabase.from(...).select(\"*\").eq(f,v)",
+      "from": "db.collection(COLLECTIONS.STUDENT_SKILLS).where('student_id','==',studentId).get()"
+    },
+    {
+      "file": "src\\modules\\skill-evolution\\services\\skillEvolution.service.js",
+      "line": 107,
+      "description": "collection(...).doc(...).get() → supabase.from(...).select(\"*\").eq(\"id\",...).single()",
+      "from": "db.collection(COLLECTIONS.SKILL_RECOMMENDATIONS).doc(studentId).get()"
+    },
+    {
+      "file": "src\\modules\\skill-prioritization\\index.js",
+      "line": 62,
+      "description": "collection(...).doc(...).get() → supabase.from(...).select(\"*\").eq(\"id\",...).single()",
+      "from": "db.collection('userProfiles').doc(userId).get()"
+    },
+    {
+      "file": "src\\modules\\skillDemand\\skillRecommendations.service.js",
+      "line": 101,
+      "description": "collection(...).doc(...).get() → supabase.from(...).select(\"*\").eq(\"id\",...).single()",
+      "from": "db.collection('userProfiles').doc(userId).get()"
+    },
+    {
+      "file": "src\\modules\\skillDemand\\skillRecommendations.service.js",
+      "line": 111,
+      "description": "collection(...).doc(...).get() → supabase.from(...).select(\"*\").eq(\"id\",...).single()",
+      "from": "db.collection('users').doc(userId).get()"
+    },
+    {
+      "file": "src\\modules\\skillDemand\\skillRecommendations.service.js",
+      "line": 230,
+      "description": "collection(...).doc(...).get() → supabase.from(...).select(\"*\").eq(\"id\",...).single()",
+      "from": "db.collection('users').doc(userId).get()"
+    },
+    {
+      "file": "src\\modules\\user\\user.registration.service.js",
+      "line": 63,
+      "description": "collection(...).doc(...).get() → supabase.from(...).select(\"*\").eq(\"id\",...).single()",
+      "from": "db.collection('users').doc(userId).get()"
+    },
+    {
+      "file": "src\\modules\\user\\user.registration.service.js",
+      "line": 64,
+      "description": "collection(...).doc(...).get() → supabase.from(...).select(\"*\").eq(\"id\",...).single()",
+      "from": "db.collection('userProfiles').doc(userId).get()"
+    },
+    {
+      "file": "src\\routes\\cvBuilder.routes.js",
+      "line": 61,
+      "description": "collection(...).doc(...).get() → supabase.from(...).select(\"*\").eq(\"id\",...).single()",
+      "from": "db.collection('user_cvs').doc(req.params.id).get()"
+    },
+    {
+      "file": "src\\routes\\internal\\aiJob.route.js",
+      "line": 67,
+      "description": "collection(...).doc(...).get() → supabase.from(...).select(\"*\").eq(\"id\",...).single()",
+      "from": "db.collection(JOB_COLLECTION).doc(jobId).get()"
+    },
+    {
+      "file": "src\\routes\\internal\\provisionalChi.route.js",
+      "line": 64,
+      "description": "collection(...).doc(...).get() → supabase.from(...).select(\"*\").eq(\"id\",...).single()",
+      "from": "db.collection('onboardingProgress').doc(userId).get()"
+    },
+    {
+      "file": "src\\routes\\internal\\provisionalChi.route.js",
+      "line": 65,
+      "description": "collection(...).doc(...).get() → supabase.from(...).select(\"*\").eq(\"id\",...).single()",
+      "from": "db.collection('userProfiles').doc(userId).get()"
+    },
+    {
+      "file": "src\\routes\\jobAnalyzer.routes.js",
+      "line": 61,
+      "description": "collection(...).doc(...).get() → supabase.from(...).select(\"*\").eq(\"id\",...).single()",
+      "from": "db.collection('job_analyses').doc(req.params.id).get()"
+    },
+    {
+      "file": "src\\routes\\skills-priority.routes.js",
+      "line": 84,
+      "description": "collection(...).doc(...).get() → supabase.from(...).select(\"*\").eq(\"id\",...).single()",
+      "from": "db.collection('userProfiles').doc(userId).get().catch(()=>null)"
+    },
+    {
+      "file": "src\\routes\\skills-priority.routes.js",
+      "line": 85,
+      "description": "collection(...).doc(...).get() → supabase.from(...).select(\"*\").eq(\"id\",...).single()",
+      "from": "db.collection('onboardingProgress').doc(userId).get().catch(()=>null)"
+    },
+    {
+      "file": "src\\routes\\skills-priority.routes.js",
+      "line": 86,
+      "description": "collection(...).doc(...).get() → supabase.from(...).select(\"*\").eq(\"id\",...).single()",
+      "from": "db.collection('users').doc(userId).get().catch(()=>null)"
+    },
+    {
+      "file": "src\\routes\\skills.routes.js",
+      "line": 265,
+      "description": "collection(...).doc(...).get() → supabase.from(...).select(\"*\").eq(\"id\",...).single()",
+      "from": "db.collection('users').doc(userId).get()"
+    },
+    {
+      "file": "src\\routes\\skills.routes.js",
+      "line": 274,
+      "description": "collection(...).doc(...).get() → supabase.from(...).select(\"*\").eq(\"id\",...).single()",
+      "from": "db.collection('userProfiles').doc(userId).get()"
+    },
+    {
+      "file": "src\\routes\\student-onboarding.routes.js",
+      "line": 74,
+      "description": "collection(...).doc(...).get() → supabase.from(...).select(\"*\").eq(\"id\",...).single()",
+      "from": "db.collection('studentOnboardingDrafts').doc(userId).get()"
+    },
+    {
+      "file": "src\\routes\\student-onboarding.routes.js",
+      "line": 199,
+      "description": "collection(...).doc(...).get() → supabase.from(...).select(\"*\").eq(\"id\",...).single()",
+      "from": "db.collection('studentCareerProfiles').doc(userId).get()"
+    },
+    {
+      "file": "src\\routes\\userDirection.routes.js",
+      "line": 98,
+      "description": "collection(...).doc(...).get() → supabase.from(...).select(\"*\").eq(\"id\",...).single()",
+      "from": "db.collection('users').doc(uid).get()"
+    },
+    {
+      "file": "src\\services\\aiUsage.service.js",
+      "line": 156,
+      "description": "collection(...).add(...) → supabase.from(...).insert(...)",
+      "from": "db.collection('ai_usage_logs').add({userId,feature:feature??'unknown',model:model??'unknown',success:success??true,error"
+    },
+    {
+      "file": "src\\services\\job.service.js",
+      "line": 94,
+      "description": "collection(...).doc(...).get() → supabase.from(...).select(\"*\").eq(\"id\",...).single()",
+      "from": "db.collection(COLLECTIONS.ROLES).doc(roleId).get()"
+    },
+    {
+      "file": "src\\services\\jobAnalyzer.service.js",
+      "line": 81,
+      "description": "collection(...).doc(...).get() → supabase.from(...).select(\"*\").eq(\"id\",...).single()",
+      "from": "db.collection('users').doc(userId).get()"
+    },
+    {
+      "file": "src\\services\\jobFetcher.service.js",
+      "line": 186,
+      "description": "collection(...).doc(...).get() → supabase.from(...).select(\"*\").eq(\"id\",...).single()",
+      "from": "db.collection(COLLECTION).doc(docId).get()"
+    }
+  ],
+  "flags": [
+    {
+      "file": "src\\ai\\observability\\metrics.service.js",
+      "line": 131,
+      "reason": "multiple .where() chains",
+      "snippet": "db.collection('ai_logs').where('feature','==',feature).where('date','==',dateStr).where('isDeleted','==',false).limit(50"
+    },
+    {
+      "file": "src\\controllers\\careerPrediction.controller.js",
+      "line": 105,
+      "reason": "unrecognised chain: collection.doc",
+      "snippet": "db.collection(COLLECTIONS.CAREER_PREDICTIONS).doc()"
+    },
+    {
+      "file": "src\\controllers\\careerPrediction.controller.js",
+      "line": 145,
+      "reason": ".orderBy()/.limit() chains need manual port",
+      "snippet": "db.collection(COLLECTIONS.CAREER_PREDICTIONS).where('student_id','==',studentId).orderBy('success_probability','desc').g"
+    },
+    {
+      "file": "src\\core\\aiJobQueue.js",
+      "line": 127,
+      "reason": ".set() requires manual upsert/insert decision",
+      "snippet": "db.collection(JOB_COLLECTION).doc(jobId).set(jobDoc)"
+    },
+    {
+      "file": "src\\data-import\\excelImporter.js",
+      "line": 151,
+      "reason": "unrecognised chain: collection.doc",
+      "snippet": "db.collection(collection).doc(String(id))"
+    },
+    {
+      "file": "src\\jobApplications\\repository\\jobApplications.repository.js",
+      "line": 74,
+      "reason": "multiple .where() chains",
+      "snippet": "db.collection(COLLECTION).where('userId','==',userId).where('deleted','==',false).get()"
+    },
+    {
+      "file": "src\\jobApplications\\repository\\jobApplications.repository.js",
+      "line": 88,
+      "reason": "multiple .where() chains",
+      "snippet": "db.collection(COLLECTION).where('userId','==',userId).where('deleted','==',false)// ← CHANGE 4\n.orderBy('createdAt','des"
+    },
+    {
+      "file": "src\\migration\\add-career-conversations.migration.js",
+      "line": 58,
+      "reason": "unrecognised chain: collection.doc",
+      "snippet": "db.collection(COLLECTION).doc('_migration_init')"
+    },
+    {
+      "file": "src\\migration\\add-career-predictions.migration.js",
+      "line": 102,
+      "reason": "unrecognised chain: collection.doc",
+      "snippet": "db.collection(NEW_COLLECTION).doc('migration_probe_tmp')"
+    },
+    {
+      "file": "src\\migration\\add-career-simulations.migration.js",
+      "line": 31,
+      "reason": "unrecognised chain: collection.doc",
+      "snippet": "db.collection(COLLECTION).doc('migration_probe_tmp')"
+    },
+    {
+      "file": "src\\migration\\add-career-simulations.migration.js",
+      "line": 52,
+      "reason": "unrecognised chain: collection.doc",
+      "snippet": "db.collection(COLLECTION).doc('_migration_sentinel')"
+    },
+    {
+      "file": "src\\migration\\add-education-intelligence.migration.js",
+      "line": 104,
+      "reason": "unrecognised chain: collection.doc",
+      "snippet": "db.collection(colName).doc('__migration_probe__')"
+    },
+    {
+      "file": "src\\migration\\add-education-roi.migration.js",
+      "line": 31,
+      "reason": "unrecognised chain: collection.doc",
+      "snippet": "db.collection(COLLECTION).doc('migration_probe_tmp')"
+    },
+    {
+      "file": "src\\migration\\add-education-roi.migration.js",
+      "line": 52,
+      "reason": "unrecognised chain: collection.doc",
+      "snippet": "db.collection(COLLECTION).doc('_migration_sentinel')"
+    },
+    {
+      "file": "src\\migration\\add-school-platform.migration.js",
+      "line": 81,
+      "reason": "unrecognised chain: collection.doc",
+      "snippet": "db.collection(name).doc('_migration_init')"
+    },
+    {
+      "file": "src\\migration\\add-skill-evolution.migration.js",
+      "line": 28,
+      "reason": "unrecognised chain: collection.doc",
+      "snippet": "db.collection('edu_student_skills').doc('__migration_canary__')"
+    },
+    {
+      "file": "src\\migration\\add-skill-evolution.migration.js",
+      "line": 41,
+      "reason": "unrecognised chain: collection.doc",
+      "snippet": "db.collection('edu_skill_recommendations').doc('__migration_canary__')"
+    },
+    {
+      "file": "src\\modules\\admin\\cms\\import\\adminCmsImport.service.js",
+      "line": 159,
+      "reason": "multiple .where() chains",
+      "snippet": "db.collection('cms_job_families').where('normalizedName','in',chunk).where('softDeleted','==',false).get()"
+    },
+    {
+      "file": "src\\modules\\analysis\\analysis.service.js",
+      "line": 95,
+      "reason": "unrecognised chain: collection.doc",
+      "snippet": "db.collection('users').doc(userId)"
+    },
+    {
+      "file": "src\\modules\\analysis\\analysis.service.js",
+      "line": 122,
+      "reason": "unrecognised chain: collection.doc",
+      "snippet": "db.collection('users').doc(userId)"
+    },
+    {
+      "file": "src\\modules\\analysis\\jobMatch.service.js",
+      "line": 95,
+      "reason": "unrecognised chain: collection.doc",
+      "snippet": "db.collection('users').doc(userId)"
+    },
+    {
+      "file": "src\\modules\\analysis\\jobMatch.service.js",
+      "line": 122,
+      "reason": "unrecognised chain: collection.doc",
+      "snippet": "db.collection('users').doc(userId)"
+    },
+    {
+      "file": "src\\modules\\career-copilot\\careerCopilot.service.js",
+      "line": 73,
+      "reason": "multiple .where() chains",
+      "snippet": "db.collection(COPILOT_CONVERSATIONS_COLLECTION).where('user_id','==',userId).where('conversation_id','==',conversationId"
+    },
+    {
+      "file": "src\\modules\\career-copilot\\retrieval\\ragRetriever.js",
+      "line": 126,
+      "reason": "sub-collection detected",
+      "snippet": "db.collection('users').doc(userId).collection('chiSnapshots').where('softDeleted','==',false).orderBy('generatedAt','des"
+    },
+    {
+      "file": "src\\modules\\career-copilot\\retrieval\\ragRetriever.js",
+      "line": 147,
+      "reason": ".orderBy()/.limit() chains need manual port",
+      "snippet": "db.collection('careerHealthIndex').where('userId','==',userId).orderBy('generatedAt','desc').limit(1).get()"
+    },
+    {
+      "file": "src\\modules\\career-digital-twin\\services\\digitalTwin.service.js",
+      "line": 253,
+      "reason": ".orderBy()/.limit() chains need manual port",
+      "snippet": "db.collection(COLLECTION).where('user_id','==',userId).orderBy('created_at','desc').limit(limit).get()"
+    },
+    {
+      "file": "src\\modules\\career-intelligence-dashboard\\services\\analytics.service.js",
+      "line": 219,
+      "reason": "unrecognised chain: collection.get",
+      "snippet": "db.collection('edu_education_roi').get()"
+    },
+    {
+      "file": "src\\modules\\career-intelligence-dashboard\\services\\analytics.service.js",
+      "line": 329,
+      "reason": ".set() requires manual upsert/insert decision",
+      "snippet": "db.collection(COLLECTIONS.AGGREGATED_CACHE).doc(metricName).set({...buildCacheDoc(metricName,data),computed_at:FieldValu"
+    },
+    {
+      "file": "src\\modules\\career-intelligence-dashboard\\services\\analytics.service.js",
+      "line": 335,
+      "reason": "unrecognised chain: collection.doc",
+      "snippet": "db.collection(COLLECTIONS.SNAPSHOTS).doc(`${metricName}_${today}`)"
+    },
+    {
+      "file": "src\\modules\\career-intelligence-dashboard\\services\\analytics.service.js",
+      "line": 354,
+      "reason": "multiple .where() chains",
+      "snippet": "db.collection(COLLECTIONS.SNAPSHOTS).where('metric_name','==',metricName).where('created_at','>=',cutoff).orderBy('creat"
+    },
+    {
+      "file": "src\\modules\\careerHealthIndex\\controllers\\careerHealthIndex.controller.js",
+      "line": 411,
+      "reason": "multiple .where() chains",
+      "snippet": "db.collection('careerHealthIndex').where('userId','==',userId).where('analysisSource','==','provisional').where('softDel"
+    },
+    {
+      "file": "src\\modules\\chiV2\\careerOpportunityEngine.js",
+      "line": 153,
+      "reason": "where() with operator \"in\" – non-== operators need manual review",
+      "snippet": "db.collection('role_market_demand').where('role_id','in',chunk).get()"
+    },
+    {
+      "file": "src\\modules\\chiV2\\careerOpportunityEngine.js",
+      "line": 281,
+      "reason": "unrecognised chain: collection",
+      "snippet": "db.collection('role_market_demand')"
+    },
+    {
+      "file": "src\\modules\\chiV2\\careerOpportunityEngine.js",
+      "line": 318,
+      "reason": "where() with operator \"in\" – non-== operators need manual review",
+      "snippet": "db.collection('role_salary_market').where('role_id','in',chunk).get()"
+    },
+    {
+      "file": "src\\modules\\conversion\\utils\\conversionSummary.job.js",
+      "line": 115,
+      "reason": ".set() requires manual upsert/insert decision",
+      "snippet": "db.collection('conversion_summaries').doc(dateKey).set({date:dateKey,counts:summary,generatedAt:FieldValue.serverTimesta"
+    },
+    {
+      "file": "src\\modules\\coverLetter\\coverLetter.service.js",
+      "line": 42,
+      "reason": "unrecognised chain: collection.doc",
+      "snippet": "db.collection('users').doc(userId)"
+    },
+    {
+      "file": "src\\modules\\coverLetter\\coverLetter.service.js",
+      "line": 69,
+      "reason": "unrecognised chain: collection.doc",
+      "snippet": "db.collection('users').doc(userId)"
+    },
+    {
+      "file": "src\\modules\\dashboard\\dashboard.service.js",
+      "line": 133,
+      "reason": "multiple .where() chains",
+      "snippet": "db.collection('careerHealthIndex').where('userId','==',userId).where('softDeleted','==',false).orderBy('generatedAt','de"
+    },
+    {
+      "file": "src\\modules\\dashboard\\dashboard.service.js",
+      "line": 161,
+      "reason": ".orderBy()/.limit() chains need manual port",
+      "snippet": "db.collection('jobMatchAnalyses').where('userId','==',userId).orderBy('analyzedAt','desc').limit(1).get()"
+    },
+    {
+      "file": "src\\modules\\education-intelligence\\collectors\\jobCollector.service.js",
+      "line": 89,
+      "reason": "unrecognised chain: collection.doc",
+      "snippet": "db.collection(COLLECTIONS.JOB_MARKET).doc()"
+    },
+    {
+      "file": "src\\modules\\education-intelligence\\collectors\\jobCollector.service.js",
+      "line": 97,
+      "reason": ".set() requires manual upsert/insert decision",
+      "snippet": "db.collection(COLLECTIONS.INGESTION_RUNS).doc(runId).set({run_id:runId,source,jobs_written:written,duration_ms:Date.now("
+    },
+    {
+      "file": "src\\modules\\education-intelligence\\collectors\\jobCollector.service.js",
+      "line": 110,
+      "reason": ".set() requires manual upsert/insert decision",
+      "snippet": "db.collection(COLLECTIONS.INGESTION_RUNS).doc(runId).set({run_id:runId,source,status:'error',error:err.message,created_a"
+    },
+    {
+      "file": "src\\modules\\education-intelligence\\controllers\\careerPrediction.controller.js",
+      "line": 105,
+      "reason": "unrecognised chain: collection.doc",
+      "snippet": "db.collection(COLLECTIONS.CAREER_PREDICTIONS).doc()"
+    },
+    {
+      "file": "src\\modules\\education-intelligence\\controllers\\careerPrediction.controller.js",
+      "line": 145,
+      "reason": ".orderBy()/.limit() chains need manual port",
+      "snippet": "db.collection(COLLECTIONS.CAREER_PREDICTIONS).where('student_id','==',studentId).orderBy('success_probability','desc').g"
+    },
+    {
+      "file": "src\\modules\\education-intelligence\\controllers\\careerSimulation.controller.js",
+      "line": 87,
+      "reason": "unrecognised chain: collection.doc",
+      "snippet": "db.collection(COLLECTIONS.CAREER_SIMULATIONS).doc()"
+    },
+    {
+      "file": "src\\modules\\education-intelligence\\controllers\\careerSimulation.controller.js",
+      "line": 131,
+      "reason": ".orderBy()/.limit() chains need manual port",
+      "snippet": "db.collection(COLLECTIONS.CAREER_SIMULATIONS).where('student_id','==',studentId).orderBy('salary_10_year','desc').get()"
+    },
+    {
+      "file": "src\\modules\\education-intelligence\\controllers\\roiAnalysis.controller.js",
+      "line": 80,
+      "reason": "unrecognised chain: collection.doc",
+      "snippet": "db.collection(COLLECTIONS.EDUCATION_ROI).doc()"
+    },
+    {
+      "file": "src\\modules\\education-intelligence\\controllers\\roiAnalysis.controller.js",
+      "line": 125,
+      "reason": ".orderBy()/.limit() chains need manual port",
+      "snippet": "db.collection(COLLECTIONS.EDUCATION_ROI).where('student_id','==',studentId).orderBy('roi_score','desc').get()"
+    },
+    {
+      "file": "src\\modules\\education-intelligence\\orchestrator\\education.orchestrator.js",
+      "line": 126,
+      "reason": ".set() requires manual upsert/insert decision",
+      "snippet": "db.collection(COLLECTIONS.STREAM_SCORES).doc(studentId).set({student_id:studentId,engineering_score:streamResult.stream_"
+    },
+    {
+      "file": "src\\modules\\education-intelligence\\orchestrator\\education.orchestrator.js",
+      "line": 145,
+      "reason": "unrecognised chain: collection.doc",
+      "snippet": "db.collection(COLLECTIONS.CAREER_PREDICTIONS).doc()"
+    },
+    {
+      "file": "src\\modules\\education-intelligence\\orchestrator\\education.orchestrator.js",
+      "line": 164,
+      "reason": "unrecognised chain: collection.doc",
+      "snippet": "db.collection(COLLECTIONS.EDUCATION_ROI).doc()"
+    },
+    {
+      "file": "src\\modules\\education-intelligence\\orchestrator\\education.orchestrator.js",
+      "line": 188,
+      "reason": "unrecognised chain: collection.doc",
+      "snippet": "db.collection(COLLECTIONS.CAREER_SIMULATIONS).doc()"
+    },
+    {
+      "file": "src\\modules\\jobSeeker\\jobMatchingEngine.service.js",
+      "line": 338,
+      "reason": ".orderBy()/.limit() chains need manual port",
+      "snippet": "db.collection('roles').where('softDeleted','!=',true).limit(500).get()"
+    },
+    {
+      "file": "src\\modules\\jobSeeker\\jobMatchingEngine.service.js",
+      "line": 352,
+      "reason": "unrecognised chain: collection.get",
+      "snippet": "db.collection('roleSkills').get()"
+    },
+    {
+      "file": "src\\modules\\jobSeeker\\jobMatchingEngine.service.js",
+      "line": 401,
+      "reason": "unrecognised chain: collection.get",
+      "snippet": "db.collection('salaryBands').get()"
+    },
+    {
+      "file": "src\\modules\\labor-market-intelligence\\collectors\\jobCollector.service.js",
+      "line": 89,
+      "reason": "unrecognised chain: collection.doc",
+      "snippet": "db.collection(COLLECTIONS.JOB_MARKET).doc()"
+    },
+    {
+      "file": "src\\modules\\labor-market-intelligence\\collectors\\jobCollector.service.js",
+      "line": 97,
+      "reason": ".set() requires manual upsert/insert decision",
+      "snippet": "db.collection(COLLECTIONS.INGESTION_RUNS).doc(runId).set({run_id:runId,source,jobs_written:written,duration_ms:Date.now("
+    },
+    {
+      "file": "src\\modules\\labor-market-intelligence\\collectors\\jobCollector.service.js",
+      "line": 110,
+      "reason": ".set() requires manual upsert/insert decision",
+      "snippet": "db.collection(COLLECTIONS.INGESTION_RUNS).doc(runId).set({run_id:runId,source,status:'error',error:err.message,created_a"
+    },
+    {
+      "file": "src\\modules\\labor-market-intelligence\\processors\\demandAnalysis.service.js",
+      "line": 97,
+      "reason": "unrecognised chain: collection.get",
+      "snippet": "db.collection(COLLECTIONS.JOB_MARKET).get()"
+    },
+    {
+      "file": "src\\modules\\labor-market-intelligence\\processors\\demandAnalysis.service.js",
+      "line": 145,
+      "reason": "unrecognised chain: collection.doc",
+      "snippet": "db.collection(COLLECTIONS.SKILL_DEMAND).doc(docId)"
+    },
+    {
+      "file": "src\\modules\\labor-market-intelligence\\processors\\demandAnalysis.service.js",
+      "line": 217,
+      "reason": "unrecognised chain: collection.doc",
+      "snippet": "db.collection(COLLECTIONS.CAREER_SCORES).doc(docId)"
+    },
+    {
+      "file": "src\\modules\\labor-market-intelligence\\processors\\demandAnalysis.service.js",
+      "line": 247,
+      "reason": "unrecognised chain: collection.get",
+      "snippet": "db.collection(COLLECTIONS.CAREER_SCORES).get()"
+    },
+    {
+      "file": "src\\modules\\labor-market-intelligence\\processors\\demandAnalysis.service.js",
+      "line": 262,
+      "reason": ".orderBy()/.limit() chains need manual port",
+      "snippet": "db.collection(COLLECTIONS.SKILL_DEMAND).orderBy('demand_score','desc').limit(50).get()"
+    },
+    {
+      "file": "src\\modules\\labor-market-intelligence\\services\\marketTrend.service.js",
+      "line": 71,
+      "reason": ".orderBy()/.limit() chains need manual port",
+      "snippet": "db.collection(COLLECTIONS.CAREER_SCORES).orderBy('trend_score','desc').get()"
+    },
+    {
+      "file": "src\\modules\\labor-market-intelligence\\services\\marketTrend.service.js",
+      "line": 107,
+      "reason": ".orderBy()/.limit() chains need manual port",
+      "snippet": "db.collection(COLLECTIONS.CAREER_SCORES).orderBy('avg_entry_salary','desc').get()"
+    },
+    {
+      "file": "src\\modules\\marketIntelligence\\marketIntelligence.service.js",
+      "line": 92,
+      "reason": ".orderBy()/.limit() chains need manual port",
+      "snippet": "db.collection(SYNC_COLLECTION).orderBy('syncedAt','desc').limit(1).get()"
+    },
+    {
+      "file": "src\\modules\\marketIntelligence\\marketIntelligence.service.js",
+      "line": 115,
+      "reason": "unrecognised chain: collection.get",
+      "snippet": "db.collection(CACHE_COLLECTION).get()"
+    },
+    {
+      "file": "src\\modules\\marketIntelligence\\marketIntelligence.service.js",
+      "line": 120,
+      "reason": ".orderBy()/.limit() chains need manual port",
+      "snippet": "db.collection(SYNC_COLLECTION).orderBy('syncedAt','desc').limit(1).get()"
+    },
+    {
+      "file": "src\\modules\\marketIntelligence\\marketIntelligence.service.js",
+      "line": 189,
+      "reason": ".set() requires manual upsert/insert decision",
+      "snippet": "db.collection(CACHE_COLLECTION).doc(key).set({...result,cachedAt:new Date().toISOString()},{merge:true})"
+    },
+    {
+      "file": "src\\modules\\onboarding\\controllers\\onboarding.controller.js",
+      "line": 520,
+      "reason": ".set() requires manual upsert/insert decision",
+      "snippet": "db.collection('userProfiles').doc(userId).set({...(extractedDetails.currentJobTitle?{currentJobTitle:extractedDetails.cu"
+    },
+    {
+      "file": "src\\modules\\onboarding\\controllers\\onboarding.controller.js",
+      "line": 528,
+      "reason": ".set() requires manual upsert/insert decision",
+      "snippet": "db.collection('onboardingProgress').doc(userId).set(progressUpdate,{merge:true})"
+    },
+    {
+      "file": "src\\modules\\onboarding\\controllers\\onboarding.controller.js",
+      "line": 741,
+      "reason": "unrecognised chain: collection.doc",
+      "snippet": "db.collection('users').doc(userId)"
+    },
+    {
+      "file": "src\\modules\\onboarding\\controllers\\onboarding.controller.js",
+      "line": 747,
+      "reason": "unrecognised chain: collection.doc",
+      "snippet": "db.collection('userProfiles').doc(userId)"
+    },
+    {
+      "file": "src\\modules\\onboarding\\controllers\\onboarding.controller.js",
+      "line": 753,
+      "reason": "unrecognised chain: collection.doc",
+      "snippet": "db.collection('onboardingProgress').doc(userId)"
+    },
+    {
+      "file": "src\\modules\\onboarding\\onboarding.analytics.service.js",
+      "line": 38,
+      "reason": "multiple .where() chains",
+      "snippet": "/* REVIEW: migrate */db.collection('careerHealthIndex').where('userId','==',userId).where('softDeleted','==',false).orde"
+    },
+    {
+      "file": "src\\modules\\onboarding\\onboarding.analytics.service.js",
+      "line": 121,
+      "reason": "multiple .where() chains",
+      "snippet": "/* REVIEW: migrate */db.collection('careerHealthIndex').where('userId','==',userId).where('softDeleted','==',false).orde"
+    },
+    {
+      "file": "src\\modules\\onboarding\\onboarding.analytics.service.js",
+      "line": 390,
+      "reason": ".orderBy()/.limit() chains need manual port",
+      "snippet": "/* REVIEW: migrate */db.collection('onboardingProgress').orderBy('onboardingStartedAt','desc').limit(limit)"
+    },
+    {
+      "file": "src\\modules\\onboarding\\onboarding.careerReport.service.js",
+      "line": 216,
+      "reason": ".set() requires manual upsert/insert decision",
+      "snippet": "/* REVIEW: migrate */db.collection('onboardingProgress').doc(userId).set({aiFailures:FieldValue.arrayUnion({step:'career"
+    },
+    {
+      "file": "src\\modules\\onboarding\\onboarding.careerReport.service.js",
+      "line": 240,
+      "reason": ".set() requires manual upsert/insert decision",
+      "snippet": "/* REVIEW: migrate */db.collection('onboardingProgress').doc(userId).set({step:'career_report_generated',careerReport:re"
+    },
+    {
+      "file": "src\\modules\\onboarding\\onboarding.cv.service.js",
+      "line": 465,
+      "reason": "unrecognised chain: collection.doc",
+      "snippet": "/* REVIEW: migrate */db.collection('resumes').doc(resumeId)"
+    },
+    {
+      "file": "src\\modules\\onboarding\\onboarding.cv.service.js",
+      "line": 467,
+      "reason": "unrecognised chain: collection.doc",
+      "snippet": "/* REVIEW: migrate */db.collection('resumes').doc(previousCvId)"
+    },
+    {
+      "file": "src\\modules\\onboarding\\onboarding.cv.service.js",
+      "line": 471,
+      "reason": "unrecognised chain: collection.doc",
+      "snippet": "/* REVIEW: migrate */db.collection('onboardingProgress').doc(userId)"
+    },
+    {
+      "file": "src\\modules\\onboarding\\onboarding.cv.service.js",
+      "line": 484,
+      "reason": "unrecognised chain: collection.doc",
+      "snippet": "/* REVIEW: migrate */db.collection('users').doc(userId)"
+    },
+    {
+      "file": "src\\modules\\onboarding\\onboarding.cv.service.js",
+      "line": 635,
+      "reason": ".set() requires manual upsert/insert decision",
+      "snippet": "/* REVIEW: migrate */db.collection('onboardingProgress').doc(userId).set({step:'completed_without_cv',wantsCv:false,...a"
+    },
+    {
+      "file": "src\\modules\\onboarding\\onboarding.cv.service.js",
+      "line": 691,
+      "reason": ".set() requires manual upsert/insert decision",
+      "snippet": "/* REVIEW: migrate */db.collection('onboardingProgress').doc(userId).set({...cvDraftUpdate,'cvDraft.savedAt':new Date()."
+    },
+    {
+      "file": "src\\modules\\onboarding\\onboarding.helpers.js",
+      "line": 257,
+      "reason": "unrecognised chain: collection.doc",
+      "snippet": "/* REVIEW: migrate */db.collection('idempotencyKeys').doc(`${userId}:${operation}:${key}`)"
+    },
+    {
+      "file": "src\\modules\\onboarding\\onboarding.helpers.js",
+      "line": 272,
+      "reason": ".set() requires manual upsert/insert decision",
+      "snippet": "/* REVIEW: migrate */db.collection('idempotencyKeys').doc(`${userId}:${operation}:${key}`).set({userId,operation,key,res"
+    },
+    {
+      "file": "src\\modules\\onboarding\\onboarding.helpers.js",
+      "line": 343,
+      "reason": ".set() requires manual upsert/insert decision",
+      "snippet": "/* REVIEW: migrate */db.collection(NOTIFICATION_JOBS_COLLECTION).doc(jobId).set({jobId,userId,type:'ONBOARDING_DRAFT_REE"
+    },
+    {
+      "file": "src\\modules\\onboarding\\onboarding.helpers.js",
+      "line": 403,
+      "reason": ".set() requires manual upsert/insert decision",
+      "snippet": "/* REVIEW: migrate */db.collection(NOTIFICATION_JOBS_COLLECTION).doc(jobId).set({status:'skipped',resolvedAt:new Date()."
+    },
+    {
+      "file": "src\\modules\\onboarding\\onboarding.helpers.js",
+      "line": 413,
+      "reason": ".set() requires manual upsert/insert decision",
+      "snippet": "/* REVIEW: migrate */db.collection(NOTIFICATION_JOBS_COLLECTION).doc(jobId).set({status:'delivered',resolvedAt:new Date("
+    },
+    {
+      "file": "src\\modules\\onboarding\\onboarding.helpers.js",
+      "line": 555,
+      "reason": "unrecognised chain: collection.doc",
+      "snippet": "/* REVIEW: migrate */db.collection('users').doc(userId)"
+    },
+    {
+      "file": "src\\modules\\onboarding\\onboarding.helpers.js",
+      "line": 751,
+      "reason": "multiple .where() chains",
+      "snippet": "/* REVIEW: migrate */db.collection('resumes').where('userId','==',userId).where('analysisStatus','==','completed').where"
+    },
+    {
+      "file": "src\\modules\\onboarding\\onboarding.helpers.js",
+      "line": 781,
+      "reason": ".set() requires manual upsert/insert decision",
+      "snippet": "/* REVIEW: migrate */db.collection('userProfiles').doc(userId).set({canonicalSkills,canonicalSkillsUpdatedAt:FieldValue."
+    },
+    {
+      "file": "src\\modules\\onboarding\\onboarding.helpers.js",
+      "line": 802,
+      "reason": "unrecognised chain: collection.doc",
+      "snippet": "/* REVIEW: migrate */db.collection('userProfiles').doc(userId)"
+    },
+    {
+      "file": "src\\modules\\onboarding\\onboarding.helpers.js",
+      "line": 810,
+      "reason": "unrecognised chain: collection.doc",
+      "snippet": "/* REVIEW: migrate */db.collection('users').doc(userId)"
+    },
+    {
+      "file": "src\\modules\\onboarding\\onboarding.helpers.js",
+      "line": 819,
+      "reason": "unrecognised chain: collection.doc",
+      "snippet": "/* REVIEW: migrate */db.collection('onboardingProgress').doc(userId)"
+    },
+    {
+      "file": "src\\modules\\onboarding\\onboarding.helpers.js",
+      "line": 830,
+      "reason": ".set() requires manual upsert/insert decision",
+      "snippet": "db.collection('userProfiles').doc(userId).set({totalExperienceYears:+(totalMonths/12).toFixed(1),updatedAt:FieldValue.se"
+    },
+    {
+      "file": "src\\modules\\onboarding\\onboarding.intake.service.js",
+      "line": 129,
+      "reason": "unrecognised chain: collection.doc",
+      "snippet": "/* REVIEW: migrate */db.collection('users').doc(userId)"
+    },
+    {
+      "file": "src\\modules\\onboarding\\onboarding.intake.service.js",
+      "line": 134,
+      "reason": "unrecognised chain: collection.doc",
+      "snippet": "/* REVIEW: migrate */db.collection('userProfiles').doc(userId)"
+    },
+    {
+      "file": "src\\modules\\onboarding\\onboarding.intake.service.js",
+      "line": 139,
+      "reason": "unrecognised chain: collection.doc",
+      "snippet": "/* REVIEW: migrate */db.collection('onboardingProgress').doc(userId)"
+    },
+    {
+      "file": "src\\modules\\onboarding\\onboarding.intake.service.js",
+      "line": 253,
+      "reason": "unrecognised chain: collection.doc",
+      "snippet": "/* REVIEW: migrate */db.collection('onboardingProgress').doc(userId)"
+    },
+    {
+      "file": "src\\modules\\onboarding\\onboarding.intake.service.js",
+      "line": 270,
+      "reason": "unrecognised chain: collection.doc",
+      "snippet": "/* REVIEW: migrate */db.collection('userProfiles').doc(userId)"
+    },
+    {
+      "file": "src\\modules\\onboarding\\onboarding.intake.service.js",
+      "line": 589,
+      "reason": ".set() requires manual upsert/insert decision",
+      "snippet": "/* REVIEW: migrate */db.collection('onboardingProgress').doc(userId).set(doc,{merge:true})"
+    },
+    {
+      "file": "src\\modules\\onboarding\\onboarding.intake.service.js",
+      "line": 618,
+      "reason": ".set() requires manual upsert/insert decision",
+      "snippet": "/* REVIEW: migrate */db.collection('userProfiles').doc(userId).set({skills:sanitisedSkills.length>0?sanitisedSkills:unde"
+    },
+    {
+      "file": "src\\modules\\onboarding\\onboarding.intake.service.js",
+      "line": 683,
+      "reason": ".set() requires manual upsert/insert decision",
+      "snippet": "/* REVIEW: migrate */db.collection('onboardingProgress').doc(userId).set({userId,step:'draft',draft:cleanPayload,draftVe"
+    },
+    {
+      "file": "src\\modules\\onboarding\\onboarding.intake.service.js",
+      "line": 759,
+      "reason": ".set() requires manual upsert/insert decision",
+      "snippet": "db.collection('onboardingProgress').doc(userId).set({emailMismatchDetectedAt:FieldValue.serverTimestamp(),emailMismatchN"
+    },
+    {
+      "file": "src\\modules\\onboarding\\onboarding.intake.service.js",
+      "line": 840,
+      "reason": ".set() requires manual upsert/insert decision",
+      "snippet": "/* REVIEW: migrate */db.collection('onboardingProgress').doc(userId).set({step:'personal_details_saved',wantsCv:true,per"
+    },
+    {
+      "file": "src\\modules\\onboarding\\onboarding.intake.service.js",
+      "line": 851,
+      "reason": ".set() requires manual upsert/insert decision",
+      "snippet": "/* REVIEW: migrate */db.collection('userProfiles').doc(userId).set({currentCountry:country,updatedAt:FieldValue.serverTi"
+    },
+    {
+      "file": "src\\modules\\onboarding\\onboarding.intake.service.js",
+      "line": 949,
+      "reason": ".set() requires manual upsert/insert decision",
+      "snippet": "/* REVIEW: migrate */db.collection('userProfiles').doc(userId).set(profileUpdate,{merge:true})"
+    },
+    {
+      "file": "src\\modules\\onboarding\\onboarding.intake.service.js",
+      "line": 950,
+      "reason": ".set() requires manual upsert/insert decision",
+      "snippet": "/* REVIEW: migrate */db.collection('onboardingProgress').doc(userId).set({...appendStepHistory('career_intent_saved'),st"
+    },
+    {
+      "file": "src\\modules\\onboarding\\onboarding.linkedin.service.js",
+      "line": 152,
+      "reason": ".set() requires manual upsert/insert decision",
+      "snippet": "db.collection('onboardingProgress').doc(userId).set({importedProfile:{education:mappedEducation,experience:mappedExperie"
+    },
+    {
+      "file": "src\\modules\\onboarding\\onboarding.linkedin.service.js",
+      "line": 236,
+      "reason": "unrecognised chain: collection.doc",
+      "snippet": "db.collection('onboardingProgress').doc(userId)"
+    },
+    {
+      "file": "src\\modules\\onboarding\\onboarding.linkedin.service.js",
+      "line": 250,
+      "reason": "unrecognised chain: collection.doc",
+      "snippet": "db.collection('userProfiles').doc(userId)"
+    },
+    {
+      "file": "src\\modules\\resume\\controllers\\resume.controller.js",
+      "line": 299,
+      "reason": "multiple .where() chains",
+      "snippet": "db.collection('resumes').where('userId','==',userId).where('softDeleted','==',false).get()"
+    },
+    {
+      "file": "src\\modules\\resume\\controllers\\resume.controller.js",
+      "line": 309,
+      "reason": "unrecognised chain: collection.doc",
+      "snippet": "db.collection('users').doc(userId)"
+    },
+    {
+      "file": "src\\modules\\roles\\roles.service.js",
+      "line": 145,
+      "reason": "unrecognised chain: collection.where",
+      "snippet": "db.collection(ROLES_COLLECTION).where('active','==',true)"
+    },
+    {
+      "file": "src\\modules\\roles\\roles.service.js",
+      "line": 359,
+      "reason": "unrecognised chain: collection.doc",
+      "snippet": "db.collection(PROFILES_COLLECTION).doc(userId)"
+    },
+    {
+      "file": "src\\modules\\roles\\roles.service.js",
+      "line": 375,
+      "reason": "unrecognised chain: collection.doc",
+      "snippet": "db.collection('onboardingProgress').doc(userId)"
+    },
+    {
+      "file": "src\\modules\\roles\\roles.service.js",
+      "line": 464,
+      "reason": ".orderBy()/.limit() chains need manual port",
+      "snippet": "db.collection(ROLES_COLLECTION).limit(fetchLimit).get()"
+    },
+    {
+      "file": "src\\modules\\roles\\roles.service.js",
+      "line": 465,
+      "reason": ".orderBy()/.limit() chains need manual port",
+      "snippet": "db.collection(CMS_ROLES_COLLECTION).limit(fetchLimit).get()"
+    },
+    {
+      "file": "src\\modules\\roles\\roles.service.js",
+      "line": 631,
+      "reason": ".orderBy()/.limit() chains need manual port",
+      "snippet": "db.collection(ROLES_COLLECTION).limit(1000).get()"
+    },
+    {
+      "file": "src\\modules\\roles\\roles.service.js",
+      "line": 632,
+      "reason": ".orderBy()/.limit() chains need manual port",
+      "snippet": "db.collection(CMS_ROLES_COLLECTION).limit(1000).get()"
+    },
+    {
+      "file": "src\\modules\\salaryImport\\salaryImport.service.js",
+      "line": 46,
+      "reason": "multiple .where() chains",
+      "snippet": "db.collection('cms_roles').where('normalizedName','==',normalized).where('softDeleted','==',false).limit(1).get()"
+    },
+    {
+      "file": "src\\modules\\secrets\\repository\\secrets.repository.js",
+      "line": 39,
+      "reason": "unrecognised chain: collection",
+      "snippet": "db.collection(COLLECTION)"
+    },
+    {
+      "file": "src\\modules\\secrets\\repository\\secrets.repository.js",
+      "line": 180,
+      "reason": ".orderBy()/.limit() chains need manual port",
+      "snippet": "this.db.collection('secrets_rotation_log').where('secretName','==',name).orderBy('rotatedAt','desc').limit(limit).get()"
+    },
+    {
+      "file": "src\\modules\\skill-evolution\\services\\skillEvolution.service.js",
+      "line": 63,
+      "reason": ".set() requires manual upsert/insert decision",
+      "snippet": "db.collection(COLLECTIONS.SKILL_RECOMMENDATIONS).doc(studentId).set({...recommendationDoc,calculated_at:FieldValue.serve"
+    },
+    {
+      "file": "src\\modules\\skill-evolution\\services\\skillEvolution.service.js",
+      "line": 78,
+      "reason": "unrecognised chain: collection.doc",
+      "snippet": "db.collection(COLLECTIONS.STUDENT_SKILLS).doc()"
+    },
+    {
+      "file": "src\\modules\\skill-evolution\\services\\skillEvolution.service.js",
+      "line": 119,
+      "reason": ".orderBy()/.limit() chains need manual port",
+      "snippet": "db.collection(COLLECTIONS.STUDENT_SKILLS).where('student_id','==',studentId).orderBy('impact_score','desc').get()"
+    },
+    {
+      "file": "src\\modules\\skillDemand\\skillRecommendations.service.js",
+      "line": 77,
+      "reason": ".orderBy()/.limit() chains need manual port",
+      "snippet": "db.collection('careerHealthIndex').where('userId','==',userId).orderBy('generatedAt','desc').limit(1).get()"
+    },
+    {
+      "file": "src\\modules\\skillDemand\\skillRecommendations.service.js",
+      "line": 241,
+      "reason": "unrecognised chain: collection.doc",
+      "snippet": "db.collection('users').doc(userId)"
+    },
+    {
+      "file": "src\\modules\\skillDemand\\skillRecommendations.service.js",
+      "line": 242,
+      "reason": "unrecognised chain: collection.doc",
+      "snippet": "db.collection('userProfiles').doc(userId)"
+    },
+    {
+      "file": "src\\modules\\user\\user.registration.service.js",
+      "line": 83,
+      "reason": "unrecognised chain: collection.doc",
+      "snippet": "db.collection('users').doc(userId)"
+    },
+    {
+      "file": "src\\modules\\user\\user.registration.service.js",
+      "line": 112,
+      "reason": "unrecognised chain: collection.doc",
+      "snippet": "db.collection('userProfiles').doc(userId)"
+    },
+    {
+      "file": "src\\modules\\user\\user.registration.service.js",
+      "line": 201,
+      "reason": "unrecognised chain: collection.doc",
+      "snippet": "db.collection('users').doc(userId)"
+    },
+    {
+      "file": "src\\modules\\user\\user.registration.service.js",
+      "line": 202,
+      "reason": "unrecognised chain: collection.doc",
+      "snippet": "db.collection('userProfiles').doc(userId)"
+    },
+    {
+      "file": "src\\modules\\userActivity\\userActivity.service.js",
+      "line": 75,
+      "reason": "sub-collection detected",
+      "snippet": "db.collection('users').doc(userId).collection('activityEvents').add({eventType,metadata,createdAt:FieldValue.serverTimes"
+    },
+    {
+      "file": "src\\modules\\userActivity\\userActivity.service.js",
+      "line": 108,
+      "reason": "sub-collection detected",
+      "snippet": "db.collection('users').doc(userId).collection('activityEvents').where('createdAt','>=',Timestamp.fromDate(thirtyDaysAgo)"
+    },
+    {
+      "file": "src\\routes\\admin\\adminMetrics.routes.js",
+      "line": 34,
+      "reason": ".count() needs Supabase { count: \"exact\", head: true }",
+      "snippet": "db.collection(collectionName).count().get()"
+    },
+    {
+      "file": "src\\routes\\admin\\adminMetrics.routes.js",
+      "line": 37,
+      "reason": "unrecognised chain: collection.get",
+      "snippet": "db.collection(collectionName).get()"
+    },
+    {
+      "file": "src\\routes\\admin\\adminMetrics.routes.js",
+      "line": 55,
+      "reason": ".orderBy()/.limit() chains need manual port",
+      "snippet": "db.collection('cms_skills').orderBy('createdAt','desc').limit(1).get()"
+    },
+    {
+      "file": "src\\routes\\admin\\adminMetrics.routes.js",
+      "line": 56,
+      "reason": ".orderBy()/.limit() chains need manual port",
+      "snippet": "db.collection('cms_roles').orderBy('createdAt','desc').limit(1).get()"
+    },
+    {
+      "file": "src\\routes\\admin\\adminMetrics.routes.js",
+      "line": 57,
+      "reason": ".orderBy()/.limit() chains need manual port",
+      "snippet": "db.collection('cms_job_families').orderBy('createdAt','desc').limit(1).get()"
+    },
+    {
+      "file": "src\\routes\\admin\\adminMetrics.routes.js",
+      "line": 58,
+      "reason": ".orderBy()/.limit() chains need manual port",
+      "snippet": "db.collection('cms_education_levels').orderBy('createdAt','desc').limit(1).get()"
+    },
+    {
+      "file": "src\\routes\\admin\\adminMetrics.routes.js",
+      "line": 59,
+      "reason": ".orderBy()/.limit() chains need manual port",
+      "snippet": "db.collection('cms_salary_benchmarks').orderBy('createdAt','desc').limit(1).get()"
+    },
+    {
+      "file": "src\\routes\\admin\\adminMetrics.service.js",
+      "line": 77,
+      "reason": "multiple .where() chains",
+      "snippet": "db.collection('users').where('tier','!=','free').where('subscriptionStatus','==','active').get()"
+    },
+    {
+      "file": "src\\routes\\admin\\adminMetrics.service.js",
+      "line": 137,
+      "reason": "sub-collection detected",
+      "snippet": "db.collection('metrics').doc('daily').collection('snapshots').where('date','>=',startStr).where('date','<=',endStr).orde"
+    },
+    {
+      "file": "src\\routes\\career-onboarding.routes.js",
+      "line": 79,
+      "reason": "unrecognised chain: collection.doc",
+      "snippet": "db.collection('users').doc(userId)"
+    },
+    {
+      "file": "src\\routes\\career-onboarding.routes.js",
+      "line": 91,
+      "reason": "unrecognised chain: collection.doc",
+      "snippet": "db.collection('userProfiles').doc(userId)"
+    },
+    {
+      "file": "src\\routes\\career-onboarding.routes.js",
+      "line": 113,
+      "reason": "unrecognised chain: collection.doc",
+      "snippet": "db.collection('professionalCareerProfiles').doc(userId)"
+    },
+    {
+      "file": "src\\routes\\skills-priority.routes.js",
+      "line": 97,
+      "reason": "sub-collection detected",
+      "snippet": "db.collection('users').doc(userId).collection('chiSnapshots').where('softDeleted','==',false).orderBy('generatedAt','des"
+    },
+    {
+      "file": "src\\routes\\skills-priority.routes.js",
+      "line": 107,
+      "reason": ".orderBy()/.limit() chains need manual port",
+      "snippet": "db.collection('careerHealthIndex').where('userId','==',userId).orderBy('generatedAt','desc').limit(1).get()"
+    },
+    {
+      "file": "src\\routes\\skills.routes.js",
+      "line": 283,
+      "reason": "unrecognised chain: collection.doc",
+      "snippet": "db.collection('users').doc(userId)"
+    },
+    {
+      "file": "src\\routes\\skills.routes.js",
+      "line": 284,
+      "reason": "unrecognised chain: collection.doc",
+      "snippet": "db.collection('userProfiles').doc(userId)"
+    },
+    {
+      "file": "src\\routes\\student-onboarding.routes.js",
+      "line": 55,
+      "reason": ".set() requires manual upsert/insert decision",
+      "snippet": "db.collection('studentOnboardingDrafts').doc(userId).set({...req.body,updatedAt:now},{merge:true})"
+    },
+    {
+      "file": "src\\routes\\student-onboarding.routes.js",
+      "line": 131,
+      "reason": "unrecognised chain: collection.doc",
+      "snippet": "db.collection('users').doc(userId)"
+    },
+    {
+      "file": "src\\routes\\student-onboarding.routes.js",
+      "line": 138,
+      "reason": "unrecognised chain: collection.doc",
+      "snippet": "db.collection('userProfiles').doc(userId)"
+    },
+    {
+      "file": "src\\routes\\student-onboarding.routes.js",
+      "line": 153,
+      "reason": "unrecognised chain: collection.doc",
+      "snippet": "db.collection('studentCareerProfiles').doc(userId)"
+    },
+    {
+      "file": "src\\routes\\student-onboarding.routes.js",
+      "line": 170,
+      "reason": "unrecognised chain: collection.doc",
+      "snippet": "db.collection('studentOnboardingDrafts').doc(userId)"
+    },
+    {
+      "file": "src\\routes\\userDirection.routes.js",
+      "line": 47,
+      "reason": "unrecognised chain: collection.doc",
+      "snippet": "db.collection('users').doc(uid)"
+    },
+    {
+      "file": "src\\routes\\userDirection.routes.js",
+      "line": 122,
+      "reason": ".set() requires manual upsert/insert decision",
+      "snippet": "db.collection('users').doc(uid).set({user_direction:null,direction_reset_at:FieldValue.serverTimestamp(),updatedAt:Field"
+    },
+    {
+      "file": "src\\services\\admin\\adminMetrics.service.js",
+      "line": 77,
+      "reason": "multiple .where() chains",
+      "snippet": "db.collection('users').where('tier','!=','free').where('subscriptionStatus','==','active').get()"
+    },
+    {
+      "file": "src\\services\\admin\\adminMetrics.service.js",
+      "line": 137,
+      "reason": "sub-collection detected",
+      "snippet": "db.collection('metrics').doc('daily').collection('snapshots').where('date','>=',startStr).where('date','<=',endStr).orde"
+    },
+    {
+      "file": "src\\services\\admin\\usageLogs.repository.js",
+      "line": 20,
+      "reason": "unrecognised chain: collection.doc",
+      "snippet": "this.db.collection(COLLECTION).doc()"
+    },
+    {
+      "file": "src\\services\\admin\\usageLogs.repository.js",
+      "line": 34,
+      "reason": "unrecognised chain: collection.doc",
+      "snippet": "this.db.collection(COLLECTION).doc()"
+    },
+    {
+      "file": "src\\services\\admin\\usageLogs.repository.js",
+      "line": 43,
+      "reason": "multiple .where() chains",
+      "snippet": "this.db.collection(COLLECTION).where('createdAt','>=',Timestamp.fromDate(startDate)).where('createdAt','<=',Timestamp.fr"
+    },
+    {
+      "file": "src\\services\\admin\\usageLogs.repository.js",
+      "line": 70,
+      "reason": ".count() needs Supabase { count: \"exact\", head: true }",
+      "snippet": "this.db.collection('users').count().get()"
+    },
+    {
+      "file": "src\\services\\aiUsage.service.js",
+      "line": 73,
+      "reason": "unrecognised chain: collection.doc",
+      "snippet": "db.collection('userProfiles').doc(userId)"
+    },
+    {
+      "file": "src\\services\\billing\\Billing.service.js",
+      "line": 331,
+      "reason": "multiple .where() chains",
+      "snippet": "db.collection('subscriptions').where('status','==','active').where('expiresAt','<=',now).limit(100)// process in batches"
+    },
+    {
+      "file": "src\\services\\billing\\Billing.service.js",
+      "line": 413,
+      "reason": ".orderBy()/.limit() chains need manual port",
+      "snippet": "db.collection('subscriptions').where('subscriptionId','==',refund.payment_id).limit(1).get()"
+    },
+    {
+      "file": "src\\services\\careerMatching.service.js",
+      "line": 51,
+      "reason": "sub-collection detected",
+      "snippet": "db.collection('users').doc(userId).collection('activityEvents').where('createdAt','>=',thirtyDaysAgo).orderBy('createdAt"
+    },
+    {
+      "file": "src\\services\\careerMatching.service.js",
+      "line": 76,
+      "reason": ".orderBy()/.limit() chains need manual port",
+      "snippet": "db.collection('ava_memory').where('user_id','==',userId).limit(1).get()"
+    },
+    {
+      "file": "src\\services\\careerMatching.service.js",
+      "line": 223,
+      "reason": "unrecognised chain: collection.doc",
+      "snippet": "db.collection('chi_scores').doc(docId)"
+    },
+    {
+      "file": "src\\services\\job.service.js",
+      "line": 60,
+      "reason": ".orderBy()/.limit() chains need manual port",
+      "snippet": "db.collection(COLLECTIONS.JOB_FAMILIES).orderBy('name').limit(JOB_FAMILIES_MAX)// FIX-8d: cap results\n.get()"
+    },
+    {
+      "file": "src\\services\\job.service.js",
+      "line": 71,
+      "reason": "unrecognised chain: collection",
+      "snippet": "db.collection(COLLECTIONS.ROLES)"
+    },
+    {
+      "file": "src\\services\\jobAnalyzer.service.js",
+      "line": 149,
+      "reason": ".set() requires manual upsert/insert decision",
+      "snippet": "db.collection('job_analyses').doc(analysisId).set(analysisDoc)"
+    },
+    {
+      "file": "src\\services\\jobAnalyzer.service.js",
+      "line": 152,
+      "reason": ".set() requires manual upsert/insert decision",
+      "snippet": "db.collection('users').doc(userId).set({latestJobFit:{analysisId,jobTitle:analysisResult.jobTitle||'Unknown',score:analy"
+    },
+    {
+      "file": "src\\services\\jobAnalyzer.service.js",
+      "line": 181,
+      "reason": ".orderBy()/.limit() chains need manual port",
+      "snippet": "db.collection('job_analyses').where('userId','==',userId).orderBy('createdAt','desc').limit(limit).get()"
+    },
+    {
+      "file": "src\\services\\jobFetcher.service.js",
+      "line": 167,
+      "reason": ".set() requires manual upsert/insert decision",
+      "snippet": "db.collection(COLLECTION).doc(docId).set({userId,cacheKey,...result,storedAt:new Date(),expiresAt:new Date(Date.now()+CA"
+    },
+    {
+      "file": "src\\services\\marketDemandService.js",
+      "line": 293,
+      "reason": ".set() requires manual upsert/insert decision",
+      "snippet": "db.collection(COLLECTION).doc(docId).set(record,{merge:true})"
+    },
+    {
+      "file": "src\\services\\marketDemandService.js",
+      "line": 337,
+      "reason": ".orderBy()/.limit() chains need manual port",
+      "snippet": "db.collection(COLLECTION).orderBy('fetchedAt','desc').limit(1).get()"
+    },
+    {
+      "file": "src\\services\\paymentActivation.service.js",
+      "line": 31,
+      "reason": "unrecognised chain: collection.doc",
+      "snippet": "db.collection('users').doc(userId)"
+    },
+    {
+      "file": "src\\services\\paymentActivation.service.js",
+      "line": 72,
+      "reason": "unrecognised chain: collection.doc",
+      "snippet": "db.collection('users').doc(userId)"
+    }
+  ]
+}

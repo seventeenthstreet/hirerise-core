@@ -1,6 +1,19 @@
 'use strict';
 
 /**
+ * MIGRATION: db.collection() → supabase.from()
+ *
+ * All db.collection() shim calls in this file have been replaced with
+ * direct supabase.from() calls. Result shapes mirror the Firestore shim:
+ *   { data, error } from supabase  →  unwrapped to plain objects
+ *   .maybeSingle()  for single-doc reads (returns null not error on 0 rows)
+ *   .select('*')    for collection queries
+ *
+ * Batch writes → Promise.all([supabase.from(T).upsert(...), ...])
+ * Transactions → sequential awaits (best-effort, same as shim behaviour)
+ */
+
+/**
  * skillGapEngine.js — Skill Gap AI Engine
  *
  * Identifies which skills a user must learn to reach their target role,
@@ -39,9 +52,9 @@ const WEEKS_BY_DIFFICULTY = Object.freeze({ 1: 2, 2: 4, 3: 6, 4: 10, 5: 16 });
  * Returns enriched records with skill metadata joined from skills collection.
  */
 async function fetchRoleSkills(roleDocId) {
-  const snap = await db.collection('role_skills')
-    .where('role_id', '==', roleDocId)
-    .get();
+  const { data: _rsdata, error: _rse } = await supabase.from('role_skills').select('*').eq('role_id', roleDocId);
+  if (_rse) logger.warn('[SkillGap] role_skills error:', _rse.message);
+  const snap = { empty: !_rsdata?.length, docs: (_rsdata||[]).map(r=>({data:()=>r})) };
 
   if (snap.empty) return [];
 
@@ -57,9 +70,7 @@ async function fetchRoleSkills(roleDocId) {
       chunks.push(skillIds.slice(i, i + 10));
     }
     const metaSnaps = await Promise.all(
-      chunks.map(chunk =>
-        db.collection('skills').where('skill_id', 'in', chunk).get()
-      )
+      chunks.map(chunk => supabase.from('skills').select('*').in('skill_id', chunk).then(({data})=>({ docs: (data||[]).map(r=>({data:()=>r})) })))
     );
     metaSnaps.forEach(s =>
       s.docs.forEach(d => { skillMeta[d.data().skill_id] = d.data(); })
@@ -93,10 +104,8 @@ async function fetchPrerequisiteChain(targetSkillId, userSkillSet) {
   while (queue.length > 0) {
     const current = queue.shift();
 
-    const snap = await db.collection('skill_relationships')
-      .where('related_skill_id', '==', current)
-      .where('relationship_type', '==', 'prerequisite')
-      .get();
+    const { data: _srdata } = await supabase.from('skill_relationships').select('*').eq('related_skill_id', current).eq('relationship_type', 'prerequisite');
+    const snap = { docs: (_srdata||[]).map(r=>({data:()=>r})) };
 
     for (const doc of snap.docs) {
       const prereqId = doc.data().skill_id;
@@ -128,7 +137,7 @@ async function fetchSkillMeta(skillIds) {
   for (let i = 0; i < unique.length; i += 10) chunks.push(unique.slice(i, i + 10));
 
   const snaps = await Promise.all(
-    chunks.map(chunk => db.collection('skills').where('skill_id', 'in', chunk).get())
+    chunks.map(chunk => supabase.from('skills').select('*').in('skill_id', chunk).then(({data})=>({ docs: (data||[]).map(r=>({data:()=>r})) })))
   );
   snaps.forEach(s =>
     s.docs.forEach(d => { meta[d.data().skill_id] = d.data(); })
@@ -138,7 +147,8 @@ async function fetchSkillMeta(skillIds) {
   const missing = unique.filter(id => !meta[id]);
   if (missing.length > 0) {
     await Promise.all(missing.map(async id => {
-      const doc = await db.collection('skills').doc(id).get();
+      const { data: _sd } = await supabase.from('skills').select('*').eq('id', id).maybeSingle();
+      const doc = { exists: !!_sd, data: () => _sd };
       if (doc.exists) meta[id] = doc.data();
     }));
   }
@@ -321,11 +331,3 @@ module.exports = {
   categorizePriority,
   PRIORITY,
 };
-
-
-
-
-
-
-
-

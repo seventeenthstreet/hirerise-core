@@ -3,85 +3,82 @@
 /**
  * src/migration/add-career-conversations.migration.js
  *
- * Migration: Add edu_career_conversations Firestore collection
+ * Migration: Add edu_career_conversations Supabase table
  *
- * Firestore is schemaless — no table creation is required.
- * This migration creates the required composite index configuration
- * and seeds a sample document to initialise the collection.
+ * This migration validates Supabase table access and seeds a placeholder
+ * row to confirm the table exists and is writable.
  *
  * Run:
  *   node src/migration/add-career-conversations.migration.js
  *
- * ─── Collection: edu_career_conversations ────────────────────────────────────
+ * ─── Table: edu_career_conversations ─────────────────────────────────────────
  *
  * Fields:
- *   id           — auto-generated Firestore doc ID
- *   student_id   — string (user ID) — indexed for .where() queries
+ *   id           — auto-generated UUID (primary key)
+ *   student_id   — string (user ID) — indexed for .eq() queries
  *   user_message — string — the student's question
  *   ai_response  — string — Claude's personalised answer
  *   created_at   — timestamp — ordered for history retrieval
  *
- * Required Firestore index (composite):
- *   Collection: edu_career_conversations
+ * Required Supabase index (composite):
+ *   Table: edu_career_conversations
  *   Fields: student_id ASC, created_at ASC
  *
- * Add to firestore.indexes.json:
+ * Add via Supabase SQL editor:
  *
- * {
- *   "indexes": [
- *     {
- *       "collectionGroup": "edu_career_conversations",
- *       "queryScope": "COLLECTION",
- *       "fields": [
- *         { "fieldPath": "student_id", "order": "ASCENDING" },
- *         { "fieldPath": "created_at", "order": "ASCENDING" }
- *       ]
- *     }
- *   ]
- * }
+ *   CREATE INDEX IF NOT EXISTS idx_edu_career_conversations_student_created
+ *     ON edu_career_conversations (student_id ASC, created_at ASC);
  */
-
 require('dotenv').config();
 require('../config/supabase');
-
-const { db }         = require('../config/supabase');
-const { FieldValue } = require('../config/supabase');
-const logger         = require('../utils/logger');
+const { supabase } = require('../config/supabase');
+const logger = require('../utils/logger');
 
 const COLLECTION = 'edu_career_conversations';
 
 async function run() {
   logger.info('[Migration] add-career-conversations — starting');
 
-  // Seed a placeholder document to initialise the collection
-  // (Firestore collections don't exist until they have at least one document)
-  const ref = db.collection(COLLECTION).doc('_migration_init');
-  const existing = await ref.get();
+  // Check if a migration init record already exists
+  const { data: existing, error: fetchError } = await supabase
+    .from(COLLECTION)
+    .select('id')
+    .eq('student_id', '_init')
+    .maybeSingle();
 
-  if (existing.exists) {
+  if (fetchError) {
+    logger.error('[Migration] Failed to check existing record', { error: fetchError.message });
+    process.exit(1);
+  }
+
+  if (existing) {
     logger.info('[Migration] Collection already initialised — skipping seed');
   } else {
-    await ref.set({
-      student_id:   '_init',
-      user_message: 'Migration initialisation record — safe to delete.',
-      ai_response:  'Migration initialisation record — safe to delete.',
-      created_at:   FieldValue.serverTimestamp(),
-    });
-    logger.info('[Migration] Seeded _migration_init document');
+    // Seed a placeholder row to initialise the table
+    const { error: insertError } = await supabase
+      .from(COLLECTION)
+      .insert({
+        student_id: '_init',
+        user_message: 'Migration initialisation record — safe to delete.',
+        ai_response: 'Migration initialisation record — safe to delete.',
+        created_at: new Date().toISOString()
+      });
+
+    if (insertError) {
+      logger.error('[Migration] Failed to seed _migration_init record', { error: insertError.message });
+      process.exit(1);
+    }
+
+    logger.info('[Migration] Seeded _migration_init record');
   }
 
   logger.info('[Migration] add-career-conversations — complete');
   logger.info('');
-  logger.info('ACTION REQUIRED: Add this composite index to firestore.indexes.json:');
-  logger.info(JSON.stringify({
-    collectionGroup: COLLECTION,
-    queryScope: 'COLLECTION',
-    fields: [
-      { fieldPath: 'student_id', order: 'ASCENDING' },
-      { fieldPath: 'created_at', order: 'ASCENDING' },
-    ],
-  }, null, 2));
-
+  logger.info('ACTION REQUIRED: Add this composite index via Supabase SQL editor:');
+  logger.info(
+    'CREATE INDEX IF NOT EXISTS idx_edu_career_conversations_student_created\n' +
+    '  ON edu_career_conversations (student_id ASC, created_at ASC);'
+  );
   process.exit(0);
 }
 
@@ -89,13 +86,3 @@ run().catch(err => {
   logger.error({ err: err.message }, '[Migration] Failed');
   process.exit(1);
 });
-
-
-
-
-
-
-
-
-
-
