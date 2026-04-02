@@ -17,7 +17,7 @@
 const logger = require('../../../utils/logger');
 const jobCollector = require('../collectors/jobCollector.service');
 const demandAnalysis = require('../processors/demandAnalysis.service');
-const supabase = require('../../../config/supabase');
+const { supabase } = require('../../../config/supabase');
 const { COLLECTIONS } = require('../models/jobMarket.model');
 
 const CACHE_TTL_MS = Number(process.env.LMI_CACHE_TTL_MS) || 60 * 60 * 1000; // 1 hour

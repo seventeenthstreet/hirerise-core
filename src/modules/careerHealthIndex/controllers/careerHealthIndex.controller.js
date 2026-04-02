@@ -1,271 +1,215 @@
 'use strict';
 
 /**
- * careerHealthIndex.controller.js — PHASE 1 FIX
+ * src/modules/career-health/controllers/careerHealthIndex.controller.js
  *
- * PROBLEM: The CHI snapshot stored in Supabase (and returned by chiService)
- * does NOT contain skillGaps, demandMetrics, or salaryBenchmark. These three
- * fields are what every dashboard card (SkillGapCard, MarketDemandCard,
- * SalaryBenchmarkCard) depends on. Without them, cards show empty states.
+ * Supabase-native production controller for Career Health Index (CHI).
  *
- * ROOT CAUSE: The CHI service AI prompt returns flat salary fields
- * (currentEstimatedSalaryLPA, nextLevelEstimatedSalaryLPA) and dimension
- * scores, but never structures them into the { skillGaps[], demandMetrics[],
- * salaryBenchmark{} } shape the frontend CareerHealthResponse type expects.
- *
- * FIX: This controller now derives all three missing fields from the snapshot
- * data that IS present, before sending the response. This is a read-only
- * transformation — the Supabase row is unchanged.
- *
- *   skillGaps[]     ← derived from dimensions (marketAlignment, skillVelocity)
- *                     + resume topSkills stored on the snapshot
- *   demandMetrics[] ← derived from dimensions.marketAlignment + topSkills
- *   salaryBenchmark ← derived from currentEstimatedSalaryLPA + salaryContext
- *
- * This approach avoids re-running AI and makes the existing CHI data
- * immediately useful to the dashboard.
+ * Goals achieved:
+ * - Zero Firebase / Firestore legacy assumptions
+ * - Row-based Supabase queries with single-row fetches where appropriate
+ * - Deterministic response enrichment without extra AI calls
+ * - Strong null safety and defensive data normalization
+ * - Consistent controller response/error flow
+ * - Connection reuse via shared singleton Supabase client
+ * - Drop-in compatible API response contract
  */
+
 const chiService = require('../careerHealthIndex.service');
-const supabase = require('../../../core/supabaseClient');
+const { supabase } = require('../../../config/supabase');
 const {
   applyTierFilter,
-  applyHistoryTierFilter
+  applyHistoryTierFilter,
 } = require('../../../utils/tier.filter');
 
-function _safeUserId(req) {
-  return req?.user?.uid ?? req?.user?.id ?? null;
+const DEFAULT_DIMENSION_SCORE = 50;
+const DEFAULT_HISTORY_LIMIT = 6;
+const MAX_HISTORY_LIMIT = 24;
+const CHI_TABLE = 'careerHealthIndex';
+
+function getUserId(req) {
+  return req?.user?.id ?? req?.user?.uid ?? null;
 }
-function _userPlan(req) {
+
+function getUserPlan(req) {
   return req?.user?.plan ?? 'free';
 }
 
-// ─── Empty state ──────────────────────────────────────────────────────────────
+function isNotFoundError(error) {
+  return error?.statusCode === 404 || error?.status === 404;
+}
 
-function _emptyChiResponse() {
+function createUnauthorizedResponse(res) {
+  return res.status(401).json({
+    success: false,
+    message: 'Unauthorized',
+  });
+}
+
+function createEmptyChiResponse() {
   return {
     chiScore: null,
     isReady: false,
     skillGaps: [],
     salaryBenchmark: null,
     demandMetrics: [],
+    automationRisk: null,
     lastCalculated: null,
     dimensions: null,
-    analysisSource: null
+    analysisSource: null,
+    detectedProfession: null,
+    currentJobTitle: null,
+    chiDelta: null,
+    estimatedExperienceYears: null,
   };
 }
 
-// ─── Phase 1: Derive missing dashboard fields from CHI snapshot ───────────────
+function clamp(value, min, max) {
+  return Math.min(max, Math.max(min, value));
+}
 
-/**
- * deriveSkillGaps(snapshot)
- *
- * Builds a SkillGapItem[] from the dimensions stored on the snapshot.
- * The CHI service stores dimension scores (0-100) and topSkills from the resume.
- * We map the marketAlignment + skillVelocity dimension scores against topSkills
- * to produce a prioritised skill gap list.
- *
- * If topSkills are not available we generate generic gaps from critical dimensions.
- */
-function deriveSkillGaps(snapshot) {
+function getDimensionScore(snapshot, key) {
+  return snapshot?.dimensions?.[key]?.score ?? snapshot?.chiScore ?? DEFAULT_DIMENSION_SCORE;
+}
+
+function deriveSkillGaps(snapshot = {}) {
   const gaps = [];
   const dimensions = snapshot.dimensions ?? {};
-  const topSkills  = snapshot.topSkills  ?? [];
+  const topSkills = Array.isArray(snapshot.topSkills) ? snapshot.topSkills : [];
 
-  // Map each top skill to a gap entry using dimension scores as proxy
-  const marketScore = dimensions.marketAlignment?.score ?? 50;
-  const skillScore  = dimensions.skillVelocity?.score   ?? 50;
+  const marketScore = dimensions.marketAlignment?.score ?? DEFAULT_DIMENSION_SCORE;
+  const skillScore = dimensions.skillVelocity?.score ?? DEFAULT_DIMENSION_SCORE;
 
   if (topSkills.length > 0) {
-    topSkills.forEach((skillName, i) => {
-      // Spread scores around the dimension average to create variance
-      const yourLevel  = Math.min(100, Math.max(0, Math.round(skillScore - i * 3)));
-      const marketLevel = Math.min(100, Math.max(0, Math.round(marketScore + 10)));
+    for (const [index, skillName] of topSkills.entries()) {
+      const yourLevel = clamp(Math.round(skillScore - index * 3), 0, 100);
+      const marketLevel = clamp(Math.round(marketScore + 10), 0, 100);
       const gap = Math.max(0, marketLevel - yourLevel);
-      let priority;
-      if      (gap >= 30) priority = 'critical';
-      else if (gap >= 20) priority = 'high';
-      else if (gap >= 10) priority = 'medium';
-      else                priority = 'low';
+
+      const priority =
+        gap >= 30 ? 'critical' :
+        gap >= 20 ? 'high' :
+        gap >= 10 ? 'medium' :
+        'low';
+
       gaps.push({
         skillName,
-        category:    i < 3 ? 'technical' : i < 6 ? 'domain' : 'soft',
+        category: index < 3 ? 'technical' : index < 6 ? 'domain' : 'soft',
         yourLevel,
         marketLevel,
         gap,
-        priority
+        priority,
       });
-    });
+    }
   } else {
-    // Fallback: generate gaps from low-scoring dimensions
     const dimensionToSkill = {
-      skillVelocity:   { skillName: 'Technical Skills',    category: 'technical' },
-      marketAlignment: { skillName: 'Industry Knowledge',  category: 'domain' },
-      experienceDepth: { skillName: 'Leadership & Scope',  category: 'soft' },
-      careerMomentum:  { skillName: 'Career Progression',  category: 'domain' }
+      skillVelocity: { skillName: 'Technical Skills', category: 'technical' },
+      marketAlignment: { skillName: 'Industry Knowledge', category: 'domain' },
+      experienceDepth: { skillName: 'Leadership & Scope', category: 'soft' },
+      careerMomentum: { skillName: 'Career Progression', category: 'domain' },
     };
-    for (const [dimKey, meta] of Object.entries(dimensionToSkill)) {
-      const score = dimensions[dimKey]?.score ?? 50;
-      if (score < 70) {
-        const gap = Math.round(80 - score);
-        gaps.push({
-          skillName:   meta.skillName,
-          category:    meta.category,
-          yourLevel:   score,
-          marketLevel: 80,
-          gap,
-          priority: score < 40 ? 'critical' : score < 55 ? 'high' : 'medium'
-        });
-      }
+
+    for (const [dimensionKey, meta] of Object.entries(dimensionToSkill)) {
+      const score = dimensions[dimensionKey]?.score ?? DEFAULT_DIMENSION_SCORE;
+      if (score >= 70) continue;
+
+      gaps.push({
+        skillName: meta.skillName,
+        category: meta.category,
+        yourLevel: score,
+        marketLevel: 80,
+        gap: Math.round(80 - score),
+        priority: score < 40 ? 'critical' : score < 55 ? 'high' : 'medium',
+      });
     }
   }
 
-  // Sort by gap descending (biggest gaps first)
   return gaps.sort((a, b) => b.gap - a.gap).slice(0, 8);
 }
 
-/**
- * deriveDemandMetrics(snapshot)
- *
- * Builds a DemandMetric[] from topSkills + marketAlignment dimension score.
- * Each skill's demand score is derived from the market alignment score with
- * position-based variance.
- */
-function deriveDemandMetrics(snapshot) {
-  const topSkills   = snapshot.topSkills ?? [];
-  const marketScore = snapshot.dimensions?.marketAlignment?.score ?? 50;
-  const marketFlag  = snapshot.dimensions?.marketAlignment?.flag  ?? false;
+function deriveDemandMetrics(snapshot = {}) {
+  const topSkills = Array.isArray(snapshot.topSkills) ? snapshot.topSkills : [];
+  const marketScore = snapshot.dimensions?.marketAlignment?.score ?? DEFAULT_DIMENSION_SCORE;
+  const marketFlag = Boolean(snapshot.dimensions?.marketAlignment?.flag);
 
-  return topSkills.slice(0, 7).map((skillName, i) => {
-    const demandScore = Math.min(
-      100,
-      Math.max(
-        20,
-        Math.round(marketScore + (i === 0 ? 15 : i === 1 ? 8 : i === 2 ? 3 : -i * 2))
-      )
-    );
+  return topSkills.slice(0, 7).map((skillName, index) => {
+    const offset = index === 0 ? 15 : index === 1 ? 8 : index === 2 ? 3 : -index * 2;
+    const demandScore = clamp(Math.round(marketScore + offset), 20, 100);
 
-    // Derive trend from overall market position
-    let trend;
-    if      (!marketFlag && demandScore >= 70) trend = 'rising';
-    else if (marketFlag || demandScore < 45)   trend = 'falling';
-    else                                        trend = 'stable';
+    const trend =
+      !marketFlag && demandScore >= 70 ? 'rising' :
+      marketFlag || demandScore < 45 ? 'falling' :
+      'stable';
 
     return {
       skillName,
       demandScore,
       trend,
-      jobPostings: Math.round(demandScore * 12) // proxy job posting count
+      jobPostings: Math.round(demandScore * 12),
     };
   });
 }
 
-/**
- * deriveSalaryBenchmark(snapshot)
- *
- * Builds a SalaryBenchmark from the LPA salary fields stored on the snapshot.
- * The CHI service stores: currentEstimatedSalaryLPA, nextLevelEstimatedSalaryLPA.
- * We convert these to a full benchmark shape (currency, median, p25, p75, percentile).
- *
- * Salary is expressed in INR (India market default from CHI system prompt).
- * 1 LPA = 100,000 INR.
- */
-function deriveSalaryBenchmark(snapshot) {
-  const currentLPA = snapshot.currentEstimatedSalaryLPA;
-  const nextLPA    = snapshot.nextLevelEstimatedSalaryLPA;
-  if (!currentLPA) return null;
+function deriveSalaryBenchmark(snapshot = {}) {
+  const currentLPA = Number(snapshot.currentEstimatedSalaryLPA);
+  const nextLPA = Number(snapshot.nextLevelEstimatedSalaryLPA);
 
-  const toINR        = lpa => Math.round(lpa * 100000);
+  if (!Number.isFinite(currentLPA) || currentLPA <= 0) {
+    return null;
+  }
+
+  const toINR = (lpa) => Math.round(lpa * 100000);
+
   const yourEstimate = toINR(currentLPA);
-  const marketMedian = toINR(currentLPA * 1.05); // median slightly above current
-  const marketP25    = toINR(currentLPA * 0.80);
-  const marketP75    = nextLPA
+  const marketMedian = toINR(currentLPA * 1.05);
+  const marketP25 = toINR(currentLPA * 0.8);
+  const marketP75 = Number.isFinite(nextLPA) && nextLPA > 0
     ? toINR((currentLPA + nextLPA) / 2)
     : toINR(currentLPA * 1.25);
 
-  // Percentile: where user sits relative to p25-p75 range
-  const range      = marketP75 - marketP25;
+  const range = marketP75 - marketP25;
   const percentile = range > 0
     ? Math.round(((yourEstimate - marketP25) / range) * 50 + 25)
     : 50;
 
   return {
-    currency:    'INR',
+    currency: 'INR',
     yourEstimate,
     marketMedian,
     marketP25,
     marketP75,
-    percentile:  Math.min(95, Math.max(5, percentile))
+    percentile: clamp(percentile, 5, 95),
   };
 }
 
-/**
- * deriveAutomationRisk(snapshot)
- *
- * Computes a deterministic automation-risk score (0–100) from the five
- * CHI dimension scores that are already stored on every snapshot.
- *
- * Logic:
- *  - skillVelocity   (weight 0.45) — stale/slow-growing skills are the
- *    strongest predictor of automation exposure.  A high score means the
- *    candidate is keeping up with AI-era tooling; a low score signals they
- *    are in danger of being displaced by automation.
- *  - marketAlignment (weight 0.35) — low demand for a skill set means
- *    employers can replace it more cheaply with automation.
- *  - experienceDepth (weight 0.20) — deep seniority / leadership experience
- *    is harder to automate and provides a protective buffer.
- *
- * automationRisk = 100 − protectionScore
- * where protectionScore = clamp(skillVelocity×0.45 + marketAlignment×0.35
- *                                + experienceDepth×0.20,  0, 100)
- *
- * Result is clamped to [5, 95] so the gauge always shows a meaningful value
- * rather than absolute extremes.
- *
- * Returns:
- *   {
- *     score:       number,   // 0–100 (higher = more at risk)
- *     level:       'low' | 'moderate' | 'high',
- *     recommendation: string,
- *     factors: {
- *       skillVelocity:   number,
- *       marketAlignment: number,
- *       experienceDepth: number,
- *     }
- *   }
- */
-function deriveAutomationRisk(snapshot) {
-  const dims            = snapshot.dimensions ?? {};
-  const skillVelocity   = dims.skillVelocity?.score   ?? snapshot.chiScore ?? 50;
-  const marketAlignment = dims.marketAlignment?.score ?? snapshot.chiScore ?? 50;
-  const experienceDepth = dims.experienceDepth?.score ?? snapshot.chiScore ?? 50;
+function deriveAutomationRisk(snapshot = {}) {
+  const skillVelocity = getDimensionScore(snapshot, 'skillVelocity');
+  const marketAlignment = getDimensionScore(snapshot, 'marketAlignment');
+  const experienceDepth = getDimensionScore(snapshot, 'experienceDepth');
 
-  const protectionScore = Math.min(
+  const protectionScore = clamp(
+    skillVelocity * 0.45 + marketAlignment * 0.35 + experienceDepth * 0.2,
+    0,
     100,
-    Math.max(0, skillVelocity * 0.45 + marketAlignment * 0.35 + experienceDepth * 0.20)
   );
-  const rawRisk = 100 - protectionScore;
-  const score   = Math.round(Math.min(95, Math.max(5, rawRisk)));
+
+  const score = Math.round(clamp(100 - protectionScore, 5, 95));
 
   let level;
   let recommendation;
+
   if (score >= 65) {
     level = 'high';
     recommendation =
-      'Your skills have significant automation exposure. ' +
-      'Prioritise learning AI-complementary skills (data analysis, strategic thinking, ' +
-      'stakeholder management) and target roles with higher human-judgement requirements.';
+      'Your skills have significant automation exposure. Prioritise AI-complementary capabilities such as strategic thinking, stakeholder management, and advanced data workflows.';
   } else if (score >= 35) {
     level = 'moderate';
     recommendation =
-      'Some of your current skills carry moderate automation exposure. ' +
-      'Upskilling in AI tooling and data literacy could reduce your risk ' +
-      'by an estimated 15–20 percentage points.';
+      'Some of your current skills carry moderate automation exposure. Upskilling in AI tooling and data literacy could materially reduce this risk.';
   } else {
     level = 'low';
     recommendation =
-      'Your profile is well-positioned for the future of work. ' +
-      'Your skills, market alignment, and experience depth provide strong ' +
-      'protection against automation displacement.';
+      'Your profile is strongly positioned for the future of work with good protection against automation displacement.';
   }
 
   return {
@@ -273,173 +217,153 @@ function deriveAutomationRisk(snapshot) {
     level,
     recommendation,
     factors: {
-      skillVelocity:   Math.round(skillVelocity),
+      skillVelocity: Math.round(skillVelocity),
       marketAlignment: Math.round(marketAlignment),
-      experienceDepth: Math.round(experienceDepth)
-    }
+      experienceDepth: Math.round(experienceDepth),
+    },
   };
 }
 
-/**
- * enrichSnapshot(snapshot)
- *
- * Takes the raw CHI snapshot from Supabase and adds the three fields
- * that the frontend dashboard cards require:
- *   - skillGaps[]
- *   - demandMetrics[]
- *   - salaryBenchmark
- *
- * Also normalises isReady and lastCalculated.
- */
-function enrichSnapshot(snapshot) {
+function enrichSnapshot(snapshot = {}) {
   return {
     ...snapshot,
-    isReady:        snapshot.chiScore != null,
+    isReady: snapshot.chiScore != null,
     lastCalculated: snapshot.generatedAt ?? null,
-    skillGaps:      snapshot.skillGaps      ?? deriveSkillGaps(snapshot),
-    demandMetrics:  snapshot.demandMetrics  ?? deriveDemandMetrics(snapshot),
+    skillGaps: Array.isArray(snapshot.skillGaps)
+      ? snapshot.skillGaps
+      : deriveSkillGaps(snapshot),
+    demandMetrics: Array.isArray(snapshot.demandMetrics)
+      ? snapshot.demandMetrics
+      : deriveDemandMetrics(snapshot),
     salaryBenchmark: snapshot.salaryBenchmark ?? deriveSalaryBenchmark(snapshot),
-    // Deterministic automation risk — derived from CHI dimension scores.
-    // No new AI call required; always present once a CHI snapshot exists.
-    automationRisk: deriveAutomationRisk(snapshot),
-    // Pass through AI-detected profession fields so frontend uses CV data, not keyword guessing
+    automationRisk: snapshot.automationRisk ?? deriveAutomationRisk(snapshot),
     detectedProfession: snapshot.detectedProfession ?? null,
-    currentJobTitle:    snapshot.currentJobTitle    ?? null,
-    // Phase 3: expose trend delta so frontend can show real "+N% this month"
-    // trend.delta is computed by calculateTrend() in the CHI service (month-over-month)
+    currentJobTitle: snapshot.currentJobTitle ?? null,
     chiDelta: snapshot.trend?.delta ?? null,
-    // Phase 3: expose experience years for career stage timeline
-    // Falls back to projectedLevelUpMonths proxy if resume field not present
     estimatedExperienceYears:
-      snapshot.estimatedExperienceYears ?? snapshot.resumeExperienceYears ?? null
+      snapshot.estimatedExperienceYears ??
+      snapshot.resumeExperienceYears ??
+      null,
   };
 }
 
-// ─── Controllers ──────────────────────────────────────────────────────────────
+function sendCareerHealthResponse(res, payload, plan) {
+  return res.status(200).json({
+    success: true,
+    data: {
+      careerHealth: applyTierFilter(payload, plan),
+    },
+  });
+}
 
-// POST /api/v1/career-health/calculate
 async function calculateChi(req, res, next) {
   try {
-    const userId = _safeUserId(req);
-    if (!userId) return res.status(401).json({ success: false, message: 'Unauthorized' });
+    const userId = getUserId(req);
+    if (!userId) return createUnauthorizedResponse(res);
 
-    const { resumeId } = req.body;
-    let result;
+    const resumeId = req?.body?.resumeId ?? null;
+
+    let snapshot;
     try {
-      result = await chiService.calculateChi(userId, resumeId || null);
-    } catch (err) {
-      // No resume found — return a clear 422 instead of letting it bubble
-      // up as a 500, so the frontend shows a helpful message.
-      if (err?.statusCode === 404 || err?.status === 404) {
+      snapshot = await chiService.calculateChi(userId, resumeId);
+    } catch (error) {
+      if (isNotFoundError(error)) {
         return res.status(422).json({
           success: false,
-          message:
-            'No resume found. Please upload your resume before calculating your Career Health Index.',
-          code: 'NO_RESUME'
+          message: 'No resume found. Please upload your resume before calculating your Career Health Index.',
+          code: 'NO_RESUME',
         });
       }
-      throw err;
+      throw error;
     }
 
-    const enriched = enrichSnapshot(result);
-    const filtered = applyTierFilter(enriched, _userPlan(req));
-    return res.status(200).json({
-      success: true,
-      data: { careerHealth: filtered }
-    });
-  } catch (err) {
-    return next(err);
+    return sendCareerHealthResponse(res, enrichSnapshot(snapshot), getUserPlan(req));
+  } catch (error) {
+    return next(error);
   }
 }
 
-// GET /api/v1/career-health  (root — what the frontend calls)
-// GET /api/v1/career-health/latest
 async function getLatestChi(req, res, next) {
   try {
-    const userId = _safeUserId(req);
-    if (!userId) return res.status(401).json({ success: false, message: 'Unauthorized' });
+    const userId = getUserId(req);
+    if (!userId) return createUnauthorizedResponse(res);
 
-    let result;
+    let snapshot;
     try {
-      result = await chiService.getLatestChi(userId);
-    } catch (err) {
-      if (err?.statusCode === 404 || err?.status === 404) {
+      snapshot = await chiService.getLatestChi(userId);
+    } catch (error) {
+      if (isNotFoundError(error)) {
         return res.status(200).json({
           success: true,
-          data: { careerHealth: _emptyChiResponse() }
+          data: { careerHealth: createEmptyChiResponse() },
         });
       }
-      throw err;
+      throw error;
     }
 
-    const enriched = enrichSnapshot(result);
-    const filtered = applyTierFilter(enriched, _userPlan(req));
-    return res.status(200).json({
-      success: true,
-      data: { careerHealth: filtered }
-    });
-  } catch (err) {
-    return next(err);
+    return sendCareerHealthResponse(res, enrichSnapshot(snapshot), getUserPlan(req));
+  } catch (error) {
+    return next(error);
   }
 }
 
-// GET /api/v1/career-health/history
 async function getChiHistory(req, res, next) {
   try {
-    const userId = _safeUserId(req);
-    if (!userId) return res.status(401).json({ success: false, message: 'Unauthorized' });
+    const userId = getUserId(req);
+    if (!userId) return createUnauthorizedResponse(res);
 
-    const limit  = parseInt(req.query.limit || '6', 10);
-    const result = await chiService.getChiHistory(userId, limit);
-    const plan   = _userPlan(req);
-    const filteredHistory = result.history.map(entry =>
-      applyHistoryTierFilter(entry, plan)
+    const requestedLimit = Number.parseInt(req?.query?.limit ?? `${DEFAULT_HISTORY_LIMIT}`, 10);
+    const limit = clamp(
+      Number.isFinite(requestedLimit) ? requestedLimit : DEFAULT_HISTORY_LIMIT,
+      1,
+      MAX_HISTORY_LIMIT,
     );
+
+    const result = await chiService.getChiHistory(userId, limit);
+    const plan = getUserPlan(req);
+
     return res.status(200).json({
       success: true,
       data: {
         ...result,
-        history: filteredHistory,
-        _plan: plan
-      }
+        history: Array.isArray(result?.history)
+          ? result.history.map((entry) => applyHistoryTierFilter(entry, plan))
+          : [],
+        _plan: plan,
+      },
     });
-  } catch (err) {
-    return next(err);
+  } catch (error) {
+    return next(error);
   }
 }
 
-// GET /api/v1/career-health/provisional
 async function getProvisionalChi(req, res, next) {
   try {
-    const userId = _safeUserId(req);
-    if (!userId) return res.status(401).json({ success: false, message: 'Unauthorized' });
+    const userId = getUserId(req);
+    if (!userId) return createUnauthorizedResponse(res);
 
     const { data, error } = await supabase
-      .from('careerHealthIndex')
+      .from(CHI_TABLE)
       .select('*')
       .eq('userId', userId)
       .eq('analysisSource', 'provisional')
       .eq('softDeleted', false)
       .order('generatedAt', { ascending: false })
-      .limit(1);
+      .limit(1)
+      .maybeSingle();
 
     if (error) throw error;
 
-    if (!data || data.length === 0) {
+    if (!data) {
       return res.status(200).json({
         success: true,
-        data: { careerHealth: _emptyChiResponse() }
+        data: { careerHealth: createEmptyChiResponse() },
       });
     }
 
-    const enriched = enrichSnapshot(data[0]);
-    const filtered = applyTierFilter(enriched, _userPlan(req));
-    return res.status(200).json({
-      success: true,
-      data: { careerHealth: filtered }
-    });
-  } catch (err) {
-    return next(err);
+    return sendCareerHealthResponse(res, enrichSnapshot(data), getUserPlan(req));
+  } catch (error) {
+    return next(error);
   }
 }
 
@@ -447,5 +371,5 @@ module.exports = {
   calculateChi,
   getLatestChi,
   getChiHistory,
-  getProvisionalChi
+  getProvisionalChi,
 };

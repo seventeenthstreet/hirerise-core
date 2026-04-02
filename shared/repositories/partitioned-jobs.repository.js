@@ -1,219 +1,167 @@
+'use strict';
+
 /**
- * shared/repositories/partitioned-jobs.repository.js
+ * partitioned-jobs.repository.js — HARDENED
  *
- * Firestore Sharded Automation Job Repository (Correct Collection Group Pattern)
- *
- * Collection Structure:
- *
- *   automationJobs/{shard}/jobs/{jobId}
- *
- * Example:
- *   automationJobs/3f/jobs/uuid-123
- *
- * Benefits:
- *   ✅ Eliminates write hotspotting
- *   ✅ Supports collectionGroup('jobs') queries
- *   ✅ Fully compatible with rate limit + admin queries
- *   ✅ No sequential index contention
- *
- * Required Indexes:
- *   collectionGroup: jobs
- *   Fields:
- *     - userId
- *     - status
- *     - deletedAt
- *     - createdAt (desc)
+ * ✅ CJS aligned
+ * ✅ Atomic fail handling
+ * ✅ Attempt increment fixed
+ * ✅ Status guards added
+ * ✅ Error normalization
  */
 
-const { db, FieldValue, Timestamp } = require('../../src/core/supabaseDbShim');
-import { createHash } from 'crypto';
-import { logger } from '../logger/index.js';
+const { supabase } = require('../../src/config/supabaseClient');
+const logger = require('../logger');
 
-const ROOT_COLLECTION = 'automationJobs';
-const SUB_COLLECTION  = 'jobs';
-const SHARD_COUNT = 256; // 00–ff hex
+// ─────────────────────────────────────────────
+// Helper
+// ─────────────────────────────────────────────
+async function execute(query, context) {
+  const { data, error } = await query;
 
-export class PartitionedJobRepository {
-  #db;
+  if (error) {
+    logger.error('DB error', { error, ...context });
 
-  constructor() {
-    this.#db = require('../../src/core/supabaseDbShim').db;
+    const err = new Error(error.message);
+    err.code = 'DB_ERROR';
+    throw err;
   }
 
-  // ────────────────────────────────────────────────────────────────────────────
-  // Shard Resolution
-  // ────────────────────────────────────────────────────────────────────────────
+  return data;
+}
 
-  #shardPrefix(jobId) {
-    return createHash('sha256')
-      .update(jobId)
-      .digest('hex')
-      .slice(0, 2); // 2 hex chars → 256 shards
-  }
+// ─────────────────────────────────────────────
+// Repository
+// ─────────────────────────────────────────────
 
-  #docRef(jobId) {
-    const shard = this.#shardPrefix(jobId);
-    return this.#db
-      .collection(ROOT_COLLECTION)
-      .doc(shard)
-      .collection(SUB_COLLECTION)
-      .doc(jobId);
-  }
+class PartitionedJobRepository {
 
-  // ────────────────────────────────────────────────────────────────────────────
-  // Write Operations
-  // ────────────────────────────────────────────────────────────────────────────
-
+  // ── CREATE ──
   async createJob(jobId, jobData) {
-    const ref = this.#docRef(jobId);
-
-    await ref.set({
-      jobId,
-      shard: this.#shardPrefix(jobId),
-      ...jobData,
-      status: 'pending',
-      attempts: 0,
-      maxAttempts: 5,
-      createdAt: FieldValue.serverTimestamp(),
-      updatedAt: FieldValue.serverTimestamp(),
-      deletedAt: null,
-    });
+    await execute(
+      supabase.from('automation_jobs').insert({
+        id: jobId,
+        ...jobData,
+        status: 'pending',
+        attempts: 0,
+        max_attempts: 5,
+        created_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
+        deleted_at: null,
+      }),
+      { method: 'createJob', jobId }
+    );
 
     return jobId;
   }
 
+  // ── CLAIM (RPC) ──
   async claimJob(jobId, workerId) {
-    const ref = this.#docRef(jobId);
-
-    return this.#db.runTransaction(async (tx) => {
-      const snap = await tx.get(ref);
-
-      if (!snap.exists) {
-        throw new Error(`Job ${jobId} not found`);
-      }
-
-      const data = snap.data();
-
-      if (data.status === 'processing' || data.status === 'complete') {
-        return { claimed: false, status: data.status };
-      }
-
-      tx.update(ref, {
-        status: 'processing',
-        workerId,
-        claimedAt: FieldValue.serverTimestamp(),
-        updatedAt: FieldValue.serverTimestamp(),
-        attempts: FieldValue.increment(1),
-      });
-
-      return { claimed: true, data };
+    const { data, error } = await supabase.rpc('claim_job', {
+      p_job_id: jobId,
+      p_worker_id: workerId,
     });
-  }
 
-  async completeJob(jobId, result = {}) {
-    await this.#docRef(jobId).update({
-      status: 'complete',
-      result,
-      completedAt: FieldValue.serverTimestamp(),
-      updatedAt: FieldValue.serverTimestamp(),
-    });
-  }
-
-  async failJob(jobId, errorCode, errorMessage) {
-    const ref = this.#docRef(jobId);
-    const snap = await ref.get();
-
-    if (!snap.exists) {
-      throw new Error(`Job ${jobId} not found`);
+    if (error) {
+      logger.error('claimJob failed', { error, jobId, workerId });
+      throw error;
     }
 
-    const data = snap.data();
-    const newStatus =
-      (data.attempts ?? 0) >= data.maxAttempts ? 'dead' : 'failed';
-
-    await ref.update({
-      status: newStatus,
-      lastErrorCode: errorCode,
-      lastErrorMessage: errorMessage?.slice(0, 500),
-      failedAt: FieldValue.serverTimestamp(),
-      updatedAt: FieldValue.serverTimestamp(),
-    });
-
-    return newStatus;
+    return data;
   }
 
-  // ────────────────────────────────────────────────────────────────────────────
-  // Read Operations (Collection Group Queries)
-  // ────────────────────────────────────────────────────────────────────────────
+  // ── COMPLETE ──
+  async completeJob(jobId, result = {}) {
+    await execute(
+      supabase
+        .from('automation_jobs')
+        .update({
+          status: 'complete',
+          result,
+          completed_at: new Date().toISOString(),
+          updated_at: new Date().toISOString(),
+        })
+        .eq('id', jobId)
+        .eq('status', 'processing'), // ✅ guard
+      { method: 'completeJob', jobId }
+    );
+  }
+
+  // ── FAIL (FIXED ATOMICITY) ──
+  async failJob(jobId, errorCode, errorMessage) {
+    const { data, error } = await supabase.rpc('fail_job', {
+      p_job_id: jobId,
+      p_error_code: errorCode,
+      p_error_message: errorMessage?.slice(0, 500),
+    });
+
+    if (error) {
+      logger.error('failJob failed', { error, jobId });
+      throw error;
+    }
+
+    return data; // { status: 'failed' | 'dead' }
+  }
+
+  // ── READ ──
 
   async findById(jobId) {
-    const snap = await this.#docRef(jobId).get();
-    if (!snap.exists || snap.data().deletedAt) return null;
-    return this.#normalize({ id: snap.id, ...snap.data() });
+    return await execute(
+      supabase
+        .from('automation_jobs')
+        .select('*')
+        .eq('id', jobId)
+        .is('deleted_at', null)
+        .maybeSingle(),
+      { method: 'findById', jobId }
+    );
   }
 
   async getPendingJobsForUser(userId, limit = 10) {
-    const snap = await this.#db
-      .collectionGroup(SUB_COLLECTION)
-      .where('userId', '==', userId)
-      .where('status', 'in', ['pending', 'processing'])
-      .where('deletedAt', '==', null)
-      .orderBy('createdAt', 'desc')
-      .limit(limit)
-      .get();
-
-    return snap.docs.map((d) =>
-      this.#normalize({ id: d.id, ...d.data() })
-    );
+    return (
+      await execute(
+        supabase
+          .from('automation_jobs')
+          .select('id, status, created_at')
+          .eq('user_id', userId)
+          .in('status', ['pending', 'processing'])
+          .is('deleted_at', null)
+          .order('created_at', { ascending: false })
+          .limit(limit),
+        { method: 'getPendingJobsForUser', userId }
+      )
+    ) ?? [];
   }
 
   async countPendingForUser(userId) {
-    const snap = await this.#db
-      .collectionGroup(SUB_COLLECTION)
-      .where('userId', '==', userId)
-      .where('status', 'in', ['pending', 'processing'])
-      .where('deletedAt', '==', null)
-      .count()
-      .get();
+    const { count, error } = await supabase
+      .from('automation_jobs')
+      .select('*', { count: 'exact', head: true })
+      .eq('user_id', userId)
+      .in('status', ['pending', 'processing'])
+      .is('deleted_at', null);
 
-    return snap.data().count;
+    if (error) throw error;
+    return count ?? 0;
   }
 
   async getDeadJobs({ limit = 50, since = null } = {}) {
-    let query = this.#db
-      .collectionGroup(SUB_COLLECTION)
-      .where('status', '==', 'dead')
-      .orderBy('failedAt', 'desc')
+    let query = supabase
+      .from('automation_jobs')
+      .select('id, failed_at, last_error_code')
+      .eq('status', 'dead')
+      .order('failed_at', { ascending: false })
       .limit(limit);
 
     if (since) {
-      query = query.where(
-        'failedAt',
-        '>=',
-        Timestamp.fromDate(since)
-      );
+      query = query.gte('failed_at', since.toISOString());
     }
 
-    const snap = await query.get();
-
-    return snap.docs.map((d) =>
-      this.#normalize({ id: d.id, ...d.data() })
-    );
-  }
-
-  // ────────────────────────────────────────────────────────────────────────────
-  // Helpers
-  // ────────────────────────────────────────────────────────────────────────────
-
-  #normalize(data) {
-    const result = { ...data };
-    for (const [k, v] of Object.entries(result)) {
-      if (v instanceof Timestamp) {
-        result[k] = v.toDate().toISOString();
-      }
-    }
-    return result;
+    return (await execute(query, { method: 'getDeadJobs' })) ?? [];
   }
 }
 
-export const partitionedJobRepo = new PartitionedJobRepository();
+module.exports = {
+  PartitionedJobRepository,
+  partitionedJobRepo: new PartitionedJobRepository(),
+};

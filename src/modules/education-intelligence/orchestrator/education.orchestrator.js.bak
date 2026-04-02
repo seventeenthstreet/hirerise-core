@@ -18,7 +18,7 @@
  *  12.  Return combined result
  */
 
-const logger     = require('../../../utils/logger');
+const logger     = require('../../../../utils/logger');
 const repository = require('../repositories/student.repository');
 const { FieldValue } = require('../../../config/supabase');
 const { db }     = require('../../../config/supabase');

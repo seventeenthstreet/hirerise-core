@@ -18,7 +18,7 @@
 
 const { db }        = require('../../../config/supabase');
 const { FieldValue } = require('../../../config/supabase');
-const logger        = require('../../../utils/logger');
+const logger        = require('../../../../utils/logger');
 const { COLLECTIONS, buildJobDoc } = require('../models/jobMarket.model');
 
 // ─── Mock job dataset ─────────────────────────────────────────────────────────

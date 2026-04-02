@@ -1,58 +1,104 @@
 'use strict';
 
 /**
- * requireContributor.middleware.js
- *
- * Allows access to users with role: 'contributor', 'admin', 'super_admin',
- * or 'MASTER_ADMIN'. Blocks regular 'user' accounts.
- *
- * Contributors can submit entries for review but cannot publish or delete.
- * Admins and above can do everything contributors can, plus approve/reject.
- *
- * Usage:
- *   router.post('/pending', authenticate, requireContributor, handler);
+ * requireContributor.middleware.js (Production Optimized)
  */
 
+const crypto = require('crypto');
 const logger = require('../utils/logger');
 
-const ALLOWED_ROLES = new Set(['contributor', 'admin', 'super_admin', 'MASTER_ADMIN']);
+// ─────────────────────────────────────────────────────────────────────────────
+// CONFIG
+// ─────────────────────────────────────────────────────────────────────────────
 
-const requireContributor = (req, res, next) => {
-  const user = req.user;
+const ALLOWED_ROLES = new Set([
+  'contributor',
+  'admin',
+  'super_admin',
+  'MASTER_ADMIN',
+]);
 
-  if (!user) {
-    return res.status(401).json({
-      success: false, errorCode: 'UNAUTHORIZED',
-      message: 'Authentication required.',
-      timestamp: new Date().toISOString(),
-    });
-  }
+// ─────────────────────────────────────────────────────────────────────────────
+// HELPERS
+// ─────────────────────────────────────────────────────────────────────────────
 
-  const role = user.role ?? '';
-  const roles = user.roles ?? [];
-  const hasAccess =
+function getRequestId(req) {
+  return (
+    req.correlationId || // ✅ use global correlation ID
+    req.headers['x-correlation-id'] ||
+    req.headers['x-request-id'] ||
+    crypto.randomUUID()
+  );
+}
+
+function normalizeRoles(roles) {
+  if (!Array.isArray(roles)) return [];
+  return roles.filter(r => typeof r === 'string');
+}
+
+function hasContributorAccess(user) {
+  const role = typeof user.role === 'string' ? user.role : '';
+  const roles = normalizeRoles(user.roles);
+
+  return (
     user.admin === true ||
     ALLOWED_ROLES.has(role) ||
-    roles.some(r => ALLOWED_ROLES.has(r));
+    roles.some(r => ALLOWED_ROLES.has(r))
+  );
+}
 
-  if (!hasAccess) {
-    logger.warn('[Auth] Contributor access denied', { uid: user.uid, role, path: req.originalUrl });
-    return res.status(403).json({
-      success: false, errorCode: 'FORBIDDEN',
-      message: 'Contributor or admin privileges required.',
+// ─────────────────────────────────────────────────────────────────────────────
+// MIDDLEWARE
+// ─────────────────────────────────────────────────────────────────────────────
+
+const requireContributor = (req, res, next) => {
+  const requestId = getRequestId(req);
+  const user = req.user;
+
+  // ── Auth check ─────────────────────────────────────────
+  if (!user) {
+    return res.status(401).json({
+      success: false,
+      error: {
+        code: 'UNAUTHORIZED',
+        message: 'Authentication required.',
+      },
+      requestId,
       timestamp: new Date().toISOString(),
     });
   }
 
-  next();
+  const allowed = hasContributorAccess(user);
+
+  // ── Access check ───────────────────────────────────────
+  if (!allowed) {
+    logger.warn('[RequireContributor] Access denied', {
+      requestId,
+      correlationId: req.correlationId, // ✅ observability
+      userId: user.uid,
+      role: user.role,
+      roles: user.roles,
+      path: req.originalUrl,
+      method: req.method,
+      ip: req.ip,
+    });
+
+    return res.status(403).json({
+      success: false,
+      error: {
+        code: 'FORBIDDEN',
+        message: 'Contributor or admin privileges required.',
+      },
+      requestId,
+      timestamp: new Date().toISOString(),
+    });
+  }
+
+  return next();
 };
 
+// ─────────────────────────────────────────────────────────────────────────────
+// EXPORT
+// ─────────────────────────────────────────────────────────────────────────────
+
 module.exports = { requireContributor };
-
-
-
-
-
-
-
-

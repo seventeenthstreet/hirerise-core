@@ -4,7 +4,7 @@
  * adminMetrics.service.js
  * Converted from adminMetrics.service.ts
  */
-const supabase = require('../../config/supabase');
+const { supabase } = require('../../config/supabase');
 const {
   usageLogsRepository
 } = require('./usageLogs.repository');

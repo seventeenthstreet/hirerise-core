@@ -1,91 +1,79 @@
 'use strict';
 
 /**
- * dashboard.service.js — FINAL ARCHITECTURE
+ * src/modules/dashboard/dashboard.service.js
  *
- * Single tier-aware dashboard. No /dashboard/free or /dashboard/pro.
- *
- * Response adds:
- *   tier (top-level)
- *   features.salaryGap.locked
- *   features.advancedInsights.locked
- *
- * Tier NEVER read from database — received as param from route.
- *
- * PHASE-4 UPDATE — Redis Snapshot Cache:
- *
- *   PROBLEM:
- *     Every GET /api/v1/dashboard triggered two database queries
- *     (latest CHI + latest job-match) regardless of how recently the data
- *     changed. At 1000 DAU × 3 dashboard loads per session = 6000 database
- *     reads per day just from dashboard calls.
- *
- *   SOLUTION:
- *     Cache getDashboardData() results in Redis under:
- *       dashboard:snap:{userId}
- *     TTL: 120 seconds + jitter(0–30 s) to prevent stampede.
- *
- *   INVALIDATION:
- *     The exported invalidateDashboardCache(userId) function deletes the key.
- *     Call it from:
- *       - resume upload / delete handlers
- *       - profile update handlers
- *       - CHI recalculation completion handlers
- *
- *   GRACEFUL DEGRADATION:
- *     If Redis is unavailable, getDashboardData falls through to Supabase
- *     as before. Caching is never a blocking dependency.
+ * Tier-aware dashboard service with:
+ * - Supabase row-based queries
+ * - Redis snapshot caching with graceful degradation
+ * - tier-safe cache validation
+ * - minimal column selection
+ * - production-grade logging consistency
  */
-const supabase = require('../../config/supabase');
-const {
-  CREDIT_COSTS,
-  getRemainingUses
-} = require('../analysis/analysis.constants');
 
-// ─── Redis client (lazy, same pattern as tokenCache / aiResultCache) ──────────
-
-let _redis = null;
-function getRedis() {
-  if (_redis) return _redis;
-  try {
-    const mgr = require('../../core/cache/cache.manager');
-    const client = mgr.getClient();
-    // Prefer the raw ioredis client for direct set/get/del operations
-    if (client?.client?.get) {
-      _redis = client.client;
-    } else if (client?.get) {
-      _redis = client;
-    }
-  } catch {
-    /* Redis unavailable */
-  }
-  return _redis;
-}
-
-// ─── Cache configuration ─────────────────────────────────────────────────────
-
-const CACHE_KEY_PREFIX = 'dashboard:snap:';
-const CACHE_TTL_BASE = 120; // seconds
-const CACHE_JITTER_MAX = 30; // jitter 0–30 s to prevent stampede
+const { supabase } = require('../../config/supabase');
 const logger = require('../../utils/logger');
 
-// ─── Cache helpers ────────────────────────────────────────────────────────────
+const {
+  CREDIT_COSTS,
+  getRemainingUses,
+} = require('../analysis/analysis.constants');
+
+let redisClient = null;
+
+function getRedis() {
+  if (redisClient) return redisClient;
+
+  try {
+    const cacheManager = require('../../core/cache/cache.manager');
+    const client = cacheManager.getClient();
+
+    redisClient = client?.client?.get
+      ? client.client
+      : client?.get
+        ? client
+        : null;
+  } catch (error) {
+    logger.warn('[DashboardService] Redis unavailable', {
+      error: error.message,
+    });
+    redisClient = null;
+  }
+
+  return redisClient;
+}
+
+const CACHE_KEY_PREFIX = 'dashboard:snap:';
+const CACHE_TTL_BASE_SECONDS = 120;
+const CACHE_JITTER_MAX_SECONDS = 30;
 
 function dashboardCacheKey(userId) {
   return `${CACHE_KEY_PREFIX}${userId}`;
 }
 
-async function getCachedSnapshot(userId) {
+async function getCachedSnapshot(userId, tier) {
   const redis = getRedis();
   if (!redis) return null;
+
   try {
     const raw = await redis.get(dashboardCacheKey(userId));
     if (!raw) return null;
-    return JSON.parse(raw);
-  } catch (err) {
-    logger.warn('[DashboardService] Cache read error', {
+
+    const parsed = JSON.parse(raw);
+
+    /**
+     * Tier-safe cache validation.
+     * Prevents stale free/pro payload crossover.
+     */
+    if (parsed?.tier && parsed.tier !== tier) {
+      return null;
+    }
+
+    return parsed;
+  } catch (error) {
+    logger.warn('[DashboardService] Cache read failed', {
       userId,
-      error: err.message
+      error: error.message,
     });
     return null;
   }
@@ -94,59 +82,61 @@ async function getCachedSnapshot(userId) {
 async function setCachedSnapshot(userId, snapshot) {
   const redis = getRedis();
   if (!redis) return;
+
   try {
-    const jitter = Math.floor(Math.random() * CACHE_JITTER_MAX);
-    const ttl = CACHE_TTL_BASE + jitter;
-    await redis.set(dashboardCacheKey(userId), JSON.stringify(snapshot), 'EX', ttl);
+    const ttl =
+      CACHE_TTL_BASE_SECONDS +
+      Math.floor(Math.random() * CACHE_JITTER_MAX_SECONDS);
+
+    await redis.set(
+      dashboardCacheKey(userId),
+      JSON.stringify(snapshot),
+      'EX',
+      ttl
+    );
+
     logger.debug('[DashboardService] Snapshot cached', {
       userId,
-      ttlS: ttl
+      ttlSeconds: ttl,
     });
-  } catch (err) {
-    // Non-fatal — dashboard still returned from Supabase
-    logger.warn('[DashboardService] Cache write error', {
+  } catch (error) {
+    logger.warn('[DashboardService] Cache write failed', {
       userId,
-      error: err.message
+      error: error.message,
     });
   }
 }
 
-/**
- * invalidateDashboardCache(userId)
- *
- * Exported for use by resume, profile, and CHI handlers.
- * Deletes the cached snapshot so the next dashboard request re-fetches
- * from Supabase with fresh data.
- *
- * Call this after:
- *   - POST   /api/v1/resumes          (resume uploaded)
- *   - DELETE /api/v1/resumes/:id      (resume deleted)
- *   - PUT    /api/v1/users/me         (profile updated)
- *   - POST   /api/v1/career-health/calculate (CHI recalculated)
- *
- * @param {string} userId
- */
 async function invalidateDashboardCache(userId) {
   const redis = getRedis();
   if (!redis) return;
+
   try {
     await redis.del(dashboardCacheKey(userId));
-    logger.debug('[DashboardService] Cache invalidated', { userId });
-  } catch (err) {
-    logger.warn('[DashboardService] Cache invalidation error', {
+
+    logger.debug('[DashboardService] Cache invalidated', {
       userId,
-      error: err.message
+    });
+  } catch (error) {
+    logger.warn('[DashboardService] Cache invalidation failed', {
+      userId,
+      error: error.message,
     });
   }
 }
-
-// ─── Supabase fetchers ────────────────────────────────────────────────────────
 
 async function fetchLatestCHI(userId) {
   try {
     const { data, error } = await supabase
       .from('careerHealthIndex')
-      .select('*')
+      .select(`
+        chiScore,
+        criticalGap,
+        currentEstimatedSalaryLPA,
+        nextLevelEstimatedSalaryLPA,
+        dimensions,
+        generatedAt
+      `)
       .eq('userId', userId)
       .eq('softDeleted', false)
       .order('generatedAt', { ascending: false })
@@ -155,55 +145,88 @@ async function fetchLatestCHI(userId) {
 
     if (error || !data) return null;
 
+    const currentSalary = data.currentEstimatedSalaryLPA ?? null;
+    const nextSalary = data.nextLevelEstimatedSalaryLPA ?? null;
+
     return {
       chiScore: data.chiScore ?? null,
-      skillCoverage: data.dimensions?.skillVelocity?.score ?? null,
+      skillCoverage:
+        data.dimensions?.skillVelocity?.score ?? null,
       growthSummary: data.criticalGap ?? null,
-      salaryPreview: data.currentEstimatedSalaryLPA
+      salaryPreview: currentSalary
         ? {
-            min: Math.round(data.currentEstimatedSalaryLPA * 0.9),
-            max: Math.round(data.nextLevelEstimatedSalaryLPA ?? data.currentEstimatedSalaryLPA * 1.3),
-            currency: 'INR'
+            min: Math.round(currentSalary * 0.9),
+            max: Math.round(nextSalary ?? currentSalary * 1.3),
+            currency: 'INR',
           }
-        : null
+        : null,
     };
-  } catch {
+  } catch (error) {
+    logger.warn('[DashboardService] CHI fetch failed', {
+      userId,
+      error: error.message,
+    });
     return null;
   }
 }
 
 async function fetchLatestJobMatch(userId) {
+  const fallback = {
+    hasAnalyzedBefore: false,
+    lastMatchScore: null,
+    lastJobTitle: null,
+    lastAnalyzedAt: null,
+  };
+
   try {
     const { data, error } = await supabase
       .from('jobMatchAnalyses')
-      .select('*')
+      .select(`
+        matchScore,
+        jobTitle,
+        analyzedAt
+      `)
       .eq('userId', userId)
       .order('analyzedAt', { ascending: false })
       .limit(1)
       .maybeSingle();
 
-    if (error || !data) {
-      return {
-        hasAnalyzedBefore: false,
-        lastMatchScore: null,
-        lastJobTitle: null,
-        lastAnalyzedAt: null
-      };
-    }
+    if (error || !data) return fallback;
 
     return {
       hasAnalyzedBefore: true,
       lastMatchScore: data.matchScore ?? null,
       lastJobTitle: data.jobTitle ?? null,
-      lastAnalyzedAt: data.analyzedAt ?? null
+      lastAnalyzedAt: data.analyzedAt ?? null,
     };
-  } catch {
-    return {
-      hasAnalyzedBefore: false,
-      lastMatchScore: null,
-      lastJobTitle: null,
-      lastAnalyzedAt: null
-    };
+  } catch (error) {
+    logger.warn('[DashboardService] Job match fetch failed', {
+      userId,
+      error: error.message,
+    });
+    return fallback;
+  }
+}
+
+async function fetchCredits(userId, tier) {
+  if (tier === 'free') return 0;
+
+  try {
+    const { data, error } = await supabase
+      .from('users')
+      .select('aiCreditsRemaining')
+      .eq('id', userId)
+      .maybeSingle();
+
+    if (error) return 0;
+
+    return data?.aiCreditsRemaining ?? 0;
+  } catch (error) {
+    logger.warn('[DashboardService] Credit fetch failed', {
+      userId,
+      error: error.message,
+    });
+    return 0;
   }
 }
 
@@ -211,113 +234,101 @@ function computeCanRunFlags(tier, credits) {
   if (tier === 'free') {
     return {
       canRunJobMatch: true,
-      canGenerateJobSpecificCV: false
+      canGenerateJobSpecificCV: false,
     };
   }
+
   return {
     canRunJobMatch: credits >= CREDIT_COSTS.jobMatchAnalysis,
-    canGenerateJobSpecificCV: credits >= CREDIT_COSTS.jobSpecificCV
+    canGenerateJobSpecificCV:
+      credits >= CREDIT_COSTS.jobSpecificCV,
   };
 }
 
 function buildFeatures(tier, chiData) {
   const isPremium = tier !== 'free';
+
   return {
     basicAnalysis: {
       locked: false,
-      jobMatchScore: chiData?.chiScore ?? null
+      jobMatchScore: chiData?.chiScore ?? null,
     },
     careerHealth: {
       locked: false,
       chiScore: chiData?.chiScore ?? null,
       skillCoverage: chiData?.skillCoverage ?? null,
-      growthSummary: chiData?.growthSummary ?? null
+      growthSummary: chiData?.growthSummary ?? null,
     },
     salaryGap: {
       locked: !isPremium,
-      salaryPreview: isPremium ? chiData?.salaryPreview ?? null : null
+      salaryPreview: isPremium
+        ? chiData?.salaryPreview ?? null
+        : null,
     },
     advancedInsights: {
       locked: !isPremium,
-      data: null
-    }
+      data: null,
+    },
   };
 }
 
-// ─── Public service function ──────────────────────────────────────────────────
-
-/**
- * getDashboardData(userId, tier)
- *
- * Returns the dashboard payload. Checks Redis cache first; falls back to
- * Supabase if cache is cold or Redis is unavailable.
- *
- * @param {string} userId
- * @param {string} tier — normalized tier from custom claim (never from database)
- */
 async function getDashboardData(userId, tier) {
-  // ── 1. Cache check ───────────────────────────────────────────────────────
-  const cached = await getCachedSnapshot(userId);
+  const cached = await getCachedSnapshot(userId, tier);
+
   if (cached) {
-    logger.debug('[DashboardService] Cache hit', { userId });
+    logger.debug('[DashboardService] Cache hit', {
+      userId,
+      tier,
+    });
     return cached;
   }
 
-  // ── 2. Supabase fetch ────────────────────────────────────────────────────
-  let credits = 0;
-  if (tier !== 'free') {
-    try {
-      const { data: userData } = await supabase
-        .from('users')
-        .select('aiCreditsRemaining')
-        .eq('id', userId)
-        .maybeSingle();
-      credits = userData?.aiCreditsRemaining ?? 0;
-    } catch {
-      credits = 0;
-    }
-  }
-
-  const [chiData, jobMatchData] = await Promise.all([
+  const [credits, chiData, jobMatchData] = await Promise.all([
+    fetchCredits(userId, tier),
     fetchLatestCHI(userId),
-    fetchLatestJobMatch(userId)
+    fetchLatestJobMatch(userId),
   ]);
 
   const remainingUses =
     tier !== 'free'
       ? getRemainingUses(credits)
-      : Object.fromEntries(Object.keys(CREDIT_COSTS).map(op => [op, 0]));
+      : Object.fromEntries(
+          Object.keys(CREDIT_COSTS).map((operation) => [
+            operation,
+            0,
+          ])
+        );
 
-  const canRunFlags = computeCanRunFlags(tier, credits);
   const features = buildFeatures(tier, chiData);
+  const canRunFlags = computeCanRunFlags(tier, credits);
 
   const snapshot = {
     tier,
     features,
     user: {
       tier,
-      aiCreditsRemaining: credits
+      aiCreditsRemaining: credits,
     },
     careerIntelligence: chiData ?? {
       chiScore: null,
       skillCoverage: null,
       growthSummary: null,
-      salaryPreview: null
+      salaryPreview: null,
     },
     applySmarter: jobMatchData,
     credits: {
       remaining: credits,
       remainingUses,
-      ...canRunFlags
-    }
+      ...canRunFlags,
+    },
   };
 
-  // ── 3. Cache the result ──────────────────────────────────────────────────
   await setCachedSnapshot(userId, snapshot);
+
   return snapshot;
 }
 
 module.exports = {
   getDashboardData,
-  invalidateDashboardCache
+  invalidateDashboardCache,
 };

@@ -15,23 +15,21 @@ const ENGINE_MAP = {
 
 const resumeRepo = new ResumeRepository();
 const scoreRepo  = new ScoreRepository();
+
 const ENGINE_VERSION = process.env.RESUME_ENGINE_VERSION ?? 'resume_score_v1.0';
 
-export async function handleResumeSubmitted(envelope, message) {
+export async function handleResumeSubmitted(envelope, message = {}) {
 
   const childLogger = logger.child({
     handler: 'handleResumeSubmitted.v2',
-    pubsubMessageId: message.id,
-    deliveryAttempt: message.deliveryAttempt,
+    pubsubMessageId: message?.id,
+    deliveryAttempt: message?.deliveryAttempt ?? 1,
   });
 
-  // ─────────────────────────────────────────────────────────────
-  // 1️⃣ Envelope Validation
-  // ─────────────────────────────────────────────────────────────
-
+  // 1️⃣ Validate Envelope
   const validated = safeValidateEnvelope(envelope, EventTypes.RESUME_SUBMITTED);
   if (!validated) {
-    childLogger.error('Permanent validation failure — message discarded');
+    childLogger.error('Invalid event — discarded');
     return;
   }
 
@@ -39,65 +37,54 @@ export async function handleResumeSubmitted(envelope, message) {
   const { userId, resumeId, jobId, resumeStoragePath, mimeType } = payload;
   const eventId = envelope.eventId;
 
-  const processingLogger = childLogger.child({
+  const log = childLogger.child({
     userId,
     resumeId,
     jobId,
     engineVersion: ENGINE_VERSION,
   });
 
-  // ─────────────────────────────────────────────────────────────
-  // 2️⃣ Deduplication (event level)
-  // ─────────────────────────────────────────────────────────────
-
+  // 2️⃣ Deduplication
   const { claimed } = await claimEvent(eventId, { userId, resumeId, jobId });
   if (!claimed) {
-    processingLogger.info('Duplicate event — skipped via dedup');
+    log.info('Duplicate event skipped');
     return;
   }
 
-  // ─────────────────────────────────────────────────────────────
-  // 3️⃣ Job Claim (Firestore sharded repo)
-  // ─────────────────────────────────────────────────────────────
-
+  // 3️⃣ Job Claim (Replace backend with Supabase internally)
   const { claimed: jobClaimed, status } =
     await jobRepo.claimJob(jobId, process.env.SERVICE_NAME);
 
   if (!jobClaimed) {
-    processingLogger.info('Job already claimed', { status });
+    log.info('Job already claimed', { status });
     return;
   }
 
-  processingLogger.info('Processing resume submission');
+  log.info('Processing resume');
 
   try {
-
     await resumeRepo.markProcessing(resumeId);
 
-    // ─────────────────────────────────────────────────────────
     // 4️⃣ Parse Resume
-    // ─────────────────────────────────────────────────────────
+    let parsed;
+    try {
+      parsed = await parseResume(resumeStoragePath, mimeType);
+    } catch (err) {
+      throw new HireRiseError(
+        err.code === 'ENOENT' || err.code === '404'
+          ? ErrorCodes.STORAGE_NOT_FOUND
+          : ErrorCodes.STORAGE_READ_FAILED,
+        `Resume read failed: ${err.message}`,
+        { resumeStoragePath }
+      );
+    }
 
-    const parsed = await parseResume(resumeStoragePath, mimeType)
-      .catch((err) => {
-        throw new HireRiseError(
-          err.code === 'ENOENT' || err.code === '404'
-            ? ErrorCodes.STORAGE_NOT_FOUND
-            : ErrorCodes.STORAGE_READ_FAILED,
-          `Failed to fetch resume: ${err.message}`,
-          { resumeStoragePath, mimeType }
-        );
-      });
-
-    processingLogger.info('Resume parsed', {
-      sectionCount: Object.keys(parsed.sections).length,
-      skillCount: parsed.skills.length,
+    log.info('Parsed resume', {
+      sections: Object.keys(parsed?.sections ?? {}).length,
+      skills: parsed?.skills?.length ?? 0,
     });
 
-    // ─────────────────────────────────────────────────────────
     // 5️⃣ Score
-    // ─────────────────────────────────────────────────────────
-
     let scoreResult;
     try {
       const engine = resolveEngine(ENGINE_VERSION, ENGINE_MAP);
@@ -105,37 +92,31 @@ export async function handleResumeSubmitted(envelope, message) {
     } catch (err) {
       throw new HireRiseError(
         ErrorCodes.SCORE_COMPUTATION_FAILED,
-        `Scoring failed: ${err.message}`,
-        { engineVersion: ENGINE_VERSION }
+        `Scoring failed: ${err.message}`
       );
     }
 
-    processingLogger.info('Resume scored', {
-      overallScore: scoreResult.overallScore,
+    log.info('Scored resume', {
+      score: scoreResult.overallScore,
       tier: scoreResult.tier,
     });
 
-    // ─────────────────────────────────────────────────────────
-    // 6️⃣ Persist Score
-    // ─────────────────────────────────────────────────────────
-
+    // 6️⃣ Persist
     await scoreRepo.upsertScore(userId, resumeId, ENGINE_VERSION, {
-      overallScore:    scoreResult.overallScore,
-      tier:            scoreResult.tier,
-      breakdown:       scoreResult.breakdown,
+      overallScore: scoreResult.overallScore,
+      tier: scoreResult.tier,
+      breakdown: scoreResult.breakdown,
       extractedSkills: scoreResult.extractedSkills,
       recommendations: scoreResult.recommendations,
     });
 
     await resumeRepo.markComplete(resumeId, ENGINE_VERSION);
+
     await jobRepo.completeJob(jobId, {
       overallScore: scoreResult.overallScore,
     });
 
-    // ─────────────────────────────────────────────────────────
-    // 7️⃣ Emit Events
-    // ─────────────────────────────────────────────────────────
-
+    // 7️⃣ Events
     await publishEvent(
       process.env.PUBSUB_SCORE_UPDATED_TOPIC,
       EventTypes.SCORE_UPDATED,
@@ -156,13 +137,12 @@ export async function handleResumeSubmitted(envelope, message) {
       },
     );
 
-    processingLogger.info('Resume pipeline complete', {
-      overallScore: scoreResult.overallScore,
-    });
+    log.info('Pipeline complete');
 
   } catch (err) {
 
     const strategy = resolveRetryStrategy(err);
+
     const logData = err instanceof HireRiseError
       ? err.toLog()
       : {
@@ -170,21 +150,19 @@ export async function handleResumeSubmitted(envelope, message) {
           errorMessage: err.message,
         };
 
-    processingLogger.error('Resume processing failed', {
+    log.error('Processing failed', {
       ...logData,
       retryStrategy: strategy,
-      deliveryAttempt: message.deliveryAttempt,
     });
 
     await jobRepo.failJob(jobId, logData.errorCode, err.message);
     await resumeRepo.markFailed(resumeId, logData.errorCode);
 
-    // 🔥 Release dedup only for retryable cases
     if (strategy === RetryStrategy.RELEASE) {
       await releaseEvent(eventId);
     }
 
-    if (strategy === RetryStrategy.NO_RETRY || message.deliveryAttempt >= 5) {
+    if (strategy === RetryStrategy.NO_RETRY || (message?.deliveryAttempt ?? 1) >= 5) {
       await publishEvent(
         process.env.PUBSUB_NOTIFICATION_TOPIC,
         EventTypes.NOTIFICATION_REQUESTED,
@@ -196,6 +174,6 @@ export async function handleResumeSubmitted(envelope, message) {
       ).catch(() => {});
     }
 
-    throw err; // nack
+    throw err;
   }
 }

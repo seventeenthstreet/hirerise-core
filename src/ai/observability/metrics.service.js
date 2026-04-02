@@ -2,118 +2,151 @@
 
 const observabilityRepo = require('../../repositories/ai-observability.repository');
 const OBSERVABILITY_CONFIG = require('../../config/observability.config');
+const logger = require('../../utils/logger');
 
-/**
- * MetricsService — AI metrics aggregation engine.
- *
- * Responsibilities:
- *  - Daily aggregation of raw ai_logs → ai_metrics_daily
- *  - p95 latency calculation
- *  - Error rate computation
- *  - Token average computation
- *  - Real-time summary for dashboard
- *
- * Called by:
- *  - DailyAggregationWorker (cron)
- *  - Admin dashboard API
- */
 class MetricsService {
-  /**
-   * Run the full daily aggregation job for a given date.
-   * Called by cron worker at ~1am UTC for previous day.
-   *
-   * @param {string} dateStr - 'YYYY-MM-DD'
-   */
+
   async runDailyAggregation(dateStr) {
     const features = OBSERVABILITY_CONFIG.drift.features;
     const results = [];
+
     for (const feature of features) {
       try {
         const logs = await this._fetchLogsForDate(feature, dateStr);
-        if (logs.length === 0) continue;
+
+        if (!logs.length) continue;
+
         const metrics = this._computeMetrics(logs);
-        await observabilityRepo.upsertDailyMetrics(feature, dateStr, metrics);
+
+        // ✅ timeout protection
+        await Promise.race([
+          observabilityRepo.upsertDailyMetrics(feature, dateStr, metrics),
+          new Promise((_, reject) =>
+            setTimeout(() => reject(new Error('timeout')), 3000)
+          ),
+        ]);
+
         results.push({
           feature,
           status: 'ok',
-          callCount: metrics.callCount
+          callCount: metrics.callCount,
         });
+
       } catch (err) {
-        console.error(`[MetricsService] Aggregation failed for ${feature} on ${dateStr}:`, err.message);
+        logger.error('[MetricsService] Aggregation failed', {
+          feature,
+          date: dateStr,
+          error: err.message,
+        });
+
         results.push({
           feature,
           status: 'error',
-          error: err.message
+          error: err.message,
         });
       }
     }
+
     return results;
   }
 
-  /**
-   * Compute all metrics from a set of raw log entries.
-   * @param {Array} logs
-   * @returns {Object} metrics payload
-   */
+  // ─────────────────────────────
+  // OPTIMIZED SINGLE-PASS METRICS
+  // ─────────────────────────────
+
   _computeMetrics(logs) {
-    const total = logs.length;
-    const successes = logs.filter(l => l.success);
-    const failures = logs.filter(l => !l.success);
-    const latencies = logs.map(l => l.latencyMs).filter(v => v != null && v >= 0).sort((a, b) => a - b);
-    const tokenTotals = logs.map(l => l.totalTokens || 0);
-    const inputTokens = logs.map(l => l.tokensInput || 0);
-    const outputTokens = logs.map(l => l.tokensOutput || 0);
-    const confidenceScores = logs.map(l => l.confidenceScore).filter(v => v != null);
+    const latencies = [];
+    const confidenceScores = [];
 
-    // Error codes breakdown
+    let successCount = 0;
+    let errorCount = 0;
+
+    let totalInputTokens = 0;
+    let totalOutputTokens = 0;
+
     const errorBreakdown = {};
-    failures.forEach(l => {
-      const code = l.errorCode || 'UNKNOWN';
-      errorBreakdown[code] = (errorBreakdown[code] || 0) + 1;
-    });
-
-    // Model distribution
     const modelDistribution = {};
-    logs.forEach(l => {
+
+    for (const l of logs) {
+      // success/error
+      if (l.success) successCount++;
+      else {
+        errorCount++;
+        const code = l.errorCode || 'UNKNOWN';
+        errorBreakdown[code] = (errorBreakdown[code] || 0) + 1;
+      }
+
+      // latency
+      if (Number.isFinite(l.latencyMs) && l.latencyMs >= 0) {
+        latencies.push(l.latencyMs);
+      }
+
+      // tokens
+      const inTok = Math.max(0, Number(l.tokensInput) || 0);
+      const outTok = Math.max(0, Number(l.tokensOutput) || 0);
+
+      totalInputTokens += inTok;
+      totalOutputTokens += outTok;
+
+      // confidence
+      if (Number.isFinite(l.confidenceScore)) {
+        confidenceScores.push(l.confidenceScore);
+      }
+
+      // model
       const m = l.model || 'unknown';
       modelDistribution[m] = (modelDistribution[m] || 0) + 1;
-    });
+    }
+
+    latencies.sort((a, b) => a - b);
+
+    const total = logs.length;
+
     return {
       callCount: total,
-      successCount: successes.length,
-      errorCount: failures.length,
-      errorRate: total > 0 ? +(failures.length / total).toFixed(4) : 0,
-      // Latency
+      successCount,
+      errorCount,
+      errorRate: total > 0 ? +(errorCount / total).toFixed(4) : 0,
+
       latencyP50Ms: this._percentile(latencies, 50),
       latencyP95Ms: this._percentile(latencies, 95),
       latencyP99Ms: this._percentile(latencies, 99),
-      latencyMinMs: latencies.length > 0 ? latencies[0] : null,
-      latencyMaxMs: latencies.length > 0 ? latencies[latencies.length - 1] : null,
-      latencyAvgMs: latencies.length > 0 ? Math.round(this._average(latencies)) : null,
-      // Tokens
-      avgInputTokens: Math.round(this._average(inputTokens)),
-      avgOutputTokens: Math.round(this._average(outputTokens)),
-      avgTotalTokens: Math.round(this._average(tokenTotals)),
-      totalInputTokens: inputTokens.reduce((s, v) => s + v, 0),
-      totalOutputTokens: outputTokens.reduce((s, v) => s + v, 0),
-      // Confidence
-      avgConfidenceScore: confidenceScores.length > 0 ? +this._average(confidenceScores).toFixed(4) : null,
-      minConfidenceScore: confidenceScores.length > 0 ? Math.min(...confidenceScores) : null,
-      // Breakdowns
+      latencyMinMs: latencies[0] ?? null,
+      latencyMaxMs: latencies[latencies.length - 1] ?? null,
+      latencyAvgMs: latencies.length ? Math.round(this._average(latencies)) : null,
+
+      avgInputTokens: total ? Math.round(totalInputTokens / total) : 0,
+      avgOutputTokens: total ? Math.round(totalOutputTokens / total) : 0,
+      avgTotalTokens: total ? Math.round((totalInputTokens + totalOutputTokens) / total) : 0,
+
+      totalInputTokens,
+      totalOutputTokens,
+
+      avgConfidenceScore: confidenceScores.length
+        ? +this._average(confidenceScores).toFixed(4)
+        : null,
+
+      minConfidenceScore: confidenceScores.length
+        ? Math.min(...confidenceScores)
+        : null,
+
       errorBreakdown,
       modelDistribution,
-      // Latency threshold breaches
-      latencyWarningBreaches: latencies.filter(l => l > OBSERVABILITY_CONFIG.latency.singleCallWarningMs).length
+
+      latencyWarningBreaches: latencies.filter(
+        l => l > OBSERVABILITY_CONFIG.latency.singleCallWarningMs
+      ).length,
     };
   }
 
-  /**
-   * Fetch raw logs for a specific feature and date.
-   * ai_logs has a 'date' string field (YYYY-MM-DD) for efficient daily partitioning.
-   * We filter by feature, date, and isDeleted=false with a safety cap of 5000 rows.
-   */
+  // ─────────────────────────────
+  // DATA FETCH
+  // ─────────────────────────────
+
   async _fetchLogsForDate(feature, dateStr) {
     const { supabase } = require('../../config/supabase');
+
+    const limit = OBSERVABILITY_CONFIG.metrics?.fetchLimit || 5000;
 
     const { data, error } = await supabase
       .from('ai_logs')
@@ -121,54 +154,87 @@ class MetricsService {
       .eq('feature', feature)
       .eq('date', dateStr)
       .eq('isDeleted', false)
-      .limit(5000); // safety cap; tune upward for high-volume features
+      .limit(limit);
 
     if (error) {
       throw new Error(`[MetricsService] Failed to fetch logs: ${error.message}`);
     }
+
     return data || [];
   }
 
-  /**
-   * Real-time summary for dashboard (last N days of pre-aggregated metrics).
-   */
+  // ─────────────────────────────
+  // DASHBOARD SUMMARY
+  // ─────────────────────────────
+
   async getDashboardSummary({ days = 7 } = {}) {
     const features = OBSERVABILITY_CONFIG.drift.features;
     const summary = {};
+
     for (const feature of features) {
-      const records = await observabilityRepo.getDailyMetrics(feature, { limit: days });
-      summary[feature] = this._rollupMetrics(records);
+      try {
+        const records = await observabilityRepo.getDailyMetrics(feature, { limit: days });
+        summary[feature] = this._rollupMetrics(records);
+      } catch (err) {
+        logger.error('[MetricsService] Dashboard fetch failed', {
+          feature,
+          error: err.message,
+        });
+        summary[feature] = null;
+      }
     }
+
     return summary;
   }
 
   _rollupMetrics(records) {
-    if (!records || records.length === 0) return null;
-    const totalCalls = records.reduce((s, r) => s + (r.callCount || 0), 0);
-    const totalErrors = records.reduce((s, r) => s + (r.errorCount || 0), 0);
-    const latencyP95s = records.map(r => r.latencyP95Ms).filter(v => v != null);
-    const avgConfidences = records.map(r => r.avgConfidenceScore).filter(v => v != null);
+    if (!records?.length) return null;
+
+    let totalCalls = 0;
+    let totalErrors = 0;
+    const latencyP95s = [];
+    const avgConfidences = [];
+
+    for (const r of records) {
+      totalCalls += r.callCount || 0;
+      totalErrors += r.errorCount || 0;
+
+      if (r.latencyP95Ms != null) latencyP95s.push(r.latencyP95Ms);
+      if (r.avgConfidenceScore != null) avgConfidences.push(r.avgConfidenceScore);
+    }
+
     return {
       periodDays: records.length,
       totalCalls,
       totalErrors,
-      errorRate: totalCalls > 0 ? +(totalErrors / totalCalls * 100).toFixed(2) : 0,
-      p95LatencyMs: latencyP95s.length > 0 ? Math.round(this._average(latencyP95s)) : null,
-      avgConfidenceScore: avgConfidences.length > 0 ? +this._average(avgConfidences).toFixed(4) : null,
-      latestDate: records[0]?.date || null
+      errorRate: totalCalls > 0
+        ? +(totalErrors / totalCalls * 100).toFixed(2)
+        : 0,
+
+      p95LatencyMs: latencyP95s.length
+        ? Math.round(this._average(latencyP95s))
+        : null,
+
+      avgConfidenceScore: avgConfidences.length
+        ? +this._average(avgConfidences).toFixed(4)
+        : null,
+
+      latestDate: records[0]?.date || null,
     };
   }
 
-  // ─── Math Utilities ──────────────────────────────────────────────────────────
+  // ─────────────────────────────
+  // UTIL
+  // ─────────────────────────────
 
-  _percentile(sortedArr, p) {
-    if (!sortedArr || sortedArr.length === 0) return null;
-    const idx = Math.ceil(p / 100 * sortedArr.length) - 1;
-    return sortedArr[Math.max(0, Math.min(idx, sortedArr.length - 1))];
+  _percentile(arr, p) {
+    if (!arr.length) return null;
+    const idx = Math.ceil((p / 100) * arr.length) - 1;
+    return arr[Math.max(0, Math.min(idx, arr.length - 1))];
   }
 
   _average(arr) {
-    if (!arr || arr.length === 0) return 0;
+    if (!arr.length) return 0;
     return arr.reduce((s, v) => s + v, 0) / arr.length;
   }
 }

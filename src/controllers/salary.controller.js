@@ -1,108 +1,205 @@
 'use strict';
 
 /**
- * salary.controller.js
+ * salary.controller.js — Fully Optimized
  *
- * CHANGES (remediation sprint):
- *   FIX-5: Removed ALL self-contained try/catch blocks that were:
- *           - Swallowing every error (including 404s, 500s) and returning 400
- *           - Using { success: false, message: error.message } (no errorCode, no timestamp)
- *           - Bypassing the central errorHandler entirely
- *          Each handler is now wrapped with asyncHandler() so any thrown AppError or
- *          unexpected error propagates to errorHandler and returns the standard envelope.
- *   FIX-7: mapExperienceToLevel in salary.intelligence.service.js expanded to L1-L6
- *          (see that file). This controller now correctly propagates the AppError thrown
- *          when a band is not found, instead of swallowing it as a generic 400.
- *   FIX-10: Corrected service method names to match salary.service.js exports:
- *           - getBenchmark    → computeBenchmark
- *           - getSalaryBands  → getAllBandsForRole
- *           - compareSalaries → compareRoles
+ * ✅ Strong validation
+ * ✅ Input sanitization
+ * ✅ Limits protection
+ * ✅ Better logging
  */
 
-const { asyncHandler }           = require('../utils/helpers');
-const { AppError, ErrorCodes }   = require('../middleware/errorHandler');
-const salaryService              = require('../services/salary.service');
-const SalaryIntelligenceService  = require('../services/salary.intelligence.service');
+const { asyncHandler } = require('../utils/helpers');
+const { AppError, ErrorCodes } = require('../middleware/errorHandler');
+const salaryService = require('../services/salary.service');
+const SalaryIntelligenceService = require('../services/salary.intelligence.service');
+const logger = require('../utils/logger');
 
 const salaryIntelligenceService = new SalaryIntelligenceService();
 
-/**
- * POST /api/v1/salary/benchmark
- */
+// ─────────────────────────────────────────────
+// Helpers
+// ─────────────────────────────────────────────
+
+function ok(res, data) {
+  return res.status(200).json({
+    success: true,
+    data,
+    meta: { requestedAt: new Date().toISOString() },
+  });
+}
+
+function requireField(value, field) {
+  if (value === undefined || value === null || value === '') {
+    throw new AppError(
+      `${field} is required`,
+      400,
+      { field },
+      ErrorCodes.VALIDATION_ERROR
+    );
+  }
+}
+
+function toNumber(val, field) {
+  const num = Number(val);
+  if (Number.isNaN(num)) {
+    throw new AppError(
+      `${field} must be a number`,
+      400,
+      { field },
+      ErrorCodes.VALIDATION_ERROR
+    );
+  }
+  return num;
+}
+
+function validateExperience(exp) {
+  if (exp < 0 || exp > 50) {
+    throw new AppError(
+      'experienceYears must be between 0 and 50',
+      400,
+      { exp },
+      ErrorCodes.VALIDATION_ERROR
+    );
+  }
+}
+
+function sanitizeString(val) {
+  if (!val) return null;
+  return String(val).trim().slice(0, 100);
+}
+
+function parseRoleIds(roleIds) {
+  if (!roleIds) return [];
+
+  let ids = [];
+
+  if (Array.isArray(roleIds)) {
+    ids = roleIds;
+  } else if (typeof roleIds === 'string') {
+    ids = roleIds.split(',').map(r => r.trim());
+  }
+
+  // 🔥 Limit protection (max 10 roles)
+  if (ids.length > 10) {
+    throw new AppError(
+      'Maximum 10 roleIds allowed',
+      400,
+      {},
+      ErrorCodes.VALIDATION_ERROR
+    );
+  }
+
+  return ids.filter(Boolean);
+}
+
+// ─────────────────────────────────────────────
+// Controllers
+// ─────────────────────────────────────────────
+
 exports.getBenchmark = asyncHandler(async (req, res) => {
   const { roleId, experienceYears, location } = req.body;
 
-  // FIX-10: was salaryService.getBenchmark (not a function)
-  const result = await salaryService.computeBenchmark({ roleId, experienceYears, location });
+  requireField(roleId, 'roleId');
+  requireField(experienceYears, 'experienceYears');
 
-  return res.status(200).json({
-    success: true,
-    data: result,
-    meta: { requestedAt: new Date().toISOString() },
+  const exp = toNumber(experienceYears, 'experienceYears');
+  validateExperience(exp);
+
+  const safeLocation = sanitizeString(location);
+
+  logger.info('[Salary] Benchmark request', {
+    roleId,
+    exp,
+    location: safeLocation,
   });
+
+  const result = await salaryService.computeBenchmark({
+    roleId,
+    experienceYears: exp,
+    location: safeLocation,
+  });
+
+  return ok(res, result);
 });
 
 
-/**
- * POST /api/v1/salary/intelligence
- */
 exports.getIntelligence = asyncHandler(async (req, res) => {
   const { roleId, experienceYears, location, industry, currentSalary } = req.body;
 
-  const result = await salaryIntelligenceService.generateIntelligence({
+  requireField(roleId, 'roleId');
+  requireField(experienceYears, 'experienceYears');
+
+  const exp = toNumber(experienceYears, 'experienceYears');
+  validateExperience(exp);
+
+  const salary = currentSalary
+    ? toNumber(currentSalary, 'currentSalary')
+    : null;
+
+  const safeLocation = sanitizeString(location);
+  const safeIndustry = sanitizeString(industry);
+
+  logger.info('[Salary] Intelligence request', {
     roleId,
-    experienceYears,
-    location,
-    industry,
-    currentSalary,
+    exp,
+    location: safeLocation,
   });
 
-  return res.status(200).json({
-    success: true,
-    data: result,
-    meta: { requestedAt: new Date().toISOString() },
+  const result = await salaryIntelligenceService.generateIntelligence({
+    roleId,
+    experienceYears: exp,
+    location: safeLocation,
+    industry: safeIndustry,
+    currentSalary: salary,
   });
+
+  return ok(res, result);
 });
 
 
-/**
- * GET /api/v1/salary/bands/:roleId
- */
 exports.getSalaryBands = asyncHandler(async (req, res) => {
   const { roleId } = req.params;
 
-  // FIX-10: was salaryService.getSalaryBands (not a function)
-  // getAllBandsForRole throws AppError itself if not found — no null check needed
+  requireField(roleId, 'roleId');
+
+  logger.info('[Salary] Bands request', { roleId });
+
   const result = await salaryService.getAllBandsForRole(roleId);
 
-  return res.status(200).json({
-    success: true,
-    data: result,
-    meta: { requestedAt: new Date().toISOString() },
-  });
+  return ok(res, result);
 });
 
 
-/**
- * GET /api/v1/salary/compare
- */
 exports.compareSalaries = asyncHandler(async (req, res) => {
   const { roleIds, experienceYears } = req.query;
 
-  // FIX-10: was salaryService.compareSalaries (not a function)
-  const result = await salaryService.compareRoles({ roleIds, experienceYears });
+  const parsedRoleIds = parseRoleIds(roleIds);
 
-  return res.status(200).json({
-    success: true,
-    data: result,
-    meta: { requestedAt: new Date().toISOString() },
+  if (!parsedRoleIds.length) {
+    throw new AppError(
+      'roleIds is required',
+      400,
+      {},
+      ErrorCodes.VALIDATION_ERROR
+    );
+  }
+
+  const exp = experienceYears
+    ? toNumber(experienceYears, 'experienceYears')
+    : null;
+
+  if (exp !== null) validateExperience(exp);
+
+  logger.info('[Salary] Compare request', {
+    roleIds: parsedRoleIds,
+    exp,
   });
+
+  const result = await salaryService.compareRoles({
+    roleIds: parsedRoleIds,
+    experienceYears: exp,
+  });
+
+  return ok(res, result);
 });
-
-
-
-
-
-
-
-

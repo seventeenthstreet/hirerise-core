@@ -4,85 +4,78 @@
  * src/migration/add-career-conversations.migration.js
  *
  * Migration: Add edu_career_conversations Supabase table
- *
- * This migration validates Supabase table access and seeds a placeholder
- * row to confirm the table exists and is writable.
- *
- * Run:
- *   node src/migration/add-career-conversations.migration.js
- *
- * ─── Table: edu_career_conversations ─────────────────────────────────────────
- *
- * Fields:
- *   id           — auto-generated UUID (primary key)
- *   student_id   — string (user ID) — indexed for .eq() queries
- *   user_message — string — the student's question
- *   ai_response  — string — Claude's personalised answer
- *   created_at   — timestamp — ordered for history retrieval
- *
- * Required Supabase index (composite):
- *   Table: edu_career_conversations
- *   Fields: student_id ASC, created_at ASC
- *
- * Add via Supabase SQL editor:
- *
- *   CREATE INDEX IF NOT EXISTS idx_edu_career_conversations_student_created
- *     ON edu_career_conversations (student_id ASC, created_at ASC);
  */
+
 require('dotenv').config();
-require('../config/supabase');
+
 const { supabase } = require('../config/supabase');
 const logger = require('../utils/logger');
 
-const COLLECTION = 'edu_career_conversations';
+const TABLE = 'edu_career_conversations';
 
 async function run() {
   logger.info('[Migration] add-career-conversations — starting');
 
-  // Check if a migration init record already exists
+  // 🔒 Validate Supabase client
+  if (!supabase) {
+    logger.error('[Migration] Supabase client not initialized');
+    process.exit(1);
+  }
+
+  // ✅ Check if init record exists
   const { data: existing, error: fetchError } = await supabase
-    .from(COLLECTION)
+    .from(TABLE)
     .select('id')
     .eq('student_id', '_init')
     .maybeSingle();
 
   if (fetchError) {
-    logger.error('[Migration] Failed to check existing record', { error: fetchError.message });
+    logger.error('[Migration] Failed to check existing record', {
+      error: fetchError.message
+    });
     process.exit(1);
   }
 
   if (existing) {
-    logger.info('[Migration] Collection already initialised — skipping seed');
+    logger.info('[Migration] Table already initialized — skipping seed');
   } else {
-    // Seed a placeholder row to initialise the table
+    // ✅ Insert seed row
     const { error: insertError } = await supabase
-      .from(COLLECTION)
-      .insert({
-        student_id: '_init',
-        user_message: 'Migration initialisation record — safe to delete.',
-        ai_response: 'Migration initialisation record — safe to delete.',
-        created_at: new Date().toISOString()
-      });
+      .from(TABLE)
+      .insert([
+        {
+          student_id: '_init',
+          user_message: 'Migration initialization record — safe to delete.',
+          ai_response: 'Migration initialization record — safe to delete.',
+          created_at: new Date().toISOString()
+        }
+      ]);
 
     if (insertError) {
-      logger.error('[Migration] Failed to seed _migration_init record', { error: insertError.message });
+      logger.error('[Migration] Failed to insert init record', {
+        error: insertError.message
+      });
       process.exit(1);
     }
 
-    logger.info('[Migration] Seeded _migration_init record');
+    logger.info('[Migration] Init record inserted successfully');
   }
 
   logger.info('[Migration] add-career-conversations — complete');
-  logger.info('');
-  logger.info('ACTION REQUIRED: Add this composite index via Supabase SQL editor:');
-  logger.info(
-    'CREATE INDEX IF NOT EXISTS idx_edu_career_conversations_student_created\n' +
-    '  ON edu_career_conversations (student_id ASC, created_at ASC);'
-  );
+
+  logger.info('\nACTION REQUIRED: Run this in Supabase SQL editor:\n');
+  logger.info(`
+CREATE INDEX IF NOT EXISTS idx_edu_career_conversations_student_created
+ON edu_career_conversations (student_id ASC, created_at ASC);
+  `);
+
   process.exit(0);
 }
 
-run().catch(err => {
-  logger.error({ err: err.message }, '[Migration] Failed');
+// 🚀 Execute migration
+run().catch((err) => {
+  logger.error('[Migration] Unexpected failure', {
+    error: err.message
+  });
   process.exit(1);
 });

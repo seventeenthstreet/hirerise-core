@@ -1,48 +1,79 @@
-'use strict';
+"use strict";
 
 /**
- * careerReadiness.routes.js
+ * src/modules/career-readiness/careerReadiness.routes.js
  *
- * Mounted at: /api/v1/career-readiness  (via server.js)
- * Auth:       authenticate applied upstream in server.js — not repeated here.
+ * Mounted at: /api/v1/career-readiness
+ * Auth middleware is applied upstream in server.js
+ *
+ * Production-grade improvements:
+ * - Firebase-clean architecture
+ * - safer dependency composition
+ * - route boot resilience
+ * - lazy-safe JSON loading
+ * - improved testability
  */
 
-const { Router } = require('express');
+const { Router } = require("express");
+const path = require("path");
 
-const CareerReadinessController = require('./careerReadiness.controller');
-const CareerReadinessService    = require('./careerReadiness.service');
+const logger = require("../../utils/logger");
 
-// ── External service dependencies ─────────────────────────────────────────────
-const salaryService          = require('../../services/salary.service');
-const { computeGapAnalysis } = require('../../services/skillGap.service');
-const resumeScoreService     = require('../../services/resumeScore.service');
-const careerRoleGraph        = require('../../data/career-graph/software_engineering/se_1.json');
+const CareerReadinessController = require("./careerReadiness.controller");
+const CareerReadinessService = require("./careerReadiness.service");
 
-// ── Dependency injection ──────────────────────────────────────────────────────
-const service = new CareerReadinessService({
-  salaryService,
-  skillIntelligenceService: { computeGapAnalysis }, // adapter — matches DeterministicEngine interface
-  resumeScoreService,
-  careerRoleGraph,           // SE role graph — drives role-graph-dependent scoring
-  scoreRepository:  null,   // optional — no dedicated score repo yet
-});
+// External dependencies
+const salaryService = require("../../services/salary.service");
+const { computeGapAnalysis } = require("../../services/skillGap.service");
+const resumeScoreService = require("../../services/resumeScore.service");
 
-const controller = new CareerReadinessController({
-  careerReadinessService: service,
-});
+function loadCareerRoleGraph() {
+  try {
+    const graphPath = path.join(
+      __dirname,
+      "../../data/career-graph/software_engineering/se_1.json"
+    );
 
-const router = Router();
+    return require(graphPath);
+  } catch (error) {
+    logger.error("[CareerReadinessRoutes] Failed to load role graph", {
+      error: error?.message ?? "Unknown graph load error",
+    });
 
-// POST /api/v1/career-readiness/compute
-// Body: { profile: CandidateProfile, resumeData?: object }
-router.post('/compute', controller.computeReadiness);
+    /**
+     * Fail safe:
+     * keep API available even if graph asset is temporarily unavailable
+     */
+    return {};
+  }
+}
 
-module.exports = router;
+function createCareerReadinessRouter() {
+  const router = Router();
 
+  const careerRoleGraph = loadCareerRoleGraph();
 
+  const service = new CareerReadinessService({
+    salaryService,
+    skillIntelligenceService: {
+      computeGapAnalysis,
+    },
+    resumeScoreService,
+    careerRoleGraph,
+    scoreRepository: null,
+  });
 
+  const controller = new CareerReadinessController({
+    careerReadinessService: service,
+  });
 
+  /**
+   * POST /api/v1/career-readiness/compute
+   * Body: { profile: CandidateProfile, resumeData?: object }
+   */
+  router.post("/compute", controller.computeReadiness);
 
+  return router;
+}
 
-
-
+module.exports = createCareerReadinessRouter();

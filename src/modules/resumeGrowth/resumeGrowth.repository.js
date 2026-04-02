@@ -6,7 +6,7 @@
  * Supabase version — stores growth signal snapshots.
  */
 
-const supabase = require('../../core/supabaseClient');
+const { supabase } = require('../../config/supabase');
 
 const TABLE = 'resume_growth_signals';
 

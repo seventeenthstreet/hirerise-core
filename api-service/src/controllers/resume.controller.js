@@ -4,7 +4,6 @@ import { ResumeRepository, ScoreRepository } from '../../../shared/repositories/
 import { partitionedJobRepo as jobRepo } from '../../../shared/repositories/partitioned-jobs.repository.js';
 import { validateResumeSubmission, sanitizeString } from '../../../shared/validation/index.js';
 import { logger } from '../../../shared/logger/index.js';
-import { AppError } from '../middleware/error.middleware.js';
 
 const resumeRepo = new ResumeRepository();
 const scoreRepo = new ScoreRepository();
@@ -17,11 +16,18 @@ export async function submitResume(req, res, next) {
   try {
     const userId = req.user.uid;
 
+    // Validate env early
+    if (!process.env.PUBSUB_RESUME_TOPIC) {
+      throw new Error('Missing PUBSUB_RESUME_TOPIC environment variable');
+    }
+
     const validation = validateResumeSubmission(req.body);
     if (!validation.valid) {
       return res.status(400).json({
         error: 'VALIDATION_ERROR',
         message: validation.error,
+        requestId: req.requestId,
+        timestamp: new Date().toISOString(),
       });
     }
 
@@ -30,17 +36,22 @@ export async function submitResume(req, res, next) {
     const resumeId = randomUUID();
     const jobId = randomUUID();
 
+    // Sanitize inputs ONCE
+    const sanitizedPath = sanitizeString(resumeStoragePath, 1024);
+    const sanitizedFileName = sanitizeString(fileName, 255);
+    const sanitizedMimeType = sanitizeString(mimeType, 100);
+
     // Persist resume metadata
     await resumeRepo.create(resumeId, {
       userId,
-      resumeStoragePath: sanitizeString(resumeStoragePath, 1024),
-      fileName: sanitizeString(fileName, 255),
-      mimeType,
+      resumeStoragePath: sanitizedPath,
+      fileName: sanitizedFileName,
+      mimeType: sanitizedMimeType,
       processingStatus: 'queued',
       status: 'active',
     });
 
-    // Create sharded automation job
+    // Create job
     await jobRepo.createJob(jobId, {
       type: 'RESUME_SCORE',
       userId,
@@ -48,11 +59,17 @@ export async function submitResume(req, res, next) {
       idempotencyKey: `resume_score_${resumeId}`,
     });
 
-    // Publish event
+    // Publish event (sanitized payload)
     await publishEvent(
       process.env.PUBSUB_RESUME_TOPIC,
       EventTypes.RESUME_SUBMITTED,
-      { userId, resumeId, jobId, resumeStoragePath, mimeType },
+      {
+        userId,
+        resumeId,
+        jobId,
+        resumeStoragePath: sanitizedPath,
+        mimeType: sanitizedMimeType,
+      },
       { userId, resumeId, jobId }
     );
 
@@ -63,11 +80,13 @@ export async function submitResume(req, res, next) {
       requestId: req.requestId,
     });
 
-    res.status(202).json({
+    return res.status(202).json({
       message: 'Resume submitted for processing',
       resumeId,
       jobId,
       statusUrl: `/v1/resume/${resumeId}/score`,
+      requestId: req.requestId,
+      timestamp: new Date().toISOString(),
     });
 
   } catch (err) {
@@ -90,6 +109,8 @@ export async function getResumeScore(req, res, next) {
       return res.status(404).json({
         error: 'NOT_FOUND',
         message: 'Resume not found',
+        requestId: req.requestId,
+        timestamp: new Date().toISOString(),
       });
     }
 
@@ -97,6 +118,8 @@ export async function getResumeScore(req, res, next) {
       return res.status(202).json({
         status: resume.processingStatus,
         message: 'Score not yet available',
+        requestId: req.requestId,
+        timestamp: new Date().toISOString(),
       });
     }
 
@@ -106,10 +129,17 @@ export async function getResumeScore(req, res, next) {
       return res.status(404).json({
         error: 'NOT_FOUND',
         message: 'Score not found',
+        requestId: req.requestId,
+        timestamp: new Date().toISOString(),
       });
     }
 
-    res.json({ resumeId, score });
+    return res.json({
+      resumeId,
+      score,
+      requestId: req.requestId,
+      timestamp: new Date().toISOString(),
+    });
 
   } catch (err) {
     next(err);

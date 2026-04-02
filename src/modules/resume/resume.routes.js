@@ -12,6 +12,11 @@
  *   FIX-5: Removed requirePaidPlan from upload — CV upload is a core free feature,
  *           not an AI-only premium endpoint. Scoring/growth remain gated.
  *   FIX-6: Upload now responds with jobId for async polling
+ *   FIX-7: Removed conversionHookMiddleware from all route chains.
+ *           conversionHook.middleware.js exports a repository singleton instance,
+ *           not an Express middleware function. Passing it to router.post() caused:
+ *           "Route.post() requires a callback function but got a [object Object]"
+ *           Conversion tracking is handled inside the controller layer, not here.
  *
  * ROUTE MAP:
  *   POST   /api/v1/resumes              — upload CV (all authenticated users)
@@ -21,20 +26,36 @@
  *   POST   /api/v1/resumes/score        — AI score (paid only)
  *   POST   /api/v1/resumes/growth       — AI growth analysis (paid only)
  *   POST   /api/v1/resumes/:id/refresh-url — refresh signed URL
+ *   POST   /api/v1/resumes/:id/rescore  — re-trigger AI scoring
+ *   POST   /api/v1/resumes/set-active   — mark resume as primary
  *
  * authenticate is applied at server.js mount point:
  *   app.use(`${API_PREFIX}/resumes`, authenticate, require('./modules/resume/resume.routes'));
  */
 
-const path   = require('path');
+const path = require('path');
 const { Router } = require('express');
 const multer = require('multer');
 
-const { scoreResume, uploadResume, analyzeResumeGrowth, refreshSignedUrl,
-        listResumes, getResume, deleteResume, setActiveResume, rescoreResume } = require('./controllers/resume.controller');
-const { conversionHookMiddleware }    = require('../conversion');
-const { requirePaidPlan }             = require('../../middleware/requirePaidPlan.middleware');
-const { aiRateLimitByPlan }           = require('../../middleware/aiRateLimitByPlan.middleware');
+const {
+  scoreResume,
+  uploadResume,
+  analyzeResumeGrowth,
+  refreshSignedUrl,
+  listResumes,
+  getResume,
+  deleteResume,
+  setActiveResume,
+  rescoreResume,
+} = require('./controllers/resume.controller');
+
+const { requirePaidPlan }    = require('../../middleware/requirePaidPlan.middleware');
+const { aiRateLimitByPlan }  = require('../../middleware/aiRateLimitByPlan.middleware');
+
+// FIX-7: conversionHookMiddleware import removed entirely.
+// The conversion repository (conversionHook.middleware.js) exports a singleton
+// class instance — it is not an Express middleware function and must not appear
+// in a router.post() chain. Conversion tracking belongs in the controller layer.
 
 const router = Router();
 
@@ -78,22 +99,18 @@ const upload = multer({
 // ─────────────────────────────────────────────────────────────
 
 // POST /api/v1/resumes — upload CV
-// FIX-4: Route is now POST / (not POST /upload) to match frontend calling POST /api/v1/resumes
-// FIX-5: requirePaidPlan REMOVED — uploading is a core feature, not AI-gated
-// File parsing (pdf-parse / mammoth) happens synchronously; AI scoring is async.
 router.post('/',
   upload.single('resume'),
-  conversionHookMiddleware,
   uploadResume,
 );
 
-// GET /api/v1/resumes — list user's uploaded resumes (FIX-1: was missing)
+// GET /api/v1/resumes — list user's uploaded resumes
 router.get('/', listResumes);
 
-// GET /api/v1/resumes/:id — get a single resume (FIX-2: was missing)
+// GET /api/v1/resumes/:id — get a single resume
 router.get('/:id', getResume);
 
-// DELETE /api/v1/resumes/:id — soft-delete a resume (FIX-3: was missing)
+// DELETE /api/v1/resumes/:id — soft-delete a resume
 router.delete('/:id', deleteResume);
 
 // ─────────────────────────────────────────────────────────────
@@ -101,39 +118,30 @@ router.delete('/:id', deleteResume);
 // ─────────────────────────────────────────────────────────────
 
 // POST /api/v1/resumes/score
+// NOTE: /score must be defined before /:id to prevent Express matching
+// "score" as a dynamic :id parameter.
 router.post('/score',
   requirePaidPlan,
   aiRateLimitByPlan,
-  conversionHookMiddleware,
   scoreResume,
 );
 
 // POST /api/v1/resumes/growth
+// NOTE: /growth must be defined before /:resumeId routes for the same reason.
 router.post('/growth',
   requirePaidPlan,
   aiRateLimitByPlan,
-  conversionHookMiddleware,
   analyzeResumeGrowth,
 );
 
-// POST /api/v1/resumes/:resumeId/refresh-url (FIX G-03)
+// POST /api/v1/resumes/set-active — mark a resume as the active/primary one
+// NOTE: defined before /:resumeId routes to avoid being swallowed by the param.
+router.post('/set-active', setActiveResume);
+
+// POST /api/v1/resumes/:resumeId/refresh-url
 router.post('/:resumeId/refresh-url', refreshSignedUrl);
 
 // POST /api/v1/resumes/:resumeId/rescore
-// Triggers AI scoring for any pending/stuck resume — no plan gate.
-// Needed for onboarding-path resumes that were created without going through the
-// upload flow, so scoreResume() was never called or failed silently.
 router.post('/:resumeId/rescore', rescoreResume);
 
-// POST /api/v1/resumes/set-active — mark a resume as the active/primary one
-router.post('/set-active', setActiveResume);
-
 module.exports = router;
-
-
-
-
-
-
-
-

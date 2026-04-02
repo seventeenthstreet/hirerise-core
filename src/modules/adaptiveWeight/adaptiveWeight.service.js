@@ -1,4 +1,14 @@
-// adaptiveWeight.service.js
+'use strict';
+
+/**
+ * adaptiveWeight.service.js
+ *
+ * Production-grade Adaptive Learning Engine
+ * - Supabase-ready
+ * - Uses normalized weight utilities
+ * - Confidence-gated learning
+ * - Safe + stable updates
+ */
 
 const {
   DEFAULT_WEIGHTS,
@@ -6,53 +16,57 @@ const {
   WEIGHT_BOUNDS,
   CONFIDENCE,
   PERFORMANCE,
-  OUTCOME,
-} = require("./adaptiveWeight.constants");
+} = require('./adaptiveWeight.constants');
 
 const {
   validateWeightKey,
   validateOutcomePayload,
   validateManualOverride,
-} = require("./adaptiveWeight.validator");
+} = require('./adaptiveWeight.validator');
 
-const logger = require("../../utils/logger");
+const {
+  normalizeWeights,
+  ensureValidWeights,
+} = require('./adaptiveWeight.utils');
 
-/**
- * AdaptiveWeightService
- *
- * Stability-first adaptive reinforcement engine.
- * No external ML libs.
- * Conservative learning.
- * Confidence-gated application.
- */
+const logger = require('../../utils/logger');
+
 class AdaptiveWeightService {
   constructor({ adaptiveWeightRepo }) {
     this._repo = adaptiveWeightRepo;
   }
 
-  // ═══════════════════════════════════════════════════════════════════════════
-  // PUBLIC: WEIGHT RETRIEVAL
-  // ═══════════════════════════════════════════════════════════════════════════
+  // ═══════════════════════════════════════════════════════════
+  // 🎯 GET WEIGHTS (Controller-compatible)
+  // ═══════════════════════════════════════════════════════════
 
-  async getWeightsForScoring(roleFamily, experienceBucket, industryTag) {
+  async getWeightsForScoring({
+    roleFamily,
+    experienceBucket,
+    industryTag,
+    requestId,
+  }) {
     try {
       validateWeightKey({ roleFamily, experienceBucket, industryTag });
 
-      const record = await this._repo.findByKey(
+      const record = await this._repo.findByKey({
         roleFamily,
         experienceBucket,
-        industryTag
-      );
+        industryTag,
+      });
 
       if (!record) {
-        return this._defaultResponse("no_record");
+        return this._defaultResponse('no_record');
       }
 
-      // Manual override ALWAYS takes precedence
+      // Ensure DB safety
+      const safeWeights = ensureValidWeights(record.weights);
+
+      // Manual override priority
       if (record.manualOverride === true) {
         return {
-          weights: record.weights,
-          source: "adaptive",
+          weights: safeWeights,
+          source: 'adaptive',
           meta: {
             manualOverride: true,
             freezeLearning: true,
@@ -65,15 +79,15 @@ class AdaptiveWeightService {
 
       // Confidence gate
       if (
-        typeof record.confidenceScore !== "number" ||
+        typeof record.confidenceScore !== 'number' ||
         record.confidenceScore < CONFIDENCE.minimumToUse
       ) {
-        return this._defaultResponse("low_confidence");
+        return this._defaultResponse('low_confidence');
       }
 
       return {
-        weights: record.weights,
-        source: "adaptive",
+        weights: safeWeights,
+        source: 'adaptive',
         meta: {
           confidenceScore: record.confidenceScore,
           performanceScore: record.performanceScore,
@@ -82,54 +96,45 @@ class AdaptiveWeightService {
           manualOverride: false,
         },
       };
+
     } catch (err) {
-      if (err.name === "AdaptiveWeightValidationError") throw err;
-      logger.error(
-        "[AdaptiveWeight] getWeightsForScoring failed — using defaults",
-        { error: err.message }
-      );
-      return this._defaultResponse("service_error");
+      if (err.name === 'AdaptiveWeightValidationError') throw err;
+
+      logger.error('[AdaptiveWeightService:getWeightsForScoring]', {
+        requestId,
+        error: err.message,
+      });
+
+      return this._defaultResponse('service_error');
     }
   }
 
-  // ═══════════════════════════════════════════════════════════════════════════
-  // PUBLIC: RECORD OUTCOME + LEARN
-  // ═══════════════════════════════════════════════════════════════════════════
+  // ═══════════════════════════════════════════════════════════
+  // 📥 RECORD OUTCOME + LEARNING
+  // ═══════════════════════════════════════════════════════════
 
-  async recordOutcome({
-    roleFamily,
-    experienceBucket,
-    industryTag,
-    predictedScore,
-    actualOutcome,
-  }) {
-    validateOutcomePayload({
+  async recordOutcome(payload) {
+    const {
       roleFamily,
       experienceBucket,
       industryTag,
       predictedScore,
       actualOutcome,
-    });
+      requestId,
+    } = payload;
 
-    let record = await this._repo.findByKey(
+    validateOutcomePayload(payload);
+
+    let record = await this._repo.findByKey({
       roleFamily,
       experienceBucket,
-      industryTag
-    );
+      industryTag,
+    });
 
-    // Initialize if not exists
+    // Initialize
     if (!record) {
-      record = this._buildInitialRecord(
-        roleFamily,
-        experienceBucket,
-        industryTag
-      );
-      await this._repo.create(
-        roleFamily,
-        experienceBucket,
-        industryTag,
-        record
-      );
+      record = this._buildInitialRecord(payload);
+      await this._repo.upsert(record); // 🔥 Supabase style
     }
 
     // Freeze protection
@@ -142,66 +147,52 @@ class AdaptiveWeightService {
       };
     }
 
-    // ── Step 1: Prediction Error ─────────────────────────────────────────────
+    // ── Prediction Error
     const normalizedPrediction = predictedScore / 100;
     const predictionError = actualOutcome - normalizedPrediction;
 
     const learningRate =
       record.learningRate ?? DEFAULT_LEARNING_RATE;
 
-    const currentWeights =
-      record.weights && typeof record.weights === "object"
-        ? record.weights
-        : DEFAULT_WEIGHTS;
+    const currentWeights = ensureValidWeights(record.weights);
 
-    // ── Step 2 & 3: Apply Uniform Delta + Clamp ─────────────────────────────
+    // ── Apply delta
     const delta = learningRate * predictionError;
-    const updatedWeights = this._applyDeltaAndClamp(
-      currentWeights,
-      delta
-    );
+    const updatedWeights = this._applyDelta(currentWeights, delta);
 
-    // ── Step 4: Normalize ───────────────────────────────────────────────────
+    // 🔒 Normalize (CRITICAL FIX)
     const normalizedWeights = normalizeWeights(updatedWeights);
 
-    // ── Step 5: EMA Performance Score ───────────────────────────────────────
+    // ── Performance (EMA)
     const currentPerformance =
-      typeof record.performanceScore === "number"
-        ? record.performanceScore
-        : PERFORMANCE.initial;
+      record.performanceScore ?? PERFORMANCE.initial;
 
-    const predictionAccuracy = 1 - Math.abs(predictionError);
+    const accuracy = 1 - Math.abs(predictionError);
 
     const newPerformanceScore = parseFloat(
       (
-        PERFORMANCE.smoothingFactor * predictionAccuracy +
+        PERFORMANCE.smoothingFactor * accuracy +
         (1 - PERFORMANCE.smoothingFactor) * currentPerformance
       ).toFixed(4)
     );
 
-    // ── Step 6: Confidence Adjustment ───────────────────────────────────────
+    // ── Confidence
     const currentConfidence =
-      typeof record.confidenceScore === "number"
-        ? record.confidenceScore
-        : CONFIDENCE.initial;
+      record.confidenceScore ?? CONFIDENCE.initial;
 
     const newConfidenceScore = this._adjustConfidence(
       currentConfidence,
       newPerformanceScore
     );
 
-    const patch = {
+    const updatedRecord = {
+      ...record,
       weights: normalizedWeights,
       performanceScore: newPerformanceScore,
       confidenceScore: newConfidenceScore,
     };
 
-    await this._repo.update(
-      roleFamily,
-      experienceBucket,
-      industryTag,
-      patch
-    );
+    await this._repo.upsert(updatedRecord);
 
     return {
       updated: true,
@@ -211,94 +202,51 @@ class AdaptiveWeightService {
     };
   }
 
-  // ═══════════════════════════════════════════════════════════════════════════
-  // PUBLIC: MANUAL OVERRIDE
-  // ═══════════════════════════════════════════════════════════════════════════
+  // ═══════════════════════════════════════════════════════════
+  // 🛠️ MANUAL OVERRIDE
+  // ═══════════════════════════════════════════════════════════
 
-  async applyManualOverride({
-    roleFamily,
-    experienceBucket,
-    industryTag,
-    weights,
-  }) {
-    validateManualOverride({
-      roleFamily,
-      experienceBucket,
-      industryTag,
-      weights,
-    });
+  async applyManualOverride(payload) {
+    validateManualOverride(payload);
 
-    const normalized = normalizeWeights(weights);
+    const normalized = normalizeWeights(payload.weights);
 
-    const patch = {
+    const record = {
+      ...payload,
       weights: normalized,
       manualOverride: true,
       freezeLearning: true,
     };
 
-    const existing = await this._repo.findByKey(
-      roleFamily,
-      experienceBucket,
-      industryTag
-    );
-
-    if (!existing) {
-      const initial = this._buildInitialRecord(
-        roleFamily,
-        experienceBucket,
-        industryTag
-      );
-      await this._repo.create(
-        roleFamily,
-        experienceBucket,
-        industryTag,
-        { ...initial, ...patch }
-      );
-    } else {
-      await this._repo.update(
-        roleFamily,
-        experienceBucket,
-        industryTag,
-        patch
-      );
-    }
+    await this._repo.upsert(record);
 
     return { weights: normalized, manualOverride: true };
   }
 
-  async releaseManualOverride({
-    roleFamily,
-    experienceBucket,
-    industryTag,
-  }) {
-    validateWeightKey({ roleFamily, experienceBucket, industryTag });
+  async releaseManualOverride(payload) {
+    validateWeightKey(payload);
 
-    await this._repo.update(
-      roleFamily,
-      experienceBucket,
-      industryTag,
-      {
-        manualOverride: false,
-        freezeLearning: false,
-      }
-    );
+    await this._repo.update(payload, {
+      manualOverride: false,
+      freezeLearning: false,
+    });
 
     return { released: true };
   }
 
-  // ═══════════════════════════════════════════════════════════════════════════
-  // PRIVATE HELPERS
-  // ═══════════════════════════════════════════════════════════════════════════
+  // ═══════════════════════════════════════════════════════════
+  // 🔧 HELPERS
+  // ═══════════════════════════════════════════════════════════
 
   _defaultResponse(reason) {
     return {
       weights: { ...DEFAULT_WEIGHTS },
-      source: "default",
+      source: 'default',
       meta: { reason },
     };
   }
 
-  _buildInitialRecord(roleFamily, experienceBucket, industryTag) {
+  _buildInitialRecord({ roleFamily, experienceBucket, industryTag }) {
     return {
       roleFamily,
       experienceBucket,
@@ -313,11 +261,12 @@ class AdaptiveWeightService {
     };
   }
 
-  _applyDeltaAndClamp(weights, delta) {
+  _applyDelta(weights, delta) {
     const result = {};
 
-    for (const [key, value] of Object.entries(weights)) {
-      const nudged = value + delta;
+    for (const key of Object.keys(weights)) {
+      const nudged = weights[key] + delta;
+
       result[key] = Math.min(
         WEIGHT_BOUNDS.max,
         Math.max(WEIGHT_BOUNDS.min, nudged)
@@ -327,93 +276,19 @@ class AdaptiveWeightService {
     return result;
   }
 
-  _adjustConfidence(currentConfidence, newPerformanceScore) {
+  _adjustConfidence(currentConfidence, performance) {
     let updated;
 
-    if (newPerformanceScore > PERFORMANCE.degradationThreshold) {
+    if (performance > PERFORMANCE.degradationThreshold) {
       updated = currentConfidence + CONFIDENCE.incrementPerGood;
     } else {
       updated = currentConfidence - CONFIDENCE.decayPerBad;
     }
 
-    // 🔒 Never allow confidence to reach absolute zero
-    const MIN_CONFIDENCE_FLOOR = 0.01;
-
     return parseFloat(
-      Math.min(CONFIDENCE.cap, Math.max(MIN_CONFIDENCE_FLOOR, updated))
-        .toFixed(4)
+      Math.min(CONFIDENCE.cap, Math.max(0.01, updated)).toFixed(4)
     );
   }
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-// normalizeWeights Utility
-// ═══════════════════════════════════════════════════════════════════════════
-
-function normalizeWeights(weightsObj) {
-  if (
-    !weightsObj ||
-    typeof weightsObj !== "object" ||
-    Array.isArray(weightsObj)
-  ) {
-    throw new Error("normalizeWeights: input must be a plain object.");
-  }
-
-  const entries = Object.entries(weightsObj);
-
-  if (entries.length === 0) {
-    throw new Error("normalizeWeights: weights object must not be empty.");
-  }
-
-  for (const [key, value] of entries) {
-    if (typeof value !== "number" || isNaN(value) || value < 0) {
-      throw new Error(
-        `normalizeWeights: invalid value for key "${key}": ${value}`
-      );
-    }
-  }
-
-  const total = entries.reduce((sum, [, v]) => sum + v, 0);
-
-  if (total === 0) {
-    throw new Error(
-      "normalizeWeights: sum of weights is zero — cannot normalize."
-    );
-  }
-
-  const normalized = {};
-
-  for (const [key, value] of entries) {
-    normalized[key] = parseFloat((value / total).toFixed(6));
-  }
-
-  const normalizedSum = Object.values(normalized).reduce(
-    (s, v) => s + v,
-    0
-  );
-
-  const residual = parseFloat((1 - normalizedSum).toFixed(6));
-
-  if (residual !== 0) {
-    const largestKey = Object.entries(normalized).reduce(
-      (max, [k, v]) => (v > max[1] ? [k, v] : max),
-      ["", -Infinity]
-    )[0];
-
-    normalized[largestKey] = parseFloat(
-      (normalized[largestKey] + residual).toFixed(6)
-    );
-  }
-
-  return normalized;
-}
-
-module.exports = { AdaptiveWeightService, normalizeWeights };
-
-
-
-
-
-
-
-
+module.exports = AdaptiveWeightService;

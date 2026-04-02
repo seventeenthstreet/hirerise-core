@@ -1,6 +1,6 @@
 'use strict';
 
-const supabase = require('../../../config/supabase');
+const { supabase } = require('../../../config/supabase');
 
 const {
   COLLECTIONS,

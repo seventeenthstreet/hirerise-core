@@ -1,28 +1,8 @@
 'use strict';
 
 /**
- * graphIntelligence.routes.js
- *
- * Admin Graph Intelligence API — powers the Career Intelligence Control Center.
- *
- * Mounted in server.js:
- *   app.use(`${API_PREFIX}/admin/graph-intelligence`, authenticate, requireAdmin,
- *           require('./modules/admin/graph/graphIntelligence.routes'));
- *
- * ┌────────────────────────────────────────────────────────────────────────────────────────┐
- * │ Method │ Path                                          │ Description                   │
- * ├────────────────────────────────────────────────────────────────────────────────────────┤
- * │ GET    │ /career-graph                                 │ All roles + transitions        │
- * │ GET    │ /career-graph/roles/:roleId                   │ Role detail panel              │
- * │ GET    │ /skill-graph                                  │ All skills + relationships     │
- * │ GET    │ /skill-graph/skills/:skillId                  │ Skill detail panel             │
- * │ POST   │ /simulate-path                                │ Career path simulation         │
- * │ GET    │ /roles/search                                 │ Role search (autocomplete)     │
- * │ GET    │ /role-impact/:roleId                          │ Role impact analysis           │
- * └────────────────────────────────────────────────────────────────────────────────────────┘
- *
- * SECURITY: All routes require authenticate + requireAdmin.
- * Does NOT modify auth, Firebase rules, or Secret Manager.
+ * graphIntelligence.routes.js (Optimized)
+ * Firebase-free + Production-ready
  */
 
 const express = require('express');
@@ -30,55 +10,125 @@ const { param, query, body } = require('express-validator');
 const { validate } = require('../../../middleware/requestValidator');
 const ctrl = require('./graphIntelligence.controller');
 
+// OPTIONAL: plug your rate limiter here
+// const rateLimiter = require('../../../middleware/rateLimiter');
+
 const router = express.Router();
 
-// ── GET /career-graph ─────────────────────────────────────────────────────────
-router.get('/career-graph', ctrl.getCareerGraph);
+// ─────────────────────────────────────────────────────────────
+// CAREER GRAPH
+// ─────────────────────────────────────────────────────────────
 
-// ── GET /career-graph/roles/:roleId ──────────────────────────────────────────
-router.get('/career-graph/roles/:roleId',
+router.get(
+  '/career-graph',
+  // rateLimiter.admin, // optional
+  ctrl.getCareerGraph
+);
+
+// ─────────────────────────────────────────────────────────────
+// ROLE DETAIL
+// ─────────────────────────────────────────────────────────────
+
+router.get(
+  '/career-graph/roles/:roleId',
   validate([
-    param('roleId').isString().trim().notEmpty().isLength({ max: 100 }),
+    param('roleId')
+      .isString().trim().notEmpty()
+      .isLength({ max: 100 })
+      .withMessage('Invalid roleId'),
   ]),
   ctrl.getRoleDetail
 );
 
-// ── GET /skill-graph ──────────────────────────────────────────────────────────
-router.get('/skill-graph', ctrl.getSkillGraph);
+// ─────────────────────────────────────────────────────────────
+// SKILL GRAPH
+// ─────────────────────────────────────────────────────────────
 
-// ── GET /skill-graph/skills/:skillId ─────────────────────────────────────────
-router.get('/skill-graph/skills/:skillId',
+router.get(
+  '/skill-graph',
+  // rateLimiter.admin,
+  ctrl.getSkillGraph
+);
+
+// ─────────────────────────────────────────────────────────────
+// SKILL DETAIL
+// ─────────────────────────────────────────────────────────────
+
+router.get(
+  '/skill-graph/skills/:skillId',
   validate([
-    param('skillId').isString().trim().notEmpty().isLength({ max: 100 }),
+    param('skillId')
+      .isString().trim().notEmpty()
+      .isLength({ max: 100 })
+      .withMessage('Invalid skillId'),
   ]),
   ctrl.getSkillDetail
 );
 
-// ── POST /simulate-path ───────────────────────────────────────────────────────
-router.post('/simulate-path',
+// ─────────────────────────────────────────────────────────────
+// SIMULATE PATH
+// ─────────────────────────────────────────────────────────────
+
+router.post(
+  '/simulate-path',
   validate([
-    body('current_role_id').isString().trim().notEmpty().withMessage('current_role_id is required'),
-    body('target_role_id').isString().trim().notEmpty().withMessage('target_role_id is required'),
-    body('max_hops').optional().isInt({ min: 1, max: 8 }).toInt(),
+    body('current_role_id')
+      .isString().trim().notEmpty()
+      .withMessage('current_role_id is required'),
+
+    body('target_role_id')
+      .isString().trim().notEmpty()
+      .withMessage('target_role_id is required'),
+
+    body('max_hops')
+      .optional()
+      .isInt({ min: 1, max: 8 })
+      .withMessage('max_hops must be between 1 and 8')
+      .toInt(),
   ]),
   ctrl.simulatePath
 );
 
-// ── GET /roles/search ─────────────────────────────────────────────────────────
-router.get('/roles/search',
+// ─────────────────────────────────────────────────────────────
+// ROLE SEARCH
+// ─────────────────────────────────────────────────────────────
+
+router.get(
+  '/roles/search',
   validate([
-    query('q').optional().isString().trim().isLength({ max: 100 }),
-    query('limit').optional().isInt({ min: 1, max: 50 }).toInt(),
+    query('q')
+      .optional()
+      .isString()
+      .trim()
+      .isLength({ max: 100 })
+      .withMessage('Search query too long'),
+
+    query('limit')
+      .optional()
+      .isInt({ min: 1, max: 50 })
+      .withMessage('Limit must be between 1 and 50')
+      .toInt(),
   ]),
   ctrl.searchRoles
 );
 
-// ── GET /role-impact/:roleId ──────────────────────────────────────────────────
-router.get('/role-impact/:roleId',
+// ─────────────────────────────────────────────────────────────
+// ROLE IMPACT
+// ─────────────────────────────────────────────────────────────
+
+router.get(
+  '/role-impact/:roleId',
   validate([
-    param('roleId').isString().trim().notEmpty().isLength({ max: 100 }),
+    param('roleId')
+      .isString()
+      .trim()
+      .notEmpty()
+      .isLength({ max: 100 })
+      .withMessage('Invalid roleId'),
   ]),
   ctrl.getRoleImpact
 );
+
+// ─────────────────────────────────────────────────────────────
 
 module.exports = router;

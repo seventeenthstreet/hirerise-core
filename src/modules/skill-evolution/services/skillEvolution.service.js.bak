@@ -12,7 +12,7 @@
  *   - Provide a read path for the API controller
  */
 
-const logger          = require('../../../utils/logger');
+const logger          = require('../../../../utils/logger');
 const { db }          = require('../../../config/supabase');
 const { FieldValue } = require('../../../config/supabase');
 const skillEngine     = require('../engines/skillRecommendation.engine');

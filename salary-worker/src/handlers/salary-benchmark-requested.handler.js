@@ -5,28 +5,50 @@ import { resolveEngine } from '../../../shared/engine-versions/index.js';
 import { SalaryBenchmarkEngineV1 } from '../engines/salary-benchmark-v1.engine.js';
 
 const ENGINE_MAP = {
-  'salary_bench_v1.0': SalaryBenchmarkEngineV1,
+  'salary_bench_v1.1': SalaryBenchmarkEngineV1,
 };
 
 const ENGINE_VERSION =
-  process.env.SALARY_ENGINE_VERSION ?? 'salary_bench_v1.0';
+  process.env.SALARY_ENGINE_VERSION ?? 'salary_bench_v1.1';
 
-export async function handleSalaryBenchmarkRequested(envelope, message) {
+export async function handleSalaryBenchmarkRequested(envelope, message = {}) {
 
-  const { payload } = envelope;
-  const { userId, jobId, jobTitle, location, yearsExperience, industry } = payload;
+  // ─────────────────────────────────────────────
+  // Safe payload extraction
+  // ─────────────────────────────────────────────
+
+  const payload = envelope?.payload ?? {};
+  const {
+    userId,
+    jobId,
+    jobTitle,
+    location,
+    yearsExperience,
+    industry,
+  } = payload;
 
   const childLogger = logger.child({
     handler: 'handleSalaryBenchmarkRequested',
     userId,
     jobId,
     engineVersion: ENGINE_VERSION,
-    deliveryAttempt: message.deliveryAttempt,
+    deliveryAttempt: message?.deliveryAttempt ?? 1,
   });
 
-  // ─────────────────────────────────────────────────────────────
-  // Claim Job (Sharded Repository)
-  // ─────────────────────────────────────────────────────────────
+  // ─────────────────────────────────────────────
+  // Basic validation (lightweight)
+  // ─────────────────────────────────────────────
+
+  if (!userId || !jobId) {
+    childLogger.error('Invalid payload — missing required fields', {
+      payload,
+    });
+    return;
+  }
+
+  // ─────────────────────────────────────────────
+  // Claim Job
+  // ─────────────────────────────────────────────
 
   const { claimed, status } =
     await jobRepo.claimJob(jobId, process.env.SERVICE_NAME);
@@ -40,6 +62,10 @@ export async function handleSalaryBenchmarkRequested(envelope, message) {
 
   try {
 
+    // ─────────────────────────────────────────
+    // Run Engine
+    // ─────────────────────────────────────────
+
     const engine = resolveEngine(ENGINE_VERSION, ENGINE_MAP);
 
     const result = await engine.benchmark({
@@ -49,15 +75,15 @@ export async function handleSalaryBenchmarkRequested(envelope, message) {
       industry,
     });
 
-    // ─────────────────────────────────────────────────────────
-    // Persist Job Result
-    // ─────────────────────────────────────────────────────────
+    // ─────────────────────────────────────────
+    // Persist Result
+    // ─────────────────────────────────────────
 
     await jobRepo.completeJob(jobId, result);
 
-    // ─────────────────────────────────────────────────────────
-    // Emit Notification Event
-    // ─────────────────────────────────────────────────────────
+    // ─────────────────────────────────────────
+    // Emit Notification
+    // ─────────────────────────────────────────
 
     await publishEvent(
       process.env.PUBSUB_NOTIFICATION_TOPIC,
@@ -78,14 +104,19 @@ export async function handleSalaryBenchmarkRequested(envelope, message) {
 
   } catch (err) {
 
-    childLogger.error('Salary benchmark failed', { err });
+    // ✅ Proper error logging (FIXED)
+    childLogger.error('Salary benchmark failed', {
+      message: err?.message,
+      code: err?.code,
+      stack: err?.stack,
+    });
 
     await jobRepo.failJob(
       jobId,
-      err.code ?? 'SALARY_ERROR',
-      err.message,
+      err?.code ?? 'SALARY_ERROR',
+      err?.message ?? 'Unknown error',
     );
 
-    throw err; // nack for retry/DLQ
+    throw err; // allow retry / DLQ
   }
 }

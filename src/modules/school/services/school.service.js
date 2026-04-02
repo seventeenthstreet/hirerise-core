@@ -2,7 +2,7 @@
 
 const { v4: uuidv4 } = require('uuid');
 const logger = require('../../../utils/logger');
-const supabase = require('../../../config/supabase');
+const { supabase } = require('../../../config/supabase');
 const { createClient } = require('@supabase/supabase-js');
 
 const schoolRepo = require('../repositories/school.repository');

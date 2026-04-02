@@ -1,17 +1,7 @@
 'use strict';
 
 /**
- * adminCmsRoles.service.js — Admin CMS Roles Business Logic
- *
- * Duplicate check uses the composite key:
- *   normalizeForComposite(name, jobFamilyId)  → "director::engineering"
- *
- * This allows:
- *   ✓ "Director" in Engineering
- *   ✓ "Director" in Product (different family — different composite key)
- *   ✗ "Director" and "director" both in Engineering (same normalized composite key)
- *
- * @module modules/admin/cms/roles/adminCmsRoles.service
+ * adminCmsRoles.service.js — Supabase Optimized Version
  */
 
 const rolesRepo  = require('./adminCmsRoles.repository');
@@ -19,97 +9,116 @@ const { normalizeForComposite } = require('../../../../shared/utils/normalizeTex
 const { DuplicateError }        = require('../../../../shared/errors/duplicate.error');
 const logger                    = require('../../../../utils/logger');
 
+// ─────────────────────────────────────────────
+// CREATE ROLE
+// ─────────────────────────────────────────────
 async function createRole(payload, adminId, agency = null) {
   const { name, jobFamilyId, level, track, description, alternativeTitles } = payload;
 
-  // ── Composite duplicate check ────────────────────────────────────────────
   const compositeKey = normalizeForComposite(name, jobFamilyId);
-  const existing     = await rolesRepo.findByCompositeKey(compositeKey);
 
-  if (existing) {
-    logger.warn('[AdminCmsRoles] Duplicate attempt blocked', {
-      event:        'duplicate_attempt',
-      dataset_type: 'roles',
-      dataset_value: name,
-      job_family_id: jobFamilyId,
-      composite_key: compositeKey,
-      admin_id:     adminId,
-      existing_id:  existing.id,
-      timestamp:    new Date().toISOString(),
+  try {
+    const created = await rolesRepo.createRole(
+      {
+        name: name.trim(),
+        jobFamilyId,
+        level,
+        track,
+        description,
+        alternativeTitles,
+        compositeKey, // 🔥 store in DB for fast lookup
+      },
+      adminId,
+      agency
+    );
+
+    logger.info('[AdminCmsRoles] Role created', {
+      roleId: created.id,
+      name: created.name,
+      family: jobFamilyId,
+      admin_id: adminId,
     });
 
-    throw new DuplicateError('roles', name, existing.id, {
-      compositeKey,
-      jobFamilyId,
-      field: 'name + jobFamilyId',
-    });
+    return created;
+
+  } catch (err) {
+    // 🔥 Handle DB-level unique constraint (Supabase/Postgres)
+    if (err.code === '23505') {
+      logger.warn('[AdminCmsRoles] Duplicate blocked (DB constraint)', {
+        compositeKey,
+        admin_id: adminId,
+      });
+
+      throw new DuplicateError('roles', name, null, {
+        compositeKey,
+        jobFamilyId,
+        source: 'database_constraint',
+      });
+    }
+
+    throw err;
+  }
+}
+
+// ─────────────────────────────────────────────
+// UPDATE ROLE
+// ─────────────────────────────────────────────
+async function updateRole(roleId, updates, adminId) {
+  const current = await rolesRepo.findById(roleId);
+
+  if (!current) {
+    const { AppError, ErrorCodes } = require('../../../../middleware/errorHandler');
+    throw new AppError('Role not found', 404, { roleId }, ErrorCodes.NOT_FOUND);
   }
 
-  const created = await rolesRepo.createRole(
-    { name, jobFamilyId, level, track, description, alternativeTitles },
-    adminId,
-    agency
-  );
+  let compositeKey = null;
 
-  logger.info('[AdminCmsRoles] Role created', {
-    roleId:    created.id,
-    name:      created.name,
-    family:    jobFamilyId,
-    admin_id:  adminId,
+  if (updates.name || updates.jobFamilyId) {
+    const newName     = updates.name || current.name;
+    const newFamilyId = updates.jobFamilyId || current.jobFamilyId;
+
+    compositeKey = normalizeForComposite(newName, newFamilyId);
+    updates.compositeKey = compositeKey;
+  }
+
+  try {
+    return await rolesRepo.updateRole(roleId, updates, adminId);
+
+  } catch (err) {
+    if (err.code === '23505') {
+      logger.warn('[AdminCmsRoles] Duplicate on update blocked', {
+        roleId,
+        compositeKey,
+        admin_id: adminId,
+      });
+
+      throw new DuplicateError('roles', updates.name || current.name, null, {
+        compositeKey,
+        source: 'database_constraint',
+      });
+    }
+
+    throw err;
+  }
+}
+
+// ─────────────────────────────────────────────
+// LIST ROLES (SUPABASE STYLE)
+// ─────────────────────────────────────────────
+async function listRoles({ limit = 100, jobFamilyId } = {}) {
+  const result = await rolesRepo.listRoles({
+    limit,
+    jobFamilyId,
   });
 
-  return created;
+  return {
+    roles: result.data,
+    total: result.count,
+  };
 }
 
-async function updateRole(roleId, updates, adminId) {
-  // If name or family changes, re-check for duplicate composite key
-  if (updates.name || updates.jobFamilyId) {
-    const current = await rolesRepo.findById(roleId);
-    if (!current) {
-      const { AppError, ErrorCodes } = require('../../../../middleware/errorHandler');
-      throw new AppError('Role not found', 404, { roleId }, ErrorCodes.NOT_FOUND);
-    }
-
-    const newName     = updates.name      || current.name;
-    const newFamilyId = updates.jobFamilyId || current.jobFamilyId;
-    const newKey      = normalizeForComposite(newName, newFamilyId);
-    const existing    = await rolesRepo.findByCompositeKey(newKey);
-
-    if (existing && existing.id !== roleId) {
-      logger.warn('[AdminCmsRoles] Duplicate name on update blocked', {
-        event:        'duplicate_attempt',
-        dataset_type: 'roles',
-        dataset_value: newName,
-        admin_id:     adminId,
-        existing_id:  existing.id,
-        timestamp:    new Date().toISOString(),
-      });
-
-      throw new DuplicateError('roles', newName, existing.id, {
-        compositeKey:  newKey,
-        jobFamilyId:   newFamilyId,
-      });
-    }
-  }
-
-  return await rolesRepo.updateRole(roleId, updates, adminId);
-}
-
-async function listRoles({ limit = 100, jobFamilyId } = {}) {
-  const filters = [];
-  if (jobFamilyId) {
-    filters.push({ field: 'jobFamilyId', op: '==', value: jobFamilyId });
-  }
-  const result = await rolesRepo.find(filters, { limit });
-  return { roles: result.docs, total: result.count };
-}
-
-module.exports = { createRole, updateRole, listRoles };
-
-
-
-
-
-
-
-
+module.exports = {
+  createRole,
+  updateRole,
+  listRoles,
+};

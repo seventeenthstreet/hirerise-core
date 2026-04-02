@@ -8,7 +8,7 @@ const lockService  = require('../core/infrastructure/locking/lock.service');
 const cacheManager = require('../core/cache/cache.manager');
 const logger       = require('../utils/logger');
 
-const supabase = require('../config/supabase');
+const { supabase } = require('../config/supabase');
 
 const cache = cacheManager.getClient();
 

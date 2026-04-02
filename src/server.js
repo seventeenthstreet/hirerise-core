@@ -69,6 +69,9 @@ const cors        = require('cors');
 const morgan      = require('morgan');
 const rateLimit   = require('express-rate-limit');
 
+// Config
+const { connectRedis } = require('./config/redisClient');
+
 // Utilities
 const logger = require('./utils/logger');
 
@@ -1006,6 +1009,11 @@ app.use(`${API_PREFIX}/career`, authenticate, require('./modules/career-digital-
 app.use(notFoundHandler);
 app.use(errorHandler);
 
+// ── Redis Connection ──────────────────────────────────────────────────────────
+(async () => {
+  await connectRedis();
+})();
+
 // B-05 FIX: Gotenberg health check on startup.
 // If GOTENBERG_URL is set (production), verify it is reachable before accepting traffic.
 // Fails fast at boot rather than at the first PDF generation request.
@@ -1024,22 +1032,31 @@ if (process.env.GOTENBERG_URL && process.env.NODE_ENV !== 'test') {
   })();
 }
 
+// ── Worker Registry ───────────────────────────────────────────────────────────
+// Shutdown functions are registered here as workers boot.
+// gracefulShutdown() drains all workers in one coordinated pass.
+// Using an array (not scattered process.on calls) prevents listener stacking
+// on hot reloads and ensures correct sequencing: workers stop before HTTP closes.
+const workerShutdownTasks = [];
+
 // ── AI Event Bus Workers ──────────────────────────────────────────────────────
 // Start BullMQ workers when event bus is enabled.
 // Workers process AI engine jobs asynchronously (SkillGraph, CareerHealth,
 // JobMatching, RiskAnalysis, OpportunityRadar, CareerAdvisor, Personalization).
 if (process.env.FEATURE_EVENT_BUS === 'true') {
   try {
-    const { startAll, stopAll } = require('./modules/ai-event-bus/workers');
+    const { startAll, stopAll }   = require('./modules/ai-event-bus/workers');
+    const { closeAllQueues }      = require('./modules/ai-event-bus/bus/aiEventBus');
     startAll();
     logger.info('[Server] AI Event Bus workers started');
 
-    process.on('SIGTERM', async () => {
-      logger.info('[Server] Stopping AI Event Bus workers...');
-      await stopAll().catch(() => {});
-      const { closeAllQueues } = require('./modules/ai-event-bus/bus/aiEventBus');
-      await closeAllQueues().catch(() => {});
-    });
+    // Register shutdown tasks — executed by gracefulShutdown() below
+    workerShutdownTasks.push(
+      () => stopAll().catch((err) =>
+        logger.warn('[Server] AI Event Bus stopAll error', { err: err.message })),
+      () => closeAllQueues().catch((err) =>
+        logger.warn('[Server] AI Event Bus closeAllQueues error', { err: err.message })),
+    );
   } catch (err) {
     logger.warn('[Server] AI Event Bus workers failed to start (non-fatal)', { err: err.message });
   }
@@ -1057,9 +1074,10 @@ if (process.env.FEATURE_PERSONALIZATION === 'true') {
     startPersonalizationHook();
     logger.info('[Server] Personalization worker started');
 
-    process.on('SIGTERM', async () => {
-      await personalizationWorkerInstance.stop().catch(() => {});
-    });
+    workerShutdownTasks.push(
+      () => personalizationWorkerInstance.stop().catch((err) =>
+        logger.warn('[Server] Personalization worker stop error', { err: err.message })),
+    );
   } catch (err) {
     logger.warn('[Server] Personalization worker failed to start (non-fatal)', { err: err.message });
   }
@@ -1075,9 +1093,10 @@ if (process.env.RUN_ENGAGEMENT_WORKER === 'true') {
     startEngagementWorker();
     logger.info('[Server] Daily engagement worker started');
 
-    process.on('SIGTERM', async () => {
-      await stopEngagementWorker().catch(() => {});
-    });
+    workerShutdownTasks.push(
+      () => stopEngagementWorker().catch((err) =>
+        logger.warn('[Server] Engagement worker stop error', { err: err.message })),
+    );
   } catch (err) {
     logger.warn('[Server] Daily engagement worker failed to start (non-fatal)', { err: err.message });
   }
@@ -1100,23 +1119,41 @@ if (process.env.NODE_ENV !== 'test') {
     }
   });
 
-  const gracefulShutdown = (signal) => {
+  // ── Consolidated Graceful Shutdown ──────────────────────────────────────────
+  // Single async shutdown sequence — registered once each for SIGTERM + SIGINT.
+  //
+  // Order:
+  //   1. Stop all BullMQ workers + close queue connections (parallel)
+  //   2. Close HTTP server (stops accepting new requests, drains in-flight)
+  //
+  // process.once prevents duplicate listener registration on hot reloads.
+  // Promise.allSettled ensures every task runs even if one throws.
+  const gracefulShutdown = async (signal) => {
     logger.info(`[Server] ${signal} received — shutting down gracefully...`);
-    if (server) server.close(() => logger.info('[Server] HTTP server closed.'));
+
+    // Step 1: drain all workers in parallel
+    if (workerShutdownTasks.length > 0) {
+      logger.info(`[Server] Stopping ${workerShutdownTasks.length} worker(s)...`);
+      await Promise.allSettled(workerShutdownTasks.map((task) => task()));
+      logger.info('[Server] All workers stopped.');
+    }
+
+    // Step 2: stop accepting new HTTP requests
+    if (server) {
+      await new Promise((resolve) => server.close(() => {
+        logger.info('[Server] HTTP server closed.');
+        resolve();
+      }));
+    }
+
+    process.exit(0);
   };
 
-  process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
-  process.on('SIGINT',  () => gracefulShutdown('SIGINT'));
+  // process.once — safe against duplicate registration (PM2 cluster, hot reload)
+  process.once('SIGTERM', () => gracefulShutdown('SIGTERM'));
+  process.once('SIGINT',  () => gracefulShutdown('SIGINT'));
   process.on('unhandledRejection', (reason) => logger.error('[Server] Unhandled Promise Rejection:', reason));
   process.on('uncaughtException',  (err)    => logger.error('[Server] Uncaught Exception:', err));
 }
 
 module.exports = app;
-
-
-
-
-
-
-
-

@@ -1,115 +1,144 @@
 'use strict';
 
-/**
- * circuitBreaker.registry.js — PHASE 1: Circuit Breaker Registry
- *
- * PROBLEM FIXED:
- *   The CircuitBreakerService exists but is only used in select places.
- *   AI calls in careerHealthIndex.service.js, resumeScore.service.js, and others
- *   call the Anthropic client directly without any circuit breaker protection.
- *   An Anthropic outage causes these endpoints to hang for 30s (TCP timeout)
- *   before failing, tying up all server connections.
- *
- * SOLUTION:
- *   A named-instance registry that any module can import to get the circuit
- *   breaker for a specific AI feature. All AI service calls must go through
- *   the registry.
- *
- *   Usage:
- *     const registry = require('./circuitBreaker.registry');
- *     const result = await registry.execute('chi-calculation', async (model) => {
- *       return anthropic.messages.create({ model, ... });
- *     });
- *
- * REGISTRY FEATURES:
- *   - Named circuit per feature (state isolated between features)
- *   - Automatic model selection from MODEL_REGISTRY
- *   - Fallback chain execution on primary failure
- *   - Status API for admin observability endpoint
- *
- * MULTI-REPLICA NOTE:
- *   The CircuitBreakerService stores state in-process (Map). In a multi-replica
- *   deployment, each replica has independent state — a failing primary won't
- *   trip all replicas. Phase 4 will migrate state to Redis for global circuit
- *   coordination. For Phase 1, in-process state is sufficient and correct.
- */
-
 const circuitBreaker = require('../ai/circuit-breaker/circuit-breaker.service');
 const modelRegistry  = require('../ai/circuit-breaker/model-registry');
 const logger         = require('../utils/logger');
 
-/**
- * Execute an AI function with full circuit breaker protection.
- *
- * @param {string}   feature     — matches MODEL_REGISTRY keys:
- *                                 'resume_scoring' | 'salary_benchmark' |
- *                                 'skill_recommendation' | 'career_path'
- * @param {Function} fn          — async (modelId: string) => result
- *                                 Receives the model to use (may be fallback)
- * @returns {Promise<*>} AI result
- * @throws if all models fail
- */
-async function execute(feature, fn) {
+const { withAiConcurrency } = require('../core/aiConcurrency');
+
+// ─────────────────────────────────────────────
+// Config
+// ─────────────────────────────────────────────
+
+const EXECUTION_TIMEOUT_MS = parseInt(
+  process.env.AI_EXECUTION_TIMEOUT_MS || '15000',
+  10
+);
+
+// ─────────────────────────────────────────────
+// Helpers
+// ─────────────────────────────────────────────
+
+function validateFeature(feature) {
+  const available = Object.values(module.exports.FEATURES);
+
+  if (!available.includes(feature)) {
+    throw new Error(`Invalid feature: ${feature}`);
+  }
+}
+
+async function withTimeout(fn) {
+  return Promise.race([
+    fn(),
+    new Promise((_, reject) =>
+      setTimeout(() => reject(new Error('AI_TIMEOUT')), EXECUTION_TIMEOUT_MS)
+    ),
+  ]);
+}
+
+// ─────────────────────────────────────────────
+// Main Execution
+// ─────────────────────────────────────────────
+
+async function execute(feature, fn, { userId = 'system' } = {}) {
+  validateFeature(feature);
+
   const primary   = modelRegistry.getPrimary(feature);
   const fallbacks = modelRegistry.getFallbacks(feature);
 
+  const start = Date.now();
+
   try {
-    return await circuitBreaker.execute(feature, primary, fallbacks, fn);
-  } catch (err) {
-    logger.error('[CircuitBreakerRegistry] All models exhausted for feature', {
-      feature, primary, fallbacks, err: err.message,
+    const result = await withAiConcurrency(feature, userId, async () => {
+      return await circuitBreaker.execute(feature, primary, fallbacks, async (model) => {
+        const modelStart = Date.now();
+
+        try {
+          const res = await withTimeout(() => fn(model));
+
+          logger.debug('[CircuitBreakerRegistry] Model success', {
+            feature,
+            model,
+            latencyMs: Date.now() - modelStart,
+          });
+
+          return res;
+
+        } catch (err) {
+          logger.warn('[CircuitBreakerRegistry] Model failed', {
+            feature,
+            model,
+            latencyMs: Date.now() - modelStart,
+            error: err.message,
+          });
+
+          throw err;
+        }
+      });
     });
+
+    logger.info('[CircuitBreakerRegistry] Execution success', {
+      feature,
+      totalLatencyMs: Date.now() - start,
+    });
+
+    return result;
+
+  } catch (err) {
+    logger.error('[CircuitBreakerRegistry] All models exhausted', {
+      feature,
+      primary,
+      fallbacks,
+      totalLatencyMs: Date.now() - start,
+      error: err.message,
+    });
+
     throw err;
   }
 }
 
-/**
- * Get the current circuit state for a feature.
- * @param {string} feature
- */
+// ─────────────────────────────────────────────
+// Status APIs
+// ─────────────────────────────────────────────
+
 function getStatus(feature) {
   return circuitBreaker.getCircuitStatus(feature);
 }
 
-/**
- * Get all circuit statuses (for admin monitoring endpoint).
- */
 function getAllStatuses() {
   return circuitBreaker.getAllStatuses();
 }
 
-/**
- * Manually trip a circuit (for testing or emergency use).
- * @param {string} feature
- * @param {string} currentModel
- * @param {string} fallbackModel
- */
 async function tripManually(feature, currentModel, fallbackModel) {
-  logger.warn('[CircuitBreakerRegistry] Manual circuit trip triggered', {
-    feature, currentModel, fallbackModel,
+  logger.warn('[CircuitBreakerRegistry] Manual trip', {
+    feature,
+    currentModel,
+    fallbackModel,
   });
+
   await circuitBreaker.tripFromDrift(feature, currentModel, fallbackModel);
 }
+
+// ─────────────────────────────────────────────
+// Feature Constants
+// ─────────────────────────────────────────────
+
+const FEATURES = Object.freeze({
+  RESUME_SCORING:       'resume_scoring',
+  SALARY_BENCHMARK:     'salary_benchmark',
+  SKILL_RECOMMENDATION: 'skill_recommendation',
+  CAREER_PATH:          'career_path',
+  CHI_CALCULATION:      'chi_calculation',
+});
+
+// ─────────────────────────────────────────────
+// Exports
+// ─────────────────────────────────────────────
 
 module.exports = {
   execute,
   getStatus,
   getAllStatuses,
   tripManually,
-  // Feature name constants to avoid typos
-  FEATURES: Object.freeze({
-    RESUME_SCORING:       'resume_scoring',
-    SALARY_BENCHMARK:     'salary_benchmark',
-    SKILL_RECOMMENDATION: 'skill_recommendation',
-    CAREER_PATH:          'career_path',
-    CHI_CALCULATION:      'chi_calculation',  // New feature added here
-  }),
+  FEATURES,
 };
-
-
-
-
-
-
-
-

@@ -1,45 +1,12 @@
 'use strict';
 
-/**
- * controllers/careerPrediction.controller.js
- *
- * HTTP handler for the Career Success Probability Engine endpoint.
- *
- * Endpoint:
- *   POST /api/v1/education/career-prediction/:studentId
- *
- * Flow:
- *   1. Auth guard  — student may only query their own profile (admin override)
- *   2. Fetch student + cognitive data
- *   3. Run CareerSuccessEngine
- *   4. Persist predictions to edu_career_predictions
- *   5. Return ranked top_careers
- *
- * Response 200:
- * {
- *   success: true,
- *   data: {
- *     top_careers: [
- *       { career: "Software Engineer", probability: 82 },
- *       ...
- *     ]
- *   }
- * }
- */
-const {
-  db
-} = require('../../../config/supabase');
-const {
-  FieldValue
-} = require('../../../config/supabase');
+const { supabase } = require('../../../config/supabase');
 const logger = require('../../../utils/logger');
 const repository = require('../repositories/student.repository');
 const CareerSuccessEngine = require('../engines/careerSuccess.engine');
-const {
-  COLLECTIONS
-} = require('../models/student.model');
+const { COLLECTIONS } = require('../models/student.model');
 
-// ─── POST /api/v1/education/career-prediction/:studentId ──────────────────────
+// ─── POST ─────────────────────────────────────────────────────────────────────
 
 async function predictCareers(req, res, next) {
   try {
@@ -63,106 +30,132 @@ async function predictCareers(req, res, next) {
         message: 'studentId path parameter must be a non-empty string.'
       });
     }
-    logger.info({
-      studentId,
-      requestingUid
-    }, '[CareerPredictionController] Prediction requested');
 
-    // ── Fetch student profile & cognitive data ─────────────────────────────
-    const [student, cognitive, streamScores] = await Promise.all([repository.getStudent(studentId), repository.getCognitive(studentId), repository.getStreamScores(studentId)]);
+    logger.info({ studentId, requestingUid }, '[CareerPrediction] Requested');
+
+    // ── Fetch data ─────────────────────────────────────────────────────────
+    const [student, cognitive, streamScores] = await Promise.all([
+      repository.getStudent(studentId),
+      repository.getCognitive(studentId),
+      repository.getStreamScores(studentId)
+    ]);
+
     if (!student) {
       return res.status(404).json({
         success: false,
         errorCode: 'STUDENT_NOT_FOUND',
-        message: 'Student profile not found. Complete onboarding first.'
+        message: 'Student profile not found.'
       });
     }
+
     if (!cognitive) {
       return res.status(422).json({
         success: false,
         errorCode: 'COGNITIVE_MISSING',
-        message: 'Cognitive assessment not completed. Please finish the cognitive test first.'
+        message: 'Complete cognitive test first.'
       });
     }
 
-    // Determine recommended stream (from previous analysis, or default)
-    const recommendedStream = streamScores?.recommended_stream ?? 'engineering';
+    const recommendedStream =
+      streamScores?.recommended_stream ?? 'engineering';
 
-    // ── Run Career Success Engine ──────────────────────────────────────────
-    const context = {
-      studentId,
-      student,
-      cognitive
-    };
-    const result = await CareerSuccessEngine.analyze(context, recommendedStream);
+    // ── Run engine ─────────────────────────────────────────────────────────
+    const context = { studentId, student, cognitive };
 
-    // ── Persist predictions (replace previous batch) ──────────────────────
-    // Delete existing predictions for this student first
-    const existingSnap = await supabase.from(COLLECTIONS.CAREER_PREDICTIONS).select("*").eq('student_id', studentId);
-    const batch = db.batch();
-    existingSnap.docs.forEach(doc => batch.delete(doc.ref));
-    for (const item of result.top_careers) {
-      // TODO: MANUAL MIGRATION REQUIRED — unrecognised chain: collection.doc
-      const ref = db.collection(COLLECTIONS.CAREER_PREDICTIONS).doc();
-      batch.set(ref, {
-        student_id: studentId,
-        career_name: item.career,
-        success_probability: item.probability,
-        created_at: FieldValue.serverTimestamp()
-      });
-    }
-    await batch.commit();
+    const result = await CareerSuccessEngine.analyze(
+      context,
+      recommendedStream
+    );
+
+    const now = new Date().toISOString();
+
+    // ── Delete existing predictions ────────────────────────────────────────
+    const { error: deleteError } = await supabase
+      .from(COLLECTIONS.CAREER_PREDICTIONS)
+      .delete()
+      .eq('student_id', studentId);
+
+    if (deleteError) throw deleteError;
+
+    // ── Insert new predictions ─────────────────────────────────────────────
+    const rows = result.top_careers.map(item => ({
+      student_id: studentId,
+      career_name: item.career,
+      success_probability: item.probability,
+      created_at: now
+    }));
+
+    const { error: insertError } = await supabase
+      .from(COLLECTIONS.CAREER_PREDICTIONS)
+      .insert(rows);
+
+    if (insertError) throw insertError;
+
     logger.info({
       studentId,
-      count: result.top_careers.length
-    }, '[CareerPredictionController] Predictions stored');
+      count: rows.length
+    }, '[CareerPrediction] Stored');
+
     return res.status(200).json({
       success: true,
       data: {
         top_careers: result.top_careers
       }
     });
+
   } catch (err) {
     next(err);
   }
 }
 
-// ─── GET /api/v1/education/career-prediction/:studentId ───────────────────────
+// ─── GET ──────────────────────────────────────────────────────────────────────
 
 async function getCareers(req, res, next) {
   try {
     const requestingUid = req.user.uid;
     const studentId = req.params.studentId;
+
     if (requestingUid !== studentId && !req.user.admin) {
       return res.status(403).json({
         success: false,
         errorCode: 'FORBIDDEN',
-        message: 'You may only view your own career predictions.'
+        message: 'You may only view your own predictions.'
       });
     }
-    // TODO: MANUAL MIGRATION REQUIRED — .orderBy()/.limit() chains need manual port
-    const snap = await db.collection(COLLECTIONS.CAREER_PREDICTIONS).where('student_id', '==', studentId).orderBy('success_probability', 'desc').get();
-    if (snap.empty) {
+
+    const { data, error } = await supabase
+      .from(COLLECTIONS.CAREER_PREDICTIONS)
+      .select('career_name, success_probability')
+      .eq('student_id', studentId)
+      .order('success_probability', { ascending: false });
+
+    if (error) throw error;
+
+    if (!data || data.length === 0) {
       return res.status(404).json({
         success: false,
         errorCode: 'PREDICTIONS_NOT_FOUND',
-        message: 'No career predictions found. Run analysis first.'
+        message: 'Run analysis first.'
       });
     }
-    const topCareers = snap.docs.map(doc => ({
-      career: doc.data().career_name,
-      probability: doc.data().success_probability
+
+    const topCareers = data.map(row => ({
+      career: row.career_name,
+      probability: row.success_probability
     }));
+
     return res.status(200).json({
       success: true,
       data: {
         top_careers: topCareers
       }
     });
+
   } catch (err) {
     next(err);
   }
 }
+
 module.exports = {
   predictCareers,
   getCareers

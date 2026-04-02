@@ -15,7 +15,7 @@
 
 'use strict';
 
-const supabase = require('../config/supabase');
+const { supabase } = require('../config/supabase');
 const { AppError, ErrorCodes } = require('../middleware/errorHandler');
 
 const COLLECTIONS = {

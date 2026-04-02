@@ -1,48 +1,48 @@
 'use strict';
 
 /**
- * adminMetrics.routes.js
- * Converted from adminMetrics.routes.ts
+ * adminMetrics.routes.js — FULLY FIXED (Production Safe)
  */
+
 const { Router } = require('express');
+const { supabase } = require('../../config/supabase'); // ✅ FIXED
 const { adminMetricsService } = require('../../services/admin/adminMetrics.service');
 const { adminMetricsAggregator } = require('../../workers/adminMetrics.aggregator');
 const { verifySuperAdmin } = require('../../middleware/verifyAdmin.middleware');
 
-// ── Content counts ─────────────────────────────────────────────────────────────
-// Fetches document counts for the five CMS collections shown on the dashboard.
-// Uses Supabase count queries (one round-trip per table).
-// Results are cached for 60 s to avoid hammering Supabase on every page load.
+// ── Content counts ─────────────────────────────────────────
 
 let _contentCountsCache = null;
 let _contentCountsCachedAt = 0;
-const CONTENT_COUNTS_TTL = 60 * 1000; // 60 seconds
+const CONTENT_COUNTS_TTL = 60 * 1000;
 
 async function getContentCounts() {
   const now = Date.now();
+
   if (_contentCountsCache && now - _contentCountsCachedAt < CONTENT_COUNTS_TTL) {
     return _contentCountsCache;
   }
 
-  const { supabase } = require('../../config/supabase');
-
-  // Safe count helper — uses Supabase { count: 'exact', head: true } for a lightweight count.
   async function safeCount(tableName) {
     try {
       const { count, error } = await supabase
         .from(tableName)
         .select('*', { count: 'exact', head: true });
 
-      if (error) throw new Error(error.message);
+      if (error) throw error;
       return count ?? 0;
-    } catch (_) {
-      // Fallback: fetch all rows and return length
-      const { data } = await supabase.from(tableName).select('id');
-      return (data ?? []).length;
+
+    } catch (err) {
+      // fallback (safe)
+      try {
+        const { data } = await supabase.from(tableName).select('id').limit(10000);
+        return (data ?? []).length;
+      } catch {
+        return 0;
+      }
     }
   }
 
-  // Run all six counts in parallel
   const [
     totalSkills,
     totalRoles,
@@ -59,20 +59,34 @@ async function getContentCounts() {
     safeCount('users')
   ]);
 
-  // Find the most recent createdAt across all five CMS tables
-  const [lastSkillRes, lastRoleRes, lastJobFamilyRes, lastEduRes, lastSalaryRes] = await Promise.all([
-    supabase.from('cms_skills').select('createdAt').order('createdAt', { ascending: false }).limit(1),
-    supabase.from('cms_roles').select('createdAt').order('createdAt', { ascending: false }).limit(1),
-    supabase.from('cms_job_families').select('createdAt').order('createdAt', { ascending: false }).limit(1),
-    supabase.from('cms_education_levels').select('createdAt').order('createdAt', { ascending: false }).limit(1),
-    supabase.from('cms_salary_benchmarks').select('createdAt').order('createdAt', { ascending: false }).limit(1)
-  ]);
+  // ── Last import dates (FIXED snake_case) ──────────────────
 
-  const importDates = [lastSkillRes, lastRoleRes, lastJobFamilyRes, lastEduRes, lastSalaryRes]
-    .map(res => res.data?.[0]?.createdAt ?? null)
+  const queries = [
+    'cms_skills',
+    'cms_roles',
+    'cms_job_families',
+    'cms_education_levels',
+    'cms_salary_benchmarks'
+  ].map(table =>
+    supabase
+      .from(table)
+      .select('created_at') // ✅ FIXED
+      .order('created_at', { ascending: false })
+      .limit(1)
+  );
+
+  const results = await Promise.all(queries);
+
+  const importDates = results
+    .map(res => {
+      if (res.error) return null;
+      return res.data?.[0]?.created_at ?? null;
+    })
     .filter(Boolean);
 
-  const lastImportAt = importDates.length > 0 ? importDates.sort().at(-1) : null;
+  const lastImportAt = importDates.length
+    ? importDates.sort().at(-1)
+    : null;
 
   const result = {
     totalSkills,
@@ -86,46 +100,75 @@ async function getContentCounts() {
 
   _contentCountsCache = result;
   _contentCountsCachedAt = now;
+
   return result;
 }
+
+// ─────────────────────────────────────────────
 
 const router = Router();
 const VALID_PERIODS = new Set(['7d', '30d', '90d', '1y']);
 
 function validateQueryParams(req) {
   const { period, startDate, endDate } = req.query;
+
   if (startDate || endDate) {
-    if (!startDate || !endDate) return { params: {}, error: 'Both startDate and endDate are required (YYYY-MM-DD)' };
-    const startMs = Date.parse(startDate), endMs = Date.parse(endDate);
-    if (isNaN(startMs) || isNaN(endMs)) return { params: {}, error: 'Invalid date format. Use YYYY-MM-DD.' };
-    if (endMs < startMs) return { params: {}, error: 'endDate must be >= startDate.' };
-    if ((endMs - startMs) / (1000 * 60 * 60 * 24) > 365) return { params: {}, error: 'Date range cannot exceed 365 days.' };
+    if (!startDate || !endDate) {
+      return { params: {}, error: 'Both startDate and endDate are required (YYYY-MM-DD)' };
+    }
+
+    const startMs = Date.parse(startDate);
+    const endMs = Date.parse(endDate);
+
+    if (isNaN(startMs) || isNaN(endMs)) {
+      return { params: {}, error: 'Invalid date format. Use YYYY-MM-DD.' };
+    }
+
+    if (endMs < startMs) {
+      return { params: {}, error: 'endDate must be >= startDate.' };
+    }
+
+    if ((endMs - startMs) / (1000 * 60 * 60 * 24) > 365) {
+      return { params: {}, error: 'Date range cannot exceed 365 days.' };
+    }
+
     return { params: { startDate, endDate } };
   }
+
   const resolvedPeriod = period ?? '30d';
-  if (!VALID_PERIODS.has(resolvedPeriod)) return { params: {}, error: `Invalid period. Valid options: ${[...VALID_PERIODS].join(', ')}` };
+
+  if (!VALID_PERIODS.has(resolvedPeriod)) {
+    return {
+      params: {},
+      error: `Invalid period. Valid options: ${[...VALID_PERIODS].join(', ')}`
+    };
+  }
+
   return { params: { period: resolvedPeriod } };
 }
 
+// ─────────────────────────────────────────────
+// MAIN ROUTE
+// ─────────────────────────────────────────────
+
 router.get('/', async (req, res) => {
   const { params, error } = validateQueryParams(req);
-  if (error) return res.status(400).json({
-    success: false,
-    errorCode: 'VALIDATION_ERROR',
-    message: error,
-    timestamp: new Date().toISOString()
-  });
+
+  if (error) {
+    return res.status(400).json({
+      success: false,
+      errorCode: 'VALIDATION_ERROR',
+      message: error,
+      timestamp: new Date().toISOString()
+    });
+  }
 
   try {
-    // Fetch content counts and AI/billing metrics in parallel
     const [contentCounts, aiMetrics] = await Promise.all([
       getContentCounts(),
       adminMetricsService.getMetrics(params)
     ]);
 
-    // Merge: content counts (dashboard stat cards) + AI billing data (metrics deep-dive)
-    // The frontend AdminMetrics type reads: totalSkills, totalRoles, totalJobFamilies,
-    // totalEducationLevels, totalSalaryRecords, totalUsers, activeUsers30d, lastImportAt
     const data = {
       ...aiMetrics,
       totalSkills: contentCounts.totalSkills,
@@ -143,8 +186,10 @@ router.get('/', async (req, res) => {
       data,
       meta: { generatedAt: new Date().toISOString() }
     });
+
   } catch (err) {
     console.error('[AdminMetrics] getMetrics failed:', err?.message);
+
     return res.status(500).json({
       success: false,
       errorCode: 'INTERNAL_ERROR',
@@ -154,16 +199,24 @@ router.get('/', async (req, res) => {
   }
 });
 
+// ─────────────────────────────────────────────
+// AGGREGATED
+// ─────────────────────────────────────────────
+
 router.get('/aggregated', async (req, res) => {
   const { params, error } = validateQueryParams(req);
-  if (error) return res.status(400).json({
-    success: false,
-    errorCode: 'VALIDATION_ERROR',
-    message: error
-  });
+
+  if (error) {
+    return res.status(400).json({
+      success: false,
+      errorCode: 'VALIDATION_ERROR',
+      message: error
+    });
+  }
 
   try {
     const data = await adminMetricsService.getAggregatedMetrics(params);
+
     return res.status(200).json({
       success: true,
       data,
@@ -172,8 +225,10 @@ router.get('/aggregated', async (req, res) => {
         note: 'Data from pre-computed daily aggregates.'
       }
     });
+
   } catch (err) {
     console.error('[AdminMetrics] getAggregatedMetrics failed:', err?.message);
+
     return res.status(500).json({
       success: false,
       errorCode: 'INTERNAL_ERROR',
@@ -182,8 +237,13 @@ router.get('/aggregated', async (req, res) => {
   }
 });
 
+// ─────────────────────────────────────────────
+// MANUAL AGGREGATION
+// ─────────────────────────────────────────────
+
 router.post('/aggregate', verifySuperAdmin, async (req, res) => {
   const dateStr = req.body?.date ?? undefined;
+
   if (dateStr && !/^\d{4}-\d{2}-\d{2}$/.test(dateStr)) {
     return res.status(400).json({
       success: false,
@@ -194,13 +254,16 @@ router.post('/aggregate', verifySuperAdmin, async (req, res) => {
 
   try {
     const result = await adminMetricsAggregator.runJob(dateStr);
+
     return res.status(200).json({
       success: true,
       data: result,
       meta: { triggeredAt: new Date().toISOString() }
     });
+
   } catch (err) {
     console.error('[AdminMetrics] Manual aggregation failed:', err?.message);
+
     return res.status(500).json({
       success: false,
       errorCode: 'INTERNAL_ERROR',

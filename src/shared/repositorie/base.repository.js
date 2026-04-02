@@ -1,33 +1,51 @@
 'use strict';
 
-// FIXED: Fully converted from Firestore shim patterns to native Supabase.
-// Removed: this.collection.doc(), snap.exists, snap.data(), .where(), .orderBy()
-// Added: supabase.from(this.table), { data, error } destructuring, .maybeSingle()
+/**
+ * BaseRepository — Supabase-native generic repository
+ * Supports:
+ *  - CRUD
+ *  - Soft delete (optional)
+ *  - Timestamps (optional)
+ *  - Batch operations
+ *  - Firestore-style condition mapping
+ */
 
-const supabase = require('../../src/config/supabase');
+const { supabase } = require('../../config/supabase');
 const logger   = require('../logger');
 
 class BaseRepository {
   /**
-   * @param {string} tableName — Postgres table name (snake_case, e.g. 'users')
+   * @param {string} tableName
+   * @param {object} options
+   * @param {boolean} options.hasSoftDelete
+   * @param {boolean} options.hasTimestamps
    */
-  constructor(tableName) {
+  constructor(tableName, options = {}) {
     if (!tableName) throw new Error('BaseRepository requires a table name');
+
     this.table = tableName;
+    this.hasSoftDelete = options.hasSoftDelete ?? false;
+    this.hasTimestamps = options.hasTimestamps ?? true;
   }
 
-  // ─── Timestamp helper ──────────────────────────────────────────────────────
+  // ─── Helpers ─────────────────────────────────────────────────────────────
 
   get serverTimestamp() {
     return new Date().toISOString();
   }
 
-  // ─── Read ──────────────────────────────────────────────────────────────────
+  _baseQuery() {
+    let query = supabase.from(this.table).select('*');
 
-  /**
-   * Find a single record by primary key.
-   * Returns null if not found or soft-deleted.
-   */
+    if (this.hasSoftDelete) {
+      query = query.is('deleted_at', null);
+    }
+
+    return query;
+  }
+
+  // ─── Read ────────────────────────────────────────────────────────────────
+
   async findById(id) {
     if (!id) return null;
 
@@ -39,24 +57,17 @@ class BaseRepository {
 
     if (error) {
       logger.error(`[BaseRepository] findById error [${this.table}/${id}]`, { error: error.message });
-      throw new Error(`DB error in findById [${this.table}]: ${error.message}`);
+      throw new Error(`DB error in findById [${this.table}]`);
     }
 
     if (!data) return null;
-    if (data.deleted_at || data.deletedAt) return null;
+    if (this.hasSoftDelete && data.deleted_at) return null;
 
     return this._normalize(data);
   }
 
-  /**
-   * Find the first record matching all conditions.
-   * conditions: array of [field, op, value] triples  (Firestore-compatible signature kept)
-   */
   async findOneWhere(conditions = []) {
-    let query = supabase
-      .from(this.table)
-      .select('*')
-      .is('deleted_at', null);
+    let query = this._baseQuery();
 
     for (const [field, op, value] of conditions) {
       query = this._applyCondition(query, field, op, value);
@@ -66,22 +77,14 @@ class BaseRepository {
 
     if (error) {
       logger.error(`[BaseRepository] findOneWhere error [${this.table}]`, { error: error.message });
-      throw new Error(`DB error in findOneWhere [${this.table}]: ${error.message}`);
+      throw new Error(`DB error in findOneWhere [${this.table}]`);
     }
 
-    if (!data) return null;
-    return this._normalize(data);
+    return data ? this._normalize(data) : null;
   }
 
-  /**
-   * Find multiple records matching conditions.
-   * conditions: array of [field, op, value] triples
-   */
   async findWhere(conditions = [], { limit = 100, orderBy = null } = {}) {
-    let query = supabase
-      .from(this.table)
-      .select('*')
-      .is('deleted_at', null);
+    let query = this._baseQuery();
 
     for (const [field, op, value] of conditions) {
       query = this._applyCondition(query, field, op, value);
@@ -98,28 +101,28 @@ class BaseRepository {
 
     if (error) {
       logger.error(`[BaseRepository] findWhere error [${this.table}]`, { error: error.message });
-      throw new Error(`DB error in findWhere [${this.table}]: ${error.message}`);
+      throw new Error(`DB error in findWhere [${this.table}]`);
     }
 
     return (data ?? []).map(row => this._normalize(row));
   }
 
-  // ─── Write ─────────────────────────────────────────────────────────────────
+  // ─── Write ───────────────────────────────────────────────────────────────
 
-  /**
-   * Create a new record.
-   * @param {string|null} id   — supply to force a specific ID; null for auto-UUID
-   * @param {object}      data — payload
-   * @returns {Promise<string>} the created record's id
-   */
   async create(id, data) {
     const now = this.serverTimestamp;
+
     const payload = {
       ...data,
-      created_at: now,
-      updated_at: now,
-      deleted_at: null,
+      ...(this.hasTimestamps && {
+        created_at: now,
+        updated_at: now,
+      }),
+      ...(this.hasSoftDelete && {
+        deleted_at: null,
+      }),
     };
+
     if (id) payload.id = id;
 
     const { data: inserted, error } = await supabase
@@ -130,17 +133,13 @@ class BaseRepository {
 
     if (error) {
       logger.error(`[BaseRepository] create error [${this.table}]`, { error: error.message });
-      throw new Error(`DB error in create [${this.table}]: ${error.message}`);
+      throw new Error(`DB error in create [${this.table}]`);
     }
 
     return inserted.id;
   }
 
-  /**
-   * Partial update. Throws if the record does not exist or is soft-deleted.
-   */
   async update(id, data) {
-    // Verify existence first (also checks soft-delete via findById)
     const existing = await this.findById(id);
     if (!existing) {
       throw new Error(`Document ${id} not found in ${this.table}`);
@@ -148,7 +147,9 @@ class BaseRepository {
 
     const payload = {
       ...data,
-      updated_at: this.serverTimestamp,
+      ...(this.hasTimestamps && {
+        updated_at: this.serverTimestamp,
+      }),
     };
 
     const { error } = await supabase
@@ -158,20 +159,20 @@ class BaseRepository {
 
     if (error) {
       logger.error(`[BaseRepository] update error [${this.table}/${id}]`, { error: error.message });
-      throw new Error(`DB error in update [${this.table}/${id}]: ${error.message}`);
+      throw new Error(`DB error in update [${this.table}/${id}]`);
     }
   }
 
-  /**
-   * Upsert: insert or merge-update on conflict.
-   */
   async upsert(id, data) {
-    const now = this.serverTimestamp;
     const payload = {
       ...data,
       id,
-      updated_at: now,
-      deleted_at: null,
+      ...(this.hasTimestamps && {
+        updated_at: this.serverTimestamp,
+      }),
+      ...(this.hasSoftDelete && {
+        deleted_at: null,
+      }),
     };
 
     const { error } = await supabase
@@ -180,21 +181,26 @@ class BaseRepository {
 
     if (error) {
       logger.error(`[BaseRepository] upsert error [${this.table}/${id}]`, { error: error.message });
-      throw new Error(`DB error in upsert [${this.table}/${id}]: ${error.message}`);
+      throw new Error(`DB error in upsert [${this.table}/${id}]`);
     }
 
     return id;
   }
 
-  /**
-   * Soft-delete: sets deleted_at timestamp, record remains in DB.
-   */
   async softDelete(id, deletedBy = null) {
+    if (!this.hasSoftDelete) {
+      throw new Error(`Soft delete not enabled for table ${this.table}`);
+    }
+
     const payload = {
       deleted_at: this.serverTimestamp,
-      updated_at: this.serverTimestamp,
+      ...(this.hasTimestamps && {
+        updated_at: this.serverTimestamp,
+      }),
+      ...(deletedBy !== null && {
+        deleted_by: deletedBy,
+      }),
     };
-    if (deletedBy !== null) payload.deleted_by = deletedBy;
 
     const { error } = await supabase
       .from(this.table)
@@ -203,13 +209,10 @@ class BaseRepository {
 
     if (error) {
       logger.error(`[BaseRepository] softDelete error [${this.table}/${id}]`, { error: error.message });
-      throw new Error(`DB error in softDelete [${this.table}/${id}]: ${error.message}`);
+      throw new Error(`DB error in softDelete [${this.table}/${id}]`);
     }
   }
 
-  /**
-   * Returns true if a non-deleted record with this id exists.
-   */
   async exists(id) {
     const { data, error } = await supabase
       .from(this.table)
@@ -218,81 +221,80 @@ class BaseRepository {
       .maybeSingle();
 
     if (error || !data) return false;
-    return !data.deleted_at;
+    if (this.hasSoftDelete && data.deleted_at) return false;
+
+    return true;
   }
 
-  /**
-   * Batch write helper. Each operation: { type: 'set'|'update'|'delete', id, data?, options? }
-   * Supabase does not have Firestore-style batches; operations are executed via Promise.all
-   * in chunks to avoid overwhelming the connection pool.
-   */
   async batchWrite(operations) {
     const chunks = this._chunk(operations, 100);
 
     for (const chunk of chunks) {
       await Promise.all(chunk.map(op => {
         if (op.type === 'set') {
-          return supabase
-            .from(this.table)
+          return supabase.from(this.table)
             .upsert({ ...op.data, id: op.id }, { onConflict: 'id' });
         }
+
         if (op.type === 'update') {
-          return supabase
-            .from(this.table)
-            .update({ ...op.data, updated_at: this.serverTimestamp })
+          return supabase.from(this.table)
+            .update({
+              ...op.data,
+              ...(this.hasTimestamps && { updated_at: this.serverTimestamp }),
+            })
             .eq('id', op.id);
         }
+
         if (op.type === 'delete') {
-          return supabase
-            .from(this.table)
+          if (!this.hasSoftDelete) {
+            throw new Error(`Soft delete not enabled for ${this.table}`);
+          }
+
+          return supabase.from(this.table)
             .update({ deleted_at: this.serverTimestamp })
             .eq('id', op.id);
         }
-        throw new Error(`[BaseRepository] Unknown batch op type: ${op.type}`);
+
+        throw new Error(`Unknown batch op type: ${op.type}`);
       }));
     }
   }
 
-  // ─── Private helpers ───────────────────────────────────────────────────────
+  // ─── Internal Helpers ─────────────────────────────────────────────────────
 
-  /**
-   * Map a Firestore-style condition operator to Supabase query builder method.
-   */
   _applyCondition(query, field, op, value) {
     switch (op) {
-      case '==':  return query.eq(field, value);
-      case '!=':  return query.neq(field, value);
-      case '>':   return query.gt(field, value);
-      case '>=':  return query.gte(field, value);
-      case '<':   return query.lt(field, value);
-      case '<=':  return query.lte(field, value);
-      case 'in':  return query.in(field, value);
+      case '==': return query.eq(field, value);
+      case '!=': return query.neq(field, value);
+      case '>': return query.gt(field, value);
+      case '>=': return query.gte(field, value);
+      case '<': return query.lt(field, value);
+      case '<=': return query.lte(field, value);
+      case 'in': return query.in(field, value);
       case 'array-contains': return query.contains(field, [value]);
       default:
-        throw new Error(`[BaseRepository] Unsupported filter operator "${op}" on table "${this.table}"`);
+        throw new Error(`Unsupported operator "${op}"`);
     }
   }
 
-  /**
-   * Convert a Postgres row to the application layer.
-   * snake_case → camelCase; Date objects → ISO strings.
-   */
   _normalize(row) {
     if (!row) return null;
+
     const out = {};
     for (const [k, v] of Object.entries(row)) {
       const camel = k.replace(/_([a-z])/g, (_, c) => c.toUpperCase());
-      out[camel]  = v instanceof Date ? v.toISOString() : v;
+      out[camel] = v instanceof Date ? v.toISOString() : v;
     }
+
     return out;
   }
 
-  _chunk(array, size) {
-    const chunks = [];
-    for (let i = 0; i < array.length; i += size) {
-      chunks.push(array.slice(i, i + size));
+  _chunk(arr, size) {
+    const out = [];
+    for (let i = 0; i < arr.length; i += size) {
+      out.push(arr.slice(i, i + size));
     }
-    return chunks;
+    return out;
   }
 }
 

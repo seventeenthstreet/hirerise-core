@@ -1,6 +1,6 @@
 'use strict';
 
-const supabase = require('../../../core/supabaseClient');
+const { supabase } = require('../../../config/supabase');
 const logger   = require('../../../utils/logger');
 
 const {

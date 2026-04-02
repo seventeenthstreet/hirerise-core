@@ -1,86 +1,140 @@
 'use strict';
 
 /**
- * models/analyticsSnapshot.model.js
+ * src/modules/analytics/models/analyticsSnapshot.model.js
  *
- * Firestore collection for the Global Career Intelligence Dashboard.
+ * Supabase row model definitions for the
+ * Global Career Intelligence Dashboard analytics layer.
  *
- * Collection: gcid_analytics_snapshots
- *   Stores point-in-time snapshots of every computed metric.
- *   One document per (metric_name, region, snapshot_date) — allows
- *   trend lines to be built by querying across timestamps.
+ * Tables:
+ * - gcid_analytics_snapshots
+ * - gcid_aggregated_cache
  *
- * Collection: gcid_aggregated_cache
- *   Single document per metric type — the latest computed aggregate,
- *   served directly by the API without re-computation on every request.
+ * This file provides:
+ * - table constants
+ * - enum-safe metric constants
+ * - supported region constants
+ * - row builders for inserts/upserts
+ * - safe normalization helpers
  */
 
-const COLLECTIONS = {
-  SNAPSHOTS:        'gcid_analytics_snapshots',
+const TABLES = Object.freeze({
+  SNAPSHOTS: 'gcid_analytics_snapshots',
   AGGREGATED_CACHE: 'gcid_aggregated_cache',
-};
+});
 
-// Metric name constants — single source of truth used by service + controller
-const METRIC_NAMES = {
-  CAREER_DEMAND:    'career_demand',
-  SKILL_DEMAND:     'skill_demand',
-  EDUCATION_ROI:    'education_roi',
-  CAREER_GROWTH:    'career_growth',
-  INDUSTRY_TRENDS:  'industry_trends',
-};
+const METRIC_NAMES = Object.freeze({
+  CAREER_DEMAND: 'career_demand',
+  SKILL_DEMAND: 'skill_demand',
+  EDUCATION_ROI: 'education_roi',
+  CAREER_GROWTH: 'career_growth',
+  INDUSTRY_TRENDS: 'industry_trends',
+});
 
-const REGIONS = ['global', 'india', 'us', 'uk', 'uae'];
+const REGIONS = Object.freeze(['global', 'india', 'us', 'uk', 'uae']);
+
+const DEFAULT_REGION = 'india';
+const DEFAULT_CACHE_TTL_SECONDS = 3600;
 
 /**
- * gcid_analytics_snapshots/{autoId}
- *
- *   id            — auto Firestore ID
- *   metric_name   — METRIC_NAMES value
- *   metric_value  — JSON-serialisable payload (the full computed result)
- *   region        — REGIONS value (default 'india')
- *   snapshot_date — ISO date string YYYY-MM-DD
- *   created_at    — serverTimestamp
+ * Returns YYYY-MM-DD in UTC
+ * @returns {string}
  */
-function buildSnapshotDoc(fields) {
+function getCurrentSnapshotDate() {
+  return new Date().toISOString().slice(0, 10);
+}
+
+/**
+ * Validate supported metric name
+ * @param {string} metricName
+ * @returns {string}
+ */
+function normalizeMetricName(metricName) {
+  if (!metricName || typeof metricName !== 'string') {
+    throw new Error('metric_name is required');
+  }
+
+  const normalized = metricName.trim().toLowerCase();
+
+  if (!Object.values(METRIC_NAMES).includes(normalized)) {
+    throw new Error(`Invalid metric_name: ${metricName}`);
+  }
+
+  return normalized;
+}
+
+/**
+ * Validate supported region
+ * @param {string | undefined} region
+ * @returns {string}
+ */
+function normalizeRegion(region) {
+  const normalized = (region || DEFAULT_REGION).trim().toLowerCase();
+
+  if (!REGIONS.includes(normalized)) {
+    return DEFAULT_REGION;
+  }
+
+  return normalized;
+}
+
+/**
+ * Build row for gcid_analytics_snapshots insert
+ *
+ * Expected SQL columns:
+ * - metric_name TEXT
+ * - metric_value JSONB
+ * - region TEXT
+ * - snapshot_date DATE
+ *
+ * created_at should be DB default now()
+ *
+ * @param {Object} fields
+ * @returns {Object}
+ */
+function buildSnapshotRow(fields = {}) {
   return {
-    metric_name:   fields.metric_name   || null,
-    metric_value:  fields.metric_value  || null,
-    region:        fields.region        || 'india',
-    snapshot_date: fields.snapshot_date || new Date().toISOString().slice(0, 10),
-    created_at:    null, // set by service via FieldValue.serverTimestamp()
+    metric_name: normalizeMetricName(fields.metric_name),
+    metric_value: fields.metric_value ?? {},
+    region: normalizeRegion(fields.region),
+    snapshot_date: fields.snapshot_date || getCurrentSnapshotDate(),
   };
 }
 
 /**
- * gcid_aggregated_cache/{metric_name}  (doc ID = metric_name — one per metric)
+ * Build row for gcid_aggregated_cache upsert
  *
- *   metric_name   — string
- *   data          — the full latest computed result object
- *   computed_at   — serverTimestamp
- *   ttl_seconds   — number (how long callers should treat this as fresh)
+ * Expected SQL columns:
+ * - metric_name TEXT PRIMARY KEY
+ * - data JSONB
+ * - ttl_seconds INTEGER
+ *
+ * computed_at should be DB default now()
+ *
+ * @param {string} metricName
+ * @param {*} data
+ * @param {number} ttlSeconds
+ * @returns {Object}
  */
-function buildCacheDoc(metricName, data) {
+function buildCacheRow(metricName, data, ttlSeconds = DEFAULT_CACHE_TTL_SECONDS) {
   return {
-    metric_name: metricName,
-    data,
-    computed_at: null, // set by service
-    ttl_seconds: 3600, // 1 hour default
+    metric_name: normalizeMetricName(metricName),
+    data: data ?? {},
+    ttl_seconds: Number.isFinite(ttlSeconds)
+      ? ttlSeconds
+      : DEFAULT_CACHE_TTL_SECONDS,
   };
 }
 
-module.exports = {
-  COLLECTIONS,
+module.exports = Object.freeze({
+  TABLES,
   METRIC_NAMES,
   REGIONS,
-  buildSnapshotDoc,
-  buildCacheDoc,
-};
-
-
-
-
-
-
-
-
-
+  DEFAULT_REGION,
+  DEFAULT_CACHE_TTL_SECONDS,
+  getCurrentSnapshotDate,
+  normalizeMetricName,
+  normalizeRegion,
+  buildSnapshotRow,
+  buildCacheRow,
+});

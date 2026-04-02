@@ -1,20 +1,38 @@
-// ai.engine.js
-//
-// REFACTORED: Uses the shared anthropic.client shim (AI Router) instead of
-// instantiating the Anthropic SDK directly. All provider fallback logic is
-// handled transparently by the router — no other changes needed in this file.
-//
-const logger = require("../../utils/logger");
+"use strict";
 
-const AI_MODEL = "claude-sonnet-4-6"; // kept for reference; router selects actual provider
+/**
+ * src/modules/career-intelligence/services/ai.engine.js
+ *
+ * Production-grade AI evaluation engine.
+ * - Uses shared AI router-backed anthropic client shim
+ * - No direct provider SDK coupling
+ * - Deterministic JSON-only output contract
+ * - Hardened parsing, validation, logging, and fallback behavior
+ */
+
+const logger = require("../../utils/logger");
+const aiClient = require("../../config/anthropic.client");
+
+const AI_MODEL = "claude-sonnet-4-6";
+
+const REQUIRED_TOP_LEVEL_FIELDS = [
+  "skill_depth_maturity",
+  "growth_readiness_index",
+  "promotion_probability",
+  "career_roadmap",
+  "market_risk_assessment",
+];
 
 class AIEngine {
   constructor() {
-    // The shared client is a router-backed proxy with the same messages.create() API.
-    this.client = require("../../config/anthropic.client");
+    /**
+     * Shared singleton router-backed client
+     * Reused across requests for connection efficiency.
+     */
+    this.client = aiClient;
   }
 
-  buildPrompt(candidateProfile, roleMetadata, deterministicMeta) {
+  buildPrompt(candidateProfile = {}, roleMetadata = {}, deterministicMeta = {}) {
     return {
       system: `You are a professional senior career analyst embedded in an enterprise HR intelligence platform.
 Your role is to evaluate a candidate's career readiness based strictly on structured data provided to you.
@@ -29,31 +47,47 @@ STRICT RULES:
 - Operate at temperature 0. Be precise, structured, and audit-ready.`,
 
       user: `## CANDIDATE PROFILE
-${JSON.stringify({
-  skills: candidateProfile.skills,
-  totalYearsExperience: candidateProfile.totalYearsExperience,
-  workHistory: candidateProfile.workHistory,
-  certifications: candidateProfile.certifications,
-  highestEducation: candidateProfile.highestEducation,
-}, null, 2)}
+${JSON.stringify(
+  {
+    skills: candidateProfile.skills ?? [],
+    totalYearsExperience: candidateProfile.totalYearsExperience ?? 0,
+    workHistory: candidateProfile.workHistory ?? [],
+    certifications: candidateProfile.certifications ?? [],
+    highestEducation: candidateProfile.highestEducation ?? null,
+  },
+  null,
+  2
+)}
 
 ## TARGET ROLE
-${JSON.stringify({
-  title: roleMetadata.title,
-  seniorityLevel: roleMetadata.seniorityLevel,
-  requiredSkills: roleMetadata.requiredSkills,
-  requiredYears: roleMetadata.requiredYears,
-  leadershipExpected: roleMetadata.leadershipExpected,
-  growthTrajectory: roleMetadata.growthTrajectory,
-}, null, 2)}
+${JSON.stringify(
+  {
+    title: roleMetadata.title ?? null,
+    seniorityLevel: roleMetadata.seniorityLevel ?? null,
+    requiredSkills: roleMetadata.requiredSkills ?? [],
+    requiredYears: roleMetadata.requiredYears ?? 0,
+    leadershipExpected: roleMetadata.leadershipExpected ?? false,
+    growthTrajectory: roleMetadata.growthTrajectory ?? null,
+  },
+  null,
+  2
+)}
 
 ## DETERMINISTIC PRE-COMPUTED DATA (use as grounding context)
-${JSON.stringify({
-  skillMatchRatio: deterministicMeta.skillMatch.coreMatchRatio,
-  missingCoreSkills: deterministicMeta.skillMatch.missingCoreSkills,
-  experienceDelta: deterministicMeta.experienceAlignment.delta,
-  salaryPositioning: deterministicMeta.salaryPositioning.positioning,
-}, null, 2)}
+${JSON.stringify(
+  {
+    skillMatchRatio:
+      deterministicMeta.skillMatch?.coreMatchRatio ?? null,
+    missingCoreSkills:
+      deterministicMeta.skillMatch?.missingCoreSkills ?? [],
+    experienceDelta:
+      deterministicMeta.experienceAlignment?.delta ?? null,
+    salaryPositioning:
+      deterministicMeta.salaryPositioning?.positioning ?? null,
+  },
+  null,
+  2
+)}
 
 ## REQUIRED OUTPUT SCHEMA
 Return ONLY this JSON object. No prose. No markdown fences.
@@ -62,7 +96,10 @@ Return ONLY this JSON object. No prose. No markdown fences.
     "score": <float 0.0–1.0>,
     "confidence": <float 0.0–1.0>,
     "skill_maturity_map": {
-      "<skill_name>": { "maturity": "novice|practitioner|advanced|expert", "evidence": "<brief>" }
+      "<skill_name>": {
+        "maturity": "novice|practitioner|advanced|expert",
+        "evidence": "<brief>"
+      }
     },
     "reasoning_trace": "<string>"
   },
@@ -97,9 +134,14 @@ Return ONLY this JSON object. No prose. No markdown fences.
   }
 
   async evaluate(candidateProfile, roleMetadata, deterministicMeta) {
-    const prompt = this.buildPrompt(candidateProfile, roleMetadata, deterministicMeta);
+    const prompt = this.buildPrompt(
+      candidateProfile,
+      roleMetadata,
+      deterministicMeta
+    );
 
-    let rawResponse;
+    let rawResponse = null;
+
     try {
       const response = await this.client.messages.create({
         model: AI_MODEL,
@@ -109,59 +151,107 @@ Return ONLY this JSON object. No prose. No markdown fences.
         messages: [{ role: "user", content: prompt.user }],
       });
 
-      rawResponse = response.content[0].text;
+      rawResponse = this._extractTextResponse(response);
+
       logger.info("[AIEngine] Raw response received", {
-        candidateId: candidateProfile.candidateId,
-        inputTokens: response.usage?.input_tokens,
-        outputTokens: response.usage?.output_tokens,
+        candidateId: candidateProfile?.candidateId ?? null,
+        inputTokens: response?.usage?.input_tokens ?? null,
+        outputTokens: response?.usage?.output_tokens ?? null,
       });
 
       const parsed = JSON.parse(rawResponse);
       this._validateAIResponse(parsed);
-      return { success: true, data: parsed, rawResponse };
 
+      return {
+        success: true,
+        data: parsed,
+        rawResponse,
+      };
     } catch (err) {
       logger.error("[AIEngine] Evaluation failed", {
-        error: err.message,
-        candidateId: candidateProfile.candidateId,
-        rawResponse: rawResponse || null,
+        error: err?.message ?? "Unknown AI error",
+        candidateId: candidateProfile?.candidateId ?? null,
+        rawResponse,
       });
 
-      // Graceful degradation — return conservative fallback
       return {
         success: false,
         data: this._fallbackResponse(),
-        error: err.message,
+        error: err?.message ?? "Unknown AI error",
       };
     }
   }
 
-  _validateAIResponse(data) {
-    const required = ["skill_depth_maturity", "growth_readiness_index", "promotion_probability", "career_roadmap"];
-    for (const key of required) {
-      if (!data[key]) throw new Error(`AI response missing required field: ${key}`);
+  _extractTextResponse(response) {
+    if (!response?.content || !Array.isArray(response.content)) {
+      throw new Error("AI response content missing");
     }
-    if (typeof data.skill_depth_maturity.score !== "number") throw new Error("AI score not numeric");
-    if (data.skill_depth_maturity.score < 0 || data.skill_depth_maturity.score > 1) throw new Error("AI score out of bounds");
+
+    const textBlock = response.content.find(
+      (item) => item?.type === "text" || typeof item?.text === "string"
+    );
+
+    if (!textBlock?.text) {
+      throw new Error("AI text block missing");
+    }
+
+    return textBlock.text.trim();
+  }
+
+  _validateAIResponse(data) {
+    if (!data || typeof data !== "object") {
+      throw new Error("AI response is not an object");
+    }
+
+    for (const field of REQUIRED_TOP_LEVEL_FIELDS) {
+      if (!(field in data)) {
+        throw new Error(`AI response missing required field: ${field}`);
+      }
+    }
+
+    const score = data?.skill_depth_maturity?.score;
+
+    if (typeof score !== "number" || Number.isNaN(score)) {
+      throw new Error("AI score must be numeric");
+    }
+
+    if (score < 0 || score > 1) {
+      throw new Error("AI score out of bounds");
+    }
+
+    if (!Array.isArray(data.career_roadmap)) {
+      throw new Error("career_roadmap must be an array");
+    }
   }
 
   _fallbackResponse() {
     return {
-      skill_depth_maturity: { score: 0.5, confidence: 0, skill_maturity_map: {}, reasoning_trace: "AI unavailable — fallback applied" },
-      growth_readiness_index: { score: 0.5, confidence: 0, growth_signals: [], risk_factors: [], reasoning_trace: "AI unavailable" },
-      promotion_probability: { score: 0.5, confidence: 0, leadership_signals: [], reasoning_trace: "AI unavailable" },
+      skill_depth_maturity: {
+        score: 0.5,
+        confidence: 0,
+        skill_maturity_map: {},
+        reasoning_trace: "AI unavailable — fallback applied",
+      },
+      growth_readiness_index: {
+        score: 0.5,
+        confidence: 0,
+        growth_signals: [],
+        risk_factors: [],
+        reasoning_trace: "AI unavailable",
+      },
+      promotion_probability: {
+        score: 0.5,
+        confidence: 0,
+        leadership_signals: [],
+        reasoning_trace: "AI unavailable",
+      },
       career_roadmap: [],
-      market_risk_assessment: { risk_level: "medium", reasoning_trace: "AI unavailable" },
+      market_risk_assessment: {
+        risk_level: "medium",
+        reasoning_trace: "AI unavailable",
+      },
     };
   }
 }
 
 module.exports = AIEngine;
-
-
-
-
-
-
-
-

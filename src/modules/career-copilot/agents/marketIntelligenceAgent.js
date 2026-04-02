@@ -1,123 +1,80 @@
 'use strict';
 
 /**
- * marketIntelligenceAgent.js — Market Intelligence Agent
+ * src/modules/career-copilot/agents/marketIntelligenceAgent.js
  *
- * Uses: Labor Market Intelligence Engine
- *
- * Calls (read-only, never modified):
- *   marketTrendService.getCareerTrends()        → career demand scores + growth rates
- *   marketTrendService.getSkillDemand(limit)    → top in-demand skills with demand_score
- *   marketTrendService.getSalaryBenchmarks()    → salary bands per career
- *
- * Output:
- *   trending_skills      — top skills by demand_score
- *   career_demand        — top careers by demand + growth
- *   salary_benchmarks    — salary ranges per career (INR)
- *   target_role_salary   — salary specifically for user's target role
- *   market_insights      — 2-3 key market sentences for the advisor prompt
- *
- * File location: src/modules/career-copilot/agents/marketIntelligenceAgent.js
- *
- * @module src/modules/career-copilot/agents/marketIntelligenceAgent
+ * Labor market intelligence orchestration agent.
+ * Optimized for:
+ * - partial upstream failures
+ * - deterministic formatting
+ * - token-efficient downstream advisor prompts
  */
 
 const BaseAgent = require('./baseAgent');
-const logger    = require('../../../utils/logger');
+const logger = require('../../../utils/logger');
 
-// ─── Salary formatter ─────────────────────────────────────────────────────────
+const marketTrendService = safeRequire(
+  '../../../modules/labor-market-intelligence/services/marketTrend.service',
+  'MarketTrendService'
+);
 
-function _formatINR(amount) {
-  if (!amount || isNaN(amount)) return null;
-  if (amount >= 100000) return `₹${(amount / 100000).toFixed(1)}L`;
-  return `₹${amount.toLocaleString('en-IN')}`;
+/**
+ * INR formatter with safe numeric coercion.
+ *
+ * @param {number|string|null} amount
+ * @returns {string|null}
+ */
+function formatINR(amount) {
+  const numeric = Number(amount);
+
+  if (!Number.isFinite(numeric) || numeric <= 0) {
+    return null;
+  }
+
+  if (numeric >= 100000) {
+    return `₹${(numeric / 100000).toFixed(1)}L`;
+  }
+
+  return `₹${numeric.toLocaleString('en-IN')}`;
 }
 
 class MarketIntelligenceAgent extends BaseAgent {
+  get agentName() {
+    return 'MarketIntelligenceAgent';
+  }
 
-  get agentName()   { return 'MarketIntelligenceAgent'; }
-  get cachePrefix() { return 'agent:market'; }
+  get cachePrefix() {
+    return 'agent:market';
+  }
 
-  async run(userId, context) {
-    const marketSvc = this._require(
-      '../../../modules/labor-market-intelligence/services/marketTrend.service',
-      'MarketTrendService'
-    );
-    if (!marketSvc) throw new Error('MarketTrendService unavailable');
-
-    // ── Fetch all market data in parallel ─────────────────────────────────────
-    const [trendsRes, skillDemandRes, salaryRes] = await Promise.allSettled([
-      marketSvc.getCareerTrends(),
-      marketSvc.getSkillDemand(20),
-      marketSvc.getSalaryBenchmarks(),
-    ]);
-
-    const rawTrends    = trendsRes.status      === 'fulfilled' ? (trendsRes.value      || []) : [];
-    const rawSkills    = skillDemandRes.status === 'fulfilled' ? (skillDemandRes.value || []) : [];
-    const rawSalaries  = salaryRes.status      === 'fulfilled' ? (salaryRes.value      || []) : [];
-
-    // ── Trending skills ───────────────────────────────────────────────────────
-    const trendingSkills = [...rawSkills]
-      .sort((a, b) => (b.demand_score || 0) - (a.demand_score || 0))
-      .slice(0, 12)
-      .map(s => ({
-        skill:        s.skill_name || s.name,
-        demand_score: Math.round(s.demand_score  || 0),
-        growth_rate:  s.growth_rate              || 0,
-        salary_boost: s.salary_boost             || 0,
-        industry:     (s.industry_usage || []).join(', ') || 'General',
-      }));
-
-    // ── Career demand ─────────────────────────────────────────────────────────
-    const careerDemand = [...rawTrends]
-      .sort((a, b) => (b.trend_score || b.demand_score || 0) - (a.trend_score || a.demand_score || 0))
-      .slice(0, 8)
-      .map(t => ({
-        career:      t.career_name || t.career || t.role_name,
-        trend_score: Math.round(t.trend_score  || t.demand_score || 0),
-        growth_rate: t.growth_rate             || 0,
-      }));
-
-    // ── Salary benchmarks ─────────────────────────────────────────────────────
-    const salaryBenchmarks = rawSalaries.slice(0, 8).map(s => ({
-      career:           s.career_name || s.career,
-      entry_salary:     _formatINR(s.avg_entry_salary),
-      mid_salary:       _formatINR(s.avg_5yr_salary),
-      senior_salary:    _formatINR(s.avg_10yr_salary),
-      salary_growth_pct: s.salary_growth
-        ? `${Math.round(s.salary_growth * 100)}%/yr`
-        : null,
-    }));
-
-    // ── Target role salary lookup ─────────────────────────────────────────────
-    const targetRole = context?.target_role || null;
-    let targetRoleSalary = null;
-
-    if (targetRole) {
-      const keyword = targetRole.toLowerCase().split(' ')[0];
-      const match   = rawSalaries.find(s =>
-        (s.career_name || s.career || '').toLowerCase().includes(keyword)
-      );
-      if (match) {
-        targetRoleSalary = {
-          career:       match.career_name || match.career,
-          entry_salary: _formatINR(match.avg_entry_salary),
-          mid_salary:   _formatINR(match.avg_5yr_salary),
-          senior_salary: _formatINR(match.avg_10yr_salary),
-        };
-      }
+  /**
+   * @param {string} userId
+   * @param {object} context
+   * @returns {Promise<object>}
+   */
+  async run(userId, context = {}) {
+    if (!marketTrendService) {
+      throw new Error('MarketTrendService unavailable');
     }
 
-    // ── Market insights (for advisor prompt context) ──────────────────────────
-    const topSkillName = trendingSkills[0]?.skill || 'technical skills';
-    const topCareer    = careerDemand[0]?.career  || null;
-    const insights     = [
-      `${topSkillName} is the most in-demand skill with a demand score of ${trendingSkills[0]?.demand_score || 'N/A'}.`,
-      topCareer ? `${topCareer} shows the strongest career demand growth right now.` : null,
-      targetRoleSalary
-        ? `${targetRoleSalary.career} entry salary: ${targetRoleSalary.entry_salary}, senior: ${targetRoleSalary.senior_salary}.`
-        : null,
-    ].filter(Boolean);
+    const [careerTrends, skillDemand, salaryBenchmarksRaw] =
+      await this._fetchMarketData();
+
+    const trendingSkills = this._buildTrendingSkills(skillDemand);
+    const careerDemand = this._buildCareerDemand(careerTrends);
+    const salaryBenchmarks =
+      this._buildSalaryBenchmarks(salaryBenchmarksRaw);
+
+    const targetRoleSalary = this._findTargetRoleSalary(
+      salaryBenchmarksRaw,
+      context?.target_role
+    );
+
+    const marketInsights = this._buildMarketInsights({
+      trendingSkills,
+      careerDemand,
+      targetRoleSalary,
+    });
 
     logger.info('[MarketIntelligenceAgent] Done', {
       userId,
@@ -127,30 +84,169 @@ class MarketIntelligenceAgent extends BaseAgent {
     });
 
     return {
-      trending_skills:    trendingSkills,
-      career_demand:      careerDemand,
-      salary_benchmarks:  salaryBenchmarks,
+      trending_skills: trendingSkills,
+      career_demand: careerDemand,
+      salary_benchmarks: salaryBenchmarks,
       target_role_salary: targetRoleSalary,
-      market_insights:    insights,
+      market_insights: marketInsights,
     };
   }
 
-  _require(path, name) {
-    try { return require(path); }
-    catch (err) {
-      logger.warn(`[MarketIntelligenceAgent] ${name} unavailable`, { err: err.message });
+  // ────────────────────────────────────────────────────────────────────────────
+  // Data fetch
+  // ────────────────────────────────────────────────────────────────────────────
+
+  async _fetchMarketData() {
+    const [trendsRes, skillsRes, salaryRes] =
+      await Promise.allSettled([
+        marketTrendService.getCareerTrends(),
+        marketTrendService.getSkillDemand(20),
+        marketTrendService.getSalaryBenchmarks(),
+      ]);
+
+    return [
+      trendsRes.status === 'fulfilled' && Array.isArray(trendsRes.value)
+        ? trendsRes.value
+        : [],
+      skillsRes.status === 'fulfilled' && Array.isArray(skillsRes.value)
+        ? skillsRes.value
+        : [],
+      salaryRes.status === 'fulfilled' && Array.isArray(salaryRes.value)
+        ? salaryRes.value
+        : [],
+    ];
+  }
+
+  // ────────────────────────────────────────────────────────────────────────────
+  // Builders
+  // ────────────────────────────────────────────────────────────────────────────
+
+  _buildTrendingSkills(rawSkills = []) {
+    return [...rawSkills]
+      .sort(
+        (a, b) =>
+          Number(b?.demand_score || 0) -
+          Number(a?.demand_score || 0)
+      )
+      .slice(0, 12)
+      .map((skill) => ({
+        skill: skill?.skill_name || skill?.name || null,
+        demand_score: this._safeScore(skill?.demand_score),
+        growth_rate: Number(skill?.growth_rate || 0),
+        salary_boost: Number(skill?.salary_boost || 0),
+        industry: Array.isArray(skill?.industry_usage)
+          ? skill.industry_usage.join(', ')
+          : 'General',
+      }))
+      .filter((skill) => skill.skill);
+  }
+
+  _buildCareerDemand(rawTrends = []) {
+    return [...rawTrends]
+      .sort((a, b) => {
+        const scoreB = Number(
+          b?.trend_score ?? b?.demand_score ?? 0
+        );
+        const scoreA = Number(
+          a?.trend_score ?? a?.demand_score ?? 0
+        );
+        return scoreB - scoreA;
+      })
+      .slice(0, 8)
+      .map((trend) => ({
+        career:
+          trend?.career_name ||
+          trend?.career ||
+          trend?.role_name ||
+          null,
+        trend_score: this._safeScore(
+          trend?.trend_score ?? trend?.demand_score
+        ),
+        growth_rate: Number(trend?.growth_rate || 0),
+      }))
+      .filter((career) => career.career);
+  }
+
+  _buildSalaryBenchmarks(rawSalaries = []) {
+    return rawSalaries.slice(0, 8).map((salary) => ({
+      career: salary?.career_name || salary?.career || null,
+      entry_salary: formatINR(salary?.avg_entry_salary),
+      mid_salary: formatINR(salary?.avg_5yr_salary),
+      senior_salary: formatINR(salary?.avg_10yr_salary),
+      salary_growth_pct:
+        salary?.salary_growth != null
+          ? `${Math.round(Number(salary.salary_growth) * 100)}%/yr`
+          : null,
+    }));
+  }
+
+  _findTargetRoleSalary(rawSalaries = [], targetRole) {
+    if (!targetRole || !Array.isArray(rawSalaries)) {
       return null;
     }
+
+    const normalized = String(targetRole).toLowerCase().trim();
+    if (!normalized) return null;
+
+    const keywords = normalized.split(/\s+/).slice(0, 2);
+
+    const match = rawSalaries.find((salary) => {
+      const careerName = String(
+        salary?.career_name || salary?.career || ''
+      ).toLowerCase();
+
+      return keywords.some((keyword) => careerName.includes(keyword));
+    });
+
+    if (!match) return null;
+
+    return {
+      career: match?.career_name || match?.career || null,
+      entry_salary: formatINR(match?.avg_entry_salary),
+      mid_salary: formatINR(match?.avg_5yr_salary),
+      senior_salary: formatINR(match?.avg_10yr_salary),
+    };
+  }
+
+  _buildMarketInsights({
+    trendingSkills = [],
+    careerDemand = [],
+    targetRoleSalary = null,
+  }) {
+    const topSkill = trendingSkills[0];
+    const topCareer = careerDemand[0];
+
+    return [
+      topSkill
+        ? `${topSkill.skill} is currently the most in-demand skill (${topSkill.demand_score}/100).`
+        : null,
+      topCareer
+        ? `${topCareer.career} currently leads career demand growth.`
+        : null,
+      targetRoleSalary
+        ? `${targetRoleSalary.career} salary ranges from ${targetRoleSalary.entry_salary} to ${targetRoleSalary.senior_salary}.`
+        : null,
+    ].filter(Boolean);
+  }
+
+  _safeScore(value) {
+    const numeric = Number(value || 0);
+    return Math.max(0, Math.min(100, Math.round(numeric)));
+  }
+}
+
+/**
+ * Safe singleton require at module load.
+ */
+function safeRequire(path, name) {
+  try {
+    return require(path);
+  } catch (err) {
+    logger.warn(`[MarketIntelligenceAgent] ${name} unavailable`, {
+      error: err instanceof Error ? err.message : 'Unknown require error',
+    });
+    return null;
   }
 }
 
 module.exports = MarketIntelligenceAgent;
-
-
-
-
-
-
-
-
-

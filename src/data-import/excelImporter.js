@@ -1,269 +1,223 @@
-/**
- * excelImporter.js — Bulk Supabase Data Import from Excel
- *
- * Usage: node src/data-import/excelImporter.js --sheet salaryBands --file ./data/hirerise_data.xlsx
- *
- * Supported sheets (must match --sheet argument):
- *   - jobFamilies
- *   - roles
- *   - salaryBands
- *   - roleSkills
- *   - certifications
- *   - careerPaths
- *
- * Scalability note:
- *   Supabase upsert supports bulk operations. This importer automatically
- *   chunks writes into 400-row batches with a delay between them to avoid
- *   overwhelming Supabase on large initial datasets.
- */
-
 'use strict';
 
-require('dotenv').config({
-  path: require('path').resolve(__dirname, '../../.env')
-});
-require('../config/supabase');
-const ExcelJS = require('exceljs'); // D-06 FIX: replaced xlsx (CVE-2023-30533) with exceljs
-const { supabase } = require('../config/supabase');
-const logger = require('../utils/logger');
+require('dotenv').config();
+const ExcelJS = require('exceljs');
+const { createClient } = require('@supabase/supabase-js');
 
-// Max batch size per upsert call; use 400 for safety headroom
-const BATCH_SIZE = 400;
-const BATCH_DELAY_MS = 500; // Pause between batches to avoid quota spikes
+const supabase = createClient(
+  process.env.SUPABASE_URL,
+  process.env.SUPABASE_SERVICE_ROLE_KEY
+);
 
-// ── Sheet-to-collection mapping ───────────────────────────────────────────────
-const SHEET_CONFIG = {
-  jobFamilies: {
-    collection: 'jobFamilies',
-    idField: 'id',
-    transform: row => ({
-      name: row.name,
-      description: row.description || '',
-      icon: row.icon || null,
-      tracks: row.tracks ? row.tracks.split(',').map(t => t.trim()) : ['individual_contributor'],
-      createdAt: new Date().toISOString()
-    })
-  },
-  roles: {
-    collection: 'roles',
-    idField: 'id',
-    transform: row => ({
-      title: row.title,
-      level: row.level,
-      jobFamilyId: row.jobFamilyId,
-      track: row.track || 'individual_contributor',
-      description: row.description || '',
-      alternativeTitles: row.alternativeTitles ? row.alternativeTitles.split(',').map(t => t.trim()) : [],
-      updatedAt: new Date().toISOString()
-    })
-  },
-  salaryBands: {
-    collection: 'salaryBands',
-    idField: 'roleId',
-    transform: (rows, roleId) => {
-      // Multiple rows per role (one per level): aggregate into levels map
-      const levels = {};
-      rows.forEach(row => {
-        levels[row.level] = {
-          min: parseInt(row.salaryMin, 10),
-          max: parseInt(row.salaryMax, 10),
-          median: parseInt(row.salaryMedian, 10),
-          percentiles: {
-            p25: parseInt(row.p25 || row.salaryMin, 10),
-            p50: parseInt(row.salaryMedian, 10),
-            p75: parseInt(row.p75 || row.salaryMax, 10),
-            p90: parseInt(row.p90 || row.salaryMax, 10)
-          }
-        };
-      });
-      return {
-        roleId,
-        levels,
-        updatedAt: new Date().toISOString()
-      };
-    },
-    groupByField: 'roleId'
-  },
-  roleSkills: {
-    collection: 'roleSkills',
-    idField: 'roleId',
-    transform: (rows, roleId) => {
-      const skills = rows.map(row => ({
-        name: row.skillName,
-        category: row.category || 'technical',
-        criticality: parseInt(row.criticality || '3', 10),
-        minimumProficiency: row.minimumProficiency || 'intermediate',
-        roleWeight: parseFloat(row.roleWeight || '0.5'),
-        learningWeeks: row.learningWeeks ? parseInt(row.learningWeeks, 10) : null,
-        resources: row.resources ? row.resources.split('|').map(r => r.trim()) : []
-      }));
-      return {
-        roleId,
-        skills,
-        updatedAt: new Date().toISOString()
-      };
-    },
-    groupByField: 'roleId'
-  },
-  certifications: {
-    collection: 'certifications',
-    idField: 'id',
-    transform: row => ({
-      title: row.title,
-      provider: row.provider,
-      url: row.url || null,
-      estimatedHours: parseInt(row.estimatedHours || '0', 10),
-      relatedSkills: row.relatedSkills ? row.relatedSkills.split(',').map(s => s.trim().toLowerCase()) : [],
-      difficulty: row.difficulty || 'intermediate',
-      free: row.free === 'true' || row.free === true,
-      createdAt: new Date().toISOString()
-    })
-  },
-  careerPaths: {
-    collection: 'careerPaths',
-    idField: 'fromRoleId',
-    transform: (rows, fromRoleId) => {
-      const nextRoles = rows.map(row => ({
-        roleId: row.toRoleId,
-        transitionType: row.transitionType || 'vertical',
-        estimatedYears: row.estimatedYears ? parseFloat(row.estimatedYears) : null,
-        prerequisites: row.prerequisites ? row.prerequisites.split(',').map(p => p.trim()) : []
-      }));
-      return {
-        fromRoleId,
-        nextRoles,
-        updatedAt: new Date().toISOString()
-      };
-    },
-    groupByField: 'fromRoleId'
-  }
-};
+const BATCH_SIZE = 500;
 
-// ─────────────────────────────────────────────────────────────────────────────
-//  Core: Write documents in chunked batches via Supabase upsert
-// ─────────────────────────────────────────────────────────────────────────────
-const batchWrite = async (collection, documents) => {
-  let written = 0;
-  for (let i = 0; i < documents.length; i += BATCH_SIZE) {
-    const chunk = documents.slice(i, i + BATCH_SIZE);
+/* ─────────────────────────────────────────────
+   🔧 Utility: Batch Insert
+───────────────────────────────────────────── */
+async function batchInsert(table, rows, conflict = null) {
+  for (let i = 0; i < rows.length; i += BATCH_SIZE) {
+    const chunk = rows.slice(i, i + BATCH_SIZE);
 
-    // Build upsert rows — each document must include its id as the primary key
-    const rows = chunk.map(({ id, data }) => ({
-      id: String(id),
-      ...data
-    }));
+    const query = supabase.from(table).upsert(chunk, {
+      onConflict: conflict || undefined
+    });
 
-    const { error } = await supabase
-      .from(collection)
-      .upsert(rows);
-
+    const { error } = await query;
     if (error) {
-      throw new Error(`[Importer] Supabase upsert failed for '${collection}': ${error.message}`);
+      console.error(`❌ Error inserting into ${table}:`, error);
+      throw error;
     }
 
-    written += chunk.length;
-    logger.info(`[Importer] Committed batch: ${written}/${documents.length} docs to '${collection}'`);
-
-    if (i + BATCH_SIZE < documents.length) {
-      await new Promise(r => setTimeout(r, BATCH_DELAY_MS));
-    }
+    console.log(`✅ Inserted ${i + chunk.length}/${rows.length} into ${table}`);
   }
-  return written;
-};
+}
 
-// ─────────────────────────────────────────────────────────────────────────────
-//  Main import function
-// ─────────────────────────────────────────────────────────────────────────────
-const importSheet = async (sheetName, filePath) => {
-  const config = SHEET_CONFIG[sheetName];
-  if (!config) {
-    throw new Error(`Unknown sheet: '${sheetName}'. Valid options: ${Object.keys(SHEET_CONFIG).join(', ')}`);
-  }
-
-  logger.info(`[Importer] Starting import: sheet='${sheetName}', file='${filePath}'`);
-
+/* ─────────────────────────────────────────────
+   🔧 Load Excel Sheet
+───────────────────────────────────────────── */
+async function loadSheet(filePath, sheetName) {
   const workbook = new ExcelJS.Workbook();
   await workbook.xlsx.readFile(filePath);
-  const worksheet = workbook.getWorksheet(sheetName);
-  if (!worksheet) {
-    const available = workbook.worksheets.map(ws => ws.name).join(', ');
-    throw new Error(`Sheet '${sheetName}' not found in workbook. Available: ${available}`);
-  }
 
-  // ExcelJS uses 1-based rows; row 1 is the header row
-  const headerRow = worksheet.getRow(1).values.slice(1); // slice(1) removes leading undefined
+  const sheet = workbook.getWorksheet(sheetName);
+  if (!sheet) throw new Error(`Sheet ${sheetName} not found`);
+
+  const headers = sheet.getRow(1).values.slice(1);
+
   const rows = [];
-  worksheet.eachRow((row, rowNumber) => {
-    if (rowNumber === 1) return; // skip header
+  sheet.eachRow((row, rowNumber) => {
+    if (rowNumber === 1) return;
+
     const obj = {};
     row.values.slice(1).forEach((val, i) => {
-      const key = headerRow[i];
-      if (key) obj[key] = val ?? null;
+      obj[headers[i]] = val ?? null;
     });
+
     rows.push(obj);
   });
 
-  logger.info(`[Importer] Parsed ${rows.length} rows from sheet '${sheetName}'`);
-
-  if (rows.length === 0) {
-    logger.warn('[Importer] No rows found in sheet — nothing to import');
-    return;
-  }
-
-  let documents;
-
-  // Grouped sheets (multiple rows per document, e.g., salaryBands)
-  if (config.groupByField) {
-    const grouped = {};
-    rows.forEach(row => {
-      const groupKey = row[config.groupByField];
-      if (!grouped[groupKey]) grouped[groupKey] = [];
-      grouped[groupKey].push(row);
-    });
-    documents = Object.entries(grouped).map(([key, groupRows]) => ({
-      id: key,
-      data: config.transform(groupRows, key)
-    }));
-  } else {
-    // One row per document
-    documents = rows.map(row => {
-      const id = row[config.idField];
-      if (!id) {
-        logger.warn('[Importer] Row missing ID field, skipping:', row);
-        return null;
-      }
-      return {
-        id,
-        data: config.transform(row)
-      };
-    }).filter(Boolean);
-  }
-
-  logger.info(`[Importer] Prepared ${documents.length} documents for collection '${config.collection}'`);
-  const written = await batchWrite(config.collection, documents);
-  logger.info(`[Importer] ✅ Import complete: ${written} documents written to '${config.collection}'`);
-};
-
-// ─────────────────────────────────────────────────────────────────────────────
-//  CLI entry point
-// ─────────────────────────────────────────────────────────────────────────────
-if (require.main === module) {
-  const args = process.argv.slice(2);
-  const sheetIdx = args.indexOf('--sheet');
-  const fileIdx = args.indexOf('--file');
-  const sheetName = sheetIdx !== -1 ? args[sheetIdx + 1] : null;
-  const filePath = fileIdx !== -1 ? args[fileIdx + 1] : null;
-  if (!sheetName || !filePath) {
-    console.error('Usage: node excelImporter.js --sheet <sheetName> --file <path>');
-    console.error('Valid sheets:', Object.keys(SHEET_CONFIG).join(', '));
-    process.exit(1);
-  }
-  importSheet(sheetName, filePath)
-    .then(() => process.exit(0))
-    .catch(err => {
-      logger.error('[Importer] Fatal error:', err);
-      process.exit(1);
-    });
+  return rows;
 }
 
-module.exports = { importSheet };
+/* ─────────────────────────────────────────────
+   🔥 Import Roles
+───────────────────────────────────────────── */
+async function importRoles(rows) {
+  const formatted = rows.map(r => ({
+    role_name: r.title,
+    seniority_level: parseInt(r.level, 10),
+    role_family: r.jobFamilyId,
+    description: r.description || ''
+  }));
+
+  await batchInsert('roles', formatted, 'role_name');
+}
+
+/* ─────────────────────────────────────────────
+   🔥 Import Skills
+───────────────────────────────────────────── */
+async function importSkills(rows) {
+  const uniqueSkills = new Map();
+
+  rows.forEach(r => {
+    if (!uniqueSkills.has(r.skill)) {
+      uniqueSkills.set(r.skill, {
+        name: r.skill
+      });
+    }
+  });
+
+  await batchInsert('skills', Array.from(uniqueSkills.values()), 'name');
+}
+
+/* ─────────────────────────────────────────────
+   🔥 Import Courses
+───────────────────────────────────────────── */
+async function importCourses(rows) {
+  const uniqueCourses = new Map();
+
+  rows.forEach(r => {
+    if (!uniqueCourses.has(r.course_name)) {
+      uniqueCourses.set(r.course_name, {
+        name: r.course_name,
+        provider: r.provider,
+        level: r.level,
+        duration_hours: parseInt(r.duration_hours || 0, 10),
+        url: r.url
+      });
+    }
+  });
+
+  await batchInsert('courses', Array.from(uniqueCourses.values()), 'name');
+}
+
+/* ─────────────────────────────────────────────
+   🔥 Build Mapping (Skill ↔ Course)
+───────────────────────────────────────────── */
+async function importSkillCourses(rows) {
+  const { data: skills } = await supabase.from('skills').select('id, name');
+  const { data: courses } = await supabase.from('courses').select('id, name');
+
+  const skillMap = new Map(skills.map(s => [s.name, s.id]));
+  const courseMap = new Map(courses.map(c => [c.name, c.id]));
+
+  const mappings = [];
+
+  rows.forEach(r => {
+    const skillId = skillMap.get(r.skill);
+    const courseId = courseMap.get(r.course_name);
+
+    if (!skillId || !courseId) return;
+
+    mappings.push({
+      skill_id: skillId,
+      course_id: courseId
+    });
+  });
+
+  await batchInsert('skill_courses', mappings, 'skill_id,course_id');
+}
+
+/* ─────────────────────────────────────────────
+   🔥 Import Career Paths
+───────────────────────────────────────────── */
+async function importCareerPaths(rows) {
+  const { data: roles } = await supabase.from('roles').select('id, role_name');
+
+  const roleMap = new Map(roles.map(r => [r.role_name, r.id]));
+
+  const paths = [];
+
+  rows.forEach(r => {
+    const fromId = roleMap.get(r.from_role);
+    const toId = roleMap.get(r.to_role);
+
+    if (!fromId || !toId) return;
+
+    paths.push({
+      from_role_id: fromId,
+      to_role_id: toId,
+      years_to_next: parseInt(r.years_to_next, 10)
+    });
+  });
+
+  await batchInsert('career_paths', paths, 'from_role_id,to_role_id');
+}
+
+/* ─────────────────────────────────────────────
+   🚀 MAIN RUNNER
+───────────────────────────────────────────── */
+async function run({ file, sheet }) {
+  console.log(`🚀 Importing ${sheet} from ${file}`);
+
+  const rows = await loadSheet(file, sheet);
+
+  switch (sheet) {
+    case 'roles':
+      await importRoles(rows);
+      break;
+
+    case 'skills':
+      await importSkills(rows);
+      break;
+
+    case 'courses':
+      await importCourses(rows);
+      break;
+
+    case 'skillCourses':
+      await importSkillCourses(rows);
+      break;
+
+    case 'careerPaths':
+      await importCareerPaths(rows);
+      break;
+
+    default:
+      throw new Error(`Unsupported sheet: ${sheet}`);
+  }
+
+  console.log(`✅ Import completed: ${sheet}`);
+}
+
+/* ─────────────────────────────────────────────
+   CLI
+───────────────────────────────────────────── */
+if (require.main === module) {
+  const args = process.argv.slice(2);
+
+  const file = args[args.indexOf('--file') + 1];
+  const sheet = args[args.indexOf('--sheet') + 1];
+
+  if (!file || !sheet) {
+    console.error('Usage: node excelImporter.js --file <path> --sheet <sheet>');
+    process.exit(1);
+  }
+
+  run({ file, sheet }).catch(err => {
+    console.error('❌ Import failed:', err);
+    process.exit(1);
+  });
+}
+
+module.exports = { run };

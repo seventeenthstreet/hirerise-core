@@ -1,71 +1,144 @@
 'use strict';
 
 /**
- * adminCmsRoles.controller.js — HTTP handlers for Admin CMS Roles
+ * adminCmsRoles.controller.js — Supabase Optimized Version
  *
  * Security contract:
- *   adminId = req.user.uid  (always from JWT, never from body)
- *   agency  = req.user.agency (always from JWT, never from body)
+ *   adminId = req.user.uid
+ *   agency  = req.user.agency
  */
 
 const { asyncHandler } = require('../../../../utils/helpers');
 const rolesService     = require('./adminCmsRoles.service');
 
+// ─────────────────────────────────────────────
+// CREATE ROLE
+// ─────────────────────────────────────────────
 const createRole = asyncHandler(async (req, res) => {
-  const adminId = req.user.uid;
-  const agency  = req.user.agency ?? null;
+  const adminId = req.user?.uid;
+  const agency  = req.user?.agency ?? null;
 
-  const { name, jobFamilyId, level, track, description, alternativeTitles } = req.body;
+  if (!adminId) {
+    return res.status(401).json({ success: false, error: 'Unauthorized' });
+  }
+
+  const {
+    name,
+    jobFamilyId,
+    level,
+    track,
+    description,
+    alternativeTitles,
+  } = req.body;
+
+  // Basic validation (fast fail)
+  if (!name || typeof name !== 'string') {
+    return res.status(400).json({ success: false, error: 'Role name is required' });
+  }
 
   const role = await rolesService.createRole(
-    { name, jobFamilyId, level, track, description, alternativeTitles },
+    {
+      name: name.trim(),
+      jobFamilyId,
+      level,
+      track,
+      description,
+      alternativeTitles,
+    },
     adminId,
     agency
   );
 
   return res.status(201).json({
     success: true,
-    data:    role,
+    data: role,
     meta: {
       createdByAdminId: adminId,
-      sourceAgency:     agency,
-      createdAt:        new Date().toISOString(),
+      sourceAgency: agency,
+      timestamp: new Date().toISOString(),
     },
   });
 });
 
+// ─────────────────────────────────────────────
+// UPDATE ROLE
+// ─────────────────────────────────────────────
 const updateRole = asyncHandler(async (req, res) => {
-  const adminId = req.user.uid;
+  const adminId = req.user?.uid;
   const roleId  = req.params.roleId;
 
-  const { name, jobFamilyId, level, track, description, alternativeTitles } = req.body;
-  const updates = {};
-  if (name              !== undefined) updates.name              = name;
-  if (jobFamilyId       !== undefined) updates.jobFamilyId       = jobFamilyId;
-  if (level             !== undefined) updates.level             = level;
-  if (track             !== undefined) updates.track             = track;
-  if (description       !== undefined) updates.description       = description;
-  if (alternativeTitles !== undefined) updates.alternativeTitles = alternativeTitles;
+  if (!adminId) {
+    return res.status(401).json({ success: false, error: 'Unauthorized' });
+  }
+
+  if (!roleId) {
+    return res.status(400).json({ success: false, error: 'Role ID is required' });
+  }
+
+  const {
+    name,
+    jobFamilyId,
+    level,
+    track,
+    description,
+    alternativeTitles,
+  } = req.body;
+
+  // Only include defined fields (PATCH behavior)
+  const updates = Object.fromEntries(
+    Object.entries({
+      name: name?.trim(),
+      jobFamilyId,
+      level,
+      track,
+      description,
+      alternativeTitles,
+    }).filter(([_, v]) => v !== undefined)
+  );
+
+  if (Object.keys(updates).length === 0) {
+    return res.status(400).json({ success: false, error: 'No valid fields to update' });
+  }
 
   const updated = await rolesService.updateRole(roleId, updates, adminId);
-  return res.status(200).json({ success: true, data: updated });
-});
 
-const listRoles = asyncHandler(async (req, res) => {
-  const { limit, jobFamilyId } = req.query;
-  const result = await rolesService.listRoles({
-    limit:       limit ? Math.min(parseInt(limit, 10), 500) : 100,
-    jobFamilyId: jobFamilyId || undefined,
+  return res.status(200).json({
+    success: true,
+    data: updated,
+    meta: {
+      updatedByAdminId: adminId,
+      timestamp: new Date().toISOString(),
+    },
   });
-  return res.status(200).json({ success: true, data: { items: result.roles, total: result.total } });
 });
 
-module.exports = { createRole, updateRole, listRoles };
+// ─────────────────────────────────────────────
+// LIST ROLES (OPTIMIZED)
+// ─────────────────────────────────────────────
+const listRoles = asyncHandler(async (req, res) => {
+  const limit = Math.min(parseInt(req.query.limit, 10) || 100, 500);
+  const jobFamilyId = req.query.jobFamilyId || undefined;
 
+  const result = await rolesService.listRoles({
+    limit,
+    jobFamilyId,
+  });
 
+  return res.status(200).json({
+    success: true,
+    data: {
+      items: result.roles,
+      total: result.total,
+    },
+    meta: {
+      limit,
+      timestamp: new Date().toISOString(),
+    },
+  });
+});
 
-
-
-
-
-
+module.exports = {
+  createRole,
+  updateRole,
+  listRoles,
+};

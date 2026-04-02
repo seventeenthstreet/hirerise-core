@@ -1,39 +1,49 @@
 'use strict';
 
 /**
- * routes/analytics.routes.js
+ * src/modules/analytics/routes/analytics.routes.js
  *
- * Mounted at: /api/v1/analytics
- * Auth applied at server.js level via authenticate middleware.
+ * Mounted at:
+ *   /api/v1/analytics
  *
- *   GET /career-demand      — Career Demand Index (ranked)
- *   GET /skill-demand       — Skill Demand Index  (ranked)
- *   GET /education-roi      — Education ROI Index (ranked)
- *   GET /career-growth      — 10-year salary forecast per career
- *   GET /industry-trends    — Emerging sector analysis
- *   GET /overview           — All five metrics in one response
- *   GET /snapshots/:metric  — Historical snapshots (?days=30)
+ * Authentication:
+ *   Applied globally at server.js level
+ *
+ * Endpoints:
+ *   GET /career-demand
+ *   GET /skill-demand
+ *   GET /education-roi
+ *   GET /career-growth
+ *   GET /industry-trends
+ *   GET /overview
+ *   GET /snapshots/:metric
  */
 
-const express    = require('express');
-const router     = express.Router();
-const controller = require('../controllers/analytics.controller');
+const { Router } = require('express');
+const analyticsController = require('../controllers/analytics.controller');
 
-router.get('/career-demand',       controller.getCareerDemand);
-router.get('/skill-demand',        controller.getSkillDemand);
-router.get('/education-roi',       controller.getEducationROI);
-router.get('/career-growth',       controller.getCareerGrowth);
-router.get('/industry-trends',     controller.getIndustryTrends);
-router.get('/overview',            controller.getOverview);
-router.get('/snapshots/:metric',   controller.getSnapshots);
+const router = Router();
 
-module.exports = router;
+/* -------------------------------------------------------------------------- */
+/* Primary analytics metrics */
+/* -------------------------------------------------------------------------- */
 
+router.get('/career-demand', analyticsController.getCareerDemand);
+router.get('/skill-demand', analyticsController.getSkillDemand);
+router.get('/education-roi', analyticsController.getEducationROI);
+router.get('/career-growth', analyticsController.getCareerGrowth);
+router.get('/industry-trends', analyticsController.getIndustryTrends);
 
+/* -------------------------------------------------------------------------- */
+/* Aggregated views */
+/* -------------------------------------------------------------------------- */
 
+router.get('/overview', analyticsController.getOverview);
 
+/* -------------------------------------------------------------------------- */
+/* Historical snapshots */
+/* -------------------------------------------------------------------------- */
 
+router.get('/snapshots/:metric', analyticsController.getSnapshots);
 
-
-
-
+module.exports = Object.freeze(router);

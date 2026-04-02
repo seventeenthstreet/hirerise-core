@@ -1,51 +1,81 @@
 'use strict';
 
-const { Router }               = require('express');
-const { db } = require('../../config/supabase');
+/**
+ * adaptiveWeight.routes.js
+ *
+ * - Clean DI setup
+ * - Supabase RPC compatible
+ * - Production-safe routing
+ */
+
+const { Router } = require('express');
+
 const AdaptiveWeightController = require('./adaptiveWeight.controller');
-const { AdaptiveWeightService } = require('./adaptiveWeight.service');
+const AdaptiveWeightService = require('./adaptiveWeight.service');
 const AdaptiveWeightRepository = require('./adaptiveWeight.repository');
+
+// Optional middlewares (recommended)
+const { verifyAdmin } = require('../../middleware/verifyAdmin.middleware');
+// const rateLimiter = require('../../middlewares/rateLimiter.middleware');
 
 const router = Router();
 
-// Wire up DI chain: repo (with db) → service → controller
-const controller = new AdaptiveWeightController({
-  adaptiveWeightService: new AdaptiveWeightService({
-    adaptiveWeightRepo: new AdaptiveWeightRepository(db),
-  }),
+// ═══════════════════════════════════════════════════════════
+// 🔗 Dependency Injection (FINAL CLEAN VERSION)
+// ═══════════════════════════════════════════════════════════
+
+const repository = new AdaptiveWeightRepository();
+
+const service = new AdaptiveWeightService({
+  adaptiveWeightRepo: repository,
 });
+
+const controller = new AdaptiveWeightController({
+  adaptiveWeightService: service,
+});
+
+// ═══════════════════════════════════════════════════════════
+// 📊 ROUTES
+// ═══════════════════════════════════════════════════════════
 
 /**
  * GET /admin/adaptive-weights
- * Fetch current weights for a given roleFamily / experienceBucket / industryTag
+ * Fetch weights for scoring
  */
-router.get('/', controller.getWeights);
+router.get(
+  '/',
+  verifyAdmin, // 🔒 protect admin route
+  controller.getWeights
+);
 
 /**
  * POST /admin/adaptive-weights/outcome
- * Record a scored outcome to update weights via reinforcement
+ * Record outcome → triggers learning
  */
-router.post('/outcome', controller.recordOutcome);
+router.post(
+  '/outcome',
+  verifyAdmin,
+  controller.recordOutcome
+);
 
 /**
  * POST /admin/adaptive-weights/override
- * Apply a manual weight override (admin use only)
+ * Apply manual override
  */
-router.post('/override', controller.applyOverride);
+router.post(
+  '/override',
+  verifyAdmin,
+  controller.applyOverride
+);
 
 /**
  * POST /admin/adaptive-weights/override/release
- * Release a manual override and restore adaptive weights
+ * Release override
  */
-router.post('/override/release', controller.releaseOverride);
+router.post(
+  '/override/release',
+  verifyAdmin,
+  controller.releaseOverride
+);
 
 module.exports = router;
-
-
-
-
-
-
-
-
-

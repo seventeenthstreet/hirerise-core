@@ -1,160 +1,150 @@
 'use strict';
 
 /**
- * migration/add-ava-memory.migration.js
+ * add-ava-memory.migration.js — Supabase Production Version
  *
- * Creates the ava_memory table — Ava's per-user retention engine.
+ * Creates the ava_memory table (stateful AI memory layer)
  *
- * One row per user. Upserted on every meaningful career event.
- * Drives personalised summaries, reminders, and weekly progress reports.
+ * Usage:
+ *   Dry run:
+ *     node add-ava-memory.migration.js
  *
- * ─── Usage ────────────────────────────────────────────────────────────────────
- *   Dry run (prints DDL, no DB writes):
- *     node src/migration/add-ava-memory.migration.js --dry-run
- *
- *   Live run:
- *     node src/migration/add-ava-memory.migration.js --run
- *
- *   Or paste SQL_DDL directly into the Supabase SQL Editor.
+ *   Execute:
+ *     node add-ava-memory.migration.js --run
  */
 
 require('dotenv').config();
+const { createClient } = require('@supabase/supabase-js');
 
-// ─── DDL ──────────────────────────────────────────────────────────────────────
+// ─── Supabase Client ──────────────────────────────────────────────────────────
 
-const SQL_DDL = `
+function getSupabase() {
+  const url = process.env.SUPABASE_URL;
+  const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
+
+  if (!url || !key) {
+    throw new Error('Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY');
+  }
+
+  return createClient(url, key, {
+    auth: { persistSession: false },
+  });
+}
+
+// ─── SQL (FINAL PRODUCTION DDL) ───────────────────────────────────────────────
+
+const SQL = `
+-- Enable required extension
+CREATE EXTENSION IF NOT EXISTS pgcrypto;
+
 -- =============================================================
---  TABLE: ava_memory
---  One row per user. Upserted on each career event.
---  Drives personalised Ava insights, reminders, and reports.
+-- TABLE: ava_memory
 -- =============================================================
 
 CREATE TABLE IF NOT EXISTS ava_memory (
-  -- Identity
-  user_id              TEXT          PRIMARY KEY,
+  user_id TEXT PRIMARY KEY,
 
-  -- Score tracking (for delta calculations)
-  last_score           NUMERIC(5,2)  NOT NULL DEFAULT 0,
-  current_score        NUMERIC(5,2)  NOT NULL DEFAULT 0,
+  last_score NUMERIC(5,2) NOT NULL DEFAULT 0,
+  current_score NUMERIC(5,2) NOT NULL DEFAULT 0,
 
-  -- Event counters (reset each weekly cycle)
-  skills_added         INTEGER       NOT NULL DEFAULT 0,
-  jobs_applied         INTEGER       NOT NULL DEFAULT 0,
-  resume_improved      BOOLEAN       NOT NULL DEFAULT FALSE,
+  skills_added INTEGER NOT NULL DEFAULT 0,
+  jobs_applied INTEGER NOT NULL DEFAULT 0,
+  resume_improved BOOLEAN NOT NULL DEFAULT FALSE,
 
-  -- Activity timestamps
-  last_active_date     TIMESTAMPTZ,
-  last_skill_added_at  TIMESTAMPTZ,
-  last_resume_update   TIMESTAMPTZ,
+  last_active_date TIMESTAMPTZ DEFAULT NOW(),
+  last_skill_added_at TIMESTAMPTZ,
+  last_resume_update TIMESTAMPTZ,
 
-  -- Weekly snapshot (written by updateWeeklyMemory cron)
-  weekly_progress      NUMERIC(5,2)  NOT NULL DEFAULT 0,
-  weekly_skills_added  INTEGER       NOT NULL DEFAULT 0,
-  weekly_jobs_applied  INTEGER       NOT NULL DEFAULT 0,
-  week_start_date      TIMESTAMPTZ,
+  weekly_progress NUMERIC(5,2) NOT NULL DEFAULT 0,
+  weekly_skills_added INTEGER NOT NULL DEFAULT 0,
+  weekly_jobs_applied INTEGER NOT NULL DEFAULT 0,
+  week_start_date TIMESTAMPTZ,
 
-  -- Lifecycle
-  created_at           TIMESTAMPTZ   NOT NULL DEFAULT NOW(),
-  updated_at           TIMESTAMPTZ   NOT NULL DEFAULT NOW()
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
--- ── Indexes ───────────────────────────────────────────────────────────────────
+-- ─── Indexes ──────────────────────────────────────────────────
 
--- For cron: fetch all rows due for weekly snapshot
-CREATE INDEX IF NOT EXISTS ava_memory_week_start_idx
+CREATE INDEX IF NOT EXISTS ava_memory_week_idx
   ON ava_memory (week_start_date);
 
--- For recency queries
-CREATE INDEX IF NOT EXISTS ava_memory_last_active_idx
-  ON ava_memory (last_active_date DESC);
+CREATE INDEX IF NOT EXISTS ava_memory_activity_idx
+  ON ava_memory (last_active_date DESC, jobs_applied DESC);
 
--- ── Auto-update updated_at ─────────────────────────────────────────────────────
+CREATE INDEX IF NOT EXISTS ava_memory_perf_idx
+  ON ava_memory (current_score DESC, weekly_progress DESC);
 
-CREATE OR REPLACE FUNCTION update_ava_memory_updated_at()
-RETURNS TRIGGER LANGUAGE plpgsql AS $$
+-- ─── Trigger (reuse global if exists) ──────────────────────────
+
+DO $$
 BEGIN
-  NEW.updated_at = NOW();
-  RETURN NEW;
-END;
-$$;
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_proc WHERE proname = 'trigger_set_updated_at'
+  ) THEN
+    CREATE OR REPLACE FUNCTION trigger_set_updated_at()
+    RETURNS TRIGGER AS $$
+    BEGIN
+      NEW.updated_at = NOW();
+      RETURN NEW;
+    END;
+    $$ LANGUAGE plpgsql;
+  END IF;
+END $$;
 
 DROP TRIGGER IF EXISTS ava_memory_updated_at_trigger ON ava_memory;
-CREATE TRIGGER ava_memory_updated_at_trigger
-  BEFORE UPDATE ON ava_memory
-  FOR EACH ROW EXECUTE FUNCTION update_ava_memory_updated_at();
 
--- ── Row Level Security ─────────────────────────────────────────────────────────
+CREATE TRIGGER ava_memory_updated_at_trigger
+BEFORE UPDATE ON ava_memory
+FOR EACH ROW EXECUTE FUNCTION trigger_set_updated_at();
+
+-- ─── RLS ──────────────────────────────────────────────────────
 
 ALTER TABLE ava_memory ENABLE ROW LEVEL SECURITY;
 
--- Authenticated users can only read/write their own row
-CREATE POLICY "ava_memory_owner_policy"
-  ON ava_memory
-  FOR ALL
-  TO authenticated
-  USING      (user_id = auth.uid()::TEXT)
-  WITH CHECK (user_id = auth.uid()::TEXT);
+CREATE POLICY IF NOT EXISTS "ava_memory_user_access"
+ON ava_memory
+FOR ALL
+TO authenticated
+USING (user_id = auth.uid()::TEXT)
+WITH CHECK (user_id = auth.uid()::TEXT);
 
--- Service role (backend) bypasses RLS
-CREATE POLICY "ava_memory_service_role_policy"
-  ON ava_memory
-  FOR ALL
-  TO service_role
-  USING (TRUE)
-  WITH CHECK (TRUE);
+CREATE POLICY IF NOT EXISTS "ava_memory_service_access"
+ON ava_memory
+FOR ALL
+TO service_role
+USING (true)
+WITH CHECK (true);
 `;
 
 // ─── Runner ───────────────────────────────────────────────────────────────────
 
 async function run(dryRun = true) {
-  console.log('\n🧠  Ava Memory System — Database Migration');
-  console.log(`    Mode: ${dryRun ? 'DRY RUN (no writes)' : 'LIVE RUN'}\n`);
+  console.log('\n🧠 Ava Memory Migration');
+  console.log(`Mode: ${dryRun ? 'DRY RUN' : 'EXECUTION'}\n`);
 
-  console.log('─── SQL DDL ────────────────────────────────────────────────────');
-  console.log(SQL_DDL);
-  console.log('────────────────────────────────────────────────────────────────\n');
+  console.log('--- SQL ---\n');
+  console.log(SQL);
+  console.log('\n-----------\n');
 
   if (dryRun) {
-    console.log('🔍  DRY RUN complete. Re-run with --run to apply to Supabase.');
+    console.log('✔ Dry run complete. Use --run to execute.\n');
     return;
   }
 
-  const supabaseUrl = process.env.SUPABASE_URL;
-  const serviceKey  = process.env.SUPABASE_SERVICE_ROLE_KEY;
+  const supabase = getSupabase();
 
-  if (!supabaseUrl || !serviceKey) {
-    console.warn('⚠️   SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY not set.');
-    console.log('    Copy the DDL above and paste it into the Supabase SQL Editor.\n');
-    return;
-  }
+  console.log('⚠️ Supabase JS cannot execute raw DDL directly.');
+  console.log('👉 Please copy the SQL above and run it in Supabase SQL Editor.\n');
 
-  const { createClient } = require('@supabase/supabase-js');
-  const client = createClient(supabaseUrl, serviceKey, {
-    auth: { autoRefreshToken: false, persistSession: false },
-  });
-
-  const { error } = await client.rpc('exec_sql', { sql: SQL_DDL });
-  if (error) {
-    // Supabase doesn't expose exec_sql by default — print instructions
-    console.warn('⚠️   Cannot run DDL via RPC. Paste the SQL above into the Supabase SQL Editor.');
-    console.warn('    Error:', error.message);
-  } else {
-    console.log('✅  ava_memory table created successfully.\n');
-  }
+  console.log('✔ Migration ready.\n');
 }
 
-// ─── CLI entry ────────────────────────────────────────────────────────────────
+// ─── CLI ──────────────────────────────────────────────────────────────────────
 
-const dryRun = !process.argv.includes('--run');
-run(dryRun).catch(err => {
+const shouldRun = process.argv.includes('--run');
+
+run(!shouldRun).catch((err) => {
   console.error('Migration failed:', err.message);
   process.exit(1);
 });
-
-
-
-
-
-
-
-

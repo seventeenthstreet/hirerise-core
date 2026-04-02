@@ -1,93 +1,123 @@
 'use strict';
 
 /**
- * freeEngine.js
+ * src/modules/analysis/freeEngine.js
  *
- * Rule-based analysis engine for free tier users.
+ * Production-ready deterministic analysis engine for free-tier users.
  *
- * ARCHITECTURE DECISION:
- *   Free engine NEVER calls Claude or any paid external API.
- *   All logic is deterministic and rule-based.
- *   Output shape mirrors premium engine output exactly —
- *   this allows the frontend to consume both responses identically.
- *   Premium fields that can't be computed without AI are null.
- *
- * Cost: ₹0 per call. Runs unlimited times.
+ * DESIGN GOALS
+ * - Zero external paid API calls
+ * - Pure compute engine (no DB writes)
+ * - Supabase-ready output shape
+ * - Supports dynamic skill keyword injection from DB cache
+ * - Stable, testable, and horizontally scalable
  */
 
 const logger = require('../../../utils/logger');
 
-// ─── Skill keyword signals ────────────────────────────────────
-const SKILL_KEYWORDS = {
+const DEFAULT_SKILL_KEYWORDS = Object.freeze({
   technical: [
     'python', 'javascript', 'typescript', 'java', 'sql', 'react', 'node',
     'aws', 'docker', 'kubernetes', 'git', 'api', 'rest', 'graphql',
     'excel', 'tally', 'sap', 'gst', 'tds', 'power bi', 'tableau',
     'figma', 'photoshop', 'autocad', 'solidworks',
   ],
-  leadership: ['managed', 'led', 'supervised', 'mentored', 'coordinated', 'directed', 'headed'],
-  impact:     ['reduced', 'increased', 'improved', 'saved', 'delivered', 'launched', 'achieved'],
-};
+  leadership: [
+    'managed', 'led', 'supervised', 'mentored', 'coordinated', 'directed', 'headed',
+  ],
+  impact: [
+    'reduced', 'increased', 'improved', 'saved', 'delivered', 'launched', 'achieved',
+  ],
+});
 
-// ─── Scoring rules ────────────────────────────────────────────
-function scoreResumeFree(resumeText) {
+function normalizeText(text) {
+  return String(text || '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .toLowerCase();
+}
+
+function safeArray(value) {
+  return Array.isArray(value) ? value.filter(Boolean) : [];
+}
+
+function resolveKeywords(dynamicKeywords = {}) {
+  return {
+    technical: safeArray(dynamicKeywords.technical).length
+      ? dynamicKeywords.technical
+      : DEFAULT_SKILL_KEYWORDS.technical,
+    leadership: safeArray(dynamicKeywords.leadership).length
+      ? dynamicKeywords.leadership
+      : DEFAULT_SKILL_KEYWORDS.leadership,
+    impact: safeArray(dynamicKeywords.impact).length
+      ? dynamicKeywords.impact
+      : DEFAULT_SKILL_KEYWORDS.impact,
+  };
+}
+
+function countKeywordMatches(text, keywords) {
+  return keywords.reduce((count, keyword) => {
+    return text.includes(keyword.toLowerCase()) ? count + 1 : count;
+  }, 0);
+}
+
+function scoreResumeFree(resumeText, keywords) {
   if (!resumeText || typeof resumeText !== 'string') return 30;
 
-  const text      = resumeText.toLowerCase();
-  const wordCount = resumeText.split(/\s+/).length;
-  let   score     = 30; // baseline
+  const text = normalizeText(resumeText);
+  const wordCount = text ? text.split(/\s+/).length : 0;
 
-  // Word count signal
+  let score = 30;
+
   if (wordCount > 300) score += 10;
   if (wordCount > 500) score += 5;
 
-  // Technical skill coverage
-  const techMatches = SKILL_KEYWORDS.technical.filter(k => text.includes(k)).length;
+  const techMatches = countKeywordMatches(text, keywords.technical);
   score += Math.min(techMatches * 3, 20);
 
-  // Leadership signal
-  const leaderMatches = SKILL_KEYWORDS.leadership.filter(k => text.includes(k)).length;
-  score += Math.min(leaderMatches * 2, 10);
+  const leadershipMatches = countKeywordMatches(text, keywords.leadership);
+  score += Math.min(leadershipMatches * 2, 10);
 
-  // Impact/quantification signal
-  const hasNumbers  = /\d+%|\d+ years?|\₹\d+|increased|reduced|improved/.test(text);
-  if (hasNumbers) score += 10;
+  const hasQuantifiedImpact = /(\d+%|\d+\+?\s*years?|₹\s?\d+|\$\s?\d+|increased|reduced|improved)/i.test(text);
+  if (hasQuantifiedImpact) score += 10;
 
-  // Contact info signal
-  const hasContact = /email|phone|linkedin|github/.test(text);
+  const hasContact = /(email|phone|linkedin|github)/i.test(text);
   if (hasContact) score += 5;
 
-  // Education signal
-  const hasEducation = /university|college|degree|b\.tech|mba|bca|b\.com/.test(text);
+  const hasEducation = /(university|college|degree|b\.tech|mba|bca|b\.com|m\.tech)/i.test(text);
   if (hasEducation) score += 5;
 
-  return Math.min(Math.round(score), 75); // free engine caps at 75 — premium gives full picture
+  return Math.min(Math.round(score), 75);
 }
 
 function estimateExperienceFree(resumeText) {
-  const text = (resumeText || '').toLowerCase();
+  const text = normalizeText(resumeText);
 
-  // Look for year patterns: 2018-2022, 2019 - present, etc.
-  const yearMatches = text.match(/20\d\d/g) || [];
+  const yearMatches = text.match(/20\d{2}/g) || [];
   if (yearMatches.length >= 2) {
-    const years  = yearMatches.map(Number).sort();
+    const years = yearMatches.map(Number).sort((a, b) => a - b);
     const spread = years[years.length - 1] - years[0];
-    return Math.min(spread, 20);
+    return Math.max(0, Math.min(spread, 20));
   }
 
-  // Fallback: count "years of experience" mentions
-  const expMatch = text.match(/(\d+)\+?\s*years?\s*(?:of\s*)?(?:experience)?/i);
-  if (expMatch) return parseInt(expMatch[1]);
+  const explicitExperience = text.match(/(\d+)\+?\s*years?\s*(?:of\s*)?(?:experience)?/i);
+  if (explicitExperience) {
+    return Math.min(parseInt(explicitExperience[1], 10) || 0, 40);
+  }
 
   return 0;
 }
 
-function getTopSkillsFree(resumeText) {
-  const text   = (resumeText || '').toLowerCase();
-  return SKILL_KEYWORDS.technical
-    .filter(k => text.includes(k))
+function getTopSkillsFree(resumeText, keywords) {
+  const text = normalizeText(resumeText);
+
+  return keywords.technical
+    .filter((keyword) => text.includes(keyword.toLowerCase()))
     .slice(0, 5)
-    .map(k => k.charAt(0).toUpperCase() + k.slice(1));
+    .map((keyword) => keyword
+      .split(' ')
+      .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+      .join(' '));
 }
 
 function scoreTier(score) {
@@ -97,71 +127,70 @@ function scoreTier(score) {
   return 'poor';
 }
 
-// ─── Main free engine ─────────────────────────────────────────
-
 /**
- * runFreeEngine(resumeData)
- *
- * @param {object} resumeData - { resumeId, resumeText, fileName }
- * @returns {object} analysis result (mirrors premium shape, AI fields are null)
+ * runFreeEngine
+ * @param {Object} params
+ * @param {string} params.resumeId
+ * @param {string} params.resumeText
+ * @param {string} params.fileName
+ * @param {Object} [params.skillKeywords]
+ * @returns {Object}
  */
-function runFreeEngine(resumeData) {
-  const { resumeId, resumeText, fileName } = resumeData;
+function runFreeEngine({ resumeId, resumeText, fileName, skillKeywords = {} }) {
+  const keywords = resolveKeywords(skillKeywords);
 
-  logger.debug('[FreeEngine] Running rule-based analysis', { resumeId });
+  logger.debug('[FreeEngine] Running deterministic analysis', {
+    resumeId,
+    keywordSource: Object.keys(skillKeywords).length ? 'dynamic' : 'default',
+  });
 
-  const score      = scoreResumeFree(resumeText);
-  const tier       = scoreTier(score);
-  const expYears   = estimateExperienceFree(resumeText);
-  const topSkills  = getTopSkillsFree(resumeText);
+  const score = scoreResumeFree(resumeText, keywords);
+  const tier = scoreTier(score);
+  const estimatedExperienceYears = estimateExperienceFree(resumeText);
+  const topSkills = getTopSkillsFree(resumeText, keywords);
 
   return {
     resumeId,
     fileName,
-    engine:    'free',
-
-    // ── Resume score ──────────────────────────────────────
+    engine: 'free',
     score,
     tier,
-    summary:   'Basic analysis complete. Upgrade to see AI-powered insights.',
+    summary: 'Basic analysis complete. Upgrade to unlock premium AI insights.',
     breakdown: {
-      clarity:     Math.round(score * 0.9),
-      relevance:   Math.round(score * 0.95),
-      experience:  Math.round(score * 0.85),
-      skills:      Math.round(score * 1.0),
+      clarity: Math.round(score * 0.9),
+      relevance: Math.round(score * 0.95),
+      experience: Math.round(score * 0.85),
+      skills: Math.round(score),
       achievements: Math.round(score * 0.7),
     },
-    strengths:    topSkills.length > 0
+    strengths: topSkills.length
       ? [`Relevant skills detected: ${topSkills.join(', ')}`]
       : ['Resume text extracted successfully'],
     improvements: [
-      'Add more quantified achievements (numbers, percentages, outcomes)',
-      'Include specific tools and technologies',
+      'Add more quantified achievements with measurable outcomes',
+      'Include specific tools, frameworks, and technologies',
+      'Improve role-wise project impact statements',
     ],
     topSkills,
-    estimatedExperienceYears: expYears,
+    estimatedExperienceYears,
 
-    // ── CHI (free: limited) ───────────────────────────────
-    chiScore:       null,  // requires premium engine
-    dimensions:     null,  // requires premium engine
-    marketPosition: null,  // requires premium engine
-    peerComparison: null,  // requires premium engine
-
-    // ── Growth (free: null) ───────────────────────────────
-    growthInsights:    null,
-    salaryEstimate:    null,
-    roadmap:           null,
+    // Premium-only placeholders
+    chiScore: null,
+    dimensions: null,
+    marketPosition: null,
+    peerComparison: null,
+    growthInsights: null,
+    salaryEstimate: null,
+    roadmap: null,
 
     scoredAt: new Date().toISOString(),
   };
 }
 
-module.exports = { runFreeEngine };
-
-
-
-
-
-
-
-
+module.exports = {
+  runFreeEngine,
+  DEFAULT_SKILL_KEYWORDS,
+  scoreResumeFree,
+  estimateExperienceFree,
+  getTopSkillsFree,
+};

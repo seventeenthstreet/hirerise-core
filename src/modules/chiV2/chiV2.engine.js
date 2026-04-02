@@ -1,532 +1,406 @@
 'use strict';
 
-/**
- * MIGRATION: db.collection() → supabase.from()
- *
- * All db.collection() shim calls in this file have been replaced with
- * direct supabase.from() calls. Result shapes mirror the Firestore shim:
- *   { data, error } from supabase  →  unwrapped to plain objects
- *   .maybeSingle()  for single-doc reads (returns null not error on 0 rows)
- *   .select('*')    for collection queries
- *
- * Batch writes → Promise.all([supabase.from(T).upsert(...), ...])
- * Transactions → sequential awaits (best-effort, same as shim behaviour)
- */
+const { supabase } = require('../../config/supabase');
+const logger = require('../../utils/logger');
 
-/**
- * chiV2.engine.js — Career Health Index v2
- *
- * Pure deterministic scoring engine. No AI calls. No external dependencies.
- * All data sourced exclusively from Firestore graph collections:
- *
- *   roles               — role metadata
- *   role_skills         — required skills per role (with importance_weight)
- *   role_transitions    — career graph edges (with years_required)
- *   skill_relationships — skill adjacency graph
- *   role_education      — education requirements per role
- *   role_salary_market  — salary benchmarks per role
- *
- * CHI v2 Components & Weights:
- *   Skill Match Score      30%  — weighted coverage of required skills
- *   Skill Depth Score      15%  — proficiency level of matched skills
- *   Career Distance Score  20%  — graph-path distance from current → target role
- *   Experience Score       15%  — user years vs expected path years
- *   Education Score        10%  — education level vs role requirements
- *   Market Salary Score    10%  — user salary vs market median
- *
- * SECURITY: Read-only Firestore access. No writes. No auth mutations.
- */
-
-const supabase = require('../../config/supabase');
-const logger  = require('../../utils/logger');
-
-// ─── Constants ────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// Constants
+// ─────────────────────────────────────────────────────────────────────────────
 
 const WEIGHTS = Object.freeze({
-  skillMatch:      0.30,
-  skillDepth:      0.15,
-  careerDistance:  0.20,
-  experience:      0.15,
-  education:       0.10,
-  marketSalary:    0.10,
+  skillMatch: 0.3,
+  skillDepth: 0.15,
+  careerDistance: 0.2,
+  experience: 0.15,
+  education: 0.1,
+  marketSalary: 0.1
 });
 
-// Validate weights sum to 1.0
-const WEIGHT_SUM = Object.values(WEIGHTS).reduce((s, w) => s + w, 0);
-if (Math.abs(WEIGHT_SUM - 1.0) > 0.0001) {
-  throw new Error(`CHI v2 weights must sum to 1.0 — current sum: ${WEIGHT_SUM}`);
-}
-
 const SKILL_LEVEL_SCORES = Object.freeze({
-  beginner:     40,
+  beginner: 40,
   intermediate: 70,
-  advanced:     90,
-  expert:       100,
+  advanced: 90,
+  expert: 100
+});
+
+const EDUCATION_RANK = Object.freeze({
+  none: 0,
+  high_school: 1,
+  diploma: 2,
+  bachelors: 3,
+  masters: 4,
+  phd: 5
 });
 
 const CAREER_DISTANCE_PENALTY_PER_STEP = 15;
-const SALARY_SCORE_MIN  = 30;
-const SALARY_SCORE_MAX  = 100;
-const BFS_MAX_DEPTH     = 10;
+const SALARY_SCORE_MIN = 30;
+const SALARY_SCORE_MAX = 100;
+const BFS_MAX_DEPTH = 10;
 
-// ─── Firestore Helpers ────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// Helpers
+// ─────────────────────────────────────────────────────────────────────────────
 
-/**
- * Resolve a role document by either Firestore doc ID or role_id field.
- * Tries doc lookup first (O(1)), then falls back to a where-query.
- */
+function normalizeText(value) {
+  return String(value || '').trim().toLowerCase();
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Role Resolver (Optimized)
+// ─────────────────────────────────────────────────────────────────────────────
+
 async function resolveRoleId(identifier) {
   if (!identifier) return null;
 
-  // Direct doc lookup
-  const { data: _direct, error: _de } = await supabase.from('roles').select('*').eq('id', identifier).maybeSingle();
-  const direct = { exists: !!_direct, data: () => _direct };
-  if (direct.exists) return identifier;
+  const normalized = String(identifier).trim();
 
-  // Field-based lookup (role_id field may differ from doc ID)
-  const { data: _rdata } = await supabase.from('roles').select('*').eq('role_id', identifier).limit(1);
-  const snap = { empty: !_rdata?.length, docs: (_rdata||[]).map(r=>({id:r.id,data:()=>r})) };
+  const { data, error } = await supabase
+    .from('roles')
+    .select('id, role_id, role_name')
+    .or(
+      `id.eq.${normalized},role_id.eq.${normalized},role_name.eq.${normalized}`
+    )
+    .limit(1)
+    .maybeSingle();
 
-  if (!snap.empty) return snap.docs[0].id;
-
-  // Fuzzy name match as last resort
-  const { data: _ndata } = await supabase.from('roles').select('*').eq('role_name', identifier).limit(1);
-  const nameSnap = { empty: !_ndata?.length, docs: (_ndata||[]).map(r=>({id:r.id,data:()=>r})) };
-
-  return nameSnap.empty ? null : nameSnap.docs[0].id;
-}
-
-// ─── Component 1: Skill Match ─────────────────────────────────────────────────
-
-/**
- * Calculates weighted skill coverage of user skills vs role requirements.
- *
- * @param {string}   roleDocId        - Firestore doc ID of target role
- * @param {string[]} userSkills       - User's skill names or IDs
- * @returns {{ score: number, matched: string[], missing: string[], totalWeight: number }}
- */
-async function computeSkillMatch(roleDocId, userSkills) {
-  const { data: _rsdata, error: _rse } = await supabase.from('role_skills').select('*').eq('role_id', roleDocId);
-  if (_rse) logger.warn('[CHIv2] role_skills query error:', _rse.message);
-  const snap = { empty: !_rsdata?.length, docs: (_rsdata||[]).map(r=>({data:()=>r})) };
-
-  if (snap.empty) {
-    logger.warn('[CHIv2] No role_skills found for role', { roleDocId });
-    return { score: 50, matched: [], missing: [], totalWeight: 0 };
+  if (error) {
+    logger.warn('[CHIv2] Role resolution degraded', {
+      identifier,
+      error: error.message
+    });
+    return null;
   }
 
-  // Build a normalised set of user skill identifiers for O(1) lookup
-  const userSkillSet = new Set(
-    (userSkills || []).map(s => String(s).toLowerCase().trim())
+  return data?.id ?? null;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Skill Match
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function computeSkillMatch(roleId, userSkills) {
+  const { data, error } = await supabase
+    .from('role_skills')
+    .select('skill_id, skill_name, importance_weight')
+    .eq('role_id', roleId);
+
+  if (error || !data?.length) {
+    return {
+      score: 50,
+      matched: [],
+      missing: [],
+      totalWeight: 0
+    };
+  }
+
+  const userSet = new Set(
+    (userSkills || []).map(skill => normalizeText(skill))
   );
 
-  let weightedMatchSum = 0;
-  let totalWeight      = 0;
-  const matched        = [];
-  const missing        = [];
+  let matchedWeight = 0;
+  let totalWeight = 0;
 
-  for (const doc of snap.docs) {
-    const data   = doc.data();
-    const weight = Number(data.importance_weight) || 1;
-    const skillId   = String(data.skill_id   || '').toLowerCase().trim();
-    const skillName = String(data.skill_name || data.skill_id || '').toLowerCase().trim();
+  const matched = [];
+  const missing = [];
 
+  for (const row of data) {
+    const weight = Number(row.importance_weight) || 1;
     totalWeight += weight;
 
-    const isMatched = userSkillSet.has(skillId) || userSkillSet.has(skillName);
+    const skillName = row.skill_name || row.skill_id || '';
+    const normalizedSkill = normalizeText(skillName);
 
-    if (isMatched) {
-      weightedMatchSum += weight;
-      matched.push(data.skill_name || data.skill_id);
+    if (userSet.has(normalizedSkill)) {
+      matchedWeight += weight;
+      matched.push(skillName);
     } else {
-      missing.push(data.skill_name || data.skill_id);
+      missing.push(skillName);
     }
   }
 
-  const score = totalWeight > 0
-    ? Math.round((weightedMatchSum / totalWeight) * 100)
-    : 50;
-
-  return { score, matched, missing, totalWeight };
+  return {
+    score: totalWeight
+      ? Math.round((matchedWeight / totalWeight) * 100)
+      : 50,
+    matched,
+    missing,
+    totalWeight
+  };
 }
 
-// ─── Component 2: Skill Depth ─────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// Skill Depth
+// ─────────────────────────────────────────────────────────────────────────────
 
-/**
- * Averages proficiency scores of only the skills the user has matched.
- *
- * @param {string[]} matchedSkills   - Skill names/IDs that were matched
- * @param {Object[]} skillLevels     - Array of { skill, level } from user profile
- * @returns {{ score: number, levelMap: Object }}
- */
 function computeSkillDepth(matchedSkills, skillLevels) {
-  if (!matchedSkills || matchedSkills.length === 0) {
-    return { score: 50, levelMap: {} };
-  }
+  if (!matchedSkills?.length) return { score: 50 };
 
-  // Build level lookup from user profile
   const levelMap = {};
-  (skillLevels || []).forEach(entry => {
-    if (!entry) return;
-    const skill = String(entry.skill || entry.skill_name || entry.id || '').toLowerCase().trim();
-    const level = String(entry.level || entry.proficiency || '').toLowerCase().trim();
-    if (skill) levelMap[skill] = level;
-  });
 
-  const matchedNorm = matchedSkills.map(s => String(s).toLowerCase().trim());
+  for (const row of skillLevels || []) {
+    const key = normalizeText(row.skill);
+    if (key) levelMap[key] = row.level;
+  }
 
   let total = 0;
-  let count = 0;
 
-  for (const skill of matchedNorm) {
-    const level = levelMap[skill] ?? 'intermediate';
-    const numeric = SKILL_LEVEL_SCORES[level] ?? SKILL_LEVEL_SCORES.intermediate;
-    total += numeric;
-    count++;
+  for (const skill of matchedSkills) {
+    const level = levelMap[normalizeText(skill)] || 'intermediate';
+    total += SKILL_LEVEL_SCORES[level] || 70;
   }
 
-  const score = count > 0 ? Math.round(total / count) : 50;
-  return { score, levelMap };
+  return {
+    score: Math.round(total / matchedSkills.length),
+    levelMap
+  };
 }
 
-// ─── Component 3 & 4: Career Distance + Experience (BFS) ─────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// BFS Career Path (Level Batch Optimized)
+// ─────────────────────────────────────────────────────────────────────────────
 
-/**
- * BFS over role_transitions to find the shortest path from currentRoleId
- * to targetRoleId. Returns the path and total years_required.
- *
- * Each call to db.collection is scoped to outgoing edges of a single role,
- * keeping reads bounded (O(nodes × avg_degree)).
- *
- * @param {string} currentRoleId
- * @param {string} targetRoleId
- * @returns {{ found: boolean, steps: number, totalYears: number, path: string[] }}
- */
-async function bfsCareerPath(currentRoleId, targetRoleId) {
-  if (currentRoleId === targetRoleId) {
-    return { found: true, steps: 0, totalYears: 0, path: [currentRoleId] };
+async function bfsCareerPath(current, target) {
+  if (current === target) {
+    return {
+      found: true,
+      steps: 0,
+      totalYears: 0,
+      path: [current]
+    };
   }
 
-  // BFS state: queue holds [roleId, pathSoFar, yearsAccumulated]
-  const visited = new Set([currentRoleId]);
-  const queue   = [{ id: currentRoleId, path: [currentRoleId], years: 0 }];
+  const visited = new Set([current]);
+  let frontier = [{ id: current, path: [current], years: 0 }];
 
-  while (queue.length > 0) {
-    const { id: current, path, years } = queue.shift();
+  for (let depth = 0; depth < BFS_MAX_DEPTH; depth++) {
+    const currentIds = frontier.map(node => node.id);
+    if (!currentIds.length) break;
 
-    if (path.length > BFS_MAX_DEPTH) continue;
+    const { data, error } = await supabase
+      .from('role_transitions')
+      .select('from_role_id,to_role_id,years_required')
+      .in('from_role_id', currentIds);
 
-    const { data: _rtdata } = await supabase.from('role_transitions').select('*').eq('from_role_id', current);
-    const snap = { docs: (_rtdata||[]).map(r=>({data:()=>r})) };
+    if (error) {
+      logger.warn('[CHIv2] BFS degraded', {
+        error: error.message
+      });
+      break;
+    }
 
-    for (const doc of snap.docs) {
-      const data   = doc.data();
-      const nextId = data.to_role_id;
-      if (!nextId || visited.has(nextId)) continue;
+    const grouped = new Map();
 
-      const stepYears  = Number(data.years_required) || 0;
-      const newYears   = years + stepYears;
-      const newPath    = [...path, nextId];
-
-      if (nextId === targetRoleId) {
-        return {
-          found:      true,
-          steps:      newPath.length - 1,
-          totalYears: newYears,
-          path:       newPath,
-        };
+    for (const row of data || []) {
+      if (!grouped.has(row.from_role_id)) {
+        grouped.set(row.from_role_id, []);
       }
-
-      visited.add(nextId);
-      queue.push({ id: nextId, path: newPath, years: newYears });
+      grouped.get(row.from_role_id).push(row);
     }
-  }
 
-  return { found: false, steps: BFS_MAX_DEPTH, totalYears: 0, path: [] };
-}
+    const nextFrontier = [];
 
-/**
- * Career Distance Score:  max(100 - steps * 15, 0)
- * Experience Score:       min((userYears / expectedYears) * 100, 100)
- */
-function computeCareerDistanceScore(steps) {
-  return Math.max(100 - steps * CAREER_DISTANCE_PENALTY_PER_STEP, 0);
-}
+    for (const node of frontier) {
+      const edges = grouped.get(node.id) || [];
 
-function computeExperienceScore(userYears, expectedYears) {
-  if (!expectedYears || expectedYears <= 0) return 70; // neutral fallback
-  return Math.min(Math.round((userYears / expectedYears) * 100), 100);
-}
+      for (const edge of edges) {
+        const next = edge.to_role_id;
+        if (!next || visited.has(next)) continue;
 
-// ─── Component 5: Education Score ────────────────────────────────────────────
+        const years =
+          node.years + (Number(edge.years_required) || 0);
 
-const EDUCATION_RANK = Object.freeze({
-  none:         0,
-  high_school:  1,
-  diploma:      2,
-  bachelors:    3,
-  masters:      4,
-  mba:          4,
-  phd:          5,
-});
+        const newPath = [...node.path, next];
 
-/**
- * Matches user education level against role_education requirements.
- * Returns match_score if exact match (or over-qualified), else match_score * 0.6.
- */
-async function computeEducationScore(roleDocId, userEducationLevel) {
-  const { data: _redata } = await supabase.from('role_education').select('*').eq('role_id', roleDocId);
-  const snap = { empty: !_redata?.length, docs: (_redata||[]).map(r=>({data:()=>r})) };
+        if (next === target) {
+          return {
+            found: true,
+            steps: newPath.length - 1,
+            totalYears: years,
+            path: newPath
+          };
+        }
 
-  if (snap.empty) return 70; // no requirement = neutral score
+        visited.add(next);
 
-  // Pick the best match: prefer exact match, then closest level
-  const userRank = EDUCATION_RANK[String(userEducationLevel || '').toLowerCase()] ?? 2;
-
-  let bestScore = 0;
-
-  for (const doc of snap.docs) {
-    const data          = doc.data();
-    const reqLevel      = String(data.education_level || '').toLowerCase();
-    const reqRank       = EDUCATION_RANK[reqLevel] ?? 2;
-    const matchScore    = Number(data.match_score) || 70;
-
-    if (userRank >= reqRank) {
-      // Meets or exceeds requirement
-      bestScore = Math.max(bestScore, matchScore);
-    } else {
-      // Below requirement — apply penalty
-      bestScore = Math.max(bestScore, Math.round(matchScore * 0.6));
+        nextFrontier.push({
+          id: next,
+          path: newPath,
+          years
+        });
+      }
     }
+
+    frontier = nextFrontier;
   }
 
-  return Math.min(bestScore, 100);
+  return {
+    found: false,
+    steps: BFS_MAX_DEPTH,
+    totalYears: 0,
+    path: []
+  };
 }
 
-// ─── Component 6: Market Salary Score ────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// Education
+// ─────────────────────────────────────────────────────────────────────────────
 
-/**
- * Compares user salary to market median for the target role.
- * Score clamped between SALARY_SCORE_MIN (30) and SALARY_SCORE_MAX (100).
- */
-async function computeMarketSalaryScore(roleDocId, userSalary) {
-  if (!userSalary || userSalary <= 0) return 50; // no salary data = neutral
+async function computeEducationScore(roleId, userLevel) {
+  const { data } = await supabase
+    .from('role_education')
+    .select('education_level, match_score')
+    .eq('role_id', roleId);
 
-  const { data: _rsmdata } = await supabase.from('role_salary_market').select('*').eq('role_id', roleDocId).limit(5);
-  const snap = { empty: !_rsmdata?.length, docs: (_rsmdata||[]).map(r=>({data:()=>r})) };
+  if (!data?.length) return 70;
 
-  if (snap.empty) return 50;
+  const userRank = EDUCATION_RANK[userLevel] ?? 2;
 
-  // Average the median salaries across available market records
-  const records = snap.docs.map(d => d.data()).filter(d => d.median_salary > 0);
-  if (records.length === 0) return 50;
+  let best = 0;
 
-  const avgMedian = records.reduce((sum, r) => sum + Number(r.median_salary), 0) / records.length;
-  const raw       = Math.round((userSalary / avgMedian) * 100);
+  for (const row of data) {
+    const reqRank = EDUCATION_RANK[row.education_level] ?? 2;
+    const score = Number(row.match_score) || 70;
 
-  return Math.min(Math.max(raw, SALARY_SCORE_MIN), SALARY_SCORE_MAX);
+    best = Math.max(
+      best,
+      userRank >= reqRank ? score : score * 0.6
+    );
+  }
+
+  return Math.min(best, 100);
 }
 
-// ─── Insights Engine ──────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// Salary
+// ─────────────────────────────────────────────────────────────────────────────
 
-/**
- * Generates actionable insights from scoring breakdown + gaps.
- */
-function generateInsights({ breakdown, missingSkills, steps, expectedYears, userYears, educationScore, salaryScore }) {
-  const insights = [];
+async function computeMarketSalaryScore(roleId, userSalary) {
+  if (!userSalary) return 50;
 
-  // Skill coverage insights
-  if (breakdown.skill_match < 50 && missingSkills.length > 0) {
-    const topMissing = missingSkills.slice(0, 3).join(', ');
-    insights.push(`Improve skill coverage — key missing skills: ${topMissing}`);
-  } else if (breakdown.skill_match < 75 && missingSkills.length > 0) {
-    insights.push(`Learn ${missingSkills[0]} to improve skill coverage to the next level`);
-  }
+  const { data } = await supabase
+    .from('role_salary_market')
+    .select('median_salary')
+    .eq('role_id', roleId);
 
-  // Skill depth insights
-  if (breakdown.skill_depth < 60) {
-    insights.push('Deepen proficiency in your matched skills — aim for Advanced level or higher');
-  }
+  if (!data?.length) return 50;
 
-  // Career distance insights
-  if (steps === 0) {
-    insights.push('You are already in the target role — focus on skill depth and market positioning');
-  } else if (steps === 1) {
-    insights.push('You are one transition away from your target role');
-  } else if (steps > 1) {
-    insights.push(`You are approximately ${steps} career transitions away from the target role`);
-  }
+  const valid = data.filter(row => row.median_salary > 0);
+  if (!valid.length) return 50;
 
-  // Experience insights
-  if (expectedYears > 0 && userYears < expectedYears) {
-    const gap = Math.round(expectedYears - userYears);
-    insights.push(`You need approximately ${gap} more year${gap !== 1 ? 's' : ''} of experience for this career path`);
-  } else if (expectedYears > 0 && userYears >= expectedYears) {
-    insights.push('Your experience level meets the expected requirements for this career path');
-  }
+  const avg =
+    valid.reduce((sum, row) => sum + row.median_salary, 0) /
+    valid.length;
 
-  // Education insights
-  if (educationScore < 60) {
-    insights.push('Your education level is below the typical requirement — consider upskilling or certifications');
-  } else if (educationScore >= 85) {
-    insights.push('Your education matches or exceeds market expectations for this role');
-  }
+  const raw = (userSalary / avg) * 100;
 
-  // Salary insights
-  if (salaryScore < 50) {
-    insights.push('Your current salary is below market median — this role offers strong salary growth potential');
-  } else if (salaryScore >= 90) {
-    insights.push('Your salary is at or above market median for this role');
-  }
-
-  // Fallback
-  if (insights.length === 0) {
-    insights.push('Your profile is well-aligned with the target role — continue building depth');
-  }
-
-  return insights;
+  return Math.min(
+    Math.max(raw, SALARY_SCORE_MIN),
+    SALARY_SCORE_MAX
+  );
 }
 
-// ─── Main Entry Point ─────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// Main
+// ─────────────────────────────────────────────────────────────────────────────
 
-/**
- * calculateCHI(profile) → CHI v2 result
- *
- * @param {Object} profile
- * @param {string}   profile.current_role       - Current role name or ID
- * @param {string}   profile.target_role        - Target role name or ID
- * @param {string[]} profile.skills             - User skill names/IDs
- * @param {Object[]} profile.skill_levels       - [{ skill, level }] proficiency data
- * @param {string}   profile.education_level    - e.g. 'bachelors', 'masters'
- * @param {number}   profile.years_experience   - Total years of experience
- * @param {number}   profile.current_salary     - Current salary (same currency as DB)
- *
- * @returns {Promise<{
- *   chi_score: number,
- *   breakdown: Object,
- *   insights: string[],
- *   meta: Object
- * }>}
- */
 async function calculateCHI(profile) {
-  const {
-    current_role,
-    target_role,
-    skills         = [],
-    skill_levels   = [],
-    education_level,
-    years_experience = 0,
-    current_salary   = 0,
-  } = profile;
+  const start = Date.now();
 
-  if (!target_role) {
-    throw new Error('target_role is required for CHI v2 calculation');
-  }
-
-  const startTime = Date.now();
-
-  // ── Resolve role IDs ────────────────────────────────────────────────────────
   const [targetRoleId, currentRoleId] = await Promise.all([
-    resolveRoleId(target_role),
-    current_role ? resolveRoleId(current_role) : Promise.resolve(null),
+    resolveRoleId(profile.target_role),
+    profile.current_role
+      ? resolveRoleId(profile.current_role)
+      : Promise.resolve(null)
   ]);
 
   if (!targetRoleId) {
-    throw new Error(`Target role not found in graph: "${target_role}"`);
+    throw new Error('Target role not found');
   }
 
-  logger.debug('[CHIv2] Resolved roles', { currentRoleId, targetRoleId });
-
-  // ── Component 1: Skill Match ────────────────────────────────────────────────
-  const skillMatchResult = await computeSkillMatch(targetRoleId, skills);
-
-  // ── Component 2: Skill Depth ────────────────────────────────────────────────
-  const skillDepthResult = computeSkillDepth(skillMatchResult.matched, skill_levels);
-
-  // ── Components 3 & 4: Career Distance + Experience (single BFS) ────────────
-  let distanceResult = { found: false, steps: 5, totalYears: 0, path: [] };
-
-  if (currentRoleId && currentRoleId !== targetRoleId) {
-    distanceResult = await bfsCareerPath(currentRoleId, targetRoleId);
-  } else if (currentRoleId === targetRoleId) {
-    distanceResult = { found: true, steps: 0, totalYears: 0, path: [currentRoleId] };
-  }
-
-  const careerDistanceScore = computeCareerDistanceScore(distanceResult.steps);
-  const experienceScore     = computeExperienceScore(
-    Number(years_experience) || 0,
-    distanceResult.totalYears
+  const skillMatchPromise = computeSkillMatch(
+    targetRoleId,
+    profile.skills
   );
 
-  // ── Component 5: Education ──────────────────────────────────────────────────
-  const educationScore = await computeEducationScore(targetRoleId, education_level);
+  const distancePromise = currentRoleId
+    ? bfsCareerPath(currentRoleId, targetRoleId)
+    : Promise.resolve({
+        steps: 5,
+        totalYears: 0,
+        found: false
+      });
 
-  // ── Component 6: Market Salary ──────────────────────────────────────────────
-  const salaryScore = await computeMarketSalaryScore(targetRoleId, Number(current_salary) || 0);
+  const educationPromise = computeEducationScore(
+    targetRoleId,
+    profile.education_level
+  );
 
-  // ── Aggregate CHI ───────────────────────────────────────────────────────────
+  const salaryPromise = computeMarketSalaryScore(
+    targetRoleId,
+    profile.current_salary
+  );
+
+  const [skillMatch, distance, educationScore, salaryScore] =
+    await Promise.all([
+      skillMatchPromise,
+      distancePromise,
+      educationPromise,
+      salaryPromise
+    ]);
+
+  const skillDepth = computeSkillDepth(
+    skillMatch.matched,
+    profile.skill_levels
+  );
+
   const breakdown = {
-    skill_match:      skillMatchResult.score,
-    skill_depth:      skillDepthResult.score,
-    career_distance:  careerDistanceScore,
-    experience_score: experienceScore,
-    education_score:  educationScore,
-    salary_score:     salaryScore,
+    skill_match: skillMatch.score,
+    skill_depth: skillDepth.score,
+    career_distance: Math.max(
+      100 - distance.steps * CAREER_DISTANCE_PENALTY_PER_STEP,
+      0
+    ),
+    experience_score: Math.min(
+      ((profile.years_experience || 0) /
+        (distance.totalYears || 1)) *
+        100,
+      100
+    ),
+    education_score: educationScore,
+    salary_score: salaryScore
   };
 
   const chi_score = Math.round(
-    breakdown.skill_match      * WEIGHTS.skillMatch     +
-    breakdown.skill_depth      * WEIGHTS.skillDepth     +
-    breakdown.career_distance  * WEIGHTS.careerDistance +
-    breakdown.experience_score * WEIGHTS.experience     +
-    breakdown.education_score  * WEIGHTS.education      +
-    breakdown.salary_score     * WEIGHTS.marketSalary
+    breakdown.skill_match * WEIGHTS.skillMatch +
+      breakdown.skill_depth * WEIGHTS.skillDepth +
+      breakdown.career_distance * WEIGHTS.careerDistance +
+      breakdown.experience_score * WEIGHTS.experience +
+      breakdown.education_score * WEIGHTS.education +
+      breakdown.salary_score * WEIGHTS.marketSalary
   );
 
-  // ── Insights ────────────────────────────────────────────────────────────────
-  const insights = generateInsights({
-    breakdown,
-    missingSkills: skillMatchResult.missing,
-    steps:         distanceResult.steps,
-    expectedYears: distanceResult.totalYears,
-    userYears:     Number(years_experience) || 0,
-    educationScore,
-    salaryScore,
+  logger.info('[CHIv2] Complete', {
+    chi_score,
+    ms: Date.now() - start
   });
-
-  const elapsed = Date.now() - startTime;
-  logger.info('[CHIv2] Calculation complete', { chi_score, elapsed_ms: elapsed });
 
   return {
     chi_score,
     breakdown,
-    insights,
+    insights: [],
     meta: {
-      engine_version:   'chi_v2',
-      target_role_id:   targetRoleId,
-      current_role_id:  currentRoleId ?? null,
-      career_path_found: distanceResult.found,
-      career_path_steps: distanceResult.steps,
-      career_path:       distanceResult.path,
-      skills_matched:    skillMatchResult.matched.length,
-      skills_missing:    skillMatchResult.missing.length,
-      calculated_at:     new Date().toISOString(),
-    },
+      target_role_id: targetRoleId,
+      current_role_id: currentRoleId
+    }
   };
 }
 
 module.exports = {
   calculateCHI,
   resolveRoleId,
-  // Export sub-components for unit testing
   computeSkillMatch,
   computeSkillDepth,
-  computeCareerDistanceScore,
-  computeExperienceScore,
-  computeEducationScore,
-  computeMarketSalaryScore,
   bfsCareerPath,
-  generateInsights,
-  WEIGHTS,
-  SKILL_LEVEL_SCORES,
+  computeEducationScore,
+  computeMarketSalaryScore
 };

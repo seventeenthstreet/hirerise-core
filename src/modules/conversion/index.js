@@ -1,62 +1,96 @@
 'use strict';
 
 /**
- * Conversion Module — Public Interface
+ * src/modules/conversion/index.js
  *
- * IMPORTANT:
- * - Consumers MUST import only from this file.
- * - Internal paths are private and may change.
+ * Conversion module public interface.
+ *
+ * Architectural rules:
+ * - Consumers MUST import only from this barrel
+ * - Internal folder layout remains private
+ * - Supports future service replacement without breaking callers
+ * - Safe for API, workers, cron jobs, and queue processors
  *
  * Example:
- *   const { conversionNudgeService } = require('@/modules/conversion');
+ *   const {
+ *     conversionHookMiddleware,
+ *     conversionIntentService,
+ *   } = require('@/modules/conversion');
  */
 
-const conversionHookMiddleware   = require('./middleware/conversionHook.middleware');
-const conversionEventService     = require('./services/conversionEvent.service');
+/* -------------------------------------------------------------------------- */
+/*                               MODULE IMPORTS                               */
+/* -------------------------------------------------------------------------- */
+
+const conversionHookMiddleware = require('./middleware/conversionHook.middleware');
+const conversionEventService = require('./services/conversionEvent.service');
 const conversionAggregateService = require('./services/conversionAggregate.service');
-const conversionIntentService    = require('./services/conversionIntent.service');
-const conversionNudgeService     = require('./services/conversionNudge.service');
+const conversionIntentService = require('./services/conversionIntent.service');
+const conversionNudgeService = require('./services/conversionNudge.service');
+
+/* -------------------------------------------------------------------------- */
+/*                             CONTRACT VALIDATION                            */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Ensures required public exports exist.
+ * Helps catch broken refactors during boot.
+ *
+ * @param {string} name
+ * @param {*} value
+ */
+function assertExport(name, value) {
+  if (!value) {
+    throw new Error(
+      `[ConversionModule] Missing required export: ${name}`
+    );
+  }
+}
+
+assertExport('conversionHookMiddleware', conversionHookMiddleware);
+assertExport('conversionEventService', conversionEventService);
+assertExport('conversionAggregateService', conversionAggregateService);
+assertExport('conversionIntentService', conversionIntentService);
+assertExport('conversionNudgeService', conversionNudgeService);
+
+/* -------------------------------------------------------------------------- */
+/*                                PUBLIC API                                  */
+/* -------------------------------------------------------------------------- */
 
 const ConversionModule = Object.freeze({
-
   /**
    * Express middleware
    */
   conversionHookMiddleware,
 
   /**
-   * Raw event recording
+   * Raw event ingestion
    */
   conversionEventService,
 
   /**
-   * Aggregate + scoring update
+   * Aggregate state updater
    */
   conversionAggregateService,
 
   /**
-   * Intent scoring (with decay + cache)
+   * Intent scoring + cache layer
    */
   conversionIntentService,
 
   /**
-   * Rule-based monetization nudging
+   * Monetization nudges + targeting rules
    */
   conversionNudgeService,
 
   /**
-   * Module metadata (future-safe)
+   * Public module metadata
    */
-  version: '2.0.0',
-
+  metadata: Object.freeze({
+    name: 'conversion',
+    version: '2.1.0',
+    database: 'supabase',
+  }),
 });
 
 module.exports = ConversionModule;
-
-
-
-
-
-
-
-

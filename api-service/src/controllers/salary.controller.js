@@ -12,35 +12,61 @@ export async function requestSalaryBenchmark(req, res, next) {
   try {
     const userId = req.user.uid;
 
+    // Validate env early
+    if (!process.env.PUBSUB_SALARY_TOPIC) {
+      throw new Error('Missing PUBSUB_SALARY_TOPIC environment variable');
+    }
+
     const validation = validateSalaryRequest(req.body);
     if (!validation.valid) {
       return res.status(400).json({
         error: 'VALIDATION_ERROR',
         message: validation.error,
+        requestId: req.requestId,
+        timestamp: new Date().toISOString(),
       });
     }
 
     const { jobTitle, location, yearsExperience, industry } = req.body;
+
     const jobId = randomUUID();
 
-    // Create sharded automation job
+    // Sanitize inputs ONCE
+    const sanitizedJobTitle = sanitizeString(jobTitle, 200);
+    const sanitizedLocation = sanitizeString(location, 200);
+    const sanitizedIndustry = industry ? sanitizeString(industry, 100) : null;
+
+    // Harden numeric input
+    const safeYearsExperience = Math.max(0, Math.min(Number(yearsExperience) || 0, 50));
+
+    // Stronger + bounded idempotency key
+    const idempotencyKey = `salary_${userId}_${sanitizedJobTitle}_${sanitizedLocation}_${safeYearsExperience}`.slice(0, 200);
+
+    // Create job
     await jobRepo.createJob(jobId, {
       type: 'SALARY_BENCHMARK',
       userId,
-      idempotencyKey: `salary_${userId}_${sanitizeString(jobTitle, 100)}_${sanitizeString(location, 100)}`,
+      idempotencyKey,
       input: {
-        jobTitle: sanitizeString(jobTitle, 200),
-        location: sanitizeString(location, 200),
-        yearsExperience,
-        industry: industry ? sanitizeString(industry, 100) : null,
+        jobTitle: sanitizedJobTitle,
+        location: sanitizedLocation,
+        yearsExperience: safeYearsExperience,
+        industry: sanitizedIndustry,
       },
     });
 
-    // Publish event
+    // Publish event (sanitized payload)
     await publishEvent(
       process.env.PUBSUB_SALARY_TOPIC,
       EventTypes.SALARY_BENCHMARK_REQUESTED,
-      { userId, jobId, jobTitle, location, yearsExperience, industry },
+      {
+        userId,
+        jobId,
+        jobTitle: sanitizedJobTitle,
+        location: sanitizedLocation,
+        yearsExperience: safeYearsExperience,
+        industry: sanitizedIndustry,
+      },
       { userId, jobId }
     );
 
@@ -50,10 +76,12 @@ export async function requestSalaryBenchmark(req, res, next) {
       requestId: req.requestId,
     });
 
-    res.status(202).json({
+    return res.status(202).json({
       message: 'Salary benchmark queued',
       jobId,
       statusUrl: `/v1/salary/result/${jobId}`,
+      requestId: req.requestId,
+      timestamp: new Date().toISOString(),
     });
 
   } catch (err) {
@@ -76,6 +104,8 @@ export async function getSalaryResult(req, res, next) {
       return res.status(404).json({
         error: 'NOT_FOUND',
         message: 'Job not found',
+        requestId: req.requestId,
+        timestamp: new Date().toISOString(),
       });
     }
 
@@ -83,10 +113,17 @@ export async function getSalaryResult(req, res, next) {
       return res.status(202).json({
         status: job.status,
         message: 'Result not yet available',
+        requestId: req.requestId,
+        timestamp: new Date().toISOString(),
       });
     }
 
-    res.json({ jobId, result: job.result });
+    return res.json({
+      jobId,
+      result: job.result,
+      requestId: req.requestId,
+      timestamp: new Date().toISOString(),
+    });
 
   } catch (err) {
     next(err);

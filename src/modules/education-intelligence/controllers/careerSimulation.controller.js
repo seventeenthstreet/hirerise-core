@@ -6,7 +6,7 @@
  * POST /api/v1/education/career-simulation/:studentId  — run CDTE, store + return
  * GET  /api/v1/education/career-simulation/:studentId  — return stored simulations
  */
-const supabase = require('../../../core/supabaseClient');
+const { supabase } = require('../../../config/supabase');
 const logger = require('../../../utils/logger');
 const repository = require('../repositories/student.repository');
 const CareerSuccessEngine = require('../engines/careerSuccess.engine');

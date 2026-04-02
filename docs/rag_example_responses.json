@@ -1,236 +1,114 @@
 {
-  "_doc": "Career Copilot RAG System — Example API Responses",
-
-  "POST /api/v1/copilot/chat — grounded response": {
-    "request": {
-      "message": "What career should I move into?",
-      "conversation_id": null
-    },
-    "response_200": {
-      "success": true,
-      "data": {
-        "response": "Based on your profile, Operations Analyst is your strongest career path right now. Your job match data shows a 78% match score, and the Opportunity Radar gives it an opportunity score of 88 with High growth trend. You're missing Power BI and SQL from the required skills, but your existing coordination and Excel skills give you a strong foundation.\n\nYour next step today: enrol in Microsoft Learn's free Power BI course — it's the single skill that would most increase your Operations Analyst match score.",
-        "data_sources": [
-          "user_profile",
-          "job_matches",
-          "opportunity_radar",
-          "skill_gaps"
-        ],
-        "confidence": 0.82,
-        "data_completeness": 0.625,
-        "signal_strength": "medium",
-        "was_grounded": true,
-        "refused": false,
-        "violations_found": false,
-        "conversation_id": "b7e2a1f3-9c4d-4e8a-b2f1-0d3e5c7a9b1d",
-        "rag_context_id": "a1b2c3d4-5678-90ab-cdef-1234567890ab",
-        "duration_ms": 1843
-      }
-    }
+  "_meta": {
+    "title": "Career Copilot RAG API",
+    "version": "2.0.0",
+    "auth": "Supabase JWT (Authorization: Bearer <access_token>)",
+    "currency": "INR"
   },
 
-  "POST /api/v1/copilot/chat — salary question (with data)": {
-    "request": { "message": "What salary can I expect as an Operations Analyst?" },
-    "response_200": {
+  "POST /copilot/chat": {
+    "response": {
       "success": true,
       "data": {
-        "response": "Based on the Salary Benchmarks in your profile for Operations Analyst: the median salary is ₹12.0L per year, with a range of ₹8.5L to ₹16.0L depending on experience and company size.\n\nYour Job Matches data also shows salary ranges for matched roles — Operations Analyst positions you're matched to show ₹10L–₹14L. With your 3 years of experience, expect offers closer to the lower-mid range.\n\nAdding Power BI would likely push you toward the upper end of this range — roles requiring BI skills command a premium in this market.",
-        "data_sources": ["salary_benchmarks", "job_matches", "user_profile"],
-        "confidence": 0.79,
-        "was_grounded": true,
-        "refused": false
-      }
-    }
-  },
+        "messageId": "uuid",
+        "conversationId": "uuid",
+        "userId": "uuid",
 
-  "POST /api/v1/copilot/chat — salary question (no data, refused)": {
-    "request": { "message": "What salary will I earn?" },
-    "response_200": {
-      "success": true,
-      "data": {
-        "response": "I don't have salary benchmark data for your target role yet. \n\nThe platform collects salary data from verified job postings. Try:\n• Checking the Salary Intelligence section directly\n• Specifying a more common role title in your profile\n\nI won't invent salary figures.",
+        "response": "string",
+
         "data_sources": [],
         "confidence": 0,
-        "was_grounded": false,
-        "refused": true,
-        "refusal_reason": "no_salary_data",
-        "duration_ms": 12
-      }
-    }
-  },
+        "data_completeness": 0,
 
-  "POST /api/v1/copilot/chat — insufficient profile (refused)": {
-    "request": { "message": "What career should I pursue?" },
-    "context": "User has no profile data",
-    "response_200": {
-      "success": true,
-      "data": {
-        "response": "I don't have enough information about your profile yet to provide personalised career advice. \n\nTo get started, please:\n1. Complete your profile (target role, skills, experience)\n2. Upload your CV for analysis\n3. Browse job listings to build your interest profile\n\nOnce your data is available, I can give you grounded, specific advice based on your actual career situation.",
-        "data_sources": [],
-        "confidence": 0,
-        "was_grounded": false,
-        "refused": true,
-        "refusal_reason": "no_profile",
-        "duration_ms": 8
-      }
-    }
-  },
+        "signal_strength": "low | medium | high",
 
-  "POST /api/v1/copilot/chat — multi-turn follow-up": {
-    "context": "Second message in same session",
-    "request": {
-      "message": "How long will it take to learn Power BI?",
-      "conversation_id": "b7e2a1f3-9c4d-4e8a-b2f1-0d3e5c7a9b1d"
-    },
-    "response_200": {
-      "success": true,
-      "data": {
-        "response": "Based on your Skill Gap Analysis, Power BI is listed as a high-demand missing skill for your Operations Analyst target role. The Learning Path data suggests 4–6 weeks to reach working proficiency.\n\nGiven your existing Excel background (which I can see in your skill profile), you'll find the transition to Power BI faster than most — Excel users typically reach Power BI fundamentals in 2–3 weeks.\n\nNext step: Start with Microsoft Learn's free Power BI Fundamentals module today.",
-        "data_sources": ["skill_gaps", "user_profile"],
-        "confidence": 0.71,
         "was_grounded": true,
         "refused": false,
-        "conversation_id": "b7e2a1f3-9c4d-4e8a-b2f1-0d3e5c7a9b1d"
+        "refusal_reason": null,
+
+        "rag_context_id": "uuid",
+
+        "meta": {
+          "duration_ms": 0,
+          "tokens_used": 0,
+          "model": "gpt-5.3",
+          "generated_at": "ISO8601"
+        }
       }
     }
   },
 
-  "GET /api/v1/copilot/welcome": {
-    "response_200": {
+  "GET /copilot/welcome": {
+    "response": {
       "success": true,
       "data": {
-        "message": "Hello, Priya! 👋 I'm your Career Copilot.\n\nI have access to your Career Health Score, skill gap analysis, job matches, opportunity radar.\n\nAsk me anything about your career path, skills to learn, or job opportunities. My answers are based only on your real platform data.",
-        "user_name": "Priya Sharma",
-        "data_sources_available": [
-          "user_profile",
-          "chi_score",
-          "skill_gaps",
-          "job_matches",
-          "opportunity_radar"
-        ],
-        "data_completeness": 0.625
+        "userId": "uuid",
+        "message": "string",
+        "data_sources_available": [],
+        "data_completeness": 0
       }
     }
   },
 
-  "GET /api/v1/copilot/context (debug, non-production)": {
-    "response_200": {
+  "GET /copilot/context": {
+    "response": {
       "success": true,
       "data": {
-        "data_sources_used":  ["user_profile", "skill_gaps", "job_matches", "opportunity_radar"],
-        "data_completeness":  0.5,
-        "confidence_score":   0.62,
-        "is_sufficient":      true,
-        "retrieval_ms":       287,
-        "sources_summary": {
-          "user_profile":            "✓",
-          "chi_score":               "✗",
-          "skill_gaps":              "✓ (4 gaps)",
-          "job_matches":             "✓ (5 matches)",
-          "opportunity_radar":       "✓ (5 opps)",
-          "risk_analysis":           "✗",
-          "salary_benchmarks":       "✗",
-          "personalization_profile": "✓ (23 events)"
-        }
+        "userId": "uuid",
+
+        "data_sources_used": [],
+        "data_completeness": 0,
+        "confidence_score": 0,
+
+        "retrieval_ms": 0
       }
     }
   },
 
-  "retrieved_context_structure": {
-    "description": "Full internal RAGContext object assembled by ragRetriever.retrieveContext()",
-    "example": {
-      "user_profile": {
-        "skills":           ["Excel", "Coordination", "Communication", "Admin Management"],
-        "target_role":      "Operations Analyst",
-        "current_role":     "Admin Executive",
-        "industry":         "Operations",
-        "years_experience": 3,
-        "education_level":  "bachelors",
-        "location":         "Bengaluru"
-      },
-      "chi_score": {
-        "chi_score":       72,
-        "analysis_source": "full_ai",
-        "dimensions": {
-          "skillMatch":      { "score": 65 },
-          "careerDistance":  { "score": 80 },
-          "experience":      { "score": 75 }
-        }
-      },
-      "skill_gaps": {
-        "existing_skills":     ["Excel", "Coordination", "Communication"],
-        "missing_high_demand": [
-          { "name": "Power BI",              "demand_score": 88 },
-          { "name": "SQL",                   "demand_score": 82 },
-          { "name": "Process Optimization",  "demand_score": 76 }
-        ],
-        "adjacent_skills": ["Data Analysis", "Business Analysis"],
-        "role_gap": {
-          "target_role":        "Operations Analyst",
-          "match_percentage":   62,
-          "missing_required":   ["Power BI", "SQL"]
-        }
-      },
-      "job_matches": {
-        "top_matches": [
-          {
-            "title":          "Operations Analyst",
-            "match_score":    78,
-            "missing_skills": ["Power BI", "SQL"],
-            "salary":         { "min": 800000, "max": 1400000 }
-          },
-          {
-            "title":          "Business Analyst",
-            "match_score":    65,
-            "missing_skills": ["SQL", "Tableau"]
-          }
-        ],
-        "total_evaluated": 42
-      },
-      "opportunity_radar": {
-        "emerging_opportunities": [
-          {
-            "role":               "Operations Analyst",
-            "opportunity_score":  88,
-            "match_score":        72,
-            "growth_trend":       "High",
-            "average_salary":     "₹12L",
-            "skills_to_learn":    ["Power BI", "Process Optimization"]
-          }
-        ]
-      },
-      "risk_analysis": null,
-      "salary_benchmarks": {
-        "role":           "Operations Analyst",
-        "median_salary":  1200000,
-        "min_salary":     850000,
-        "max_salary":     1600000,
-        "currency":       "INR"
-      },
-      "personalization_profile": {
-        "preferred_roles":  [{ "name": "Data Analyst", "score": 0.85 }],
-        "preferred_skills": [{ "name": "Power BI",     "score": 0.9  }],
-        "total_events":     23
-      },
-      "data_sources_used":  ["user_profile", "chi_score", "skill_gaps", "job_matches", "opportunity_radar", "salary_benchmarks", "personalization_profile"],
-      "data_completeness":  0.875,
-      "confidence_score":   0.82,
-      "is_sufficient":      true,
-      "retrieval_ms":       312
+  "salary_standard": {
+    "salary": {
+      "min": 0,
+      "max": 0,
+      "currency": "INR"
     }
   },
 
-  "grounding_rules_injected_into_llm": {
-    "description": "The 7 hard rules injected into every LLM system prompt",
-    "rules": [
-      "1. Do NOT invent, estimate, or assume salary figures not present in the context",
-      "2. Do NOT reference companies, statistics, or studies not present in the context",
-      "3. Do NOT make predictions with specific numbers unless those numbers are in the context",
-      "4. Do NOT say 'typically' or 'on average' without a source from the context",
-      "5. Do NOT provide career advice that contradicts the retrieved job matches or opportunity scores",
-      "6. Do NOT claim a skill is 'in demand' unless the skill gap or opportunity data says so",
-      "7. Do NOT give salary ranges unless they appear explicitly in the Salary Benchmarks or Job Matches sections"
-    ],
-    "refusal_instruction": "If data is missing, say: 'I don't have that specific data in your profile yet. You can find this in [relevant dashboard section].'"
+  "rag_context_structure": {
+    "job_matches": {
+      "top_matches": [
+        {
+          "title": "Operations Analyst",
+          "match_score": 78,
+          "salary": {
+            "min": 800000,
+            "max": 1400000,
+            "currency": "INR"
+          }
+        }
+      ]
+    },
+
+    "opportunity_radar": {
+      "emerging_opportunities": [
+        {
+          "role": "Operations Analyst",
+          "opportunity_score": 88,
+          "salary": {
+            "min": 800000,
+            "max": 1400000,
+            "currency": "INR"
+          }
+        }
+      ]
+    }
+  },
+
+  "error_model": {
+    "success": false,
+    "error": {
+      "code": "ERROR_CODE",
+      "message": "Human readable message",
+      "retryable": true
+    }
   }
 }

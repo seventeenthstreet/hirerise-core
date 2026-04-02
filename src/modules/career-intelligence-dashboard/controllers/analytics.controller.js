@@ -1,12 +1,16 @@
 'use strict';
 
 /**
- * controllers/analytics.controller.js
+ * src/modules/analytics/controllers/analytics.controller.js
  *
  * HTTP controller for the Global Career Intelligence Dashboard.
  *
- * All endpoints are public-read (require Firebase auth but no admin role).
- * Heavy computation is cached in-memory (10 min) + Firestore (hourly snapshot).
+ * Supabase-ready, backend-agnostic controller layer:
+ * - No Firebase assumptions
+ * - Service-driven architecture
+ * - Standardized async error propagation
+ * - Safe query parsing
+ * - Consistent structured logging
  *
  * Routes:
  *   GET /api/v1/analytics/career-demand
@@ -14,107 +18,172 @@
  *   GET /api/v1/analytics/education-roi
  *   GET /api/v1/analytics/career-growth
  *   GET /api/v1/analytics/industry-trends
- *   GET /api/v1/analytics/overview          ← all five in one call
- *   GET /api/v1/analytics/snapshots/:metric ← historical trend data
+ *   GET /api/v1/analytics/overview
+ *   GET /api/v1/analytics/snapshots/:metric
  */
 
-const logger  = require('../../../utils/logger');
-const service = require('../services/analytics.service');
+const logger = require('../../../utils/logger');
+const analyticsService = require('../services/analytics.service');
 
-// ─── Helper ───────────────────────────────────────────────────────────────────
+const VALID_SNAPSHOT_METRICS = Object.freeze([
+  'career_demand',
+  'skill_demand',
+  'education_roi',
+  'career_growth',
+  'industry_trends',
+]);
 
-function _ok(res, data) {
-  return res.status(200).json({ success: true, data });
+const MAX_SNAPSHOT_DAYS = 90;
+const DEFAULT_SNAPSHOT_DAYS = 30;
+
+/**
+ * Standard success response helper
+ * @param {import('express').Response} res
+ * @param {*} data
+ * @returns {import('express').Response}
+ */
+function sendSuccess(res, data) {
+  return res.status(200).json({
+    success: true,
+    data,
+  });
 }
 
-function _err(res, next, err, label) {
-  logger.error({ err: err.message }, `[GCID] ${label} failed`);
-  return next(err);
+/**
+ * Standard error forwarding helper
+ * @param {Error} error
+ * @param {string} operation
+ * @param {import('express').Request} req
+ * @param {import('express').NextFunction} next
+ */
+function handleError(error, operation, req, next) {
+  logger.error(
+    {
+      operation,
+      path: req.originalUrl,
+      method: req.method,
+      error: error.message,
+      stack: error.stack,
+    },
+    `[AnalyticsController] ${operation} failed`
+  );
+
+  return next(error);
 }
 
-// ─── Career Demand Index ──────────────────────────────────────────────────────
-
-async function getCareerDemand(req, res, next) {
-  try {
-    const data = await service.getCareerDemand();
-    _ok(res, data);
-  } catch (err) { _err(res, next, err, 'getCareerDemand'); }
+/**
+ * Wrap async controllers for consistent error handling
+ * @param {string} operation
+ * @param {(req: any, res: any) => Promise<any>} handler
+ * @returns {Function}
+ */
+function asyncHandler(operation, handler) {
+  return async function wrappedController(req, res, next) {
+    try {
+      const data = await handler(req, res);
+      return sendSuccess(res, data);
+    } catch (error) {
+      return handleError(error, operation, req, next);
+    }
+  };
 }
 
-// ─── Skill Demand Index ───────────────────────────────────────────────────────
+/**
+ * Safely parse snapshot days query param
+ * @param {string | undefined} rawDays
+ * @returns {number}
+ */
+function parseSnapshotDays(rawDays) {
+  const parsed = Number.parseInt(rawDays ?? `${DEFAULT_SNAPSHOT_DAYS}`, 10);
 
-async function getSkillDemand(req, res, next) {
-  try {
-    const data = await service.getSkillDemand();
-    _ok(res, data);
-  } catch (err) { _err(res, next, err, 'getSkillDemand'); }
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    return DEFAULT_SNAPSHOT_DAYS;
+  }
+
+  return Math.min(parsed, MAX_SNAPSHOT_DAYS);
 }
 
-// ─── Education ROI Index ──────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// Metric Endpoints
+// ─────────────────────────────────────────────────────────────────────────────
 
-async function getEducationROI(req, res, next) {
-  try {
-    const data = await service.getEducationROI();
-    _ok(res, data);
-  } catch (err) { _err(res, next, err, 'getEducationROI'); }
-}
+const getCareerDemand = asyncHandler('getCareerDemand', async () => {
+  return analyticsService.getCareerDemand();
+});
 
-// ─── Career Growth Forecast ───────────────────────────────────────────────────
+const getSkillDemand = asyncHandler('getSkillDemand', async () => {
+  return analyticsService.getSkillDemand();
+});
 
-async function getCareerGrowth(req, res, next) {
-  try {
-    const data = await service.getCareerGrowth();
-    _ok(res, data);
-  } catch (err) { _err(res, next, err, 'getCareerGrowth'); }
-}
+const getEducationROI = asyncHandler('getEducationROI', async () => {
+  return analyticsService.getEducationROI();
+});
 
-// ─── Industry Trend Analysis ──────────────────────────────────────────────────
+const getCareerGrowth = asyncHandler('getCareerGrowth', async () => {
+  return analyticsService.getCareerGrowth();
+});
 
-async function getIndustryTrends(req, res, next) {
-  try {
-    const data = await service.getIndustryTrends();
-    _ok(res, data);
-  } catch (err) { _err(res, next, err, 'getIndustryTrends'); }
-}
+const getIndustryTrends = asyncHandler('getIndustryTrends', async () => {
+  return analyticsService.getIndustryTrends();
+});
 
-// ─── Overview — all five in one shot ─────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// Overview Endpoint
+// ─────────────────────────────────────────────────────────────────────────────
 
-async function getOverview(req, res, next) {
-  try {
-    const [careerDemand, skillDemand, educationROI, careerGrowth, industryTrends] =
-      await Promise.all([
-        service.getCareerDemand(),
-        service.getSkillDemand(),
-        service.getEducationROI(),
-        service.getCareerGrowth(),
-        service.getIndustryTrends(),
-      ]);
+const getOverview = asyncHandler('getOverview', async () => {
+  const [
+    careerDemand,
+    skillDemand,
+    educationROI,
+    careerGrowth,
+    industryTrends,
+  ] = await Promise.all([
+    analyticsService.getCareerDemand(),
+    analyticsService.getSkillDemand(),
+    analyticsService.getEducationROI(),
+    analyticsService.getCareerGrowth(),
+    analyticsService.getIndustryTrends(),
+  ]);
 
-    _ok(res, { careerDemand, skillDemand, educationROI, careerGrowth, industryTrends });
-  } catch (err) { _err(res, next, err, 'getOverview'); }
-}
+  return {
+    careerDemand,
+    skillDemand,
+    educationROI,
+    careerGrowth,
+    industryTrends,
+  };
+});
 
-// ─── Historical snapshots ─────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// Historical Snapshots
+// ─────────────────────────────────────────────────────────────────────────────
 
 async function getSnapshots(req, res, next) {
-  const { metric } = req.params;
-  const days = Math.min(90, parseInt(req.query.days ?? '30', 10));
+  const metric = req.params?.metric;
+  const days = parseSnapshotDays(req.query?.days);
 
-  const VALID = ['career_demand', 'skill_demand', 'education_roi', 'career_growth', 'industry_trends'];
-  if (!VALID.includes(metric)) {
+  if (!VALID_SNAPSHOT_METRICS.includes(metric)) {
     return res.status(400).json({
       success: false,
-      error: `Invalid metric. Must be one of: ${VALID.join(', ')}`,
+      error: `Invalid metric. Must be one of: ${VALID_SNAPSHOT_METRICS.join(', ')}`,
     });
   }
 
   try {
-    const snapshots = await service.getSnapshots(metric, days);
-    _ok(res, { metric, snapshots });
-  } catch (err) { _err(res, next, err, 'getSnapshots'); }
+    const snapshots = await analyticsService.getSnapshots(metric, days);
+
+    return sendSuccess(res, {
+      metric,
+      days,
+      snapshots: snapshots ?? [],
+    });
+  } catch (error) {
+    return handleError(error, 'getSnapshots', req, next);
+  }
 }
 
-module.exports = {
+module.exports = Object.freeze({
   getCareerDemand,
   getSkillDemand,
   getEducationROI,
@@ -122,13 +191,4 @@ module.exports = {
   getIndustryTrends,
   getOverview,
   getSnapshots,
-};
-
-
-
-
-
-
-
-
-
+});

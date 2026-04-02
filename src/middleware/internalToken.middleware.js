@@ -1,99 +1,157 @@
 'use strict';
 
 /**
- * internalToken.middleware.js
- *
- * Guards internal service-to-service endpoints (e.g. Cloud Tasks callbacks).
- * These endpoints are NOT protected by auth token because the caller is
- * Google Cloud Tasks (a server), not a user.
- *
- * HOW IT WORKS:
- *   - Checks Authorization: Bearer <token> matches INTERNAL_SERVICE_TOKEN env var
- *   - Returns 401 if token is missing or mismatched
- *   - Returns 503 if INTERNAL_SERVICE_TOKEN is not configured (misconfiguration guard)
- *
- * SETUP:
- *   1. Generate a strong random secret:
- *        node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
- *   2. Set in Cloud Run:
- *        INTERNAL_SERVICE_TOKEN=<generated-secret>
- *   3. Set the same value in the Cloud Tasks task header (already done in
- *      triggerProvisionalChi in onboarding.helpers.js).
- *
- * USAGE:
- *   const { requireInternalToken } = require('../middleware/internalToken.middleware');
- *   router.post('/internal/provisional-chi', requireInternalToken, handler);
- *
- * SECURITY NOTE:
- *   - This route should never be exposed to the public internet.
- *     In Cloud Run, it is called only from Cloud Tasks which uses the same VPC.
- *   - The token is compared using timingSafeEqual to prevent timing attacks.
+ * requireInternalToken.middleware.js (Production Optimized)
  */
 
 const crypto = require('crypto');
 const logger = require('../utils/logger');
 
+// ─────────────────────────────────────────────────────────────────────────────
+// HELPERS
+// ─────────────────────────────────────────────────────────────────────────────
+
+function getRequestId(req) {
+  return (
+    req.correlationId || // ✅ use correlation middleware first
+    req.headers['x-correlation-id'] ||
+    req.headers['x-request-id'] ||
+    crypto.randomUUID()
+  );
+}
+
+function extractToken(authHeader) {
+  if (!authHeader) return '';
+
+  if (Array.isArray(authHeader)) {
+    authHeader = authHeader[0];
+  }
+
+  if (typeof authHeader !== 'string') return '';
+
+  return authHeader.startsWith('Bearer ')
+    ? authHeader.slice(7).trim()
+    : '';
+}
+
+function safeCompare(a, b) {
+  try {
+    const bufA = Buffer.from(a, 'utf8');
+    const bufB = Buffer.from(b, 'utf8');
+
+    if (bufA.length !== bufB.length) return false;
+
+    return crypto.timingSafeEqual(bufA, bufB);
+  } catch {
+    return false;
+  }
+}
+
+// Optional: IP allowlist (comma-separated env)
+function isIpAllowed(ip) {
+  const allowlist = process.env.INTERNAL_IP_ALLOWLIST;
+  if (!allowlist) return true; // disabled
+
+  const allowedIps = allowlist.split(',').map(ip => ip.trim());
+  return allowedIps.includes(ip);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// MIDDLEWARE
+// ─────────────────────────────────────────────────────────────────────────────
+
 function requireInternalToken(req, res, next) {
+  const requestId = getRequestId(req);
   const configuredToken = process.env.INTERNAL_SERVICE_TOKEN;
 
-  // Misconfiguration guard — fail loudly at request time, not silently
+  // ── Misconfiguration Guard ───────────────────────────────────────
   if (!configuredToken) {
-    logger.error('[InternalToken] INTERNAL_SERVICE_TOKEN is not set — internal endpoint is unprotected', {
+    logger.error('[InternalToken] Missing INTERNAL_SERVICE_TOKEN', {
+      requestId,
       path: req.path,
+      method: req.method,
     });
+
     return res.status(503).json({
-      success:   false,
-      errorCode: 'SERVICE_MISCONFIGURED',
-      message:   'Internal service token not configured.',
+      success: false,
+      error: {
+        code: 'SERVICE_MISCONFIGURED',
+        message: 'Internal service token not configured.',
+      },
+      requestId,
       timestamp: new Date().toISOString(),
     });
   }
 
-  const authHeader = req.headers.authorization || '';
-  const incoming   = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : '';
+  // ── Optional IP Allowlist ───────────────────────────────────────
+  if (!isIpAllowed(req.ip)) {
+    logger.warn('[InternalToken] Blocked IP', {
+      requestId,
+      ip: req.ip,
+      path: req.path,
+    });
+
+    return res.status(403).json({
+      success: false,
+      error: {
+        code: 'FORBIDDEN',
+        message: 'IP not allowed.',
+      },
+      requestId,
+      timestamp: new Date().toISOString(),
+    });
+  }
+
+  // ── Extract Token ───────────────────────────────────────────────
+  const incoming = extractToken(req.headers.authorization);
 
   if (!incoming) {
-    logger.warn('[InternalToken] Missing Authorization header on internal endpoint', { path: req.path });
-    return res.status(401).json({
-      success:   false,
-      errorCode: 'UNAUTHORIZED',
-      message:   'Internal service token required.',
-      timestamp: new Date().toISOString(),
-    });
-  }
-
-  // Constant-time comparison — prevents timing attacks
-  let valid = false;
-  try {
-    const a = Buffer.from(incoming,        'utf8');
-    const b = Buffer.from(configuredToken, 'utf8');
-    valid = a.length === b.length && crypto.timingSafeEqual(a, b);
-  } catch {
-    valid = false;
-  }
-
-  if (!valid) {
-    logger.warn('[InternalToken] Invalid internal service token', {
+    logger.warn('[InternalToken] Missing token', {
+      requestId,
       path: req.path,
-      ip:   req.ip,
+      method: req.method,
+      ip: req.ip,
     });
+
     return res.status(401).json({
-      success:   false,
-      errorCode: 'UNAUTHORIZED',
-      message:   'Invalid internal service token.',
+      success: false,
+      error: {
+        code: 'UNAUTHORIZED',
+        message: 'Internal service token required.',
+      },
+      requestId,
       timestamp: new Date().toISOString(),
     });
   }
 
+  // ── Validate Token (constant-time) ──────────────────────────────
+  const isValid = safeCompare(incoming, configuredToken);
+
+  if (!isValid) {
+    logger.warn('[InternalToken] Invalid token attempt', {
+      requestId,
+      path: req.path,
+      method: req.method,
+      ip: req.ip,
+    });
+
+    return res.status(401).json({
+      success: false,
+      error: {
+        code: 'UNAUTHORIZED',
+        message: 'Invalid internal service token.',
+      },
+      requestId,
+      timestamp: new Date().toISOString(),
+    });
+  }
+
+  // ── Success ────────────────────────────────────────────────────
   return next();
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// EXPORTS
+// ─────────────────────────────────────────────────────────────────────────────
+
 module.exports = { requireInternalToken };
-
-
-
-
-
-
-
-

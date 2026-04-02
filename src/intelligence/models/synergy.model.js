@@ -1,24 +1,33 @@
-"use strict";
+'use strict';
 
 /**
- * Skill Synergy Model
- *
- * Detects compound intelligence between related high-value skills.
- * Applies controlled boost to priority score.
+ * Skill Synergy Model (Production Optimized)
  */
 
 function applySkillSynergy({
-  scoredSkills,
-  profile,
-  config,
+  scoredSkills = [],
+  profile = {},
+  config = {},
 }) {
-  if (!scoredSkills.length) return scoredSkills;
+  if (!scoredSkills.length) return [];
+
+  const synergyConfig = config.synergy || {};
+  const priorityBands = config.priorityBands || {};
+
+  const strongThreshold =
+    synergyConfig.strongProficiencyThreshold ?? 70;
+
+  const weight =
+    synergyConfig.relatedSkillBoostWeight ?? 0.02;
+
+  const maxBoost =
+    synergyConfig.maxSynergyBoost ?? 0.1;
 
   const skillMap = Object.fromEntries(
     scoredSkills.map((s) => [s.skillId, s])
   );
 
-  for (const skill of scoredSkills) {
+  return scoredSkills.map((skill) => {
     const relatedSkills = skill.dependencySkills ?? [];
 
     let synergyBoost = 0;
@@ -28,51 +37,59 @@ function applySkillSynergy({
 
       if (
         relatedSkill &&
-        relatedSkill.currentProficiency >=
-          config.synergy.strongProficiencyThreshold
+        safe(relatedSkill.currentProficiency) >= strongThreshold
       ) {
-        synergyBoost +=
-          config.synergy.relatedSkillBoostWeight;
+        synergyBoost += weight;
       }
     }
 
-    synergyBoost = Math.min(
-      synergyBoost,
-      config.synergy.maxSynergyBoost
+    synergyBoost = clamp(synergyBoost, 0, maxBoost);
+
+    // 🔥 Controlled additive boost (instead of multiplicative distortion)
+    const boostedScore = clamp(
+      safe(skill.priorityScore) + synergyBoost * 100,
+      0,
+      100
     );
 
-    skill.priorityScore = parseFloat(
-      Math.min(
-        100,
-        skill.priorityScore * (1 + synergyBoost)
-      ).toFixed(2)
-    );
+    return {
+      ...skill,
+      priorityScore: round(boostedScore),
+      priorityLevel: classifyPriority(boostedScore, priorityBands),
 
-    skill.priorityLevel = classifyPriority(
-      skill.priorityScore,
-      config
-    );
-  }
-
-  return scoredSkills;
+      meta: {
+        synergyBoost: round(synergyBoost * 100),
+        relatedSkillsCount: relatedSkills.length,
+      },
+    };
+  });
 }
 
-function classifyPriority(score, config) {
-  const { high, medium } = config.priorityBands;
-  if (score >= high.min) return "HIGH";
-  if (score >= medium.min) return "MEDIUM";
-  return "LOW";
+// ─────────────────────────────────────────────
+// HELPERS
+// ─────────────────────────────────────────────
+
+function classifyPriority(score, bands) {
+  const high = bands.high?.min ?? 75;
+  const medium = bands.medium?.min ?? 50;
+
+  if (score >= high) return 'HIGH';
+  if (score >= medium) return 'MEDIUM';
+  return 'LOW';
+}
+
+function clamp(val, min, max) {
+  return Math.max(min, Math.min(max, val));
+}
+
+function round(val) {
+  return parseFloat(val.toFixed(2));
+}
+
+function safe(val) {
+  return typeof val === 'number' && !isNaN(val) ? val : 0;
 }
 
 module.exports = {
   applySkillSynergy,
 };
-
-
-
-
-
-
-
-
-

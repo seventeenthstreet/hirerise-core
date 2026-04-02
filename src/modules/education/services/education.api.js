@@ -1,122 +1,124 @@
 /**
  * src/modules/education/services/education.api.js
  *
- * All API calls for the Education Intelligence module.
- * Uses apiFetch from services/apiClient.ts — auth headers handled automatically.
+ * Production-hardened Education Intelligence API service.
  *
- * Never constructs Authorization headers manually.
- * Never includes uid in request payloads — backend reads from req.user.uid.
- *
- * UPDATED (Step 5):
- *   - Added getAnalysisResult()  → GET  /education/analyze/:studentId
- *   - Added triggerAnalysis()    → POST /education/analyze/:studentId
+ * Supabase-safe improvements:
+ * - zero Firebase legacy assumptions
+ * - stable REST response normalization
+ * - URL-safe studentId encoding
+ * - shared request builders
+ * - cleaner query param handling
+ * - stronger null safety
+ * - easier Edge Function compatibility
  */
 
 import { apiFetch } from '@/services/apiClient';
 
-// ─── POST /api/v1/education/student ──────────────────────────────────────────
+// ───────────────────────────────────────────────────────────────────────────────
+// Helpers
+// ───────────────────────────────────────────────────────────────────────────────
 
-export function createStudent(payload) {
-  return apiFetch('/education/student', {
+function safeId(value) {
+  return encodeURIComponent(String(value || 'me'));
+}
+
+function jsonPost(path, payload) {
+  return apiFetch(path, {
     method: 'POST',
-    body:   JSON.stringify(payload),
+    body: JSON.stringify(payload),
   });
 }
 
-// ─── POST /api/v1/education/academics ────────────────────────────────────────
+function buildQuery(params = {}) {
+  const search = new URLSearchParams();
 
-export function saveAcademics(records) {
-  return apiFetch('/education/academics', {
-    method: 'POST',
-    body:   JSON.stringify({ records }),
+  Object.entries(params).forEach(([key, value]) => {
+    if (value !== undefined && value !== null) {
+      search.set(key, String(value));
+    }
   });
+
+  const query = search.toString();
+  return query ? `?${query}` : '';
 }
 
-// ─── POST /api/v1/education/activities ───────────────────────────────────────
+// ───────────────────────────────────────────────────────────────────────────────
+// Student lifecycle
+// ───────────────────────────────────────────────────────────────────────────────
 
-export function saveActivities(activities) {
-  return apiFetch('/education/activities', {
-    method: 'POST',
-    body:   JSON.stringify({ activities }),
-  });
+export function createStudent(payload = {}) {
+  return jsonPost('/education/student', payload);
 }
-
-// ─── POST /api/v1/education/cognitive ────────────────────────────────────────
-
-export function saveCognitive(payload) {
-  return apiFetch('/education/cognitive', {
-    method: 'POST',
-    body:   JSON.stringify(payload),
-  });
-}
-
-// ─── GET /api/v1/education/student/:id ───────────────────────────────────────
 
 export function getStudentProfile(userId) {
-  return apiFetch(`/education/student/${userId}`);
+  return apiFetch(`/education/student/${safeId(userId)}`);
 }
 
-// ─── GET /api/v1/education/analyze/:studentId ────────────────────────────────
-/**
- * Returns the most recently cached stream analysis result.
- * Does NOT re-run the pipeline.
- *
- * @param {string} studentId
- * @returns {{
- *   recommended_stream:  string,
- *   recommended_label:   string,
- *   confidence:          number,
- *   alternative_stream:  string,
- *   alternative_label:   string,
- *   stream_scores: { engineering, medical, commerce, humanities },
- *   rationale:           string,
- *   _debug: { academic, cognitive, activity }
- * }}
- */
+// ───────────────────────────────────────────────────────────────────────────────
+// Step data saves
+// ───────────────────────────────────────────────────────────────────────────────
+
+export function saveAcademics(records = []) {
+  return jsonPost('/education/academics', {
+    records: Array.isArray(records) ? records : [],
+  });
+}
+
+export function saveActivities(activities = []) {
+  return jsonPost('/education/activities', {
+    activities: Array.isArray(activities) ? activities : [],
+  });
+}
+
+export function saveCognitive(payload = {}) {
+  return jsonPost('/education/cognitive', payload);
+}
+
+// ───────────────────────────────────────────────────────────────────────────────
+// Analysis
+// ───────────────────────────────────────────────────────────────────────────────
+
 export function getAnalysisResult(studentId) {
-  return apiFetch(`/education/analyze/${studentId}`);
+  return apiFetch(
+    `/education/analyze/${safeId(studentId)}`
+  );
 }
 
-// ─── POST /api/v1/education/analyze/:studentId ───────────────────────────────
-/**
- * Triggers (or re-triggers) the full AI pipeline for a student.
- * Returns the fresh recommendation immediately.
- *
- * @param {string} studentId
- * @param {{ requireComplete?: boolean }} options
- */
-export function triggerAnalysis(studentId, { requireComplete = true } = {}) {
+export function triggerAnalysis(
+  studentId,
+  { requireComplete = true } = {}
+) {
   return apiFetch(
-    `/education/analyze/${studentId}?requireComplete=${requireComplete}`,
+    `/education/analyze/${safeId(studentId)}${buildQuery({
+      requireComplete,
+    })}`,
     { method: 'POST' }
   );
 }
 
-// ─── POST /api/v1/education/career-prediction/:studentId ─────────────────────
-/**
- * Runs the Career Success Probability Engine for a student.
- * Returns top 5 ranked careers with probability scores.
- *
- * @param {string} studentId
- * @returns {{ top_careers: [{career: string, probability: number}] }}
- */
+// ───────────────────────────────────────────────────────────────────────────────
+// Career prediction
+// ───────────────────────────────────────────────────────────────────────────────
+
 export function triggerCareerPrediction(studentId) {
-  return apiFetch(`/education/career-prediction/${studentId}`, { method: 'POST' });
+  return apiFetch(
+    `/education/career-prediction/${safeId(studentId)}`,
+    { method: 'POST' }
+  );
 }
 
-// ─── GET /api/v1/education/career-prediction/:studentId ──────────────────────
-/**
- * Returns previously stored career predictions (no re-run).
- *
- * @param {string} studentId
- */
 export function getCareerPredictions(studentId) {
-  return apiFetch(`/education/career-prediction/${studentId}`);
+  return apiFetch(
+    `/education/career-prediction/${safeId(studentId)}`
+  );
 }
 
-// ─── Named export bundle ──────────────────────────────────────────────────────
+// ───────────────────────────────────────────────────────────────────────────────
+// Named service bundle
+// ───────────────────────────────────────────────────────────────────────────────
 
-export const educationApi = {
+export const educationApi = Object.freeze({
   createStudent,
   saveAcademics,
   saveActivities,
@@ -126,12 +128,4 @@ export const educationApi = {
   triggerAnalysis,
   triggerCareerPrediction,
   getCareerPredictions,
-};
-
-
-
-
-
-
-
-
+});

@@ -3,161 +3,162 @@
 /**
  * coverLetter.service.js
  *
- * Orchestrates cover letter generation.
+ * Production-grade Supabase orchestration layer.
  *
- * CREDIT FLOW (mirrors jobMatch.service.js exactly):
- *   1. Verify tier — free users blocked at service level (route also blocks them)
- *   2. Deduct credits BEFORE calling Claude
- *   3. Call engine — refund on ANY failure
- *   4. Save to Supabase (non-fatal if save fails)
- *   5. Log usage to usageLogs (fire-and-forget, never blocks)
- *
- * FEATURE IDENTIFIER: 'cover_letter'
- * CREDIT COST: 2 credits (same as fullAnalysis — similar token usage)
+ * Responsibilities:
+ * - tier safety enforcement
+ * - atomic credit deduction via consume_ai_credits RPC
+ * - Claude engine orchestration
+ * - atomic credit refund via refund_ai_credits RPC on engine failure
+ * - non-fatal persistence
+ * - async usage logging
  */
-const supabase = require('../../config/supabase');
+
+const { supabase } = require('../../config/supabase');
 const {
   AppError,
-  ErrorCodes
+  ErrorCodes,
 } = require('../../middleware/errorHandler');
 const logger = require('../../utils/logger');
 const {
-  generateCoverLetter
+  generateCoverLetter,
 } = require('./engine/coverLetter.engine');
-
-// Lazy require — safe if admin services not yet deployed
-function getLogUsage() {
-  try {
-    return require('../services/admin/logUsageToFirestore').logUsageToFirestore;
-  } catch {
-    return async () => {}; // no-op fallback
-  }
-}
-
-// ─── Constants ────────────────────────────────────────────────────────────────
 
 const FEATURE_ID = 'cover_letter';
 const CREDIT_COST = 2;
 const FREE_TIERS = new Set(['free']);
 
-// ─── Credit helpers (identical pattern to jobMatch.service.js) ────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// USAGE LOGGER (SUPABASE-NATIVE, NON-BLOCKING)
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function logUsageAsync(payload) {
+  try {
+    await supabase
+      .from('usage_logs')
+      .insert({
+        user_id: payload.userId,
+        feature: payload.feature,
+        tier: payload.tier,
+        model: payload.model,
+        input_tokens: payload.inputTokens,
+        output_tokens: payload.outputTokens,
+        plan_amount: payload.planAmount,
+        created_at: new Date().toISOString(),
+      });
+  } catch (error) {
+    logger.warn('[CoverLetterService] Usage log failed (non-fatal)', {
+      userId: payload.userId,
+      error: error.message,
+    });
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ATOMIC CREDIT HELPERS
+// ─────────────────────────────────────────────────────────────────────────────
 
 async function deductCredits(userId, amount) {
-  const { data: userData, error: fetchError } = await supabase
-    .from('users')
-    .select('aiCreditsRemaining')
-    .eq('id', userId)
-    .maybeSingle();
+  const { data, error } = await supabase.rpc('consume_ai_credits', {
+    p_user_id: userId,
+    p_amount: amount,
+  });
 
-  if (fetchError) throw fetchError;
-  if (!userData) {
-    throw new AppError('User not found.', 404, {}, ErrorCodes.NOT_FOUND);
-  }
+  if (error) {
+    if (error.message?.includes('INSUFFICIENT_CREDITS')) {
+      throw new AppError(
+        'Insufficient AI credits. Please purchase a new plan.',
+        402,
+        { creditsRequired: amount },
+        ErrorCodes.PAYMENT_REQUIRED
+      );
+    }
 
-  const current = userData.aiCreditsRemaining ?? 0;
-  if (current < amount) {
     throw new AppError(
-      'Insufficient AI credits. Please purchase a new plan.',
-      402,
-      { creditsRequired: amount, creditsAvailable: current },
-      ErrorCodes.PAYMENT_REQUIRED
+      'Failed to deduct credits.',
+      500,
+      { error: error.message },
+      ErrorCodes.DB_ERROR
     );
   }
-
-  const creditsAfter = current - amount;
-  const { error: updateError } = await supabase
-    .from('users')
-    .update({
-      aiCreditsRemaining: creditsAfter,
-      updatedAt: new Date().toISOString()
-    })
-    .eq('id', userId);
-
-  if (updateError) throw updateError;
 
   logger.debug('[CoverLetterService] Credits deducted', {
     userId,
     amount,
-    creditsAfter
+    creditsRemaining: data,
   });
-  return { creditsRemaining: creditsAfter };
+
+  return { creditsRemaining: data };
 }
 
 async function refundCredits(userId, amount) {
   try {
-    const { data: userData, error: fetchError } = await supabase
-      .from('users')
-      .select('aiCreditsRemaining')
-      .eq('id', userId)
-      .maybeSingle();
+    const { data, error } = await supabase.rpc('refund_ai_credits', {
+      p_user_id: userId,
+      p_amount: amount,
+    });
 
-    if (fetchError || !userData) return;
-
-    const current = userData.aiCreditsRemaining ?? 0;
-    const { error: updateError } = await supabase
-      .from('users')
-      .update({
-        aiCreditsRemaining: current + amount,
-        updatedAt: new Date().toISOString()
-      })
-      .eq('id', userId);
-
-    if (updateError) throw updateError;
+    if (error) throw error;
 
     logger.debug('[CoverLetterService] Credits refunded', {
       userId,
-      amount
+      amount,
+      creditsRemaining: data,
     });
-  } catch (err) {
+  } catch (error) {
     logger.error(
-      '[CoverLetterService] CRITICAL: Refund failed — manual reconciliation required',
-      { userId, amount, error: err.message }
+      '[CoverLetterService] Refund failed — manual reconciliation required',
+      {
+        userId,
+        amount,
+        error: error.message,
+      }
     );
   }
 }
 
-// ─── Save to Supabase ─────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// SAVE RESULT (NON-FATAL)
+// ─────────────────────────────────────────────────────────────────────────────
 
 async function saveCoverLetter(userId, payload, content) {
   try {
     const { data, error } = await supabase
-      .from('coverLetters')
+      .from('cover_letters')
       .insert({
-        userId,
-        companyName: payload.companyName,
-        jobTitle: payload.jobTitle,
-        jobDescription: payload.jobDescription,
+        user_id: userId,
+        company_name: payload.companyName,
+        job_title: payload.jobTitle,
+        job_description: payload.jobDescription,
         tone: payload.tone ?? 'professional',
         content,
-        createdAt: new Date().toISOString()
+        created_at: new Date().toISOString(),
       })
       .select('id')
       .maybeSingle();
 
     if (error) throw error;
 
-    logger.debug('[CoverLetterService] Saved to Supabase', {
+    logger.debug('[CoverLetterService] Saved', {
       userId,
-      docId: data?.id
+      coverLetterId: data?.id,
     });
+
     return data?.id ?? null;
-  } catch (err) {
-    // Non-fatal — user gets their cover letter even if save fails
+  } catch (error) {
     logger.warn('[CoverLetterService] Save failed (non-fatal)', {
       userId,
-      error: err.message
+      error: error.message,
     });
+
     return null;
   }
 }
 
-// ─── Main orchestrator ────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// MAIN ORCHESTRATOR
+// ─────────────────────────────────────────────────────────────────────────────
 
-/**
- * generateCoverLetterForUser({ userId, tier, planAmount, companyName, jobTitle, jobDescription, tone })
- *
- * @returns {{ content: string, coverLetterId: string|null, creditsRemaining: number }}
- */
 async function generateCoverLetterForUser({
   userId,
   tier,
@@ -165,12 +166,13 @@ async function generateCoverLetterForUser({
   companyName,
   jobTitle,
   jobDescription,
-  tone
+  tone,
 }) {
-  // ── Tier gate — free users blocked ───────────────────────────────────────
-  // Route's requirePaidTier middleware catches this first,
-  // but service enforces it too as a safety net.
-  if (FREE_TIERS.has(tier)) {
+  const normalizedTier = String(tier ?? 'free')
+    .trim()
+    .toLowerCase();
+
+  if (FREE_TIERS.has(normalizedTier)) {
     throw new AppError(
       'Cover letter generation is a Pro feature. Upgrade your plan to access it.',
       403,
@@ -183,69 +185,63 @@ async function generateCoverLetterForUser({
     userId,
     companyName,
     jobTitle,
-    tone
+    tone,
   });
 
-  // ── Deduct credits BEFORE calling Claude ─────────────────────────────────
   let creditsRemaining;
-  let deductionSucceeded = false;
-  try {
-    const deduction = await deductCredits(userId, CREDIT_COST);
-    creditsRemaining = deduction.creditsRemaining;
-    deductionSucceeded = true;
-  } catch (err) {
-    throw err; // PAYMENT_REQUIRED or NOT_FOUND — propagate as-is
-  }
-
-  // ── Call engine — refund on failure ──────────────────────────────────────
   let engineResult;
+  let creditsDeducted = false;
+
   try {
+    ({ creditsRemaining } = await deductCredits(userId, CREDIT_COST));
+    creditsDeducted = true;
+
     engineResult = await generateCoverLetter({
       userId,
       companyName,
       jobTitle,
       jobDescription,
-      tone
+      tone,
     });
-  } catch (err) {
-    if (deductionSucceeded) await refundCredits(userId, CREDIT_COST);
-    throw err;
+  } catch (error) {
+    if (creditsDeducted) {
+      await refundCredits(userId, CREDIT_COST);
+    }
+
+    throw error;
   }
 
-  // ── Save result (non-fatal) ───────────────────────────────────────────────
   const coverLetterId = await saveCoverLetter(
     userId,
     { companyName, jobTitle, jobDescription, tone },
     engineResult.content
   );
 
-  // ── Log usage — fire-and-forget, never blocks response ───────────────────
-  const logUsage = getLogUsage();
-  logUsage({
+  void logUsageAsync({
     userId,
     feature: FEATURE_ID,
-    tier,
+    tier: normalizedTier,
     model: engineResult.model,
     inputTokens: engineResult.inputTokens,
     outputTokens: engineResult.outputTokens,
-    planAmount: planAmount ?? null
-  }).catch(() => {});
+    planAmount: planAmount ?? null,
+  });
 
   logger.debug('[CoverLetterService] Complete', {
     userId,
     coverLetterId,
-    creditsRemaining
+    creditsRemaining,
   });
 
   return {
     content: engineResult.content,
     coverLetterId,
-    creditsRemaining
+    creditsRemaining,
   };
 }
 
 module.exports = {
   generateCoverLetterForUser,
   CREDIT_COST,
-  FEATURE_ID
+  FEATURE_ID,
 };

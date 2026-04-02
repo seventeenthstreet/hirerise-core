@@ -1,42 +1,36 @@
-"use strict";
+'use strict';
 
-module.exports = {
+/**
+ * scoring.config.js (HARDENED)
+ *
+ * ✅ Validation added
+ * ✅ Deep freeze
+ * ✅ Safe numeric constraints
+ * ✅ Future-proof
+ */
 
-  // ─────────────────────────────────────────────────────────────────────────────
-  // CORE SCORING WEIGHTS
-  // These are additive components (not normalized sum).
-  // Each weight scales its respective contribution.
-  // ─────────────────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────
+// CONFIG
+// ─────────────────────────────────────────────
+
+const config = {
   marketDemandWeight: 0.35,
   salaryImpactWeight: 0.30,
   promotionWeight: 0.20,
-  proficiencyPenaltyWeight: 0.25,        // Applied when proficiency is high
-  careerAccelerationMultiplier: 1.15,    // Used in weighted gateway boost
+  proficiencyPenaltyWeight: 0.25,
+  careerAccelerationMultiplier: 1.15,
 
-  // ─────────────────────────────────────────────────────────────────────────────
-  // GAP-BASED URGENCY BOOST
-  // boostedScore = baseScore × (1 + (proficiencyGap / 100) × gapWeight)
-  // ─────────────────────────────────────────────────────────────────────────────
   gapWeight: 0.35,
 
-  // ─────────────────────────────────────────────────────────────────────────────
-  // PROFICIENCY THRESHOLDS
-  // ─────────────────────────────────────────────────────────────────────────────
   highProficiencyThreshold: 80,
   weakProficiencyThreshold: 40,
 
-  // ─────────────────────────────────────────────────────────────────────────────
-  // PRIORITY SCORE BANDS
-  // ─────────────────────────────────────────────────────────────────────────────
   priorityBands: {
     high: { min: 70, label: "HIGH" },
     medium: { min: 40, label: "MEDIUM" },
     low: { min: 0, label: "LOW" },
   },
 
-  // ─────────────────────────────────────────────────────────────────────────────
-  // ROI CATEGORIZATION RULES
-  // ─────────────────────────────────────────────────────────────────────────────
   roi: {
     fastGainMaxWeeks: 8,
     fastGainMinDemand: 70,
@@ -44,9 +38,6 @@ module.exports = {
     longTermMinFuture: 65,
   },
 
-  // ─────────────────────────────────────────────────────────────────────────────
-  // EXPERIENCE-BASED CONTEXTUAL ADJUSTMENTS
-  // ─────────────────────────────────────────────────────────────────────────────
   experience: {
     juniorMaxYears: 2,
     juniorCoreBoost: 0.20,
@@ -54,17 +45,11 @@ module.exports = {
     seniorLeadershipBoost: 0.25,
   },
 
-  // ─────────────────────────────────────────────────────────────────────────────
-  // RESUME SCORE CONTEXTUAL ADJUSTMENTS
-  // ─────────────────────────────────────────────────────────────────────────────
   resumeScore: {
     lowThreshold: 60,
     foundationalBoost: 0.15,
   },
 
-  // ─────────────────────────────────────────────────────────────────────────────
-  // SKILL CLUSTER DEFINITIONS
-  // ─────────────────────────────────────────────────────────────────────────────
   skillClusters: {
     CORE: { baseWeeksMultiplier: 1.0 },
     ADJACENT: { baseWeeksMultiplier: 0.7 },
@@ -72,29 +57,18 @@ module.exports = {
     TREND: { baseWeeksMultiplier: 1.2 },
   },
 
-  // ─────────────────────────────────────────────────────────────────────────────
-  // LEARNING TIME ESTIMATION
-  // ─────────────────────────────────────────────────────────────────────────────
   learningTime: {
     baseWeeksPerGap10Points: 1.5,
     minWeeks: 1,
     maxWeeks: 52,
   },
 
-  // ─────────────────────────────────────────────────────────────────────────────
-  // SKILL SYNERGY BOOST
-  // Applies when user has strong related skills
-  // finalScore = finalScore × (1 + synergyBoost)
-  // ─────────────────────────────────────────────────────────────────────────────
   synergy: {
     strongProficiencyThreshold: 75,
-    relatedSkillBoostWeight: 0.05,  // boost per strong related skill
-    maxSynergyBoost: 0.20,          // cap total boost
+    relatedSkillBoostWeight: 0.05,
+    maxSynergyBoost: 0.20,
   },
- //─────────────────────────────────────────────────────────────────────────────
-  // PROMOTION PROBABILITY MODEL
-  // Controls how unlock probability is blended
-  // ─────────────────────────────────────────────────────────────────────────────
+
   promotionModel: {
     gatewayProgressWeight: 0.4,
     readinessWeight: 0.25,
@@ -102,17 +76,84 @@ module.exports = {
     experienceWeight: 0.20,
     maxProbabilityCap: 95,
   },
-  // ─────────────────────────────────────────────────────────────────────────────
-  // PREMIUM GATING
-  // ─────────────────────────────────────────────────────────────────────────────
+
   freeUserSkillLimit: 3,
 };
 
+// ─────────────────────────────────────────────
+// VALIDATION (CRITICAL)
+// ─────────────────────────────────────────────
 
+function assertNumber(name, value, min = 0, max = Infinity) {
+  if (typeof value !== 'number' || isNaN(value)) {
+    throw new Error(`[scoring] ${name} must be a number`);
+  }
+  if (value < min || value > max) {
+    throw new Error(`[scoring] ${name} out of range (${min}-${max})`);
+  }
+}
 
+function validateConfig(cfg) {
+  // Weights
+  assertNumber('marketDemandWeight', cfg.marketDemandWeight, 0, 1);
+  assertNumber('salaryImpactWeight', cfg.salaryImpactWeight, 0, 1);
+  assertNumber('promotionWeight', cfg.promotionWeight, 0, 1);
+  assertNumber('proficiencyPenaltyWeight', cfg.proficiencyPenaltyWeight, 0, 1);
 
+  // Thresholds
+  assertNumber('highProficiencyThreshold', cfg.highProficiencyThreshold, 0, 100);
+  assertNumber('weakProficiencyThreshold', cfg.weakProficiencyThreshold, 0, 100);
 
+  // Learning time
+  assertNumber('minWeeks', cfg.learningTime.minWeeks, 0, 52);
+  assertNumber('maxWeeks', cfg.learningTime.maxWeeks, 1, 104);
 
+  if (cfg.learningTime.minWeeks > cfg.learningTime.maxWeeks) {
+    throw new Error('[scoring] minWeeks cannot exceed maxWeeks');
+  }
 
+  // Promotion model
+  const p = cfg.promotionModel;
+  const totalWeight =
+    p.gatewayProgressWeight +
+    p.readinessWeight +
+    p.resumeWeight +
+    p.experienceWeight;
 
+  if (Math.abs(totalWeight - 1) > 0.001) {
+    throw new Error('[scoring] promotionModel weights must sum to 1');
+  }
 
+  assertNumber('maxProbabilityCap', p.maxProbabilityCap, 0, 100);
+
+  // Synergy
+  assertNumber('maxSynergyBoost', cfg.synergy.maxSynergyBoost, 0, 1);
+}
+
+validateConfig(config);
+
+// ─────────────────────────────────────────────
+// DEEP FREEZE (IMMUTABLE)
+// ─────────────────────────────────────────────
+
+function deepFreeze(obj) {
+  Object.freeze(obj);
+  Object.getOwnPropertyNames(obj).forEach((prop) => {
+    if (
+      obj[prop] &&
+      typeof obj[prop] === 'object' &&
+      !Object.isFrozen(obj[prop])
+    ) {
+      deepFreeze(obj[prop]);
+    }
+  });
+  return obj;
+}
+
+deepFreeze(config);
+
+// ─────────────────────────────────────────────
+// EXPORT
+// ─────────────────────────────────────────────
+
+module.exports = config;

@@ -9,7 +9,7 @@ const { normalizeText } = require('../../../../shared/utils/normalizeText');
 const { AppError, ErrorCodes } = require('../../../../middleware/errorHandler');
 const logger = require('../../../../utils/logger');
 
-function getSupabase() { return require('../../../../core/supabaseClient'); }
+function getSupabase() { return require('../../../../config/supabase'); }
 
 const TABLE = 'cms_skills';
 

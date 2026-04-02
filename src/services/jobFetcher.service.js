@@ -29,7 +29,7 @@
  *   const jobs = await fetchJobsForUser({ userId, parsedData, targetRole, skills });
  */
 
-const supabase = require('../config/supabase');
+const { supabase } = require('../config/supabase');
 const cacheManager = require('../core/cache/cache.manager');
 const logger = require('../utils/logger');
 const { detectUserCountry } = require('./salary.service');

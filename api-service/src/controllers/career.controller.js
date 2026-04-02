@@ -12,36 +12,58 @@ export async function requestCareerPath(req, res, next) {
   try {
     const userId = req.user.uid;
 
+    // Validate env early
+    if (!process.env.PUBSUB_CAREER_TOPIC) {
+      throw new Error('Missing PUBSUB_CAREER_TOPIC environment variable');
+    }
+
     const validation = validateCareerPathRequest(req.body);
     if (!validation.valid) {
       return res.status(400).json({
         error: 'VALIDATION_ERROR',
         message: validation.error,
+        requestId: req.requestId,
+        timestamp: new Date().toISOString(),
       });
     }
 
     const { currentTitle, targetTitle, currentSkills = [] } = req.body;
+
     const jobId = randomUUID();
 
-    // Create sharded automation job
+    // Sanitize inputs ONCE
+    const sanitizedCurrentTitle = sanitizeString(currentTitle, 200);
+    const sanitizedTargetTitle = sanitizeString(targetTitle, 200);
+    const sanitizedSkills = Array.isArray(currentSkills)
+      ? currentSkills.slice(0, 50).map(s => sanitizeString(s, 100))
+      : [];
+
+    // Stronger idempotency key (short + hashed-like)
+    const idempotencyKey = `career_${userId}_${sanitizedCurrentTitle}_${sanitizedTargetTitle}`.slice(0, 200);
+
+    // Create job
     await jobRepo.createJob(jobId, {
       type: 'CAREER_PATH',
       userId,
-      idempotencyKey: `career_${userId}_${sanitizeString(currentTitle, 100)}_${sanitizeString(targetTitle, 100)}`,
+      idempotencyKey,
       input: {
-        currentTitle: sanitizeString(currentTitle, 200),
-        targetTitle: sanitizeString(targetTitle, 200),
-        currentSkills: Array.isArray(currentSkills)
-          ? currentSkills.slice(0, 50).map(s => sanitizeString(s, 100))
-          : [],
+        currentTitle: sanitizedCurrentTitle,
+        targetTitle: sanitizedTargetTitle,
+        currentSkills: sanitizedSkills,
       },
     });
 
-    // Publish event
+    // Publish event with sanitized payload
     await publishEvent(
       process.env.PUBSUB_CAREER_TOPIC,
       EventTypes.CAREER_PATH_REQUESTED,
-      { userId, jobId, currentTitle, targetTitle, currentSkills },
+      {
+        userId,
+        jobId,
+        currentTitle: sanitizedCurrentTitle,
+        targetTitle: sanitizedTargetTitle,
+        currentSkills: sanitizedSkills,
+      },
       { userId, jobId }
     );
 
@@ -51,10 +73,12 @@ export async function requestCareerPath(req, res, next) {
       requestId: req.requestId,
     });
 
-    res.status(202).json({
+    return res.status(202).json({
       message: 'Career path analysis queued',
       jobId,
       statusUrl: `/v1/career/result/${jobId}`,
+      requestId: req.requestId,
+      timestamp: new Date().toISOString(),
     });
 
   } catch (err) {
@@ -77,6 +101,8 @@ export async function getCareerResult(req, res, next) {
       return res.status(404).json({
         error: 'NOT_FOUND',
         message: 'Job not found',
+        requestId: req.requestId,
+        timestamp: new Date().toISOString(),
       });
     }
 
@@ -84,10 +110,17 @@ export async function getCareerResult(req, res, next) {
       return res.status(202).json({
         status: job.status,
         message: 'Result not yet available',
+        requestId: req.requestId,
+        timestamp: new Date().toISOString(),
       });
     }
 
-    res.json({ jobId, result: job.result });
+    return res.json({
+      jobId,
+      result: job.result,
+      requestId: req.requestId,
+      timestamp: new Date().toISOString(),
+    });
 
   } catch (err) {
     next(err);

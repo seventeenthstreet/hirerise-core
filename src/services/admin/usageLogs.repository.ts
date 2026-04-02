@@ -1,21 +1,29 @@
 'use strict';
 
-/**
- * usageLogs.repository.ts
- *
- * Firestore repository for the `usageLogs` collection.
- */
+const { supabase } = require('../../config/supabase');
 
-const { db, FieldValue, Timestamp } = require('../../core/supabaseDbShim');
-import type { CostRow, UserTier } from '../../types/metrics.types';
-
-const COLLECTION = 'usageLogs';
+const TABLE = 'usage_logs';
 const DOC_LIMIT = 10_000;
+
+// ───────────────── TYPES ─────────────────
+
+type CostRow = {
+  userId: string;
+  feature: string;
+  tier: string;
+  model: string;
+  inputTokens: number;
+  outputTokens: number;
+  totalTokens: number;
+  costUSD: number;
+  revenueUSD: number;
+  date: string;
+};
 
 export interface LogWriteParams {
   userId: string;
   feature: string;
-  tier: UserTier;
+  tier: string;
   model: string;
   inputTokens: number;
   outputTokens: number;
@@ -29,46 +37,38 @@ export interface FetchResult {
   capped: boolean;
 }
 
-class UsageLogsRepository {
-  private get db() {
-    return require('../../core/supabaseDbShim').db;
-  }
+// ───────────────── REPOSITORY ─────────────────
 
-  // ───────────────── WRITE ─────────────────
+class UsageLogsRepository {
+
+  // ───────── WRITE ─────────
 
   async logUsage(params: LogWriteParams): Promise<string | null> {
     try {
-      const {
-        userId,
-        feature,
-        tier,
-        model,
-        inputTokens,
-        outputTokens,
-        costUSD,
-        revenueUSD,
-      } = params;
+      const totalTokens = params.inputTokens + params.outputTokens;
 
-      const totalTokens = inputTokens + outputTokens;
-      const marginUSD = parseFloat((revenueUSD - costUSD).toFixed(8));
+      const { data, error } = await supabase
+        .from(TABLE)
+        .insert({
+          user_id: params.userId,
+          feature: params.feature,
+          tier: params.tier,
+          model: params.model,
+          input_tokens: params.inputTokens,
+          output_tokens: params.outputTokens,
+          total_tokens: totalTokens,
+          cost_usd: params.costUSD,
+          revenue_usd: params.revenueUSD,
+          margin_usd: +(params.revenueUSD - params.costUSD).toFixed(8),
+          created_at: new Date().toISOString(),
+        })
+        .select()
+        .single();
 
-      const docRef = this.db.collection(COLLECTION).doc();
+      if (error) throw error;
 
-      await docRef.set({
-        userId,
-        feature,
-        tier,
-        model,
-        inputTokens,
-        outputTokens,
-        totalTokens,
-        costUSD,
-        revenueUSD,
-        marginUSD,
-        createdAt: FieldValue.serverTimestamp(),
-      });
+      return data?.id ?? null;
 
-      return docRef.id;
     } catch (err: any) {
       console.error('[UsageLogsRepository] Failed to write log:', err?.message);
       return null;
@@ -76,81 +76,77 @@ class UsageLogsRepository {
   }
 
   async batchWriteLogs(entries: LogWriteParams[]): Promise<void> {
-    const chunks = this.chunk(entries, 500);
-
-    for (const chunk of chunks) {
-      const batch = this.db.batch();
-
-      chunk.forEach(params => {
-        const ref = this.db.collection(COLLECTION).doc();
+    try {
+      const rows = entries.map((params) => {
         const totalTokens = params.inputTokens + params.outputTokens;
 
-        batch.set(ref, {
-          ...params,
-          totalTokens,
-          marginUSD: parseFloat(
-            (params.revenueUSD - params.costUSD).toFixed(8)
-          ),
-          createdAt: FieldValue.serverTimestamp(),
-        });
+        return {
+          user_id: params.userId,
+          feature: params.feature,
+          tier: params.tier,
+          model: params.model,
+          input_tokens: params.inputTokens,
+          output_tokens: params.outputTokens,
+          total_tokens: totalTokens,
+          cost_usd: params.costUSD,
+          revenue_usd: params.revenueUSD,
+          margin_usd: +(params.revenueUSD - params.costUSD).toFixed(8),
+          created_at: new Date().toISOString(),
+        };
       });
 
-      await batch.commit();
+      const { error } = await supabase.from(TABLE).insert(rows);
+
+      if (error) throw error;
+
+    } catch (err: any) {
+      console.error('[UsageLogsRepository] Batch insert failed:', err?.message);
     }
   }
 
-  // ───────────────── QUERY ─────────────────
+  // ───────── QUERY ─────────
 
-  async getByDateRange(
-    startDate: Date,
-    endDate: Date
-  ): Promise<FetchResult> {
-    const snap = await this.db
-      .collection(COLLECTION)
-      .where('createdAt', '>=', Timestamp.fromDate(startDate))
-      .where('createdAt', '<=', Timestamp.fromDate(endDate))
-      .orderBy('createdAt', 'asc')
-      .limit(DOC_LIMIT)
-      .get();
+  async getByDateRange(startDate: Date, endDate: Date): Promise<FetchResult> {
+    const { data, error } = await supabase
+      .from(TABLE)
+      .select('*')
+      .gte('created_at', startDate.toISOString())
+      .lte('created_at', endDate.toISOString())
+      .order('created_at', { ascending: true })
+      .limit(DOC_LIMIT);
 
-    const rows: CostRow[] = snap.docs.map(doc => {
-      const data = doc.data();
+    if (error) throw error;
 
-      return {
-        userId: data.userId,
-        feature: data.feature,
-        tier: data.tier,
-        model: data.model,
-        inputTokens: data.inputTokens ?? 0,
-        outputTokens: data.outputTokens ?? 0,
-        totalTokens: data.totalTokens ?? 0,
-        costUSD: data.costUSD ?? 0,
-        revenueUSD: data.revenueUSD ?? 0,
-        date:
-          data.createdAt?.toDate?.()?.toISOString?.()?.split('T')[0] ?? '',
-      };
-    });
+    const rows: CostRow[] = (data || []).map((row: any) => ({
+      userId: row.user_id,
+      feature: row.feature,
+      tier: row.tier,
+      model: row.model,
+      inputTokens: row.input_tokens ?? 0,
+      outputTokens: row.output_tokens ?? 0,
+      totalTokens: row.total_tokens ?? 0,
+      costUSD: row.cost_usd ?? 0,
+      revenueUSD: row.revenue_usd ?? 0,
+      date: row.created_at
+        ? new Date(row.created_at).toISOString().split('T')[0]
+        : '',
+    }));
 
     return {
       rows,
-      docCount: snap.size,
-      capped: snap.size >= DOC_LIMIT,
+      docCount: data?.length ?? 0,
+      capped: (data?.length ?? 0) >= DOC_LIMIT,
     };
   }
 
   async getTotalUserCount(): Promise<number> {
-    const snap = await this.db.collection('users').count().get();
-    return snap.data().count ?? 0;
-  }
+    const { count, error } = await supabase
+      .from('users')
+      .select('*', { count: 'exact', head: true });
 
-  // ───────────────── HELPERS ─────────────────
+    if (error) throw error;
 
-  private chunk<T>(arr: T[], size: number): T[][] {
-    const chunks: T[][] = [];
-    for (let i = 0; i < arr.length; i += size) {
-      chunks.push(arr.slice(i, i + size));
-    }
-    return chunks;
+    return count ?? 0;
   }
 }
 

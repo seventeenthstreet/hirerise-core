@@ -1,218 +1,451 @@
 'use strict';
 
 /**
- * careerRiskAgent.js — Career Risk Agent
+ * @file src/modules/career-copilot/agents/riskAndOpportunityAgents.js
+ * @description
+ * Production-grade Risk + Opportunity agents.
  *
- * Uses: Career Risk Predictor Engine
- *
- * Primary data source: Supabase risk_analysis_results table
- * (written by the async RiskAnalysisWorker from the event bus).
- * Falls back to a live engine call if precomputed data not available.
- *
- * Output:
- *   overall_risk_score  — 0-100
- *   risk_level          — 'Low' | 'Moderate' | 'High' | 'Critical'
- *   risk_factors        — [{ factor, description, score }]
- *   recommendations     — string[]
- *   stability_insight   — short sentence for advisor prompt
- *
- * File location: src/modules/career-copilot/agents/careerRiskAgent.js
- *
- * @module src/modules/career-copilot/agents/careerRiskAgent
+ * Optimized for:
+ * - Supabase-safe row queries
+ * - unified freshness logic
+ * - live engine graceful degradation
+ * - null-safe shaping
+ * - maintainability
  */
 
 const BaseAgent = require('./baseAgent');
-const supabase  = require('../../../core/supabaseClient');
-const logger    = require('../../../utils/logger');
+const { supabase } = require('../../../config/supabase');
+const logger = require('../../../utils/logger');
 
+const careerRiskEngine = safeRequireMany([
+  '../../../engines/careerRisk.engine',
+  '../../../modules/careerRisk/careerRisk.engine',
+]);
+
+const opportunityRadarEngine = safeRequire(
+  '../../../engines/opportunityRadar.engine',
+  'OpportunityRadarEngine'
+);
+
+const PRECOMPUTED_MAX_AGE_HOURS = Number(
+  process.env.PRECOMPUTED_AGENT_MAX_AGE_HOURS || 24
+);
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Shared helpers
+// ─────────────────────────────────────────────────────────────────────────────
+function isFreshTimestamp(computedAt) {
+  if (!computedAt) return false;
+
+  const ts = new Date(computedAt).getTime();
+  if (!Number.isFinite(ts)) return false;
+
+  const ageMs = Date.now() - ts;
+  const maxAgeMs =
+    PRECOMPUTED_MAX_AGE_HOURS * 60 * 60 * 1000;
+
+  return ageMs >= 0 && ageMs <= maxAgeMs;
+}
+
+function clampScore(value) {
+  const numeric = Number(value || 0);
+  return Math.max(0, Math.min(100, Math.round(numeric)));
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Career Risk Agent
+// ─────────────────────────────────────────────────────────────────────────────
 class CareerRiskAgent extends BaseAgent {
-
-  get agentName()   { return 'CareerRiskAgent'; }
-  get cachePrefix() { return 'agent:risk'; }
-
-  async run(userId, context) {
-
-    // ── 1. Check pre-computed Supabase result (fastest path) ──────────────────
-    const { data: stored } = await supabase
-      .from('risk_analysis_results')
-      .select('overall_risk_score, risk_level, risk_factors, recommendations, computed_at')
-      .eq('user_id', userId)
-      .maybeSingle();
-
-    if (stored?.overall_risk_score !== null && stored?.overall_risk_score !== undefined) {
-      logger.info('[CareerRiskAgent] Using precomputed result', { userId });
-
-      return this._shape(
-        stored.overall_risk_score,
-        stored.risk_level,
-        stored.risk_factors    || [],
-        stored.recommendations || [],
-        'precomputed'
-      );
-    }
-
-    // ── 2. Try live risk engine ───────────────────────────────────────────────
-    let riskEngine = null;
-    for (const path of [
-      '../../../engines/careerRisk.engine',
-      '../../../modules/careerRisk/careerRisk.engine',
-    ]) {
-      try { riskEngine = require(path); break; }
-      catch (_) {}
-    }
-
-    if (riskEngine?.analyzeCareerRisk) {
-      const result = await riskEngine.analyzeCareerRisk(userId);
-      return this._shape(
-        result.overall_risk_score || result.riskScore  || 0,
-        result.risk_level         || result.riskLevel  || 'Unknown',
-        result.risk_factors       || result.factors    || [],
-        result.recommendations    || [],
-        'live'
-      );
-    }
-
-    // ── 3. Context-derived heuristic (graceful degradation) ──────────────────
-    logger.warn('[CareerRiskAgent] No engine available — deriving from context', { userId });
-    return this._deriveFromContext(context);
+  get agentName() {
+    return 'CareerRiskAgent';
   }
 
-  _shape(score, level, factors, recommendations, source) {
-    const normFactors = (factors || []).slice(0, 5).map(f =>
-      typeof f === 'string'
-        ? { factor: f, description: null, score: null }
-        : { factor: f.factor || f.name, description: f.description || null, score: f.score ?? null }
+  get cachePrefix() {
+    return 'agent:risk';
+  }
+
+  async run(userId, context = {}) {
+    const stored = await this.getStoredRiskResult(userId);
+
+    if (
+      stored &&
+      stored.overall_risk_score != null &&
+      isFreshTimestamp(stored.computed_at)
+    ) {
+      logger.info('[CareerRiskAgent] Using precomputed result', {
+        userId,
+      });
+
+      return this.shape({
+        score: stored.overall_risk_score,
+        level: stored.risk_level,
+        factors: stored.risk_factors,
+        recommendations: stored.recommendations,
+        source: 'precomputed',
+        computedAt: stored.computed_at,
+      });
+    }
+
+    if (careerRiskEngine?.analyzeCareerRisk) {
+      try {
+        const result =
+          await careerRiskEngine.analyzeCareerRisk(userId);
+
+        return this.shape({
+          score:
+            result?.overall_risk_score ??
+            result?.riskScore ??
+            0,
+          level:
+            result?.risk_level ??
+            result?.riskLevel ??
+            'Unknown',
+          factors:
+            result?.risk_factors ??
+            result?.factors ??
+            [],
+          recommendations:
+            result?.recommendations ?? [],
+          source: 'live',
+        });
+      } catch (err) {
+        logger.warn(
+          '[CareerRiskAgent] Live engine failed, using heuristic',
+          {
+            userId,
+            error: err.message,
+          }
+        );
+      }
+    }
+
+    logger.warn('[CareerRiskAgent] Using heuristic derivation', {
+      userId,
+    });
+
+    return this.deriveFromContext(context);
+  }
+
+  async getStoredRiskResult(userId) {
+    try {
+      const { data, error } = await supabase
+        .from('risk_analysis_results')
+        .select(
+          'overall_risk_score, risk_level, risk_factors, recommendations, computed_at'
+        )
+        .eq('user_id', userId)
+        .maybeSingle();
+
+      if (error) throw error;
+      return data || null;
+    } catch (err) {
+      logger.warn('[CareerRiskAgent] Stored fetch failed', {
+        userId,
+        error: err.message,
+      });
+      return null;
+    }
+  }
+
+  shape({
+    score = 0,
+    level = 'Unknown',
+    factors = [],
+    recommendations = [],
+    source = 'unknown',
+    computedAt = null,
+  }) {
+    const normalizedScore = clampScore(score);
+
+    const normalizedFactors = (Array.isArray(factors)
+      ? factors
+      : []
+    )
+      .slice(0, 5)
+      .map((factor) =>
+        typeof factor === 'string'
+          ? {
+              factor,
+              description: null,
+              score: null,
+            }
+          : {
+              factor:
+                factor?.factor ||
+                factor?.name ||
+                null,
+              description:
+                factor?.description || null,
+              score:
+                factor?.score != null
+                  ? clampScore(factor.score)
+                  : null,
+            }
+      )
+      .filter((factor) => factor.factor);
+
+    const stabilityInsight =
+      normalizedScore <= 30
+        ? `Career risk is ${level} — your skills are aligned with market demand.`
+        : normalizedScore <= 60
+          ? 'Moderate career risk detected — focused upskilling is recommended.'
+          : 'High career risk detected — major upskilling or role pivot is advisable.';
+
+    return {
+      overall_risk_score: normalizedScore,
+      risk_level: level,
+      risk_factors: normalizedFactors,
+      recommendations: (Array.isArray(recommendations)
+        ? recommendations
+        : []
+      ).slice(0, 4),
+      stability_insight: stabilityInsight,
+      source,
+      _computed_at:
+        source === 'precomputed' ? computedAt : null,
+    };
+  }
+
+  deriveFromContext(context = {}) {
+    const skills = Array.isArray(
+      context?.existing_skills || context?.skills
+    )
+      ? context.existing_skills || context.skills
+      : [];
+
+    const years = Number(
+      context?.years_experience ??
+      context?.yearsExperience ??
+      0
     );
 
-    const stability = score <= 30
-      ? `Career risk is ${level} — current skills are well-aligned with market demand.`
-      : score <= 60
-        ? `Moderate career risk detected — some upskilling recommended.`
-        : `High career risk — significant upskilling or career pivot advisable.`;
+    const techKeywords = [
+      'python',
+      'sql',
+      'power bi',
+      'machine learning',
+      'cloud',
+      'data',
+      'api',
+    ];
 
-    return {
-      overall_risk_score: Math.round(score),
-      risk_level:         level,
-      risk_factors:       normFactors,
-      recommendations:    (recommendations || []).slice(0, 4),
-      stability_insight:  stability,
-      source,
-    };
-  }
-
-  _deriveFromContext(context) {
-    const skills = context?.existing_skills || context?.skills || [];
-    const yrs    = context?.years_experience || 0;
-
-    const techKeywords = ['python', 'sql', 'power bi', 'machine learning', 'cloud', 'data', 'api'];
-    const techCount = skills.filter(s =>
-      techKeywords.some(k => s.toLowerCase().includes(k))
+    const techCount = skills.filter((skill) =>
+      techKeywords.some((keyword) =>
+        String(skill).toLowerCase().includes(keyword)
+      )
     ).length;
 
-    const score = techCount >= 3 ? 25 : techCount >= 1 ? 45 : 65;
-    const level = score <= 30 ? 'Low' : score <= 50 ? 'Moderate' : 'High';
+    const score =
+      techCount >= 3 ? 25 : techCount >= 1 ? 45 : 65;
 
-    return this._shape(score, level, [
-      { factor: 'Skill Currency', description: techCount > 0 ? 'Has some tech skills' : 'Limited tech skills', score },
-      { factor: 'Experience Depth', description: yrs >= 3 ? 'Solid experience' : 'Early career stage', score: null },
-    ], ['Upskill in high-demand areas', 'Build specialised domain expertise'], 'derived');
+    const level =
+      score <= 30 ? 'Low' : score <= 50 ? 'Moderate' : 'High';
+
+    return this.shape({
+      score,
+      level,
+      factors: [
+        {
+          factor: 'Skill Currency',
+          description:
+            techCount > 0
+              ? 'Has relevant technical skills'
+              : 'Limited technical skill depth',
+          score,
+        },
+        {
+          factor: 'Experience Depth',
+          description:
+            years >= 3
+              ? 'Solid experience base'
+              : 'Early career stage',
+        },
+      ],
+      recommendations: [
+        'Upskill in high-demand areas',
+        'Build specialized domain expertise',
+      ],
+      source: 'derived',
+    });
   }
 }
 
-// ═════════════════════════════════════════════════════════════════════════════
-
-/**
- * opportunityRadarAgent.js — Opportunity Radar Agent
- *
- * Uses: AI Career Opportunity Radar
- *
- * Primary data source: Supabase opportunity_radar_results table.
- * Falls back to live opportunityRadar.engine call.
- *
- * Output:
- *   emerging_opportunities  — top scored emerging roles
- *   total_signals_evaluated — total signals the radar analysed
- *   top_opportunity         — single best opportunity for advisor prompt
- *
- * File location: src/modules/career-copilot/agents/opportunityRadarAgent.js
- *
- * @module src/modules/career-copilot/agents/opportunityRadarAgent
- */
-
+// ─────────────────────────────────────────────────────────────────────────────
+// Opportunity Radar Agent
+// ─────────────────────────────────────────────────────────────────────────────
 class OpportunityRadarAgent extends BaseAgent {
-
-  get agentName()   { return 'OpportunityRadarAgent'; }
-  get cachePrefix() { return 'agent:radar'; }
-
-  async run(userId, context) {
-
-    // ── 1. Precomputed result from Supabase (written by OpportunityRadarWorker) ─
-    const { data: stored } = await supabase
-      .from('opportunity_radar_results')
-      .select('emerging_opportunities, total_signals_evaluated, computed_at')
-      .eq('user_id', userId)
-      .maybeSingle();
-
-    if (stored?.emerging_opportunities?.length > 0) {
-      logger.info('[OpportunityRadarAgent] Using precomputed result', { userId });
-      return this._shape(
-        stored.emerging_opportunities,
-        stored.total_signals_evaluated || 0,
-        'precomputed'
-      );
-    }
-
-    // ── 2. Live engine ────────────────────────────────────────────────────────
-    let engine = null;
-    try { engine = require('../../../engines/opportunityRadar.engine'); } catch (_) {}
-
-    if (engine?.getOpportunityRadar) {
-      const result = await engine.getOpportunityRadar(userId, {
-        topN: 8,
-        minOpportunityScore: 40,
-      });
-      return this._shape(
-        result?.emerging_opportunities || [],
-        result?.total_signals_evaluated || 0,
-        'live'
-      );
-    }
-
-    throw new Error('OpportunityRadarEngine unavailable — run opportunity-radar/refresh first');
+  get agentName() {
+    return 'OpportunityRadarAgent';
   }
 
-  _shape(rawOpps, totalEvaluated, source) {
-    const opportunities = (rawOpps || []).slice(0, 8).map(o => ({
-      role:              o.role              || o.role_name,
-      opportunity_score: Math.round(o.opportunity_score || o.growth_score || 0),
-      match_score:       o.match_score !== undefined ? Math.round(o.match_score) : null,
-      growth_trend:      o.growth_trend      || null,
-      average_salary:    o.average_salary    || null,
-      skills_to_learn:   (o.skills_to_learn  || []).slice(0, 4),
-      industry:          o.industry          || null,
-    }));
+  get cachePrefix() {
+    return 'agent:radar';
+  }
 
-    const top = opportunities[0] || null;
+  async run(userId, context = {}) {
+    const stored = await this.getStoredRadarResult(userId);
+
+    if (
+      stored?.emerging_opportunities?.length &&
+      isFreshTimestamp(stored.computed_at)
+    ) {
+      logger.info(
+        '[OpportunityRadarAgent] Using precomputed result',
+        { userId }
+      );
+
+      return this.shape({
+        rawOpportunities:
+          stored.emerging_opportunities,
+        totalEvaluated:
+          stored.total_signals_evaluated,
+        source: 'precomputed',
+        computedAt: stored.computed_at,
+      });
+    }
+
+    if (opportunityRadarEngine?.getOpportunityRadar) {
+      try {
+        const result =
+          await opportunityRadarEngine.getOpportunityRadar(
+            userId,
+            {
+              topN: 8,
+              minOpportunityScore: 40,
+              context,
+            }
+          );
+
+        return this.shape({
+          rawOpportunities:
+            result?.emerging_opportunities,
+          totalEvaluated:
+            result?.total_signals_evaluated,
+          source: 'live',
+        });
+      } catch (err) {
+        logger.warn(
+          '[OpportunityRadarAgent] Live engine failed',
+          {
+            userId,
+            error: err.message,
+          }
+        );
+      }
+    }
+
+    return this.shape({
+      rawOpportunities: [],
+      totalEvaluated: 0,
+      source: 'derived',
+    });
+  }
+
+  async getStoredRadarResult(userId) {
+    try {
+      const { data, error } = await supabase
+        .from('opportunity_radar_results')
+        .select(
+          'emerging_opportunities, total_signals_evaluated, computed_at'
+        )
+        .eq('user_id', userId)
+        .maybeSingle();
+
+      if (error) throw error;
+      return data || null;
+    } catch (err) {
+      logger.warn(
+        '[OpportunityRadarAgent] Stored fetch failed',
+        {
+          userId,
+          error: err.message,
+        }
+      );
+      return null;
+    }
+  }
+
+  shape({
+    rawOpportunities = [],
+    totalEvaluated = 0,
+    source = 'unknown',
+    computedAt = null,
+  }) {
+    const opportunities = (Array.isArray(rawOpportunities)
+      ? rawOpportunities
+      : []
+    )
+      .slice(0, 8)
+      .map((opp) => ({
+        role: opp?.role || opp?.role_name || null,
+        opportunity_score: clampScore(
+          opp?.opportunity_score ??
+          opp?.growth_score
+        ),
+        match_score:
+          opp?.match_score != null
+            ? clampScore(opp.match_score)
+            : null,
+        growth_trend: opp?.growth_trend || null,
+        average_salary:
+          opp?.average_salary || null,
+        skills_to_learn: Array.isArray(
+          opp?.skills_to_learn
+        )
+          ? opp.skills_to_learn.slice(0, 4)
+          : [],
+        industry: opp?.industry || null,
+      }))
+      .filter((opp) => opp.role);
+
+    const topOpportunity = opportunities[0] || null;
 
     return {
-      emerging_opportunities:  opportunities,
-      top_opportunity:         top,
-      total_signals_evaluated: totalEvaluated,
+      emerging_opportunities: opportunities,
+      top_opportunity: topOpportunity,
+      total_signals_evaluated: Number(
+        totalEvaluated || 0
+      ),
       source,
-      summary: top
-        ? `${top.role} is your top emerging opportunity (score: ${top.opportunity_score}).`
-        : 'No opportunity radar data yet. Run a full analysis to populate.',
+      _computed_at:
+        source === 'precomputed' ? computedAt : null,
+      summary: topOpportunity
+        ? `${topOpportunity.role} is your top emerging opportunity (${topOpportunity.opportunity_score}/100).`
+        : 'No opportunity radar data available yet.',
     };
   }
 }
 
-module.exports = { CareerRiskAgent, OpportunityRadarAgent };
+// ─────────────────────────────────────────────────────────────────────────────
+// Safe requires
+// ─────────────────────────────────────────────────────────────────────────────
+function safeRequire(path, name) {
+  try {
+    return require(path);
+  } catch (err) {
+    logger.warn(
+      `[RiskOpportunityAgents] ${name} unavailable`,
+      {
+        error: err instanceof Error
+          ? err.message
+          : 'Unknown require error',
+      }
+    );
+    return null;
+  }
+}
 
+function safeRequireMany(paths = []) {
+  for (const path of paths) {
+    try {
+      return require(path);
+    } catch {}
+  }
 
+  return null;
+}
 
-
-
-
-
-
-
+module.exports = {
+  CareerRiskAgent,
+  OpportunityRadarAgent,
+};

@@ -31,7 +31,7 @@
  */
 const path = require('path');
 const crypto = require('crypto');
-const supabase = require('../../config/supabase');
+const { supabase } = require('../../config/supabase');
 const {
   AppError,
   ErrorCodes

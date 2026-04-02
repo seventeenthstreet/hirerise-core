@@ -60,7 +60,7 @@
  *   subscriptionEvents: [provider ASC, externalEventId ASC]  (idempotency)
  */
 
-const supabase = require('../../config/supabase');
+const { supabase } = require('../../config/supabase');
 const { FieldValue, Timestamp } = require('../../config/supabase');
 const { AppError, ErrorCodes } = require('../../middleware/errorHandler');
 const logger = require('../../utils/logger');

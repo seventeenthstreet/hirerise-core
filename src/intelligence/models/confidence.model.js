@@ -1,49 +1,53 @@
-"use strict";
+'use strict';
 
 /**
- * Confidence Model
- *
- * Evaluates reliability of prioritization results.
- *
- * Confidence is NOT prediction probability.
- * It measures trustworthiness of inputs + model completeness.
+ * Confidence Model (Production Optimized)
  */
 
 function calculateConfidence({
-  scoredSkills,
-  dependencyMap,
-  careerGraphData,
-  profile,
-  marketData,
-  config,
+  scoredSkills = [],
+  dependencyMap = {},
+  careerGraphData = {},
+  profile = {},
+  marketData = {},
+  config = {}
 }) {
-  const dataCoverage = calculateDataCoverage(scoredSkills, marketData);
-  const gatewayCompleteness = calculateGatewayCompleteness(dependencyMap);
-  const profileStrength = calculateProfileStrength(profile);
-  const marketSignalStrength = calculateMarketSignalStrength(scoredSkills);
+  const weights = {
+    dataCoverage: config?.weights?.dataCoverage ?? 0.30,
+    gatewayCompleteness: config?.weights?.gatewayCompleteness ?? 0.25,
+    profileStrength: config?.weights?.profileStrength ?? 0.25,
+    marketSignalStrength: config?.weights?.marketSignalStrength ?? 0.20
+  };
 
-  // Weighted blend (can be tuned in config later)
+  const dataCoverage = safe(calculateDataCoverage(scoredSkills, marketData));
+  const gatewayCompleteness = safe(calculateGatewayCompleteness(dependencyMap));
+  const profileStrength = safe(calculateProfileStrength(profile));
+  const marketSignalStrength = safe(calculateMarketSignalStrength(scoredSkills));
+
   const confidenceScore =
-    0.30 * dataCoverage +
-    0.25 * gatewayCompleteness +
-    0.25 * profileStrength +
-    0.20 * marketSignalStrength;
+    weights.dataCoverage * dataCoverage +
+    weights.gatewayCompleteness * gatewayCompleteness +
+    weights.profileStrength * profileStrength +
+    weights.marketSignalStrength * marketSignalStrength;
 
   return {
-    confidenceScore: parseFloat(confidenceScore.toFixed(2)),
+    confidenceScore: round(confidenceScore),
     confidenceLevel: classifyConfidence(confidenceScore),
     factors: {
       dataCoverage: round(dataCoverage),
       gatewayCompleteness: round(gatewayCompleteness),
       profileStrength: round(profileStrength),
-      marketSignalStrength: round(marketSignalStrength),
+      marketSignalStrength: round(marketSignalStrength)
     },
+    meta: {
+      weights,
+      evaluatedAt: new Date().toISOString()
+    }
   };
 }
 
 // ─────────────────────────────────────────────
 // FACTOR 1 — DATA COVERAGE
-// How many skills used real market data vs defaults?
 // ─────────────────────────────────────────────
 
 function calculateDataCoverage(scoredSkills, marketData) {
@@ -52,9 +56,12 @@ function calculateDataCoverage(scoredSkills, marketData) {
   let realDataCount = 0;
 
   for (const skill of scoredSkills) {
+    const data = marketData?.[skill.skillId];
+
     if (
-      marketData?.[skill.skillId]?.demandScore !== undefined &&
-      marketData?.[skill.skillId]?.promotionBoost !== undefined
+      data &&
+      isValidNumber(data.demandScore) &&
+      isValidNumber(data.promotionBoost)
     ) {
       realDataCount++;
     }
@@ -64,72 +71,81 @@ function calculateDataCoverage(scoredSkills, marketData) {
 }
 
 // ─────────────────────────────────────────────
-// FACTOR 2 — GATEWAY COMPLETENESS
-// Are transition skills weighted & structured?
+// FACTOR 2 — GATEWAY COMPLETENESS (IMPROVED)
 // ─────────────────────────────────────────────
 
 function calculateGatewayCompleteness(dependencyMap) {
-  if (!dependencyMap || !dependencyMap.totalGatewayWeight) {
-    return 50; // neutral fallback
-  }
+  if (!dependencyMap) return 50;
 
-  if (dependencyMap.totalGatewayWeight === 0) {
-    return 40; // weak transition mapping
-  }
+  const total = dependencyMap.totalGatewayWeight ?? 0;
+  const maxExpected = dependencyMap.maxPossibleWeight ?? 100;
 
-  return 90; // strong weighted transition model present
+  if (maxExpected === 0) return 50;
+
+  const ratio = total / maxExpected;
+
+  return clamp(ratio * 100);
 }
 
 // ─────────────────────────────────────────────
 // FACTOR 3 — PROFILE STRENGTH
-// Resume + experience completeness
 // ─────────────────────────────────────────────
 
 function calculateProfileStrength(profile) {
-  const resumeScore = profile.resumeScore ?? 50;
-  const experienceScore = Math.min(100, (profile.experienceYears / 15) * 100);
+  const resumeScore = safe(profile.resumeScore ?? 50);
+  const experienceYears = safe(profile.experienceYears ?? 0);
+
+  const experienceScore = clamp((experienceYears / 15) * 100);
 
   return (resumeScore * 0.6) + (experienceScore * 0.4);
 }
 
 // ─────────────────────────────────────────────
 // FACTOR 4 — MARKET SIGNAL STRENGTH
-// Average demand signal strength
 // ─────────────────────────────────────────────
 
 function calculateMarketSignalStrength(scoredSkills) {
   if (!scoredSkills.length) return 0;
 
-  const avgDemand =
-    scoredSkills.reduce((sum, s) => sum + s.marketDemandScore, 0) /
-    scoredSkills.length;
+  const validScores = scoredSkills
+    .map(s => s.marketDemandScore)
+    .filter(isValidNumber);
 
-  return avgDemand;
+  if (!validScores.length) return 0;
+
+  const avg =
+    validScores.reduce((sum, val) => sum + val, 0) / validScores.length;
+
+  return clamp(avg);
 }
 
 // ─────────────────────────────────────────────
-// CLASSIFIER
+// HELPERS
 // ─────────────────────────────────────────────
 
 function classifyConfidence(score) {
-  if (score >= 80) return "HIGH";
-  if (score >= 60) return "MEDIUM";
-  return "LOW";
+  if (score >= 80) return 'HIGH';
+  if (score >= 60) return 'MEDIUM';
+  return 'LOW';
 }
 
 function round(num) {
-  return parseFloat(num.toFixed(1));
+  return parseFloat(num.toFixed(2));
+}
+
+function clamp(num) {
+  if (!isValidNumber(num)) return 0;
+  return Math.max(0, Math.min(100, num));
+}
+
+function safe(num) {
+  return isValidNumber(num) ? num : 0;
+}
+
+function isValidNumber(val) {
+  return typeof val === 'number' && !isNaN(val);
 }
 
 module.exports = {
-  calculateConfidence,
+  calculateConfidence
 };
-
-
-
-
-
-
-
-
-

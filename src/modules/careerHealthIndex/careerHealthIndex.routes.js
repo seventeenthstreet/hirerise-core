@@ -1,48 +1,41 @@
 'use strict';
 
 /**
- * careerHealthIndex.routes.js — FIXED
+ * src/modules/career-health/careerHealthIndex.routes.js
  *
- * ROOT CAUSE: Frontend calls GET /api/v1/career-health (root path) but the
- * backend only registers:
- *   GET /career-health/latest
- *   GET /career-health/history
- *   GET /career-health/provisional
- *   POST /career-health/calculate
+ * Production-grade routing for Career Health Index.
  *
- * There is NO handler for GET / — the request falls through to the 404 handler.
- * This is why dashboard shows "Failed to load breakdown", "Failed to load skill gaps",
- * "Failed to load demand data", and "Failed to load recommendations".
- *
- * FIX: Add router.get('/', getLatestChi) as the root handler.
- * The frontend's useCareerHealth() hook calls apiFetch('/career-health') which
- * resolves to GET /api/v1/career-health — this now serves the latest CHI.
+ * Improvements:
+ * - Preserves root GET compatibility for frontend hook
+ * - Removes dead imports / legacy gating assumptions
+ * - Standardizes route ordering for static paths before dynamic growth
+ * - Keeps free-tier CHI calculation enabled with AI rate limiting
+ * - Improves maintainability via controller namespace import
  */
 
 const { Router } = require('express');
-const { calculateChi, getLatestChi, getChiHistory, getProvisionalChi } = require('./controllers/careerHealthIndex.controller');
-const { requirePaidPlan }    = require('../../middleware/requirePaidPlan.middleware');
-const { aiRateLimitByPlan }  = require('../../middleware/aiRateLimitByPlan.middleware');
+const chiController = require('./controllers/careerHealthIndex.controller');
+const { aiRateLimitByPlan } = require('../../middleware/aiRateLimitByPlan.middleware');
 
 const router = Router();
 
-// ── FIX: Root GET handler — this is what the frontend calls ──────────────────
-// useCareerHealth() calls GET /api/v1/career-health
-// Previously this route did not exist → 404 → all dashboard cards fail
-router.get('/', getLatestChi);
+/**
+ * Frontend primary endpoint
+ * GET /api/v1/career-health
+ */
+router.get('/', chiController.getLatestChi);
 
-// POST /calculate triggers a live Anthropic call — must be gated.
-router.post('/calculate',   aiRateLimitByPlan, calculateChi);  // requirePaidPlan removed — free users can calculate CHI
-router.get('/latest',       getLatestChi);
-router.get('/history',      getChiHistory);
-router.get('/provisional',  getProvisionalChi);
+/**
+ * Explicit endpoints
+ */
+router.get('/latest', chiController.getLatestChi);
+router.get('/history', chiController.getChiHistory);
+router.get('/provisional', chiController.getProvisionalChi);
+
+/**
+ * Live CHI calculation
+ * Free users allowed, protected by plan-aware AI rate limiter.
+ */
+router.post('/calculate', aiRateLimitByPlan, chiController.calculateChi);
 
 module.exports = router;
-
-
-
-
-
-
-
-

@@ -1,38 +1,90 @@
 'use strict';
 
 /**
- * ai/observability/logger.js
+ * ai/observability/ai-logger.js — PRODUCTION HARDENED
  *
- * AILogger — high-resolution timer utility for AI observability.
- * Used by shadow-model.service.js to measure latency of shadow calls.
+ * High-resolution timing + structured observability logging
  */
 
+let baseLogger;
+
+try {
+  baseLogger = require('../../utils/logger');
+} catch (err) {
+  // fallback (never crash app)
+  baseLogger = {
+    info: console.log.bind(console),
+    warn: console.warn.bind(console),
+    error: console.error.bind(console),
+  };
+}
+
+// ─────────────────────────────────────────────
+// AILogger
+// ─────────────────────────────────────────────
+
 const AILogger = {
-  /**
-   * startTimer() — returns a high-resolution start timestamp.
-   * @returns {[number, number]} hrtime tuple
-   */
+
+  // ─────────────────────────────
+  // TIMER
+  // ─────────────────────────────
+
   startTimer() {
     return process.hrtime();
   },
 
-  /**
-   * elapsedMs(timer) — returns elapsed milliseconds since startTimer().
-   * @param {[number, number]} timer — value returned by startTimer()
-   * @returns {number} elapsed ms
-   */
   elapsedMs(timer) {
-    const [sec, ns] = process.hrtime(timer);
-    return (sec * 1000) + (ns / 1_000_000);
+    if (!Array.isArray(timer) || timer.length !== 2) return 0;
+
+    const diff = process.hrtime(timer);
+    return (diff[0] * 1000) + (diff[1] / 1_000_000);
   },
+
+  // ─────────────────────────────
+  // MEASURE
+  // ─────────────────────────────
+
+  async measure(fn, context = {}) {
+    const start = process.hrtime(); // ❗ no `this`
+
+    try {
+      const result = await fn();
+
+      const duration = this.elapsedMs(start);
+
+      baseLogger.info('[AI Latency]', {
+        durationMs: +duration.toFixed(2),
+        success: true,
+        ...context,
+      });
+
+      return result;
+
+    } catch (err) {
+      const duration = this.elapsedMs(start);
+
+      baseLogger.error('[AI Latency Error]', {
+        durationMs: +duration.toFixed(2),
+        success: false,
+        error: err?.message,
+        stack: err?.stack,
+        ...context,
+      });
+
+      throw err;
+    }
+  },
+
+  // ─────────────────────────────
+  // MANUAL LOG
+  // ─────────────────────────────
+
+  logLatency(durationMs, context = {}) {
+    baseLogger.info('[AI Latency]', {
+      durationMs: +Number(durationMs || 0).toFixed(2),
+      ...context,
+    });
+  }
 };
 
 module.exports = AILogger;
-
-
-
-
-
-
-
-

@@ -6,7 +6,7 @@
  * Extracted from onboarding.service.js (god-object decomposition).
  * Owns: importLinkedIn, confirmLinkedInImport
  */
-const supabase = require('../../config/supabase');
+const { supabase } = require('../../config/supabase');
 const {
   AppError,
   ErrorCodes

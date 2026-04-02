@@ -1,7 +1,7 @@
 'use strict';
 
 const logger = require('../../../utils/logger');
-const supabase = require('../../../config/supabase');
+const { supabase } = require('../../../config/supabase');
 
 const uniRepo = require('../../university/repositories/university.repository');
 const empRepo = require('../../employer/repositories/employer.repository');

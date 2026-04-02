@@ -1,139 +1,208 @@
 'use strict';
 
-// FIX: Converted from ESM to CJS to match the rest of the codebase.
+/**
+ * BaseRepository — PRODUCTION HARDENED (SUPABASE)
+ *
+ * ✅ Select optimization
+ * ✅ Pagination support
+ * ✅ Error normalization
+ * ✅ Timeout protection
+ * ✅ Bulk operations added
+ */
 
-const { db, FieldValue, Timestamp } = require('../../src/core/supabaseDbShim');
+const { supabase } = require('../config/supabaseClient');
 const logger = require('../logger');
 
+const DEFAULT_TIMEOUT = 10000;
+
+// ─────────────────────────────────────────────
+// Helper: Safe Query Execution
+// ─────────────────────────────────────────────
+async function execute(queryPromise, context) {
+  try {
+    const timeout = new Promise((_, reject) =>
+      setTimeout(() => reject(new Error('DB_TIMEOUT')), DEFAULT_TIMEOUT)
+    );
+
+    const { data, error } = await Promise.race([queryPromise, timeout]);
+
+    if (error) {
+      logger.error('Database error', { error, ...context });
+
+      const err = new Error(error.message);
+      err.code = 'DB_ERROR';
+      throw err;
+    }
+
+    return data;
+  } catch (err) {
+    logger.error('Database failure', { err, ...context });
+    throw err;
+  }
+}
+
+// ─────────────────────────────────────────────
+// Repository
+// ─────────────────────────────────────────────
+
 class BaseRepository {
-  constructor(collectionName) {
-    if (!collectionName) throw new Error('BaseRepository requires a collection name');
-    this._collectionName = collectionName;
-    this._db = require('../../src/core/supabaseDbShim').db;
+  constructor(tableName) {
+    if (!tableName) throw new Error('BaseRepository requires a table name');
+    this.table = tableName;
   }
 
-  get collection() {
-    return this._db.collection(this._collectionName);
+  // ─────────────────────────────────────────────
+  // READ
+  // ─────────────────────────────────────────────
+
+  async findById(id, columns = '*') {
+    const query = supabase
+      .from(this.table)
+      .select(columns)
+      .eq('id', id)
+      .is('deleted_at', null)
+      .maybeSingle();
+
+    return await execute(query, { method: 'findById', table: this.table });
   }
 
-  get db() {
-    return this._db;
-  }
+  async findWhere(
+    conditions = [],
+    {
+      limit = 50,
+      offset = 0,
+      orderBy = null,
+      columns = '*',
+    } = {}
+  ) {
+    let query = supabase
+      .from(this.table)
+      .select(columns)
+      .range(offset, offset + limit - 1);
 
-  get serverTimestamp() {
-    return FieldValue.serverTimestamp();
-  }
-
-  async findById(id) {
-    const snap = await this.collection.doc(id).get();
-    if (!snap.exists) return null;
-    const data = snap.data();
-    if (data.deletedAt) return null;
-    return this._normalize({ id: snap.id, ...data });
-  }
-
-  async findOneWhere(conditions = []) {
-    let query = this.collection.where('deletedAt', '==', null);
     for (const [field, op, value] of conditions) {
-      query = query.where(field, op, value);
+      if (op === '==') query = query.eq(field, value);
+      else if (op === '!=') query = query.neq(field, value);
+      else if (op === '>') query = query.gt(field, value);
+      else if (op === '<') query = query.lt(field, value);
     }
-    const snap = await query.limit(1).get();
-    if (snap.empty) return null;
-    const doc = snap.docs[0];
-    return this._normalize({ id: doc.id, ...doc.data() });
+
+    query = query.is('deleted_at', null);
+
+    if (orderBy) {
+      query = query.order(orderBy.field, {
+        ascending: orderBy.direction !== 'desc',
+      });
+    }
+
+    return (await execute(query, { method: 'findWhere' })) || [];
   }
 
-  async findWhere(conditions = [], { limit = 100, orderBy = null, startAfter = null } = {}) {
-    let query = this.collection.where('deletedAt', '==', null);
-    for (const [field, op, value] of conditions) {
-      query = query.where(field, op, value);
-    }
-    if (orderBy) query = query.orderBy(orderBy.field, orderBy.direction ?? 'asc');
-    if (startAfter) query = query.startAfter(startAfter);
-    query = query.limit(limit);
+  // ─────────────────────────────────────────────
+  // CREATE
+  // ─────────────────────────────────────────────
 
-    const snap = await query.get();
-    return snap.docs.map((d) => this._normalize({ id: d.id, ...d.data() }));
-  }
-
-  async create(id, data) {
-    const ref = id ? this.collection.doc(id) : this.collection.doc();
+  async create(data, { returning = 'minimal' } = {}) {
     const payload = {
       ...data,
-      createdAt: this.serverTimestamp,
-      updatedAt: this.serverTimestamp,
-      deletedAt: null,
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+      deleted_at: null,
     };
-    await ref.set(payload);
-    return ref.id;
+
+    let query = supabase.from(this.table).insert(payload);
+
+    if (returning === 'full') {
+      query = query.select().maybeSingle();
+    }
+
+    const result = await execute(query, { method: 'create' });
+
+    return returning === 'full' ? result : payload.id;
   }
 
+  // ─────────────────────────────────────────────
+  // BULK INSERT (NEW)
+  // ─────────────────────────────────────────────
+
+  async bulkInsert(records = []) {
+    if (!records.length) return [];
+
+    const payload = records.map((r) => ({
+      ...r,
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+      deleted_at: null,
+    }));
+
+    return await execute(
+      supabase.from(this.table).insert(payload),
+      { method: 'bulkInsert' }
+    );
+  }
+
+  // ─────────────────────────────────────────────
+  // UPDATE
+  // ─────────────────────────────────────────────
+
   async update(id, data) {
-    const ref = this.collection.doc(id);
-    const snap = await ref.get();
-    if (!snap.exists || snap.data().deletedAt) {
-      throw new Error(`Document ${id} not found in ${this._collectionName}`);
-    }
-    await ref.update({ ...data, updatedAt: this.serverTimestamp });
+    return await execute(
+      supabase
+        .from(this.table)
+        .update({
+          ...data,
+          updated_at: new Date().toISOString(),
+        })
+        .eq('id', id)
+        .is('deleted_at', null),
+      { method: 'update', id }
+    );
   }
 
   async upsert(id, data) {
-    const ref = this.collection.doc(id);
-    await ref.set(
-      { ...data, updatedAt: this.serverTimestamp, deletedAt: null },
-      { merge: true }
+    const payload = {
+      id,
+      ...data,
+      updated_at: new Date().toISOString(),
+      deleted_at: null,
+    };
+
+    return await execute(
+      supabase.from(this.table).upsert(payload, { onConflict: 'id' }),
+      { method: 'upsert', id }
     );
-    return id;
   }
 
+  // ─────────────────────────────────────────────
+  // DELETE
+  // ─────────────────────────────────────────────
+
   async softDelete(id, deletedBy = null) {
-    const ref = this.collection.doc(id);
-    await ref.update({
-      deletedAt: this.serverTimestamp,
-      deletedBy,
-      updatedAt: this.serverTimestamp,
-    });
+    return await execute(
+      supabase
+        .from(this.table)
+        .update({
+          deleted_at: new Date().toISOString(),
+          deleted_by: deletedBy,
+          updated_at: new Date().toISOString(),
+        })
+        .eq('id', id),
+      { method: 'softDelete', id }
+    );
   }
 
   async exists(id) {
-    const snap = await this.collection.doc(id).get();
-    return snap.exists && !snap.data().deletedAt;
-  }
+    const data = await execute(
+      supabase
+        .from(this.table)
+        .select('id')
+        .eq('id', id)
+        .is('deleted_at', null)
+        .maybeSingle(),
+      { method: 'exists', id }
+    );
 
-  async runTransaction(fn) {
-    return this._db.runTransaction(fn);
-  }
-
-  async batchWrite(operations) {
-    const chunks = this._chunk(operations, 500);
-    for (const chunk of chunks) {
-      const batch = this._db.batch();
-      for (const op of chunk) {
-        const ref = this.collection.doc(op.id);
-        if (op.type === 'set')    batch.set(ref, op.data, op.options ?? {});
-        else if (op.type === 'update') batch.update(ref, op.data);
-        else if (op.type === 'delete') batch.delete(ref);
-      }
-      await batch.commit();
-    }
-  }
-
-  _normalize(data) {
-    const result = { ...data };
-    for (const [key, val] of Object.entries(result)) {
-      if (val instanceof Timestamp) {
-        result[key] = val.toDate().toISOString();
-      }
-    }
-    return result;
-  }
-
-  _chunk(array, size) {
-    const chunks = [];
-    for (let i = 0; i < array.length; i += size) {
-      chunks.push(array.slice(i, i + size));
-    }
-    return chunks;
+    return !!data;
   }
 }
 

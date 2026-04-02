@@ -1,78 +1,93 @@
 'use strict';
 
 /**
- * agentCoordinator.routes.js — Multi-Agent Copilot API
+ * @file src/modules/career-copilot/routes/agentCoordinator.routes.js
+ * @description
+ * Production-grade Multi-Agent Copilot API routes.
  *
- * Mounts on the existing /copilot prefix — additive, does NOT replace
- * the existing RAG chat endpoints (/copilot/chat, /copilot/welcome).
- *
- * Mount in server.js (one line — place after the existing copilot route):
- *
- *   app.use(`${API_PREFIX}/copilot`, authenticate,
- *     require('./modules/career-copilot/routes/agentCoordinator.routes'));
- *
- * Endpoints:
- *
- *   POST /api/v1/copilot/agent/ask          — question-driven routing
- *   POST /api/v1/copilot/agent/analyze      — full analysis (all agents)
- *   GET  /api/v1/copilot/agent/status       — agent registry + health
- *   POST /api/v1/copilot/agent/cache/clear  — invalidate user's agent caches
- *   GET  /api/v1/copilot/agent/history      — recent agent response history
- *
- * File location: src/modules/career-copilot/routes/agentCoordinator.routes.js
- *
- * @module src/modules/career-copilot/routes/agentCoordinator.routes
+ * Optimized for:
+ * - Supabase-safe row queries
+ * - consistent response envelopes
+ * - route-level validation hygiene
+ * - safer query builder flow
+ * - logging consistency
+ * - better maintainability
  */
 
-'use strict';
-
-const { Router }   = require('express');
+const { Router } = require('express');
 const { body, query: qv } = require('express-validator');
+
 const { validate } = require('../../../middleware/requestValidator');
-const logger        = require('../../../utils/logger');
-const coordinator   = require('../coordinator/careerAgentCoordinator');
-const supabase      = require('../../../core/supabaseClient');
+const logger = require('../../../utils/logger');
+const coordinator = require('../coordinator/careerAgentCoordinator');
+const { supabase } = require('../../../config/supabase');
 
 const router = Router();
 
-// ─── Helpers ──────────────────────────────────────────────────────────────────
+const MAX_MESSAGE_LENGTH = 2000;
+const MAX_SESSION_ID_LENGTH = 100;
+const DEFAULT_HISTORY_LIMIT = 10;
+const MAX_HISTORY_LIMIT = 30;
 
-const ok  = (res, data)            => res.status(200).json({ success: true,  data });
-const bad = (res, msg, code = 400) => res.status(code).json({ success: false, error: msg });
-
-function _uid(req) {
-  return req.user?.uid || req.user?.id || null;
+// ─────────────────────────────────────────────────────────────────────────────
+// Response helpers
+// ─────────────────────────────────────────────────────────────────────────────
+function ok(res, data) {
+  res.set('Cache-Control', 'no-store');
+  return res.status(200).json({
+    success: true,
+    data,
+  });
 }
 
-// ─── POST /copilot/agent/ask ─────────────────────────────────────────────────
+function bad(res, message, code = 400) {
+  res.set('Cache-Control', 'no-store');
+  return res.status(code).json({
+    success: false,
+    error: message,
+  });
+}
 
-/**
- * Question-driven agent routing.
- * Coordinator classifies the intent, selects relevant agents, returns answer.
- *
- * Body:
- *   message       {string}  required — user question (max 2000 chars)
- *   session_id    {string}  optional — keep multi-turn context
- *   force_refresh {boolean} optional — bypass caches (default false)
- *
- * Response includes:
- *   skills_to_learn, job_matches, career_risk, opportunities,
- *   ai_recommendation, agents_used, intent_detected, confidence
- */
-router.post('/agent/ask',
+// ─────────────────────────────────────────────────────────────────────────────
+// Auth helper
+// ─────────────────────────────────────────────────────────────────────────────
+function getUserId(req) {
+  return req.user?.id || req.user?.uid || null;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Shared validators
+// ─────────────────────────────────────────────────────────────────────────────
+const sessionIdValidator = body('session_id')
+  .optional({ nullable: true })
+  .isString()
+  .trim()
+  .isLength({ max: MAX_SESSION_ID_LENGTH });
+
+const forceRefreshValidator = body('force_refresh')
+  .optional({ nullable: true })
+  .isBoolean()
+  .toBoolean();
+
+// ─────────────────────────────────────────────────────────────────────────────
+// POST /copilot/agent/ask
+// ─────────────────────────────────────────────────────────────────────────────
+router.post(
+  '/agent/ask',
   validate([
     body('message')
-      .isString().trim().notEmpty().isLength({ max: 2000 })
-      .withMessage('message is required (string, max 2000 chars)'),
-    body('session_id')
-      .optional({ nullable: true })
-      .isString().trim().isLength({ max: 100 }),
-    body('force_refresh')
-      .optional({ nullable: true })
-      .isBoolean().toBoolean(),
+      .isString()
+      .trim()
+      .notEmpty()
+      .isLength({ max: MAX_MESSAGE_LENGTH })
+      .withMessage(
+        `message is required (string, max ${MAX_MESSAGE_LENGTH} chars)`
+      ),
+    sessionIdValidator,
+    forceRefreshValidator,
   ]),
   async (req, res) => {
-    const userId = _uid(req);
+    const userId = getUserId(req);
     if (!userId) return bad(res, 'Unauthenticated', 401);
 
     const { message, session_id, force_refresh } = req.body;
@@ -80,145 +95,157 @@ router.post('/agent/ask',
     try {
       const result = await coordinator.coordinate(userId, message, {
         forceRefresh: force_refresh === true,
-        sessionId:    session_id   || undefined,
+        sessionId: session_id || undefined,
       });
-      ok(res, result);
+
+      return ok(res, result);
     } catch (err) {
-      logger.error('[AgentRoute] ask error', { userId, err: err.message });
-      bad(res, 'Agent routing failed. Please try again.', 500);
+      logger.error('[AgentRoute] ask error', {
+        userId,
+        error: err.message,
+      });
+
+      return bad(res, 'Agent routing failed. Please try again.', 500);
     }
   }
 );
 
-// ─── POST /copilot/agent/analyze ─────────────────────────────────────────────
-
-/**
- * Full analysis — runs all five specialist agents regardless of query.
- * Use for: dashboard load, post-CV-upload, manual "refresh analysis" button.
- *
- * Body:
- *   session_id    {string}  optional
- *   force_refresh {boolean} optional
- *
- * Returns the same shape as /ask but with all five agents populated.
- */
-router.post('/agent/analyze',
-  validate([
-    body('session_id')
-      .optional({ nullable: true })
-      .isString().trim().isLength({ max: 100 }),
-    body('force_refresh')
-      .optional({ nullable: true })
-      .isBoolean().toBoolean(),
-  ]),
+// ─────────────────────────────────────────────────────────────────────────────
+// POST /copilot/agent/analyze
+// ─────────────────────────────────────────────────────────────────────────────
+router.post(
+  '/agent/analyze',
+  validate([sessionIdValidator, forceRefreshValidator]),
   async (req, res) => {
-    const userId = _uid(req);
+    const userId = getUserId(req);
     if (!userId) return bad(res, 'Unauthenticated', 401);
 
     try {
       const result = await coordinator.coordinate(userId, null, {
         forceRefresh: req.body.force_refresh === true,
-        sessionId:    req.body.session_id    || undefined,
-        agentSubset:  ['skill', 'jobs', 'market', 'risk', 'opportunity'], // all five
+        sessionId: req.body.session_id || undefined,
+        agentSubset: [
+          'skill',
+          'jobs',
+          'market',
+          'risk',
+          'opportunity',
+        ],
       });
-      ok(res, result);
+
+      return ok(res, result);
     } catch (err) {
-      logger.error('[AgentRoute] analyze error', { userId, err: err.message });
-      bad(res, 'Full analysis failed. Please try again.', 500);
+      logger.error('[AgentRoute] analyze error', {
+        userId,
+        error: err.message,
+      });
+
+      return bad(res, 'Full analysis failed. Please try again.', 500);
     }
   }
 );
 
-// ─── GET /copilot/agent/status ───────────────────────────────────────────────
-
-/**
- * Returns agent registry + intent routing map.
- * Useful for dashboard UI showing which agents are active.
- */
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /copilot/agent/status
+// ─────────────────────────────────────────────────────────────────────────────
 router.get('/agent/status', async (req, res) => {
-  const userId = _uid(req);
+  const userId = getUserId(req);
   if (!userId) return bad(res, 'Unauthenticated', 401);
 
   try {
     const status = await coordinator.getAgentStatus();
-    ok(res, status);
+    return ok(res, status);
   } catch (err) {
-    bad(res, 'Failed to get agent status', 500);
+    logger.error('[AgentRoute] status error', {
+      userId,
+      error: err.message,
+    });
+
+    return bad(res, 'Failed to get agent status', 500);
   }
 });
 
-// ─── POST /copilot/agent/cache/clear ─────────────────────────────────────────
-
-/**
- * Invalidate all agent + coordinator caches for the authenticated user.
- * Call this after CV upload or profile update to force fresh agent runs.
- */
+// ─────────────────────────────────────────────────────────────────────────────
+// POST /copilot/agent/cache/clear
+// ─────────────────────────────────────────────────────────────────────────────
 router.post('/agent/cache/clear', async (req, res) => {
-  const userId = _uid(req);
+  const userId = getUserId(req);
   if (!userId) return bad(res, 'Unauthenticated', 401);
 
   try {
     await coordinator.invalidateUserCache(userId);
-    ok(res, { invalidated: true });
+    return ok(res, { invalidated: true });
   } catch (err) {
-    bad(res, 'Cache clear failed', 500);
+    logger.error('[AgentRoute] cache clear error', {
+      userId,
+      error: err.message,
+    });
+
+    return bad(res, 'Cache clear failed', 500);
   }
 });
 
-// ─── GET /copilot/agent/history ──────────────────────────────────────────────
-
-/**
- * Returns the user's recent agent response history from Supabase.
- *
- * Query params:
- *   limit      {number} — max results (default 10, max 30)
- *   session_id {string} — filter by session
- */
-router.get('/agent/history',
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /copilot/agent/history
+// ─────────────────────────────────────────────────────────────────────────────
+router.get(
+  '/agent/history',
   validate([
     qv('limit')
       .optional()
-      .isInt({ min: 1, max: 30 }).toInt()
-      .withMessage('limit must be 1–30'),
+      .isInt({ min: 1, max: MAX_HISTORY_LIMIT })
+      .toInt()
+      .withMessage(`limit must be 1–${MAX_HISTORY_LIMIT}`),
     qv('session_id')
       .optional()
-      .isString().trim().isLength({ max: 100 }),
+      .isString()
+      .trim()
+      .isLength({ max: MAX_SESSION_ID_LENGTH }),
   ]),
   async (req, res) => {
-    const userId    = _uid(req);
+    const userId = getUserId(req);
     if (!userId) return bad(res, 'Unauthenticated', 401);
 
-    const limit     = Math.min(parseInt(req.query.limit) || 10, 30);
-    const sessionId = req.query.session_id || null;
+    const limit = Math.min(
+      Number(req.query.limit) || DEFAULT_HISTORY_LIMIT,
+      MAX_HISTORY_LIMIT
+    );
+
+    const sessionId =
+      typeof req.query.session_id === 'string'
+        ? req.query.session_id
+        : null;
 
     try {
-      let q = supabase
+      let query = supabase
         .from('agent_responses')
-        .select('id, session_id, turn_index, user_query, intent, agents_used, confidence, duration_ms, created_at')
+        .select(
+          'id, session_id, turn_index, user_query, intent, agents_used, confidence, duration_ms, created_at'
+        )
         .eq('user_id', userId)
         .order('created_at', { ascending: false })
         .limit(limit);
 
-      if (sessionId) q = q.eq('session_id', sessionId);
+      if (sessionId) {
+        query = query.eq('session_id', sessionId);
+      }
 
-      const { data, error } = await q;
-      if (error) throw new Error(error.message);
+      const { data, error } = await query;
+      if (error) throw error;
 
-      ok(res, { history: data || [], total: (data || []).length });
+      return ok(res, {
+        history: data || [],
+        total: Array.isArray(data) ? data.length : 0,
+      });
     } catch (err) {
-      logger.error('[AgentRoute] history error', { userId, err: err.message });
-      bad(res, 'Failed to load agent history', 500);
+      logger.error('[AgentRoute] history error', {
+        userId,
+        error: err.message,
+      });
+
+      return bad(res, 'Failed to load agent history', 500);
     }
   }
 );
 
 module.exports = router;
-
-
-
-
-
-
-
-
-

@@ -1,44 +1,99 @@
+'use strict';
+
 /**
  * Engine Version Registry
  *
- * Defines versioned engine identifiers for all intelligence modules.
- * When a new engine version is deployed:
- *   1. Add the new version constant
- *   2. Update CURRENT_* pointer
- *   3. Historical scores retain their engineVersion — no backfill required
- *   4. The worker's ENGINE_VERSION env var controls which version is active
+ * ✅ CJS compatible
+ * ✅ Env-safe resolution
+ * ✅ Better error handling
+ * ✅ Dependency injection ready
  */
 
-export const RESUME_ENGINES = Object.freeze({
+const RESUME_ENGINES = Object.freeze({
   V1_0: 'resume_score_v1.0',
   V1_1: 'resume_score_v1.1',
   V2_0: 'resume_score_v2.0',
 });
 
-export const SALARY_ENGINES = Object.freeze({
+const SALARY_ENGINES = Object.freeze({
   V1_0: 'salary_bench_v1.0',
   V1_1: 'salary_bench_v1.1',
 });
 
-export const CAREER_ENGINES = Object.freeze({
+const CAREER_ENGINES = Object.freeze({
   V1_0: 'career_path_v1.0',
 });
 
-export const CURRENT_RESUME_ENGINE = RESUME_ENGINES.V1_0;
-export const CURRENT_SALARY_ENGINE = SALARY_ENGINES.V1_0;
-export const CURRENT_CAREER_ENGINE = CAREER_ENGINES.V1_0;
+const CURRENT_RESUME_ENGINE = RESUME_ENGINES.V1_0;
+const CURRENT_SALARY_ENGINE = SALARY_ENGINES.V1_0;
+const CURRENT_CAREER_ENGINE = CAREER_ENGINES.V1_0;
+
+// ─── Helpers ────────────────────────────────────────────────────────────────
+
+function validateVersion(version, engineMap, type) {
+  if (!version || typeof version !== 'string') {
+    throw new Error(`[EngineRegistry] Invalid ${type} engine version: ${version}`);
+  }
+
+  if (!engineMap[version]) {
+    throw new Error(
+      `[EngineRegistry] Unknown ${type} engine version: ${version}. Available: ${Object.keys(engineMap).join(', ')}`
+    );
+  }
+}
+
+// ─── resolveEngine ──────────────────────────────────────────────────────────
 
 /**
- * Returns the engine class for a given version identifier.
- * Workers import this to resolve which engine to instantiate.
+ * Resolves and instantiates an engine
  *
- * @param {string} version - engine version string
- * @param {Object} engineMap - { [version]: EngineClass }
+ * @param {string} version
+ * @param {Object} engineMap
+ * @param {Object} [options] - dependencies/config injection
  */
-export function resolveEngine(version, engineMap) {
+function resolveEngine(version, engineMap, options = {}) {
+  validateVersion(version, engineMap, 'generic');
+
   const Engine = engineMap[version];
-  if (!Engine) {
-    throw new Error(`Unknown engine version: ${version}. Available: ${Object.keys(engineMap).join(', ')}`);
+
+  try {
+    return new Engine(options); // ✅ supports DI
+  } catch (err) {
+    throw new Error(
+      `[EngineRegistry] Failed to instantiate engine ${version}: ${err.message}`
+    );
   }
-  return new Engine();
 }
+
+// ─── resolveFromEnv (NEW - IMPORTANT) ───────────────────────────────────────
+
+/**
+ * Safely resolves engine from environment variable
+ *
+ * @param {string} envVar
+ * @param {Object} engineMap
+ * @param {string} fallback
+ * @param {Object} [options]
+ */
+function resolveFromEnv(envVar, engineMap, fallback, options = {}) {
+  const version = process.env[envVar] || fallback;
+
+  validateVersion(version, engineMap, envVar);
+
+  return resolveEngine(version, engineMap, options);
+}
+
+// ─── Exports ────────────────────────────────────────────────────────────────
+
+module.exports = {
+  RESUME_ENGINES,
+  SALARY_ENGINES,
+  CAREER_ENGINES,
+
+  CURRENT_RESUME_ENGINE,
+  CURRENT_SALARY_ENGINE,
+  CURRENT_CAREER_ENGINE,
+
+  resolveEngine,
+  resolveFromEnv,
+};

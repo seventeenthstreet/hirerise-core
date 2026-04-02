@@ -29,7 +29,7 @@
 
 const { db }              = require('../../../config/supabase');
 const { FieldValue } = require('../../../config/supabase');
-const logger              = require('../../../utils/logger');
+const logger              = require('../../../../utils/logger');
 const repository          = require('../repositories/student.repository');
 const CareerSuccessEngine = require('../engines/careerSuccess.engine');
 const { COLLECTIONS }     = require('../models/student.model');

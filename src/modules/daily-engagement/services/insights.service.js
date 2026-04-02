@@ -1,7 +1,21 @@
 'use strict';
 
-const logger     = require('../../../utils/logger');
-const supabase   = require('../../../config/supabase');
+/**
+ * modules/daily-engagement/services/insights.service.js
+ *
+ * Production-grade Daily Insights service.
+ *
+ * Improvements:
+ * - fixes Supabase singleton import
+ * - correct unread field usage
+ * - filter-safe cache behavior
+ * - better row selection ordering
+ * - centralized cache helpers
+ * - stronger null safety
+ */
+
+const { supabase } = require('../../../config/supabase');
+const logger = require('../../../utils/logger');
 const cacheManager = require('../../../core/cache/cache.manager');
 
 const repo = require('../models/engagement.repository');
@@ -13,113 +27,158 @@ const {
   DAILY_INSIGHT_LIMIT,
 } = require('../models/engagement.constants');
 
-// ─── Lazy-load LMI service ───────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// Lazy dependencies
+// ─────────────────────────────────────────────────────────────────────────────
 
 function getMarketTrend() {
   return require('../../labor-market-intelligence/services/marketTrend.service');
 }
 
-// ─── Redis helpers ───────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// Cache helpers
+// ─────────────────────────────────────────────────────────────────────────────
 
-async function _cacheGet(key) {
+function getCacheClient() {
+  return cacheManager.getClient();
+}
+
+async function cacheGet(key) {
   try {
-    const raw = await cacheManager.getClient().get(key);
+    const raw = await getCacheClient().get(key);
     return raw ? JSON.parse(raw) : null;
-  } catch { return null; }
+  } catch (error) {
+    logger.debug('[InsightsService] Cache read failed', {
+      key,
+      error: error.message,
+    });
+    return null;
+  }
 }
 
-async function _cacheSet(key, value) {
+async function cacheSet(key, value) {
   try {
-    await cacheManager.getClient().set(key, JSON.stringify(value), CACHE_TTL_SEC);
-  } catch {}
+    await getCacheClient().set(
+      key,
+      JSON.stringify(value),
+      { ttl: CACHE_TTL_SEC }
+    );
+  } catch (error) {
+    logger.debug('[InsightsService] Cache write failed', {
+      key,
+      error: error.message,
+    });
+  }
 }
 
-async function _cacheDel(key) {
-  try { await cacheManager.getClient().delete(key); } catch {}
-}
-
-// ─── Engine output readers ───────────────────────────────────────────────────
-
-async function _readSkillDemand() {
+async function cacheDel(key) {
   try {
-    const marketTrend = getMarketTrend();
-    return await marketTrend.getSkillDemand() || [];
-  } catch (err) {
-    logger.warn('[InsightsService] LMI skill demand read failed', { err: err.message });
+    await getCacheClient().delete(key);
+  } catch (error) {
+    logger.debug('[InsightsService] Cache delete failed', {
+      key,
+      error: error.message,
+    });
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// External engine readers
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function readSkillDemand() {
+  try {
+    return (await getMarketTrend().getSkillDemand()) ?? [];
+  } catch (error) {
+    logger.warn('[InsightsService] Skill demand read failed', {
+      error: error.message,
+    });
     return [];
   }
 }
 
-async function _readCareerTrends() {
+async function readCareerTrends() {
   try {
-    const marketTrend = getMarketTrend();
-    return await marketTrend.getCareerTrends() || [];
-  } catch (err) {
-    logger.warn('[InsightsService] LMI career trends read failed', { err: err.message });
+    return (await getMarketTrend().getCareerTrends()) ?? [];
+  } catch (error) {
+    logger.warn('[InsightsService] Career trends read failed', {
+      error: error.message,
+    });
     return [];
   }
 }
 
-// ✅ FIXED: Supabase version
-async function _readOpportunityRadar(userId) {
+async function readOpportunityRadar(userId) {
   try {
     const { data, error } = await supabase
       .from('career_opportunities')
       .select('*')
       .eq('user_id', userId)
+      .order('created_at', { ascending: false })
+      .limit(1)
       .maybeSingle();
 
     if (error) throw error;
-    return data || null;
-
-  } catch (err) {
-    logger.warn('[InsightsService] OpportunityRadar read failed', { err: err.message, userId });
+    return data ?? null;
+  } catch (error) {
+    logger.warn('[InsightsService] Opportunity radar read failed', {
+      userId,
+      error: error.message,
+    });
     return null;
   }
 }
 
-// ✅ FIXED: Supabase version
-async function _readJobMatches(userId) {
+async function readJobMatches(userId) {
   try {
     const { data, error } = await supabase
       .from('job_matches')
       .select('*')
       .eq('user_id', userId)
+      .order('created_at', { ascending: false })
+      .limit(1)
       .maybeSingle();
 
     if (error) throw error;
-    return data || null;
-
-  } catch (err) {
-    logger.warn('[InsightsService] JobMatches read failed', { err: err.message, userId });
+    return data ?? null;
+  } catch (error) {
+    logger.warn('[InsightsService] Job matches read failed', {
+      userId,
+      error: error.message,
+    });
     return null;
   }
 }
 
-// ✅ FIXED: Supabase version
-async function _readCareerRisk(userId) {
+async function readCareerRisk(userId) {
   try {
     const { data, error } = await supabase
       .from('career_risk')
       .select('*')
       .eq('user_id', userId)
+      .order('updated_at', { ascending: false })
+      .limit(1)
       .maybeSingle();
 
     if (error) throw error;
-    return data || null;
-
-  } catch (err) {
-    logger.warn('[InsightsService] CareerRisk read failed', { err: err.message, userId });
+    return data ?? null;
+  } catch (error) {
+    logger.warn('[InsightsService] Career risk read failed', {
+      userId,
+      error: error.message,
+    });
     return null;
   }
 }
 
-// ─── Insight builders (UNCHANGED) ───────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// Insight builders
+// ─────────────────────────────────────────────────────────────────────────────
 
-function _buildSkillDemandInsights(userId, skillDemand) {
+function buildSkillDemandInsights(userId, skillDemand) {
   if (!Array.isArray(skillDemand)) return [];
 
-  return skillDemand.slice(0, 3).map(skill => ({
+  return skillDemand.slice(0, 3).map((skill) => ({
     user_id: userId,
     insight_type: INSIGHT_TYPES.SKILL_DEMAND,
     source_engine: SOURCE_ENGINES.LABOR_MARKET,
@@ -130,116 +189,140 @@ function _buildSkillDemandInsights(userId, skillDemand) {
   }));
 }
 
-function _buildMarketTrendInsights(userId, careerTrends) {
+function buildMarketTrendInsights(userId, careerTrends) {
   if (!Array.isArray(careerTrends)) return [];
 
-  return careerTrends.slice(0, 2).map(trend => ({
+  return careerTrends.slice(0, 2).map((trend) => ({
     user_id: userId,
     insight_type: INSIGHT_TYPES.MARKET_TREND,
     source_engine: SOURCE_ENGINES.LABOR_MARKET,
     priority: 3,
     title: `${trend.role || trend.career} is trending`,
-    description: `Career demand is rising in this area.`,
+    description: 'Career demand is rising in this area.',
     payload: trend,
   }));
 }
 
-function _buildOpportunityInsights(userId, radarData) {
-  if (!radarData?.opportunities) return [];
+function buildOpportunityInsights(userId, radarData) {
+  if (!Array.isArray(radarData?.opportunities)) return [];
 
-  return radarData.opportunities.slice(0, 2).map(opp => ({
+  return radarData.opportunities.slice(0, 2).map((opp) => ({
     user_id: userId,
     insight_type: INSIGHT_TYPES.OPPORTUNITY_SIGNAL,
     source_engine: SOURCE_ENGINES.OPPORTUNITY_RADAR,
     priority: 2,
     title: `New opportunity: ${opp.role}`,
-    description: `Opportunity detected for your profile.`,
+    description: 'Opportunity detected for your profile.',
     payload: opp,
   }));
 }
 
-function _buildJobMatchInsights(userId, matchData) {
-  if (!matchData?.matches) return [];
+function buildJobMatchInsights(userId, matchData) {
+  if (!Array.isArray(matchData?.matches)) return [];
 
-  return matchData.matches.slice(0, 2).map(match => ({
+  return matchData.matches.slice(0, 2).map((match) => ({
     user_id: userId,
     insight_type: INSIGHT_TYPES.JOB_MATCH,
     source_engine: SOURCE_ENGINES.JOB_MATCHING,
     priority: 2,
     title: `Job match: ${match.title}`,
-    description: `A matching job is available.`,
+    description: 'A matching job is available.',
     payload: match,
   }));
 }
 
-function _buildRiskInsights(userId, riskData) {
+function buildRiskInsights(userId, riskData) {
   if (!riskData || riskData.overall_risk_score < 50) return [];
 
-  return [{
-    user_id: userId,
-    insight_type: INSIGHT_TYPES.RISK_ALERT,
-    source_engine: SOURCE_ENGINES.CAREER_RISK_PREDICTOR,
-    priority: 1,
-    title: 'Career risk alert',
-    description: `Risk score: ${riskData.overall_risk_score}`,
-    payload: riskData,
-  }];
+  return [
+    {
+      user_id: userId,
+      insight_type: INSIGHT_TYPES.RISK_ALERT,
+      source_engine: SOURCE_ENGINES.CAREER_RISK_PREDICTOR,
+      priority: 1,
+      title: 'Career risk alert',
+      description: `Risk score: ${riskData.overall_risk_score}`,
+      payload: riskData,
+    },
+  ];
 }
 
-// ─── MAIN SERVICE ───────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// Main service
+// ─────────────────────────────────────────────────────────────────────────────
 
 async function generateInsightsForUser(userId) {
-
   const todayCount = await repo.countTodayInsights(userId);
-  if (todayCount >= DAILY_INSIGHT_LIMIT) return [];
+
+  if (todayCount >= DAILY_INSIGHT_LIMIT) {
+    return [];
+  }
 
   const remaining = DAILY_INSIGHT_LIMIT - todayCount;
 
-  const [skillDemand, trends, radar, matches, risk] = await Promise.all([
-    _readSkillDemand(),
-    _readCareerTrends(),
-    _readOpportunityRadar(userId),
-    _readJobMatches(userId),
-    _readCareerRisk(userId),
-  ]);
+  const [skillDemand, trends, radar, matches, risk] =
+    await Promise.all([
+      readSkillDemand(),
+      readCareerTrends(),
+      readOpportunityRadar(userId),
+      readJobMatches(userId),
+      readCareerRisk(userId),
+    ]);
 
   const insights = [
-    ..._buildSkillDemandInsights(userId, skillDemand),
-    ..._buildMarketTrendInsights(userId, trends),
-    ..._buildOpportunityInsights(userId, radar),
-    ..._buildJobMatchInsights(userId, matches),
-    ..._buildRiskInsights(userId, risk),
+    ...buildSkillDemandInsights(userId, skillDemand),
+    ...buildMarketTrendInsights(userId, trends),
+    ...buildOpportunityInsights(userId, radar),
+    ...buildJobMatchInsights(userId, matches),
+    ...buildRiskInsights(userId, risk),
   ].slice(0, remaining);
+
+  if (insights.length === 0) {
+    return [];
+  }
 
   const inserted = await repo.insertInsightsBatch(insights);
 
-  await _cacheDel(CacheKeys.insights(userId));
+  await cacheDel(CacheKeys.insights(userId));
 
   return inserted;
 }
 
 async function getInsightsFeed(userId, opts = {}) {
+  const isDefault =
+    !opts.unreadOnly &&
+    !opts.insightType &&
+    !opts.offset;
 
   const cacheKey = CacheKeys.insights(userId);
-  const cached = await _cacheGet(cacheKey);
 
-  if (cached) return { ...cached, cached: true };
+  if (isDefault) {
+    const cached = await cacheGet(cacheKey);
+    if (cached) {
+      return { ...cached, cached: true };
+    }
+  }
 
   const insights = await repo.getUserInsights(userId, opts);
 
   const result = {
     insights,
-    unread_count: insights.filter(i => !i.read).length,
+    unread_count: insights.filter((i) => !i.is_read).length,
+    cached: false,
   };
 
-  await _cacheSet(cacheKey, result);
+  if (isDefault) {
+    await cacheSet(cacheKey, result);
+  }
 
   return result;
 }
 
 async function markInsightsRead(userId, ids = []) {
   const updated = await repo.markInsightsRead(userId, ids);
-  await _cacheDel(CacheKeys.insights(userId));
+
+  await cacheDel(CacheKeys.insights(userId));
+
   return { updated };
 }
 
@@ -248,8 +331,3 @@ module.exports = {
   getInsightsFeed,
   markInsightsRead,
 };
-
-
-
-
-

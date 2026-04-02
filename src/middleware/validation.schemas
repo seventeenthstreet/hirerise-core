@@ -1,52 +1,58 @@
 'use strict';
 
 /**
- * validation.schemas.js — Centralized Zod Validation Schemas
- * ===========================================================
- * PRODUCTION HARDENED — Phase 1
- *
- * WHY ZOD over express-validator:
- *   - Type inference: schema doubles as TypeScript type definition
- *   - Coercion built-in (.coerce.number())
- *   - Transform pipeline: strip unknown fields before they reach services
- *   - Better error messages out of the box
- *
- * ARCHITECTURE:
- *   Schemas live here (one source of truth).
- *   Routes use validateBody/validateQuery middleware wrappers.
- *   Services receive already-validated, already-typed data.
- *   No validation logic inside controllers or services.
- *
- * ADDING NEW SCHEMAS:
- *   1. Export a new z.object() schema from this file.
- *   2. Use validateBody(yourSchema) in the route.
- *   Done. No other files need changing.
- *
- * NOTE: This codebase already uses express-validator in requestValidator.js.
- *   Both can coexist — use this for new routes, migrate old routes gradually.
- *   The middleware interface is identical from the route's perspective.
+ * validation.schemas.js (Production Optimized)
  */
 
 const { z } = require('zod');
 const { AppError, ErrorCodes } = require('./errorHandler');
+const logger = require('../utils/logger');
 
-// ─── Middleware factories ─────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// HELPERS
+// ─────────────────────────────────────────────────────────────────────────────
 
-/**
- * validateBody(schema)
- * Validates req.body against a Zod schema.
- * On success: replaces req.body with the parsed (coerced + stripped) value.
- * On failure: calls next() with a 400 AppError.
- */
+function getRequestId(req) {
+  return (
+    req.correlationId ||
+    req.headers['x-correlation-id'] ||
+    req.headers['x-request-id']
+  );
+}
+
+function formatZodErrors(issues, includeValue = false) {
+  return issues.map(issue => ({
+    field: issue.path.join('.'),
+    message: issue.message,
+    ...(includeValue && { value: issue.input }),
+  }));
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// MIDDLEWARE FACTORIES
+// ─────────────────────────────────────────────────────────────────────────────
+
 function validateBody(schema) {
   return (req, res, next) => {
+    const requestId = getRequestId(req);
+
     const result = schema.safeParse(req.body);
+
     if (!result.success) {
-      const fields = result.error.issues.map(issue => ({
-        field:   issue.path.join('.'),
-        message: issue.message,
-        value:   undefined, // don't echo back PII
-      }));
+      const fields = formatZodErrors(
+        result.error.issues,
+        process.env.NODE_ENV === 'development'
+      );
+
+      logger.warn('[ZodValidation] Body validation failed', {
+        requestId,
+        correlationId: req.correlationId,
+        path: req.path,
+        method: req.method,
+        fields: fields.map(f => f.field),
+        count: fields.length,
+      });
+
       return next(new AppError(
         'Request validation failed',
         400,
@@ -54,24 +60,28 @@ function validateBody(schema) {
         ErrorCodes.VALIDATION_ERROR
       ));
     }
-    req.body = result.data; // replace with coerced, stripped data
-    next();
+
+    req.body = result.data;
+    return next();
   };
 }
 
-/**
- * validateQuery(schema)
- * Validates req.query against a Zod schema.
- * On success: replaces req.query with parsed value.
- */
 function validateQuery(schema) {
   return (req, res, next) => {
+    const requestId = getRequestId(req);
+
     const result = schema.safeParse(req.query);
+
     if (!result.success) {
-      const fields = result.error.issues.map(issue => ({
-        field:   issue.path.join('.'),
-        message: issue.message,
-      }));
+      const fields = formatZodErrors(result.error.issues);
+
+      logger.warn('[ZodValidation] Query validation failed', {
+        requestId,
+        correlationId: req.correlationId,
+        path: req.path,
+        fields: fields.map(f => f.field),
+      });
+
       return next(new AppError(
         'Query parameter validation failed',
         400,
@@ -79,100 +89,139 @@ function validateQuery(schema) {
         ErrorCodes.VALIDATION_ERROR
       ));
     }
+
     req.query = result.data;
-    next();
+    return next();
   };
 }
 
-// ─── Shared primitives ────────────────────────────────────────────────────────
+function validateParams(schema) {
+  return (req, res, next) => {
+    const requestId = getRequestId(req);
 
-const userId       = z.string().min(1).max(128);
-const resumeId     = z.string().min(1).max(128);
-const dateString   = z.string().regex(/^\d{4}-\d{2}-\d{2}$/, 'Must be YYYY-MM-DD format');
+    const result = schema.safeParse(req.params);
 
-// ─── Analysis schemas ─────────────────────────────────────────────────────────
+    if (!result.success) {
+      const fields = formatZodErrors(result.error.issues);
+
+      logger.warn('[ZodValidation] Params validation failed', {
+        requestId,
+        correlationId: req.correlationId,
+        path: req.path,
+        fields: fields.map(f => f.field),
+      });
+
+      return next(new AppError(
+        'Route parameter validation failed',
+        400,
+        { fields },
+        ErrorCodes.VALIDATION_ERROR
+      ));
+    }
+
+    req.params = result.data;
+    return next();
+  };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SHARED PRIMITIVES
+// ─────────────────────────────────────────────────────────────────────────────
+
+const userId     = z.string().min(1).max(128);
+const resumeId   = z.string().min(1).max(128);
+const dateString = z.string().regex(/^\d{4}-\d{2}-\d{2}$/, 'Must be YYYY-MM-DD format');
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ANALYSIS SCHEMAS
+// ─────────────────────────────────────────────────────────────────────────────
 
 const VALID_OPERATIONS = ['fullAnalysis', 'generateCV', 'jobMatchAnalysis', 'jobSpecificCV'];
 
 const AnalysisBodySchema = z.object({
-  resumeId:      resumeId,
-  operationType: z.enum(VALID_OPERATIONS, {
-    errorMap: () => ({ message: `operationType must be one of: ${VALID_OPERATIONS.join(', ')}` }),
-  }),
-}).strict(); // reject unknown fields
-
-const JobMatchBodySchema = z.object({
-  resumeId:      resumeId,
-  jobDescription: z.string().min(50, 'Job description must be at least 50 characters').max(10000),
-  operationType:  z.enum(['jobMatchAnalysis', 'jobSpecificCV']),
+  resumeId: resumeId,
+  operationType: z.enum(VALID_OPERATIONS),
 }).strict();
 
-// ─── Onboarding schemas ───────────────────────────────────────────────────────
+const JobMatchBodySchema = z.object({
+  resumeId: resumeId,
+  jobDescription: z.string().min(50).max(10000),
+  operationType: z.enum(['jobMatchAnalysis', 'jobSpecificCV']),
+}).strict();
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ONBOARDING SCHEMAS
+// ─────────────────────────────────────────────────────────────────────────────
 
 const EducationEntrySchema = z.object({
-  degree:           z.string().min(2).max(200),
-  institution:      z.string().min(2).max(200),
+  degree: z.string().min(2).max(200),
+  institution: z.string().min(2).max(200),
   yearOfGraduation: z.coerce.number().int().min(1960).max(new Date().getFullYear() + 5).optional(),
-  specialization:   z.string().max(200).optional(),
-  certifications:   z.array(z.string().max(200)).max(20).default([]),
+  specialization: z.string().max(200).optional(),
+  certifications: z.array(z.string().max(200)).max(20).default([]),
 });
 
 const ExperienceEntrySchema = z.object({
-  jobTitle:         z.string().min(2).max(200),
-  company:          z.string().min(1).max(200),
-  industry:         z.string().max(200).optional(),
-  startDate:        z.string().max(20).optional(),
-  endDate:          z.string().max(20).optional(),
-  isCurrent:        z.boolean().default(false),
+  jobTitle: z.string().min(2).max(200),
+  company: z.string().min(1).max(200),
+  industry: z.string().max(200).optional(),
+  startDate: z.string().max(20).optional(),
+  endDate: z.string().max(20).optional(),
+  isCurrent: z.boolean().default(false),
   responsibilities: z.array(z.string().max(500)).max(20).default([]),
 });
 
 const EducationExperienceBodySchema = z.object({
-  education:  z.array(EducationEntrySchema).min(0).max(10).default([]),
+  education: z.array(EducationEntrySchema).min(0).max(10).default([]),
   experience: z.array(ExperienceEntrySchema).min(0).max(20).default([]),
 }).refine(
   (data) => data.education.length > 0 || data.experience.length > 0,
   { message: 'At least one education or experience entry is required.' }
 );
 
-// ─── Admin metrics schemas ────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// ADMIN METRICS
+// ─────────────────────────────────────────────────────────────────────────────
 
 const VALID_PERIODS = ['7d', '30d', '90d', '1y'];
 
 const AdminMetricsQuerySchema = z.object({
-  period:    z.enum(VALID_PERIODS).optional().default('30d'),
+  period: z.enum(VALID_PERIODS).default('30d'),
   startDate: dateString.optional(),
-  endDate:   dateString.optional(),
+  endDate: dateString.optional(),
 }).refine(
-  (data) => {
-    if (data.startDate && !data.endDate) return false;
-    if (data.endDate && !data.startDate) return false;
-    return true;
-  },
+  (data) => !(data.startDate && !data.endDate) && !(data.endDate && !data.startDate),
   { message: 'Both startDate and endDate are required for custom range.' }
 );
 
-// ─── Salary schemas ───────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// SALARY
+// ─────────────────────────────────────────────────────────────────────────────
 
 const SalaryBenchmarkBodySchema = z.object({
-  roleId:            z.string().min(1).max(128),
-  experienceYears:   z.coerce.number().int().min(0).max(60),
-  location:          z.string().max(100).optional(),
-  skills:            z.array(z.string().max(100)).max(50).default([]),
+  roleId: z.string().min(1).max(128),
+  experienceYears: z.coerce.number().int().min(0).max(60),
+  location: z.string().max(100).optional(),
+  skills: z.array(z.string().max(100)).max(50).default([]),
 }).strict();
 
-// ─── Quota check schema ───────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// QUOTA
+// ─────────────────────────────────────────────────────────────────────────────
 
 const TierQuotaQuerySchema = z.object({
   feature: z.string().min(1).max(100),
 });
 
+// ─────────────────────────────────────────────────────────────────────────────
+// EXPORTS
+// ─────────────────────────────────────────────────────────────────────────────
+
 module.exports = {
-  // Middleware factories
   validateBody,
   validateQuery,
+  validateParams,
 
-  // Schemas
   AnalysisBodySchema,
   JobMatchBodySchema,
   EducationExperienceBodySchema,
@@ -180,7 +229,6 @@ module.exports = {
   SalaryBenchmarkBodySchema,
   TierQuotaQuerySchema,
 
-  // Primitives (for reuse in custom schemas)
   userId,
   resumeId,
   dateString,

@@ -14,7 +14,7 @@
  * Called by:   marketTrend.service.js → full refresh cycle
  *              market.controller.js   → POST /api/v1/market/refresh
  */
-const supabase = require('../../../config/supabase');
+const { supabase } = require('../../../config/supabase');
 const logger = require('../../../utils/logger');
 const {
   COLLECTIONS,

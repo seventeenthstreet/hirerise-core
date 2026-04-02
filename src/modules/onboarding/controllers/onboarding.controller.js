@@ -421,7 +421,7 @@ async function uploadCvDuringOnboarding(req, res, next) {
     const { uploadResume } = require('../../resume/resume.service');
     const uploadResult = await uploadResume(userId, req.file);
 
-    const supabase = require('../../../config/supabase');
+    const { supabase } = require('../../../config/supabase');
     const { appendStepHistory, mergeStepHistory, persistCompletionIfReady } = require('../onboarding.service');
 
     // ── FIX: Extract personal details from the uploaded CV text ───────────────
@@ -735,7 +735,7 @@ async function completeOnboarding(req, res, next) {
     const userId = _safeUserId(req);
     if (!userId) return res.status(401).json({ success: false, message: 'Unauthorized' });
 
-    const supabase = require('../../../config/supabase');
+    const { supabase } = require('../../../config/supabase');
     const logger   = require('../../../utils/logger');
     const { mergeStepHistory } = require('../onboarding.helpers');
 

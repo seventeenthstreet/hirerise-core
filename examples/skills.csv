@@ -1,16 +1,16 @@
-name,category,description,demandScore
-JavaScript,language,High-level interpreted programming language,95
-TypeScript,language,Typed superset of JavaScript,88
-Python,language,General-purpose high-level language,92
-SQL,tool,Structured Query Language for databases,85
-React,framework,JavaScript library for building UIs,90
-Node.js,framework,JavaScript runtime built on V8,82
-Docker,tool,Container platform for application deployment,80
-Kubernetes,tool,Container orchestration system,75
-PostgreSQL,tool,Advanced open-source relational database,78
-Redis,tool,In-memory data structure store,72
-GraphQL,language,Query language for APIs,68
-AWS,tool,Amazon Web Services cloud platform,85
-Git,tool,Distributed version control system,95
-REST API,technical,Representational State Transfer API design,88
-Machine Learning,technical,Subset of AI enabling systems to learn,70
+skill_id,name,category,category_group,description,demand_score
+javascript,JavaScript,language,programming,High-level interpreted programming language,95
+typescript,TypeScript,language,programming,Typed superset of JavaScript,88
+python,Python,language,programming,General-purpose high-level language,92
+sql,SQL,query_language,data,Structured Query Language for databases,85
+react,React,framework,frontend,JavaScript library for building UIs,90
+nodejs,Node.js,runtime,backend,JavaScript runtime built on V8,82
+docker,Docker,tool,devops,Container platform for application deployment,80
+kubernetes,Kubernetes,tool,devops,Container orchestration system,75
+postgresql,PostgreSQL,database,data,Advanced open-source relational database,78
+redis,Redis,database,data,In-memory data structure store,72
+graphql,GraphQL,query_language,backend,Query language for APIs,68
+aws,AWS,cloud,devops,Amazon Web Services cloud platform,85
+git,Git,tool,devops,Distributed version control system,95
+rest_api,REST API,api,backend,Representational State Transfer API design,88
+machine_learning,Machine Learning,ai,data,Subset of AI enabling systems to learn,70

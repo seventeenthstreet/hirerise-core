@@ -1,42 +1,30 @@
+'use strict';
+
 /**
- * Career Readiness Scoring Configuration
- * ----------------------------------------
- * Governs:
- * - Dimension weights
- * - Deterministic scoring parameters
- * - Readiness bands
- * - Model lifecycle versioning
+ * Career Readiness Scoring Configuration (HARDENED)
  *
- * PROMPT-3 RECONCILIATION (was v1.0.0):
- *   Previous config defined a 7-dimension model (skillMatch, experienceAlignment,
- *   skillDepthMaturity, marketDemandAlignment, salaryPositioning, resumeStrength,
- *   growthReadiness) that was NEVER implemented in careerHealthIndex.service.js.
- *   The live service has always computed 5 dimensions. This config now reflects
- *   reality. jobMarketDemand + careerClarity are roadmap items requiring external
- *   data sources — they will be introduced in SCORING_VERSION 2.0.0.
+ * ✅ Deep freeze
+ * ✅ Schema validation
+ * ✅ Weight normalization guard
+ * ✅ Version enforcement ready
+ * ✅ Immutable dimension contract
  */
 
-const config = {
-  // 🔄 SCORING MODEL VERSION
-  // Increment when:
-  // - Weight distribution changes
-  // - Deterministic formulas change
-  // - AI dampening logic changes
-  // - Aggregation formula changes
-  SCORING_VERSION: '1.1.0', // bumped: 7→5 dimension reconciliation
+// ─────────────────────────────────────────────────────────────
+// CONFIG
+// ─────────────────────────────────────────────────────────────
 
-  // 🎯 DIMENSION WEIGHTS (Must sum to 1.0)
-  // These exactly match the weights hardcoded in careerHealthIndex.service.js.
-  // Both files must be updated together when weights change.
+const config = {
+  SCORING_VERSION: '1.1.0',
+
   WEIGHTS: {
-    skillVelocity:    0.25, // Are skills current and growing vs market demand?
-    experienceDepth:  0.20, // Is career progression strong for years of experience?
-    marketAlignment:  0.25, // How well does profile match current hiring demand?
-    salaryTrajectory: 0.15, // On track, underpaid, or above market?
-    careerMomentum:   0.15, // Moving forward consistently — no long gaps, regular growth?
+    skillVelocity:    0.25,
+    experienceDepth:  0.20,
+    marketAlignment:  0.25,
+    salaryTrajectory: 0.15,
+    careerMomentum:   0.15,
   },
 
-  // 📊 READINESS CLASSIFICATION BANDS
   READINESS_BANDS: [
     { min: 85, label: 'Highly Ready' },
     { min: 70, label: 'Ready' },
@@ -45,13 +33,11 @@ const config = {
     { min: 0,  label: 'Not Ready' },
   ],
 
-  // 🧠 SKILL VELOCITY PARAMETERS
   SKILL_MATCH: {
     coreSkillWeight:      0.70,
     secondarySkillWeight: 0.30,
   },
 
-  // 📈 EXPERIENCE DEPTH PARAMETERS
   EXPERIENCE: {
     yearsFullMatchThreshold: 1.0,
     penaltyPerYearShort:     0.08,
@@ -60,34 +46,88 @@ const config = {
   },
 };
 
+// ─────────────────────────────────────────────────────────────
+// VALIDATION
+// ─────────────────────────────────────────────────────────────
 
-// 🔐 WEIGHT SUM VALIDATION (Enterprise Safety Check)
-const totalWeight = Object.values(config.WEIGHTS)
-  .reduce((sum, weight) => sum + weight, 0);
+function validateConfig(cfg) {
+  // ── Weight Type Check ──
+  for (const [key, value] of Object.entries(cfg.WEIGHTS)) {
+    if (typeof value !== 'number' || Number.isNaN(value)) {
+      throw new Error(`Invalid weight for ${key}: must be a number`);
+    }
+  }
 
-if (Math.abs(totalWeight - 1) > 0.0001) {
-  throw new Error(
-    `Career Readiness WEIGHTS must sum to 1. Current sum: ${totalWeight}`
-  );
+  // ── Weight Sum Check ──
+  const totalWeight = Object.values(cfg.WEIGHTS)
+    .reduce((sum, w) => sum + w, 0);
+
+  if (Math.abs(totalWeight - 1) > 0.0001) {
+    throw new Error(
+      `WEIGHTS must sum to 1. Current sum: ${totalWeight}`
+    );
+  }
+
+  // ── Readiness Bands Order Check ──
+  for (let i = 1; i < cfg.READINESS_BANDS.length; i++) {
+    if (cfg.READINESS_BANDS[i].min > cfg.READINESS_BANDS[i - 1].min) {
+      throw new Error('READINESS_BANDS must be sorted descending by min');
+    }
+  }
+
+  // ── Skill Match Check ──
+  const sm = cfg.SKILL_MATCH;
+  if (Math.abs(sm.coreSkillWeight + sm.secondarySkillWeight - 1) > 0.0001) {
+    throw new Error('SKILL_MATCH weights must sum to 1');
+  }
 }
 
-// 🛡 Freeze config to prevent runtime mutation
-Object.freeze(config);
-Object.freeze(config.WEIGHTS);
-Object.freeze(config.SKILL_MATCH);
-Object.freeze(config.EXPERIENCE);
-Object.freeze(config.READINESS_BANDS);
+validateConfig(config);
 
-// Canonical dimension list — import this in careerHealthIndex.service.js
-// to ensure the service and config stay in sync.
+// ─────────────────────────────────────────────────────────────
+// DIMENSIONS CONTRACT (CRITICAL)
+// ─────────────────────────────────────────────────────────────
+
 const CHI_DIMENSIONS = Object.freeze(Object.keys(config.WEIGHTS));
 
-module.exports = { ...config, CHI_DIMENSIONS };
+// ─────────────────────────────────────────────────────────────
+// DEEP FREEZE (IMMUTABILITY GUARANTEE)
+// ─────────────────────────────────────────────────────────────
 
+function deepFreeze(obj) {
+  Object.freeze(obj);
+  Object.getOwnPropertyNames(obj).forEach((prop) => {
+    if (
+      obj[prop] &&
+      typeof obj[prop] === 'object' &&
+      !Object.isFrozen(obj[prop])
+    ) {
+      deepFreeze(obj[prop]);
+    }
+  });
+  return obj;
+}
 
+deepFreeze(config);
 
+// ─────────────────────────────────────────────────────────────
+// VERSION GUARD (OPTIONAL BUT POWERFUL)
+// ─────────────────────────────────────────────────────────────
 
+function assertVersion(expectedVersion) {
+  if (config.SCORING_VERSION !== expectedVersion) {
+    throw new Error(
+      `Scoring version mismatch: expected ${expectedVersion}, got ${config.SCORING_VERSION}`
+    );
+  }
+}
 
+// ─────────────────────────────────────────────────────────────
+// EXPORTS
+// ─────────────────────────────────────────────────────────────
 
-
-
+module.exports = {
+  ...config,
+  CHI_DIMENSIONS,
+  assertVersion,
+};

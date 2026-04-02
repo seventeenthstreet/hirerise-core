@@ -9,7 +9,7 @@
  *   POST /api/v1/education/roi-analysis/:studentId  — run ERE, store + return
  *   GET  /api/v1/education/roi-analysis/:studentId  — return stored results
  */
-const supabase = require('../../../core/supabaseClient');
+const { supabase } = require('../../../config/supabase');
 const logger = require('../../../utils/logger');
 const repository = require('../repositories/student.repository');
 const CareerSuccessEngine = require('../engines/careerSuccess.engine');

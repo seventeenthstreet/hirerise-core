@@ -1,54 +1,78 @@
 'use strict';
 
 /**
- * dashboard.route.js
+ * src/modules/dashboard/dashboard.route.js
  *
  * GET /api/v1/dashboard
  *
- * Single tier-aware dashboard endpoint.
- * Auth applied at server.js mount point — trusts req.user.
+ * Tier-aware dashboard endpoint.
  *
- * IMPORTANT: Tier is read from req.user.plan (custom claim), NEVER from Firestore.
- * getDashboardData receives tier as a parameter.
+ * Authentication is applied at the server mount point and this route
+ * trusts `req.user` injected by the auth middleware.
  *
- * Registration in server.js:
- *   app.use(`${API_PREFIX}/dashboard`, authenticate, require('./modules/dashboard/dashboard.route'));
+ * Tier source:
+ * - Preferred: req.user.normalizedTier (cached by middleware)
+ * - Fallback:  req.user.plan (JWT claim / auth metadata)
+ *
+ * Registration:
+ *   app.use(
+ *     `${API_PREFIX}/dashboard`,
+ *     authenticate,
+ *     require('./modules/dashboard/dashboard.route')
+ *   );
  */
 
 const express = require('express');
 const { getDashboardData } = require('./dashboard.service');
-const { normalizeTier }    = require('../../middleware/requireTier.middleware');
-const { AppError, ErrorCodes } = require('../../middleware/errorHandler');
+const {
+  normalizeTier,
+} = require('../../middleware/requireTier.middleware');
+const {
+  AppError,
+  ErrorCodes,
+} = require('../../middleware/errorHandler');
 
 const router = express.Router();
 
+/**
+ * GET /
+ * Returns tier-aware dashboard payload for authenticated users.
+ */
 router.get('/', async (req, res, next) => {
   try {
-    const userId = req.user?.uid;
+    const user = req.user;
+    const userId = user?.uid;
+
     if (!userId) {
-      return next(new AppError('Unauthorized.', 401, {}, ErrorCodes.UNAUTHORIZED));
+      return next(
+        new AppError(
+          'Unauthorized.',
+          401,
+          { reason: 'Missing authenticated user context.' },
+          ErrorCodes.UNAUTHORIZED
+        )
+      );
     }
 
-    // Tier from custom claim only — never Firestore
-    const tier = req.user.normalizedTier ?? normalizeTier(req.user.plan);
-    req.user.normalizedTier = tier;
+    /**
+     * Normalize once per request and cache on req.user
+     * to avoid duplicate normalization work downstream.
+     */
+    const tier =
+      user.normalizedTier ||
+      normalizeTier(user.plan);
 
-    const payload = await getDashboardData(userId, tier);
+    user.normalizedTier = tier;
 
-    return res.status(200).json({ success: true, data: payload });
+    const dashboardData = await getDashboardData(userId, tier);
 
-  } catch (err) {
-    return next(err);
+    return res.status(200).json({
+      success: true,
+      data: dashboardData,
+    });
+  } catch (error) {
+    return next(error);
   }
 });
 
 module.exports = router;
-
-
-
-
-
-
-
-
-

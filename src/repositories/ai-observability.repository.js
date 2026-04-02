@@ -1,6 +1,6 @@
 'use strict';
 
-const supabase = require('../config/supabase');
+const { supabase } = require('../config/supabase');
 const logger   = require('../utils/logger');
 
 const OBSERVABILITY_CONFIG = require('../config/observability.config');

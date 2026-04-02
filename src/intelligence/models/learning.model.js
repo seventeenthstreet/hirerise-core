@@ -1,33 +1,23 @@
-"use strict";
+'use strict';
 
 /**
- * Learning Model
- *
- * Responsible for:
- * - Estimating time required to close skill gaps
- * - ROI categorization
- * - Learning efficiency modeling
- *
- * This keeps the engine purely orchestration-focused.
+ * Learning Model (Production Optimized)
  */
 
 module.exports = {
 
-  /**
-   * Main Learning Intelligence Entry
-   */
   calculateLearning({
-    gap,
-    cluster,
-    adjustedMarketScore,
-    promoScore,
-    futureTrend,
-    config,
+    gap = {},
+    cluster = 'default',
+    adjustedMarketScore = 0,
+    promoScore = 0,
+    futureTrend = 0,
+    config = {},
   }) {
 
     const learningWeeks = this._estimateLearningTime({
-      currentProficiency: gap.currentProficiency,
-      targetProficiency: gap.targetProficiency,
+      currentProficiency: safe(gap.currentProficiency),
+      targetProficiency: safe(gap.targetProficiency),
       cluster,
       config,
     });
@@ -56,12 +46,15 @@ module.exports = {
       roiCategory,
       difficultyScore,
       efficiencyIndex,
+      meta: {
+        evaluatedAt: new Date().toISOString()
+      }
     };
   },
 
-  // ─────────────────────────────────────────────────────────────
+  // ─────────────────────────────────────────────
   // TIME ESTIMATION
-  // ─────────────────────────────────────────────────────────────
+  // ─────────────────────────────────────────────
 
   _estimateLearningTime({
     currentProficiency,
@@ -69,36 +62,29 @@ module.exports = {
     cluster,
     config,
   }) {
-    const {
-      baseWeeksPerGap10Points,
-      minWeeks,
-      maxWeeks,
-    } = config.learningTime;
+    const learningConfig = config.learningTime || {};
+
+    const baseWeeksPerGap10Points =
+      learningConfig.baseWeeksPerGap10Points ?? 2;
+
+    const minWeeks = learningConfig.minWeeks ?? 1;
+    const maxWeeks = learningConfig.maxWeeks ?? 52;
 
     const clusterMultiplier =
       config.skillClusters?.[cluster]?.baseWeeksMultiplier ?? 1.0;
 
-    const gap = Math.max(
-      0,
-      targetProficiency - currentProficiency
-    );
+    const gap = Math.max(0, targetProficiency - currentProficiency);
 
-    const baseWeeks =
-      (gap / 10) * baseWeeksPerGap10Points;
+    const baseWeeks = (gap / 10) * baseWeeksPerGap10Points;
 
-    const finalWeeks = Math.round(
-      baseWeeks * clusterMultiplier
-    );
+    const finalWeeks = Math.round(baseWeeks * clusterMultiplier);
 
-    return Math.min(
-      maxWeeks,
-      Math.max(minWeeks, finalWeeks)
-    );
+    return clamp(finalWeeks, minWeeks, maxWeeks);
   },
 
-  // ─────────────────────────────────────────────────────────────
-  // ROI CLASSIFICATION
-  // ─────────────────────────────────────────────────────────────
+  // ─────────────────────────────────────────────
+  // ROI CLASSIFICATION (IMPROVED)
+  // ─────────────────────────────────────────────
 
   _categorizeROI({
     marketScore,
@@ -107,87 +93,73 @@ module.exports = {
     futureTrend,
     config,
   }) {
-    const {
-      fastGainMaxWeeks,
-      fastGainMinDemand,
-      strategicMinPromo,
-      longTermMinFuture,
-    } = config.roi;
+    const roiConfig = config.roi || {};
 
-    if (
-      marketScore >= fastGainMinDemand &&
-      learningWeeks <= fastGainMaxWeeks
-    ) {
-      return "FAST_GAIN";
-    }
+    const fastGainMaxWeeks = roiConfig.fastGainMaxWeeks ?? 8;
+    const fastGainMinDemand = roiConfig.fastGainMinDemand ?? 70;
+    const strategicMinPromo = roiConfig.strategicMinPromo ?? 60;
+    const longTermMinFuture = roiConfig.longTermMinFuture ?? 65;
 
-    if (promoScore >= strategicMinPromo) {
-      return "STRATEGIC";
-    }
+    // Score-based approach (more flexible)
+    let score = 0;
 
-    if (futureTrend >= longTermMinFuture) {
-      return "LONG_TERM";
-    }
+    if (marketScore >= fastGainMinDemand) score += 40;
+    if (learningWeeks <= fastGainMaxWeeks) score += 30;
+    if (promoScore >= strategicMinPromo) score += 20;
+    if (futureTrend >= longTermMinFuture) score += 10;
 
-    return "STRATEGIC";
+    if (score >= 70) return 'FAST_GAIN';
+    if (score >= 40) return 'STRATEGIC';
+    return 'LONG_TERM';
   },
 
-  // ─────────────────────────────────────────────────────────────
-  // DIFFICULTY SCORE (0–100)
-  // ─────────────────────────────────────────────────────────────
+  // ─────────────────────────────────────────────
+  // DIFFICULTY SCORE (FIXED)
+  // ─────────────────────────────────────────────
 
   _calculateDifficultyScore({
     gap,
     cluster,
     config,
   }) {
-    const gapFactor = Math.min(
-      1,
-      gap.proficiencyGap / 100
-    );
+    const gapFactor = clamp((gap.proficiencyGap ?? 0) / 100, 0, 1);
 
     const clusterMultiplier =
       config.skillClusters?.[cluster]?.baseWeeksMultiplier ?? 1;
 
-    const rawDifficulty =
-      gapFactor * 70 +
-      (clusterMultiplier - 1) * 30;
+    const normalizedCluster = clamp(clusterMultiplier / 2, 0, 1);
 
-    return Math.min(
-      100,
-      Math.max(0, Math.round(rawDifficulty))
-    );
+    const difficulty =
+      (gapFactor * 0.7 + normalizedCluster * 0.3) * 100;
+
+    return Math.round(difficulty);
   },
 
-  // ─────────────────────────────────────────────────────────────
+  // ─────────────────────────────────────────────
   // LEARNING EFFICIENCY INDEX
-  // (Economic Return Per Week)
-  // ─────────────────────────────────────────────────────────────
+  // ─────────────────────────────────────────────
 
   _calculateLearningEfficiency({
     adjustedMarketScore,
     learningWeeks,
   }) {
-    if (!learningWeeks || learningWeeks <= 0) {
-      return 0;
-    }
+    if (!learningWeeks || learningWeeks <= 0) return 0;
 
-    const efficiency =
-      adjustedMarketScore / learningWeeks;
+    const efficiency = adjustedMarketScore / learningWeeks;
 
-    return Math.min(
-      100,
-      parseFloat(efficiency.toFixed(2))
-    );
+    return clamp(parseFloat(efficiency.toFixed(2)), 0, 100);
   },
 
 };
 
+// ─────────────────────────────────────────────
+// HELPERS
+// ─────────────────────────────────────────────
 
+function clamp(value, min, max) {
+  return Math.max(min, Math.min(max, value));
+}
 
-
-
-
-
-
-
+function safe(value) {
+  return typeof value === 'number' && !isNaN(value) ? value : 0;
+}

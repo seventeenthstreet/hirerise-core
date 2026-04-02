@@ -1,45 +1,41 @@
 'use strict';
 
 /**
- * dashboardCache.js
+ * src/modules/dashboard/dashboardCache.js
  *
- * Thin re-export of invalidateDashboardCache from dashboard.service.js.
+ * Thin lazy proxy for dashboard cache invalidation.
  *
- * WHY:
- *   Resume upload, profile update, and CHI recalculation handlers need to
- *   invalidate the dashboard Redis snapshot. Importing directly from
- *   dashboard.service.js would create circular dependency chains if those
- *   modules are also imported by dashboard.service.js.
+ * WHY THIS FILE EXISTS
+ * --------------------
+ * Resume, profile, and CHI handlers need dashboard cache invalidation
+ * without importing dashboard.service directly, which may create
+ * circular dependency chains.
  *
- *   This lightweight module breaks the potential cycle — handlers import
- *   this file, not dashboard.service.js directly.
+ * This module provides a lazy boundary so dashboard.service is resolved
+ * only when invalidation is actually called.
  *
- * USAGE in any handler / service / controller:
- *
- *   const { invalidateDashboardCache } = require('../../modules/dashboard/dashboardCache');
- *
- *   // After resume upload:
- *   await invalidateDashboardCache(userId).catch(() => {});  // non-fatal
- *
- *   // After profile update:
- *   await invalidateDashboardCache(userId).catch(() => {});
- *
- *   // After CHI recalculation completes:
- *   await invalidateDashboardCache(userId).catch(() => {});
- *
- * The .catch(() => {}) is intentional — cache invalidation is never a
- * blocking dependency. If Redis is down, the cache key will expire
- * naturally after 120–150 seconds.
+ * Cache invalidation is intentionally non-blocking at call sites.
+ * If Redis is unavailable, the service degrades gracefully and the
+ * cache expires naturally via TTL.
  */
 
-const { invalidateDashboardCache } = require('./dashboard.service');
+/**
+ * invalidateDashboardCache(userId)
+ *
+ * Lazy-loads dashboard.service only at execution time,
+ * preventing eager circular dependency resolution.
+ *
+ * @param {string} userId
+ * @returns {Promise<void>}
+ */
+async function invalidateDashboardCache(userId) {
+  const {
+    invalidateDashboardCache: invalidate,
+  } = require('./dashboard.service');
 
-module.exports = { invalidateDashboardCache };
+  return invalidate(userId);
+}
 
-
-
-
-
-
-
-
+module.exports = {
+  invalidateDashboardCache,
+};

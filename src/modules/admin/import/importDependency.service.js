@@ -1,116 +1,186 @@
 'use strict';
 
 /**
- * importDependency.service.js — Import Order Validation (Supabase)
- * MIGRATED: Firestore collection counts → Supabase cms_* table counts
- * Same interface — adminImport.service.js needs no changes.
+ * importDependency.service.js
+ * Supabase-native import dependency validation
  */
 
-const { AppError } = require('../../../middleware/errorHandler');
-const logger       = require('../../../utils/logger');
-
-function getSupabase() { return require('../../../core/supabaseClient'); }
+const { AppError, ErrorCodes } = require('../../../middleware/errorHandler');
+const logger = require('../../../utils/logger');
+const { supabase } = require('../../../config/supabase');
 
 const TABLES = {
-  careerDomains:    'cms_career_domains',
-  jobFamilies:      'cms_job_families',
-  skillClusters:    'cms_skill_clusters',
-  skills:           'cms_skills',
-  roles:            'cms_roles',
-  educationLevels:  'cms_education_levels',
-  salaryBenchmarks: 'cms_salary_benchmarks',
+  careerDomains: 'career_domains',
+  jobFamilies: 'job_families',
+  skillClusters: 'skill_clusters',
+  skills: 'skills',
+  roles: 'roles',
+  educationLevels: 'education_levels',
+  salaryBenchmarks: 'salary_benchmarks',
+  skillDemand: 'skill_demand',
+  roleSkills: 'role_skills',
 };
 
 const IMPORT_STEPS = [
-  { step: 1, datasetType: 'careerDomains',    label: 'Career Domains',    deps: [] },
-  { step: 2, datasetType: 'jobFamilies',       label: 'Job Families',       deps: [{ datasetType: 'careerDomains',   label: 'Career Domains',  table: TABLES.careerDomains,  message: 'Career Domains must be imported before Job Families.' }] },
-  { step: 3, datasetType: 'skillClusters',     label: 'Skill Clusters',     deps: [{ datasetType: 'careerDomains',   label: 'Career Domains',  table: TABLES.careerDomains,  message: 'Career Domains must be imported before Skill Clusters.' }] },
-  { step: 4, datasetType: 'skills',            label: 'Skills',             deps: [{ datasetType: 'skillClusters',   label: 'Skill Clusters',  table: TABLES.skillClusters,  message: 'Skill Clusters must be imported before Skills.' }] },
-  { step: 5, datasetType: 'roles',             label: 'Roles',              deps: [{ datasetType: 'jobFamilies',     label: 'Job Families',    table: TABLES.jobFamilies,    message: 'Job Families must be imported before Roles.' }] },
-  { step: null, datasetType: 'educationLevels',  label: 'Education Levels',  deps: [] },
-  { step: null, datasetType: 'salaryBenchmarks', label: 'Salary Benchmarks', deps: [] },
+  {
+    step: 1,
+    datasetType: 'careerDomains',
+    label: 'Career Domains',
+    deps: [],
+  },
+  {
+    step: 2,
+    datasetType: 'jobFamilies',
+    label: 'Job Families',
+    deps: ['careerDomains'],
+  },
+  {
+    step: 3,
+    datasetType: 'skillClusters',
+    label: 'Skill Clusters',
+    deps: ['careerDomains'],
+  },
+  {
+    step: 4,
+    datasetType: 'skills',
+    label: 'Skills',
+    deps: ['skillClusters'],
+  },
+  {
+    step: 5,
+    datasetType: 'roles',
+    label: 'Roles',
+    deps: ['jobFamilies'],
+  },
+  {
+    step: 6,
+    datasetType: 'educationLevels',
+    label: 'Education Levels',
+    deps: [],
+  },
+  {
+    step: 7,
+    datasetType: 'salaryBenchmarks',
+    label: 'Salary Benchmarks',
+    deps: [],
+  },
+  {
+    step: 8,
+    datasetType: 'skillDemand',
+    label: 'Skill Demand',
+    deps: [],
+  },
+  {
+    step: 9,
+    datasetType: 'roleSkills',
+    label: 'Role Skills',
+    deps: ['roles', 'skills'],
+  },
 ];
 
-const STEP_MAP = new Map(IMPORT_STEPS.map(s => [s.datasetType, s]));
+const STEP_MAP = new Map(
+  IMPORT_STEPS.map((step) => [step.datasetType, step])
+);
 
-async function _countActive(tableName) {
+async function countRows(tableName) {
   try {
-    const supabase = getSupabase();
     const { count, error } = await supabase
       .from(tableName)
-      .select('id', { count: 'exact', head: true })
-      .eq('soft_deleted', false);
-    if (error) throw new Error(error.message);
-    return count ?? 0;
+      .select('*', {
+        count: 'exact',
+        head: true,
+      });
+
+    if (error) {
+      throw error;
+    }
+
+    return count || 0;
   } catch (err) {
-    logger.warn(`[ImportDep] count failed for ${tableName}`, { error: err.message });
+    logger.error('[ImportDependency] Count failed', {
+      tableName,
+      error: err.message,
+    });
     return 0;
   }
 }
 
 async function checkDependencies(datasetType) {
-  // skill-demand and role-skills go to Supabase directly — no dep checks needed
-  if (datasetType === 'skillDemand' || datasetType === 'roleSkills') return;
+  const step = STEP_MAP.get(datasetType);
 
-  const stepConfig = STEP_MAP.get(datasetType);
-  if (!stepConfig || stepConfig.deps.length === 0) return;
+  if (!step || !step.deps.length) {
+    return;
+  }
 
-  const unmetDeps = [];
-  for (const dep of stepConfig.deps) {
-    const count = await _countActive(dep.table);
+  const unmet = [];
+
+  for (const depType of step.deps) {
+    const table = TABLES[depType];
+    const count = await countRows(table);
+
     if (count === 0) {
-      unmetDeps.push(dep);
-      logger.warn('[ImportDep] Dependency not met', { importing: datasetType, requires: dep.datasetType, count });
+      unmet.push(depType);
     }
   }
 
-  if (unmetDeps.length > 0) {
+  if (unmet.length > 0) {
     throw new AppError(
-      unmetDeps[0].message,
+      `Import dependency not met for ${datasetType}. Missing: ${unmet.join(', ')}`,
       422,
       {
-        importing: datasetType,
-        unmetDeps: unmetDeps.map(d => ({ requires: d.datasetType, label: d.label, table: d.table, message: d.message })),
-        hint: `Import in this order: ${IMPORT_STEPS.filter(s => s.step).map(s => s.label).join(' → ')}`,
+        datasetType,
+        unmetDependencies: unmet,
       },
-      'DEPENDENCY_NOT_MET'
+      ErrorCodes.VALIDATION_ERROR
     );
   }
 }
 
 async function getImportStatus() {
-  const orderedSteps = IMPORT_STEPS.filter(s => s.step !== null);
-  const counts = await Promise.all(orderedSteps.map(s => _countActive(TABLES[s.datasetType])));
+  const results = [];
 
-  return orderedSteps.map((s, i) => ({
-    step:        s.step,
-    datasetType: s.datasetType,
-    label:       s.label,
-    count:       counts[i],
-    completed:   counts[i] > 0,
-    deps:        s.deps.map(d => d.label),
-    depsUnmet:   s.deps.some(dep => {
-      const depStep = orderedSteps.find(os => os.datasetType === dep.datasetType);
-      if (!depStep) return false;
-      return counts[orderedSteps.indexOf(depStep)] === 0;
-    }),
-  }));
+  for (const step of IMPORT_STEPS) {
+    const table = TABLES[step.datasetType];
+    const count = await countRows(table);
+
+    const unmetDeps = [];
+
+    for (const dep of step.deps) {
+      const depCount = await countRows(TABLES[dep]);
+      if (depCount === 0) {
+        unmetDeps.push(dep);
+      }
+    }
+
+    results.push({
+      step: step.step,
+      datasetType: step.datasetType,
+      label: step.label,
+      count,
+      completed: count > 0,
+      deps: step.deps,
+      depsUnmet: unmetDeps.length > 0,
+    });
+  }
+
+  return results;
 }
 
 function getNextStep(datasetType) {
-  const orderedSteps = IMPORT_STEPS.filter(s => s.step !== null);
-  const current = orderedSteps.find(s => s.datasetType === datasetType);
+  const current = STEP_MAP.get(datasetType);
   if (!current) return null;
-  const next = orderedSteps.find(s => s.step === current.step + 1);
-  return next ? next.label : null;
+
+  const next = IMPORT_STEPS.find(
+    (step) => step.step === current.step + 1
+  );
+
+  return next?.label || null;
 }
 
-module.exports = { checkDependencies, getImportStatus, getNextStep, IMPORT_STEPS, COLLECTIONS: TABLES };
-
-
-
-
-
-
-
-
+module.exports = {
+  checkDependencies,
+  getImportStatus,
+  getNextStep,
+  IMPORT_STEPS,
+  TABLES,
+};

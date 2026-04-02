@@ -5,27 +5,45 @@ const jobSyncService = require('../services/jobSync.service');
 const { validateSyncRequest } = require('../validators/jobSync.validator');
 const logger = require('../../../../utils/logger');
 
-const MAX_RESPONSE_ERRORS = 200; // prevent huge payloads
+const MAX_RESPONSE_ERRORS = 200;
+
+/**
+ * Extract authenticated user ID from Supabase/JWT middleware
+ */
+function getAuthenticatedUserId(req) {
+  return (
+    req.user?.id ||
+    req.user?.userId ||
+    req.auth?.userId ||
+    req.auth?.sub ||
+    null
+  );
+}
 
 async function syncJobs(req, res, next) {
-  const requestId = req.headers['x-request-id'] || crypto.randomUUID();
+  const requestId =
+    req.headers['x-request-id'] ||
+    req.headers['x-correlation-id'] ||
+    crypto.randomUUID();
 
   try {
-    // 1. Validate request body
+    // 1) Validate request payload
     const { value: body, error } = validateSyncRequest(req.body);
+
     if (error) {
       return res.status(400).json({
         success: false,
         message: 'Invalid request body',
-        errors: error.details.map((d) => ({
-          field: d.context?.key ?? null,
-          message: d.message,
+        errors: error.details.map((detail) => ({
+          field: detail.context?.key || null,
+          message: detail.message,
         })),
       });
     }
 
-    // 2. Enforce authenticated user
-    const initiatedBy = req.user?.uid ?? req.user?.id;
+    // 2) Supabase-authenticated user enforcement
+    const initiatedBy = getAuthenticatedUserId(req);
+
     if (!initiatedBy) {
       return res.status(401).json({
         success: false,
@@ -33,37 +51,43 @@ async function syncJobs(req, res, next) {
       });
     }
 
-    logger.info('[JobSyncController.syncJobs] initiated', {
+    logger.info('[JobSyncController.syncJobs] started', {
       requestId,
       sourceType: body.sourceType,
       initiatedBy,
     });
 
-    // 3. Delegate to service
+    // 3) Delegate to service layer
     const result = await jobSyncService.syncJobs({
       sourceType: body.sourceType,
-      sourceUrl:  body.sourceUrl,
-      options:    body.options,
+      sourceUrl: body.sourceUrl,
+      options: body.options,
       initiatedBy,
     });
 
+    const safeResult = {
+      total: result?.total || 0,
+      success: result?.success || 0,
+      failed: result?.failed || 0,
+      errors: Array.isArray(result?.errors) ? result.errors : [],
+    };
+
     const statusCode =
-      result.failed > 0 && result.success === 0 ? 422 : 200;
+      safeResult.failed > 0 && safeResult.success === 0 ? 422 : 200;
 
     return res.status(statusCode).json({
-      success: result.failed === 0,
-      message: `Job sync complete. ${result.success} succeeded, ${result.failed} failed out of ${result.total} records.`,
+      success: safeResult.failed === 0,
+      message: `Job sync complete. ${safeResult.success} succeeded, ${safeResult.failed} failed out of ${safeResult.total} records.`,
       data: {
-        total:   result.total,
-        success: result.success,
-        failed:  result.failed,
-        errors:  result.errors.slice(0, MAX_RESPONSE_ERRORS),
+        total: safeResult.total,
+        success: safeResult.success,
+        failed: safeResult.failed,
+        errors: safeResult.errors.slice(0, MAX_RESPONSE_ERRORS),
       },
     });
-
   } catch (err) {
-
-    if (err.statusCode === 409) {
+    // Lock conflict from service
+    if (err?.statusCode === 409) {
       logger.warn('[JobSyncController.syncJobs] lock conflict', {
         requestId,
         reason: err.message,
@@ -77,19 +101,12 @@ async function syncJobs(req, res, next) {
 
     logger.error('[JobSyncController.syncJobs] unhandled error', {
       requestId,
-      error: err.message,
+      error: err?.message,
+      stack: err?.stack,
     });
 
-    next(err);
+    return next(err);
   }
 }
 
 module.exports = { syncJobs };
-
-
-
-
-
-
-
-

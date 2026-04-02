@@ -1,126 +1,137 @@
+"use strict";
+
+/**
+ * src/modules/career-readiness/scoring.aggregator.js
+ *
+ * Final scoring contract layer
+ * - Supabase JSONB safe
+ * - deterministic fallback safe
+ * - AI degradation safe
+ * - dashboard contract stable
+ */
+
 const config = require("../../config/careerReadiness.weights");
 
 class ScoringAggregator {
-  aggregate(deterministicResult, aiResult, candidateProfile) {
+  aggregate(deterministicResult = {}, aiResult = {}, candidateProfile = {}) {
     const { WEIGHTS, READINESS_BANDS } = config;
 
-    const D = deterministicResult.scores;
-    const AI = aiResult.data;
-
-    // ──────────────────────────────────────────────
-    // AI CONFIDENCE DAMPENING
-    // ──────────────────────────────────────────────
+    const D = deterministicResult?.scores ?? {};
+    const meta = deterministicResult?.meta ?? {};
+    const AI = aiResult?.data ?? {};
 
     const dampenedSkillDepth = this._applyConfidenceDampening(
-      AI.skill_depth_maturity?.score,
-      AI.skill_depth_maturity?.confidence
+      AI?.skill_depth_maturity?.score,
+      AI?.skill_depth_maturity?.confidence
     );
 
     const dampenedGrowthReadiness = this._applyConfidenceDampening(
-      AI.growth_readiness_index?.score,
-      AI.growth_readiness_index?.confidence
+      AI?.growth_readiness_index?.score,
+      AI?.growth_readiness_index?.confidence
     );
-
-    // ──────────────────────────────────────────────
-    // DIMENSION DEFINITIONS (ALL RAW 0–1)
-    // ──────────────────────────────────────────────
 
     const dimensionScores = {
       skillMatch: {
-        raw: this._clamp01(D.skillMatch),
+        raw: this._safe01(D.skillMatch),
         weight: WEIGHTS.skillMatch,
       },
       experienceAlignment: {
-        raw: this._clamp01(D.experienceAlignment),
+        raw: this._safe01(D.experienceAlignment),
         weight: WEIGHTS.experienceAlignment,
       },
       skillDepthMaturity: {
-        raw: this._clamp01(dampenedSkillDepth),
+        raw: this._safe01(dampenedSkillDepth),
         weight: WEIGHTS.skillDepthMaturity,
       },
       marketDemandAlignment: {
-        raw: this._clamp01(D.marketDemandAlignment),
+        raw: this._safe01(D.marketDemandAlignment),
         weight: WEIGHTS.marketDemandAlignment,
       },
       salaryPositioning: {
-        raw: this._clamp01(D.salaryPositioning),
+        raw: this._safe01(D.salaryPositioning),
         weight: WEIGHTS.salaryPositioning,
       },
       resumeStrength: {
-        raw: this._clamp01(D.resumeStrength),
+        raw: this._safe01(D.resumeStrength),
         weight: WEIGHTS.resumeStrength,
       },
       growthReadiness: {
-        raw: this._clamp01(dampenedGrowthReadiness),
+        raw: this._safe01(dampenedGrowthReadiness),
         weight: WEIGHTS.growthReadiness,
       },
     };
 
-    // ──────────────────────────────────────────────
-    // WEIGHTED CRS CALCULATION
-    // CRS = Σ(dimensionScore × weight) × 100
-    // ──────────────────────────────────────────────
-
     let crs = 0;
     const weightedBreakdown = {};
 
-    for (const [dim, { raw, weight }] of Object.entries(dimensionScores)) {
+    for (const [dimension, { raw, weight }] of Object.entries(
+      dimensionScores
+    )) {
       const contribution = raw * weight * 100;
       crs += contribution;
 
-      weightedBreakdown[dim] = {
-        rawScore: parseFloat((raw * 100).toFixed(2)),
-        weight: weight,
-        weightedContribution: parseFloat(contribution.toFixed(2)),
+      weightedBreakdown[dimension] = {
+        rawScore: this._safeNumber(raw * 100),
+        weight: this._safeNumber(weight),
+        weightedContribution: this._safeNumber(contribution),
       };
     }
 
-    crs = parseFloat(this._clampRange(crs, 0, 100).toFixed(2));
-    const readinessLevel = this._classifyReadiness(crs, READINESS_BANDS);
-
-    // ──────────────────────────────────────────────
-    // BUILD OUTPUT OBJECT
-    // ──────────────────────────────────────────────
+    crs = this._safeNumber(this._clampRange(crs, 0, 100));
+    const readinessLevel = this._classifyReadiness(
+      crs,
+      READINESS_BANDS
+    );
 
     return {
       career_readiness_score: crs,
       readiness_level: readinessLevel,
       dimension_scores: weightedBreakdown,
-      skill_gaps: this._buildSkillGaps(deterministicResult.meta),
+      skill_gaps: this._buildSkillGaps(meta),
       strength_areas: this._identifyStrengths(dimensionScores),
-      promotion_probability: parseFloat(
-        (this._clamp01(AI.promotion_probability?.score) * 100).toFixed(2)
+      promotion_probability: this._safeNumber(
+        this._safe01(AI?.promotion_probability?.score) * 100
       ),
-      salary_positioning_index:
-        deterministicResult.meta.salaryPositioning?.ratio,
-      growth_readiness_index: parseFloat(
-        (dampenedGrowthReadiness * 100).toFixed(2)
+      salary_positioning_index: this._safeNumber(
+        meta?.salaryPositioning?.ratio
       ),
-      career_roadmap: AI.career_roadmap || [],
+      growth_readiness_index: this._safeNumber(
+        dampenedGrowthReadiness * 100
+      ),
+      career_roadmap: Array.isArray(AI?.career_roadmap)
+        ? AI.career_roadmap
+        : [],
       explainability: {
         deterministic_factors: {
-          skillMatch: deterministicResult.meta.skillMatch,
+          skillMatch: meta?.skillMatch ?? {},
           experienceAlignment:
-            deterministicResult.meta.experienceAlignment,
-          salaryPositioning:
-            deterministicResult.meta.salaryPositioning,
-          marketDemand: deterministicResult.meta.marketDemand,
+            meta?.experienceAlignment ?? {},
+          salaryPositioning: meta?.salaryPositioning ?? {},
+          marketDemand: meta?.marketDemand ?? {},
           certificationMatch:
-            deterministicResult.meta.certificationMatch,
+            meta?.certificationMatch ?? {},
           educationAlignment:
-            deterministicResult.meta.educationAlignment,
+            meta?.educationAlignment ?? {},
         },
         ai_factors: {
-          skillDepthMaturity: AI.skill_depth_maturity,
-          growthReadiness: AI.growth_readiness_index,
-          promotionProbability: AI.promotion_probability,
-          marketRisk: AI.market_risk_assessment,
+          skillDepthMaturity:
+            AI?.skill_depth_maturity ?? {},
+          growthReadiness:
+            AI?.growth_readiness_index ?? {},
+          promotionProbability:
+            AI?.promotion_probability ?? {},
+          marketRisk:
+            AI?.market_risk_assessment ?? {},
           confidence_dampening_applied: true,
           dampened_values: {
-            skillDepthMaturity: dampenedSkillDepth,
-            growthReadiness: dampenedGrowthReadiness,
+            skillDepthMaturity: this._safeNumber(
+              dampenedSkillDepth
+            ),
+            growthReadiness: this._safeNumber(
+              dampenedGrowthReadiness
+            ),
           },
-          aiFallbackUsed: !aiResult.success,
+          aiFallbackUsed: !aiResult?.success,
         },
         weight_distribution: WEIGHTS,
         formula: "CRS = Σ(dimensionScore × weight) × 100",
@@ -129,42 +140,29 @@ class ScoringAggregator {
     };
   }
 
-  // ──────────────────────────────────────────────
-  // CONFIDENCE DAMPENING
-  // ──────────────────────────────────────────────
-
   _applyConfidenceDampening(score, confidence) {
     if (typeof score !== "number") return 0;
 
-    const safeScore = this._clamp01(score);
+    const safeScore = this._safe01(score);
     const safeConfidence =
       typeof confidence === "number"
-        ? this._clamp01(confidence)
-        : 0.5; // default moderate confidence
+        ? this._safe01(confidence)
+        : 0.5;
 
-    // Balanced dampening formula
     return safeScore * (0.5 + 0.5 * safeConfidence);
   }
 
-  // ──────────────────────────────────────────────
-  // READINESS CLASSIFICATION
-  // ──────────────────────────────────────────────
-
-  _classifyReadiness(score, bands) {
+  _classifyReadiness(score, bands = []) {
     return (
       bands.find((band) => score >= band.min)?.label ||
-      "Not Ready"
+      "low"
     );
   }
 
-  // ──────────────────────────────────────────────
-  // SKILL GAPS
-  // ──────────────────────────────────────────────
-
-  _buildSkillGaps(meta) {
+  _buildSkillGaps(meta = {}) {
     const gaps = [];
 
-    for (const skill of meta.skillMatch?.missingCoreSkills || []) {
+    for (const skill of meta?.skillMatch?.missingCoreSkills ?? []) {
       gaps.push({
         skill,
         type: "core",
@@ -173,7 +171,7 @@ class ScoringAggregator {
       });
     }
 
-    for (const skill of meta.skillMatch?.missingSecondarySkills || []) {
+    for (const skill of meta?.skillMatch?.missingSecondarySkills ?? []) {
       gaps.push({
         skill,
         type: "secondary",
@@ -185,36 +183,25 @@ class ScoringAggregator {
     return gaps;
   }
 
-  // ──────────────────────────────────────────────
-  // STRENGTH IDENTIFICATION (FIXED BUG)
-  // ──────────────────────────────────────────────
-
-  _identifyStrengths(dimensionScores) {
+  _identifyStrengths(dimensionScores = {}) {
     return Object.entries(dimensionScores)
-      .filter(([, v]) => v.raw * 100 >= 75)
-      .map(([dim]) => dim);
+      .filter(([, value]) => this._safe01(value.raw) >= 0.75)
+      .map(([dimension]) => dimension);
   }
 
-  // ──────────────────────────────────────────────
-  // UTILITIES
-  // ──────────────────────────────────────────────
+  _safe01(value) {
+    return this._clampRange(Number(value) || 0, 0, 1);
+  }
 
-  _clamp01(value) {
-    return Math.min(1, Math.max(0, value));
+  _safeNumber(value) {
+    const num = Number(value);
+    if (!Number.isFinite(num)) return 0;
+    return parseFloat(num.toFixed(2));
   }
 
   _clampRange(value, min, max) {
-    return Math.min(max, Math.max(min, value));
+    return Math.min(max, Math.max(min, Number(value) || 0));
   }
 }
 
 module.exports = ScoringAggregator;
-
-
-
-
-
-
-
-
-

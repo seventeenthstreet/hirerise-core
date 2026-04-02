@@ -19,7 +19,7 @@
  */
 const logger = require('../../../utils/logger');
 const repository = require('../repositories/student.repository');
-const supabase = require('../../../core/supabaseClient');
+const { supabase } = require('../../../config/supabase');
 const { COLLECTIONS } = require('../models/student.model');
 const AcademicTrendEngine = require('../engines/academicTrend.engine');
 const CognitiveProfileEngine = require('../engines/cognitiveProfile.engine');

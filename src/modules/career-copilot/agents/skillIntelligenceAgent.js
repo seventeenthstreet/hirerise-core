@@ -1,143 +1,252 @@
 'use strict';
 
 /**
- * skillIntelligenceAgent.js — Skill Intelligence Agent
+ * src/modules/career-copilot/agents/skillIntelligenceAgent.js
  *
- * Uses: Skill Graph Engine + Semantic Skill Intelligence
- *
- * Calls (read-only, never modified):
- *   skillGraphEngine.getUserSkillGraph(userId)   → existing_skills, adjacent_skills, next_level_skills
- *   skillGraphEngine.detectSkillGap(userId)      → missing_high_demand, role_gap, learning_paths
- *   semanticSkill.findSimilarSkills(skill)       → semantic neighbours for top gaps (if enabled)
- *
- * Output:
- *   existing_skills     — user's current skills
- *   missing_high_demand — high-demand skills user lacks (with demand_score)
- *   adjacent_skills     — learnable next skills from graph traversal
- *   next_level_skills   — advanced skills beyond current level
- *   role_gap            — { target_role, match_percentage, missing_required[] }
- *   learning_paths      — [{ skill, path[] }] for top 3 missing skills
- *   recommended_skills  — prioritised list for the advisor prompt
- *
- * File location: src/modules/career-copilot/agents/skillIntelligenceAgent.js
- *
- * @module src/modules/career-copilot/agents/skillIntelligenceAgent
+ * Skill graph + skill gap intelligence agent.
+ * Production hardened for:
+ * - parallel graph + gap analysis
+ * - optional semantic enrichment
+ * - stable recommendation ranking
+ * - safe null handling
  */
 
 const BaseAgent = require('./baseAgent');
-const logger    = require('../../../utils/logger');
+const logger = require('../../../utils/logger');
+
+const skillGraphEngine = safeRequire(
+  '../../../modules/jobSeeker/skillGraphEngine.service',
+  'SkillGraphEngine'
+);
+
+const semanticSkillEngine = safeRequire(
+  '../../../engines/semanticSkill.engine',
+  'SemanticSkillEngine'
+);
 
 class SkillIntelligenceAgent extends BaseAgent {
+  get agentName() {
+    return 'SkillIntelligenceAgent';
+  }
 
-  get agentName()   { return 'SkillIntelligenceAgent'; }
-  get cachePrefix() { return 'agent:skill'; }
+  get cachePrefix() {
+    return 'agent:skill';
+  }
 
-  async run(userId, context) {
-    // ── Load engines ──────────────────────────────────────────────────────────
-    const skillGraphSvc = this._loadEngine(
-      '../../../modules/jobSeeker/skillGraphEngine.service',
-      'SkillGraphEngine'
-    );
-    // Both getUserSkillGraph and detectSkillGap come from the same service
-    if (!skillGraphSvc) throw new Error('SkillGraphEngine unavailable');
-
-    // ── Run graph + gap in parallel ───────────────────────────────────────────
-    const [graphRes, gapRes] = await Promise.allSettled([
-      skillGraphSvc.getUserSkillGraph(userId),
-      skillGraphSvc.detectSkillGap(userId),
-    ]);
-
-    const graph = graphRes.status === 'fulfilled' ? graphRes.value : null;
-    const gap   = gapRes.status   === 'fulfilled' ? gapRes.value   : null;
-
-    if (graphRes.status === 'rejected') {
-      logger.warn('[SkillIntelligenceAgent] getUserSkillGraph failed', {
-        userId, err: graphRes.reason?.message,
-      });
-    }
-    if (gapRes.status === 'rejected') {
-      logger.warn('[SkillIntelligenceAgent] detectSkillGap failed', {
-        userId, err: gapRes.reason?.message,
-      });
+  /**
+   * @param {string} userId
+   * @param {object} context
+   * @returns {Promise<object>}
+   */
+  async run(userId, context = {}) {
+    if (!skillGraphEngine) {
+      throw new Error('SkillGraphEngine unavailable');
     }
 
-    // ── Optional: semantic enrichment for top missing skills ──────────────────
-    let semanticNeighbours = [];
-    if (
-      process.env.FEATURE_SEMANTIC_MATCHING === 'true' &&
-      (gap?.missing_high_demand || []).length > 0
-    ) {
-      const semanticSvc = this._loadEngine(
-        '../../../engines/semanticSkill.engine',
-        'SemanticSkillEngine'
-      );
-      if (semanticSvc) {
-        const topMissing = (gap.missing_high_demand || []).slice(0, 3)
-          .map(s => (typeof s === 'string' ? s : s?.name))
-          .filter(Boolean);
+    const [graph, gap] = await this._fetchSkillData(userId);
 
-        const semResults = await Promise.allSettled(
-          topMissing.map(name =>
-            semanticSvc.findSimilarSkills(name, { topK: 3, minScore: 0.7 })
-          )
-        );
+    const semanticNeighbours = await this._getSemanticNeighbours(gap);
 
-        for (const r of semResults) {
-          if (r.status === 'fulfilled' && r.value?.length) {
-            semanticNeighbours.push(...r.value.map(s => s.skill_name || s.name).filter(Boolean));
-          }
-        }
-        // Deduplicate
-        semanticNeighbours = [...new Set(semanticNeighbours)].slice(0, 6);
-      }
-    }
-
-    // ── Normalise and return ──────────────────────────────────────────────────
-    const missingHighDemand = (gap?.missing_high_demand || []).slice(0, 8).map(s =>
-      typeof s === 'string'
-        ? { name: s, demand_score: null, category: null }
-        : { name: s.name, demand_score: s.demand_score || null, category: s.category || null }
+    const missingHighDemand = this._normalizeMissingSkills(
+      gap?.missing_high_demand
     );
 
-    // Combine missing + semantic neighbours into a prioritised recommendations list
-    const recommended = [
-      ...missingHighDemand.map(s => s.name),
-      ...semanticNeighbours.filter(n => !missingHighDemand.find(m => m.name === n)),
-    ].filter(Boolean).slice(0, 10);
+    const recommendedSkills = this._buildRecommendations(
+      missingHighDemand,
+      semanticNeighbours
+    );
 
     return {
-      existing_skills:     graph?.existing_skills     || [],
-      adjacent_skills:     graph?.adjacent_skills     || [],
-      next_level_skills:   graph?.next_level_skills   || [],
-      role_specific_skills: graph?.role_specific_skills || [],
+      existing_skills: this._safeArray(graph?.existing_skills),
+      adjacent_skills: this._safeArray(graph?.adjacent_skills),
+      next_level_skills: this._safeArray(graph?.next_level_skills),
+      role_specific_skills: this._safeArray(graph?.role_specific_skills),
       missing_high_demand: missingHighDemand,
-      role_gap:            gap?.role_gap              || null,
-      learning_paths:      (gap?.learning_paths       || []).slice(0, 3),
+      role_gap: gap?.role_gap || null,
+      learning_paths: this._normalizeLearningPaths(gap?.learning_paths),
       semantic_neighbours: semanticNeighbours,
-      recommended_skills:  recommended,
-      target_role:         graph?.target_role         || gap?.target_role || null,
-      industry:            graph?.industry            || null,
-      skill_count:         graph?.skill_count         || 0,
+      recommended_skills: recommendedSkills,
+      target_role: graph?.target_role || gap?.target_role || null,
+      industry: graph?.industry || null,
+      skill_count: Number(graph?.skill_count || 0),
     };
   }
 
-  _loadEngine(path, name) {
-    try {
-      return require(path);
-    } catch (err) {
-      logger.warn(`[SkillIntelligenceAgent] ${name} not available`, { err: err.message });
-      return null;
+  // ────────────────────────────────────────────────────────────────────────────
+  // Data fetch
+  // ────────────────────────────────────────────────────────────────────────────
+
+  async _fetchSkillData(userId) {
+    const [graphRes, gapRes] = await Promise.allSettled([
+      skillGraphEngine.getUserSkillGraph(userId),
+      skillGraphEngine.detectSkillGap(userId),
+    ]);
+
+    const graph =
+      graphRes.status === 'fulfilled' ? graphRes.value : null;
+    const gap =
+      gapRes.status === 'fulfilled' ? gapRes.value : null;
+
+    if (graphRes.status === 'rejected') {
+      logger.warn(
+        '[SkillIntelligenceAgent] getUserSkillGraph failed',
+        {
+          userId,
+          error: graphRes.reason?.message || 'Unknown graph error',
+        }
+      );
     }
+
+    if (gapRes.status === 'rejected') {
+      logger.warn(
+        '[SkillIntelligenceAgent] detectSkillGap failed',
+        {
+          userId,
+          error: gapRes.reason?.message || 'Unknown gap error',
+        }
+      );
+    }
+
+    return [graph, gap];
+  }
+
+  // ────────────────────────────────────────────────────────────────────────────
+  // Semantic enrichment
+  // ────────────────────────────────────────────────────────────────────────────
+
+  async _getSemanticNeighbours(gap) {
+    const semanticEnabled =
+      String(process.env.FEATURE_SEMANTIC_MATCHING).toLowerCase() === 'true';
+
+    if (
+      !semanticEnabled ||
+      !semanticSkillEngine?.findSimilarSkills
+    ) {
+      return [];
+    }
+
+    const topMissing = this._safeArray(gap?.missing_high_demand)
+      .slice(0, 3)
+      .map((skill) =>
+        typeof skill === 'string'
+          ? skill
+          : skill?.name
+      )
+      .filter(Boolean);
+
+    if (!topMissing.length) {
+      return [];
+    }
+
+    const results = await Promise.allSettled(
+      topMissing.map((skillName) =>
+        semanticSkillEngine.findSimilarSkills(skillName, {
+          topK: 3,
+          minScore: 0.7,
+        })
+      )
+    );
+
+    const dedupe = new Set();
+
+    for (const result of results) {
+      if (result.status !== 'fulfilled') continue;
+
+      for (const skill of result.value || []) {
+        const name = skill?.skill_name || skill?.name;
+        if (name) dedupe.add(name);
+      }
+    }
+
+    return [...dedupe].slice(0, 6);
+  }
+
+  // ────────────────────────────────────────────────────────────────────────────
+  // Builders
+  // ────────────────────────────────────────────────────────────────────────────
+
+  _normalizeMissingSkills(rawSkills = []) {
+    return this._safeArray(rawSkills)
+      .slice(0, 8)
+      .map((skill) =>
+        typeof skill === 'string'
+          ? {
+              name: skill,
+              demand_score: null,
+              category: null,
+            }
+          : {
+              name: skill?.name || null,
+              demand_score:
+                skill?.demand_score != null
+                  ? this._safeScore(skill.demand_score)
+                  : null,
+              category: skill?.category || null,
+            }
+      )
+      .filter((skill) => skill.name);
+  }
+
+  _normalizeLearningPaths(paths = []) {
+    return this._safeArray(paths)
+      .slice(0, 3)
+      .map((path) => ({
+        skill: path?.skill || null,
+        path: this._safeArray(path?.path).slice(0, 6),
+      }))
+      .filter((item) => item.skill);
+  }
+
+  _buildRecommendations(missingHighDemand, semanticNeighbours) {
+    const ordered = [];
+    const seen = new Set();
+
+    for (const skill of missingHighDemand) {
+      const name = skill?.name;
+      if (name && !seen.has(name)) {
+        seen.add(name);
+        ordered.push(name);
+      }
+    }
+
+    for (const neighbour of semanticNeighbours) {
+      if (neighbour && !seen.has(neighbour)) {
+        seen.add(neighbour);
+        ordered.push(neighbour);
+      }
+    }
+
+    return ordered.slice(0, 10);
+  }
+
+  // ────────────────────────────────────────────────────────────────────────────
+  // Helpers
+  // ────────────────────────────────────────────────────────────────────────────
+
+  _safeArray(value) {
+    return Array.isArray(value) ? value : [];
+  }
+
+  _safeScore(value) {
+    const numeric = Number(value || 0);
+    return Math.max(0, Math.min(100, Math.round(numeric)));
+  }
+}
+
+function safeRequire(path, name) {
+  try {
+    return require(path);
+  } catch (err) {
+    logger.warn(
+      `[SkillIntelligenceAgent] ${name} unavailable`,
+      {
+        error: err instanceof Error
+          ? err.message
+          : 'Unknown require error',
+      }
+    );
+    return null;
   }
 }
 
 module.exports = SkillIntelligenceAgent;
-
-
-
-
-
-
-
-
-

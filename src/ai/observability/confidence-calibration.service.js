@@ -2,88 +2,79 @@
 
 const observabilityRepo = require('../../repositories/ai-observability.repository');
 const alertService = require('../observability/alert.service');
-
-/**
- * confidence-calibration.service.js
- *
- * Confidence Calibration Tracking — measures how well AI confidence scores
- * predict actual outcome accuracy.
- *
- * WHY THIS IS CRITICAL FOR AI GOVERNANCE:
- *   A model that says "I'm 90% confident" but is only correct 60% of the time
- *   is OVERCONFIDENT. This erodes user trust and creates liability in enterprise contexts
- *   (e.g., salary benchmarks used for compensation decisions, resume scores affecting
- *   hiring pipelines).
- *
- *   Calibration tracking enables:
- *   - Procurement audits: "prove your AI confidence scores are reliable"
- *   - Model comparison: compare calibration of gpt-4o vs claude-3-5-sonnet
- *   - Threshold tuning: adjust UI confidence thresholds based on real data
- *
- * CALIBRATION METRIC — Simplified Expected Calibration Error (ECE):
- *   Group predictions into confidence buckets (0–0.5, 0.5–0.7, 0.7–0.9, 0.9–1.0).
- *   For each bucket: ECE_bucket = |mean_confidence - actual_accuracy|
- *   Overall ECE = weighted average of bucket ECEs.
- *   ECE near 0 = well-calibrated. ECE > 0.1 = governance concern.
- *
- *   Simplified proxy (when ground truth is binary feedback):
- *   Brier Score = mean((confidence - outcome)^2)
- *   Perfect model: Brier = 0. Random: Brier = 0.25.
- *
- * FEEDBACK COLLECTION:
- *   User feedback is optional. Without it, we can only track internal metrics
- *   (e.g., did the user accept a recommendation = proxy for agreement).
- *   Feedback schema: { logId, userId, feature, outcome: 0|1, feedbackType }
- */
+const logger = require('../../utils/logger');
 
 const CALIBRATION_THRESHOLDS = {
-  overconfidenceECE: 0.10,     // ECE > 10% = overconfidence alert
-  underconfidenceECE: 0.10,    // Same threshold, different direction
+  overconfidenceECE: 0.10,
+  underconfidenceECE: 0.10,
   brierScoreWarning: 0.15,
-  minFeedbackSamples: 30,       // Minimum feedback records before computing
+  minFeedbackSamples: 30,
 };
 
 class ConfidenceCalibrationService {
-  /**
-   * Record user feedback for a specific AI call.
-   * outcome: 1 = user agreed/accepted, 0 = user disagreed/rejected
-   *
-   * @param {Object} params
-   * @param {string} params.logId       - ai_logs document ID
-   * @param {string} params.userId
-   * @param {string} params.feature
-   * @param {number} params.confidenceScore - original AI confidence (0–1)
-   * @param {number} params.outcome     - 0 or 1
-   * @param {string} [params.feedbackType] - 'explicit' | 'implicit' | 'downstream'
-   */
+
+  // ─────────────────────────────────────────────
+  // RECORD FEEDBACK
+  // ─────────────────────────────────────────────
+
   async recordFeedback(params) {
-    const { logId, userId, feature, confidenceScore, outcome, feedbackType = 'explicit' } = params;
+    const {
+      logId,
+      userId,
+      feature,
+      confidenceScore,
+      outcome,
+      feedbackType = 'explicit',
+    } = params;
 
     if (confidenceScore == null || outcome == null) return;
     if (outcome !== 0 && outcome !== 1) throw new Error('outcome must be 0 or 1');
 
-    await observabilityRepo.writeCalibrationFeedback({
-      logId,
-      userId,
-      feature,
-      confidenceScore: Number(confidenceScore),
-      outcome: Number(outcome),
-      feedbackType,
-      disagreement: outcome === 0 ? 1 : 0,
+    const score = Number(confidenceScore);
+
+    // ✅ validation
+    if (Number.isNaN(score) || score < 0 || score > 1) {
+      logger.warn('[Calibration] Invalid confidence score', { confidenceScore });
+      return;
+    }
+
+    // ✅ timeout protection
+    await Promise.race([
+      observabilityRepo.writeCalibrationFeedback({
+        logId,
+        userId,
+        feature,
+        confidenceScore: score,
+        outcome: Number(outcome),
+        feedbackType,
+        disagreement: outcome === 0 ? 1 : 0,
+      }),
+      new Promise((_, reject) =>
+        setTimeout(() => reject(new Error('timeout')), 2000)
+      ),
+    ]).catch((err) => {
+      logger.error('[Calibration] write failed', { error: err.message });
     });
 
-    // Check calibration (sampled 1 in 10 to reduce read cost)
-    if (Math.random() < 0.1) {
+    // ✅ deterministic sampling (10%)
+    if (this._shouldSample(logId)) {
       this._checkCalibration(feature).catch(() => {});
     }
   }
 
-  /**
-   * Compute calibration metrics for a feature over a lookback window.
-   * Returns ECE, Brier score, overconfidence/underconfidence flags.
-   */
+  // ─────────────────────────────────────────────
+  // COMPUTE CALIBRATION
+  // ─────────────────────────────────────────────
+
   async computeCalibration(feature, { days = 30 } = {}) {
-    const feedbackRecords = await observabilityRepo.getCalibrationFeedback(feature, days);
+    let feedbackRecords;
+
+    try {
+      feedbackRecords = await observabilityRepo.getCalibrationFeedback(feature, days);
+    } catch (err) {
+      logger.error('[Calibration] fetch failed', { error: err.message });
+      return { feature, status: 'error' };
+    }
 
     if (feedbackRecords.length < CALIBRATION_THRESHOLDS.minFeedbackSamples) {
       return {
@@ -94,14 +85,12 @@ class ConfidenceCalibrationService {
       };
     }
 
-    // Brier Score
     const brierScore = this._computeBrierScore(feedbackRecords);
+    const { ece, buckets, overconfident, underconfident } =
+      this._computeECE(feedbackRecords);
 
-    // Expected Calibration Error (ECE)
-    const { ece, buckets, overconfident, underconfident } = this._computeECE(feedbackRecords);
-
-    // Disagreement rate
-    const disagreementRate = feedbackRecords.filter(r => r.disagreement).length / feedbackRecords.length;
+    const disagreementRate =
+      feedbackRecords.filter(r => r.disagreement).length / feedbackRecords.length;
 
     return {
       feature,
@@ -113,38 +102,64 @@ class ConfidenceCalibrationService {
       underconfident,
       calibrationGrade: this._grade(ece),
       buckets,
-      alerts: this._buildCalibrationAlerts(feature, { ece, brierScore, overconfident }),
+      alerts: this._buildCalibrationAlerts(feature, {
+        ece,
+        brierScore,
+        overconfident,
+      }),
     };
   }
 
   async _checkCalibration(feature) {
     const result = await this.computeCalibration(feature);
-    if (result.status === 'insufficient_data') return;
+    if (!result || result.status === 'insufficient_data') return;
 
     if (result.ece > CALIBRATION_THRESHOLDS.overconfidenceECE) {
       await alertService.fire({
         type: 'CALIBRATION',
         feature,
         severity: result.ece > 0.20 ? 'CRITICAL' : 'WARNING',
-        title: `Confidence calibration issue: ${feature} ECE=${result.ece} (${result.overconfident ? 'overconfident' : 'underconfident'})`,
-        detail: { ece: result.ece, brierScore: result.brierScore, grade: result.calibrationGrade },
+        title: `Calibration issue: ${feature} ECE=${result.ece}`,
+        detail: {
+          ece: result.ece,
+          brierScore: result.brierScore,
+          grade: result.calibrationGrade,
+        },
       });
     }
   }
 
+  // ─────────────────────────────────────────────
+  // METRICS
+  // ─────────────────────────────────────────────
+
   _computeBrierScore(records) {
-    const sum = records.reduce((s, r) => s + (r.confidenceScore - r.outcome) ** 2, 0);
+    let sum = 0;
+
+    for (const r of records) {
+      sum += (r.confidenceScore - r.outcome) ** 2;
+    }
+
     return sum / records.length;
   }
 
   _computeECE(records) {
-    // 4 confidence buckets
-    const bucketDefs = [
-      { label: '0.0–0.5', min: 0.0, max: 0.5 },
-      { label: '0.5–0.7', min: 0.5, max: 0.7 },
-      { label: '0.7–0.9', min: 0.7, max: 0.9 },
-      { label: '0.9–1.0', min: 0.9, max: 1.0 },
-    ];
+    const bucketsMap = {
+      '0.0–0.5': [],
+      '0.5–0.7': [],
+      '0.7–0.9': [],
+      '0.9–1.0': [],
+    };
+
+    // ✅ single pass bucketing (performance fix)
+    for (const r of records) {
+      const c = r.confidenceScore;
+
+      if (c < 0.5) bucketsMap['0.0–0.5'].push(r);
+      else if (c < 0.7) bucketsMap['0.5–0.7'].push(r);
+      else if (c < 0.9) bucketsMap['0.7–0.9'].push(r);
+      else bucketsMap['0.9–1.0'].push(r);
+    }
 
     const n = records.length;
     let weightedSum = 0;
@@ -152,27 +167,39 @@ class ConfidenceCalibrationService {
     let underconfidentCount = 0;
     const buckets = [];
 
-    for (const def of bucketDefs) {
-      const inBucket = records.filter(r => r.confidenceScore >= def.min && r.confidenceScore < def.max);
-      if (inBucket.length === 0) continue;
+    for (const [label, bucket] of Object.entries(bucketsMap)) {
+      if (!bucket.length) continue;
 
-      const meanConf = inBucket.reduce((s, r) => s + r.confidenceScore, 0) / inBucket.length;
-      const actualAccuracy = inBucket.reduce((s, r) => s + r.outcome, 0) / inBucket.length;
+      let confSum = 0;
+      let outcomeSum = 0;
+
+      for (const r of bucket) {
+        confSum += r.confidenceScore;
+        outcomeSum += r.outcome;
+      }
+
+      const meanConf = confSum / bucket.length;
+      const actualAccuracy = outcomeSum / bucket.length;
       const gap = meanConf - actualAccuracy;
 
-      if (gap > 0.05) overconfidentCount += inBucket.length;
-      if (gap < -0.05) underconfidentCount += inBucket.length;
+      if (gap > 0.05) overconfidentCount += bucket.length;
+      if (gap < -0.05) underconfidentCount += bucket.length;
 
       const bucketECE = Math.abs(gap);
-      weightedSum += (inBucket.length / n) * bucketECE;
+      weightedSum += (bucket.length / n) * bucketECE;
 
       buckets.push({
-        range: def.label,
-        sampleCount: inBucket.length,
+        range: label,
+        sampleCount: bucket.length,
         meanConfidence: +meanConf.toFixed(4),
         actualAccuracy: +actualAccuracy.toFixed(4),
         gap: +gap.toFixed(4),
-        calibrationStatus: Math.abs(gap) < 0.05 ? 'OK' : (gap > 0 ? 'OVERCONFIDENT' : 'UNDERCONFIDENT'),
+        calibrationStatus:
+          Math.abs(gap) < 0.05
+            ? 'OK'
+            : gap > 0
+            ? 'OVERCONFIDENT'
+            : 'UNDERCONFIDENT',
       });
     }
 
@@ -185,37 +212,50 @@ class ConfidenceCalibrationService {
   }
 
   _grade(ece) {
-    if (ece < 0.03) return 'A'; // Excellent calibration
-    if (ece < 0.07) return 'B'; // Good
-    if (ece < 0.12) return 'C'; // Acceptable
-    if (ece < 0.20) return 'D'; // Governance concern
-    return 'F';                  // Audit flag
+    if (ece < 0.03) return 'A';
+    if (ece < 0.07) return 'B';
+    if (ece < 0.12) return 'C';
+    if (ece < 0.20) return 'D';
+    return 'F';
   }
 
   _buildCalibrationAlerts(feature, { ece, brierScore, overconfident }) {
     const alerts = [];
+
     if (ece > CALIBRATION_THRESHOLDS.overconfidenceECE) {
       alerts.push({
         type: overconfident ? 'OVERCONFIDENCE' : 'UNDERCONFIDENCE',
         ece,
         message: overconfident
-          ? 'Model overstates confidence — users may over-rely on AI output'
-          : 'Model understates confidence — users may under-utilize AI output',
+          ? 'Model overstates confidence'
+          : 'Model understates confidence',
       });
     }
+
     if (brierScore > CALIBRATION_THRESHOLDS.brierScoreWarning) {
-      alerts.push({ type: 'POOR_BRIER', brierScore, message: 'Prediction quality below threshold' });
+      alerts.push({
+        type: 'POOR_BRIER',
+        brierScore,
+        message: 'Prediction quality below threshold',
+      });
     }
+
     return alerts;
+  }
+
+  // ─────────────────────────────────────────────
+  // UTIL
+  // ─────────────────────────────────────────────
+
+  _shouldSample(key = '') {
+    // deterministic hash sampling
+    let hash = 0;
+    for (let i = 0; i < key.length; i++) {
+      hash = (hash << 5) - hash + key.charCodeAt(i);
+      hash |= 0;
+    }
+    return Math.abs(hash % 10) === 0; // 10%
   }
 }
 
 module.exports = new ConfidenceCalibrationService();
-
-
-
-
-
-
-
-

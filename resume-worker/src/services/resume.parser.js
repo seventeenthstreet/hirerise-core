@@ -1,16 +1,13 @@
-import { Storage } from '@google-cloud/storage';
+import { createClient } from '@supabase/supabase-js';
 import { logger } from '../../../shared/logger/index.js';
 
-const storage = new Storage();
+const supabase = createClient(
+  process.env.SUPABASE_URL,
+  process.env.SUPABASE_SERVICE_ROLE_KEY
+);
 
 /**
- * Fetches resume from Cloud Storage and extracts structured sections.
- * In production, integrate with Document AI or a dedicated parsing service.
- * This implementation handles plain text with section header detection.
- *
- * @param {string} storagePath - gs://bucket/path or bucket/path format
- * @param {string} mimeType
- * @returns {ParsedResume}
+ * Parse resume from Supabase Storage
  */
 export async function parseResume(storagePath, mimeType) {
   const rawText = await fetchFromStorage(storagePath);
@@ -18,14 +15,28 @@ export async function parseResume(storagePath, mimeType) {
 }
 
 async function fetchFromStorage(storagePath) {
-  const path = storagePath.replace(/^gs:\/\/[^/]+\//, '');
-  const bucketName = process.env.RESUME_STORAGE_BUCKET;
+  const bucket = process.env.RESUME_STORAGE_BUCKET;
 
-  if (!bucketName) throw new Error('RESUME_STORAGE_BUCKET env var not set');
+  if (!bucket) {
+    throw new Error('RESUME_STORAGE_BUCKET env var not set');
+  }
 
-  const [content] = await storage.bucket(bucketName).file(path).download();
-  return content.toString('utf-8');
+  const { data, error } = await supabase.storage
+    .from(bucket)
+    .download(storagePath);
+
+  if (error) {
+    logger.error('Storage fetch failed', { error });
+    throw new Error(`Storage fetch failed: ${error.message}`);
+  }
+
+  const text = await data.text();
+  return text;
 }
+
+/* =========================
+   EXISTING LOGIC (UNCHANGED)
+========================= */
 
 function extractStructure(text, mimeType) {
   const lines = text
@@ -39,7 +50,7 @@ function extractStructure(text, mimeType) {
   const totalYearsExperience = estimateYearsExperience(sections.experience ?? []);
 
   return {
-    rawText: text.slice(0, 50000), // cap for safety
+    rawText: text.slice(0, 50000),
     sections,
     skills,
     metadata: {
@@ -68,6 +79,7 @@ function classifySections(lines) {
 
   for (const line of lines) {
     let matched = false;
+
     for (const [name, pattern] of Object.entries(SECTION_HEADERS)) {
       if (pattern.test(line) && line.length < 60) {
         currentSection = name;
@@ -88,6 +100,7 @@ function classifySections(lines) {
 
 function extractSkills(skillLines) {
   const raw = skillLines.join(' ');
+
   return raw
     .split(/[,|•·/\n]+/)
     .map((s) => s.trim())
@@ -98,10 +111,13 @@ function extractSkills(skillLines) {
 function estimateYearsExperience(experienceLines) {
   const yearPattern = /\b(19|20)\d{2}\b/g;
   const years = [];
+
   for (const line of experienceLines) {
     const matches = line.match(yearPattern);
     if (matches) years.push(...matches.map(Number));
   }
+
   if (years.length < 2) return null;
+
   return Math.max(...years) - Math.min(...years);
 }

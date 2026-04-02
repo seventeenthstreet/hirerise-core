@@ -3,102 +3,108 @@
 /**
  * modules/career-digital-twin/models/simulation.model.js
  *
- * Defines the Firestore collection name, field contracts, and document
- * builders for career simulation records.
+ * SQL row builders and shared constants for the career_simulations table.
  *
- * Supabase SQL schema for career_simulations is in:
- *   src/migration/add-career-digital-twin.migration.js
+ * Table:
+ *   career_simulations
  *
- * Firestore collection: career_simulations
- * Supabase table:       career_simulations
+ * Row shape:
+ * ┌──────────────────────┬──────────────────────────────────────────────┐
+ * │ Field                │ Type                                         │
+ * ├──────────────────────┼──────────────────────────────────────────────┤
+ * │ id                   │ uuid (db-generated)                          │
+ * │ user_id              │ text / uuid                                 │
+ * │ career_path          │ jsonb                                        │
+ * │ salary_projection    │ text                                         │
+ * │ risk_level           │ text                                         │
+ * │ growth_score         │ integer                                      │
+ * │ meta                 │ jsonb                                        │
+ * │ created_at           │ timestamptz                                  │
+ * └──────────────────────┴──────────────────────────────────────────────┘
  *
- * Document / Row shape:
- * ┌──────────────────────┬───────────────────────────────────────────────────┐
- * │ Field                │ Type / Notes                                      │
- * ├──────────────────────┼───────────────────────────────────────────────────┤
- * │ id                   │ auto UUID (Supabase) / Firestore doc ID           │
- * │ user_id              │ string — user ID                             │
- * │ career_path          │ jsonb  — full CareerPath[]                        │
- * │ salary_projection    │ string — e.g. "₹18L"                             │
- * │ risk_level           │ 'Low' | 'Medium' | 'High'                        │
- * │ growth_score         │ integer 0–100                                     │
- * │ meta                 │ jsonb  — engine meta (role, industry, version)    │
- * │ created_at           │ timestamptz                                       │
- * └──────────────────────┴───────────────────────────────────────────────────┘
+ * This module is intentionally Supabase-only.
+ * No Firestore compatibility helpers remain.
  */
 
-const { FieldValue } = require('../../../config/supabase');
+const TABLE = 'career_simulations';
 
-// ─── Collection / Table constants ────────────────────────────────────────────
-
-const COLLECTION = 'career_simulations';   // Firestore collection
-const TABLE      = 'career_simulations';   // Supabase table
-
-// ─── Risk level enum ──────────────────────────────────────────────────────────
+// ───────────────────────────────────────────────────────────────────────────────
+// Risk levels
+// ───────────────────────────────────────────────────────────────────────────────
 
 const RISK_LEVELS = Object.freeze({
-  LOW:    'Low',
+  LOW: 'Low',
   MEDIUM: 'Medium',
-  HIGH:   'High',
+  HIGH: 'High',
 });
 
-// ─── Document builder ─────────────────────────────────────────────────────────
+const VALID_RISK_LEVELS = new Set(Object.values(RISK_LEVELS));
 
 /**
- * buildSimulationDoc(userId, simulationResult)
+ * Normalize risk level safely.
  *
- * Maps the raw engine output to a Firestore / Supabase-ready document.
- *
- * @param {string} userId
- * @param {Object} simulationResult  — output of CareerDigitalTwinEngine.simulateCareerPaths()
- * @returns {Object}  Document ready for Firestore .set() or Supabase .insert()
+ * @param {string|null|undefined} value
+ * @returns {string}
  */
-function buildSimulationDoc(userId, simulationResult) {
-  const paths      = simulationResult.career_paths || [];
-  const topPath    = paths[0] || {};
-  const meta       = simulationResult.meta || {};
-
-  return {
-    user_id:           userId,
-    career_path:       paths,                          // full jsonb blob
-    salary_projection: topPath.salary_projection || null,
-    risk_level:        topPath.risk_level         || RISK_LEVELS.MEDIUM,
-    growth_score:      topPath.growth_score       || 0,
-    meta:              meta,
-    created_at:        FieldValue.serverTimestamp(),   // swap for `new Date()` in Supabase
-  };
+function normalizeRiskLevel(value) {
+  return VALID_RISK_LEVELS.has(value)
+    ? value
+    : RISK_LEVELS.MEDIUM;
 }
 
 /**
- * buildSupabaseDoc(userId, simulationResult)
+ * Normalize growth score into integer 0–100.
  *
- * Same as buildSimulationDoc but uses a plain JS Date so it's compatible
- * with Supabase's JS client (which does not use Firebase FieldValue).
+ * @param {unknown} value
+ * @returns {number}
+ */
+function normalizeGrowthScore(value) {
+  const score = Number(value);
+
+  if (!Number.isFinite(score)) {
+    return 0;
+  }
+
+  return Math.max(0, Math.min(100, Math.round(score)));
+}
+
+/**
+ * Build a production-safe SQL row payload for career_simulations.
  *
  * @param {string} userId
  * @param {Object} simulationResult
  * @returns {Object}
  */
-function buildSupabaseDoc(userId, simulationResult) {
-  const doc = buildSimulationDoc(userId, simulationResult);
-  doc.created_at = new Date().toISOString(); // override Firestore sentinel
-  return doc;
+function buildSimulationRow(userId, simulationResult = {}) {
+  const paths = Array.isArray(simulationResult.career_paths)
+    ? simulationResult.career_paths
+    : [];
+
+  const topPath =
+    paths.length > 0 && paths[0] && typeof paths[0] === 'object'
+      ? paths[0]
+      : {};
+
+  const meta =
+    simulationResult.meta &&
+    typeof simulationResult.meta === 'object' &&
+    !Array.isArray(simulationResult.meta)
+      ? simulationResult.meta
+      : {};
+
+  return {
+    user_id: userId,
+    career_path: paths,
+    salary_projection: topPath.salary_projection ?? null,
+    risk_level: normalizeRiskLevel(topPath.risk_level),
+    growth_score: normalizeGrowthScore(topPath.growth_score),
+    meta,
+    created_at: new Date().toISOString(),
+  };
 }
 
 module.exports = {
-  COLLECTION,
   TABLE,
   RISK_LEVELS,
-  buildSimulationDoc,
-  buildSupabaseDoc,
+  buildSimulationRow,
 };
-
-
-
-
-
-
-
-
-
-

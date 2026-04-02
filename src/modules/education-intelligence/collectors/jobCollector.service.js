@@ -15,7 +15,7 @@
  * Scheduled by:  automation/lmi.scheduler.js  (every 12 hours)
  * Called by:     market.controller.js          (POST /api/v1/market/ingest)
  */
-const supabase = require('../../../config/supabase');
+const { supabase } = require('../../../config/supabase');
 const logger = require('../../../utils/logger');
 const {
   COLLECTIONS,

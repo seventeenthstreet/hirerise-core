@@ -1,139 +1,219 @@
 'use strict';
 
 /**
- * jobMatchingAgent.js — Job Matching Agent
+ * src/modules/career-copilot/agents/jobMatchingAgent.js
  *
- * Uses: Job Matching Engine + Semantic Job Matching Engine
- *
- * Calls (read-only, never modified):
- *   jobMatchingEngine.getJobMatches(userId, { limit, minScore })
- *     → recommended_jobs[], total_roles_evaluated, user_skills_count
- *   jobMatchingEngine.getRecommendations(userId)
- *     → enriched top-5 with summary
- *   semanticJobMatching.getSemanticJobRecommendations(profile, candidates, opts)
- *     → semantic vector-scored matches (when FEATURE_SEMANTIC_MATCHING=true)
- *
- * Output:
- *   recommended_jobs   — top matched roles with scores and missing skills
- *   top_match          — the single best match (for advisor prompt)
- *   total_evaluated    — total roles evaluated by the engine
- *   scoring_mode       — 'semantic' | 'keyword'
- *   summary            — human-readable match summary
- *
- * File location: src/modules/career-copilot/agents/jobMatchingAgent.js
- *
- * @module src/modules/career-copilot/agents/jobMatchingAgent
+ * Job matching orchestration agent.
+ * Supports:
+ * - keyword matching (primary)
+ * - semantic ranking (feature-flagged)
+ * - safe fallback behavior
  */
 
 const BaseAgent = require('./baseAgent');
-const logger    = require('../../../utils/logger');
+const logger = require('../../../utils/logger');
+
+const jobMatchingEngine = safeRequire(
+  '../../../modules/jobSeeker/jobMatchingEngine.service',
+  'JobMatchingEngine'
+);
+
+const semanticJobMatchingEngine = safeRequire(
+  '../../../engines/semanticJobMatching.engine',
+  'SemanticJobMatchingEngine'
+);
+
+const skillGraphEngine = safeRequire(
+  '../../../modules/jobSeeker/skillGraphEngine.service',
+  'SkillGraphEngine'
+);
 
 class JobMatchingAgent extends BaseAgent {
+  get agentName() {
+    return 'JobMatchingAgent';
+  }
 
-  get agentName()   { return 'JobMatchingAgent'; }
-  get cachePrefix() { return 'agent:jobs'; }
+  get cachePrefix() {
+    return 'agent:jobs';
+  }
 
-  async run(userId, context) {
-    const jobMatchSvc = this._require(
-      '../../../modules/jobSeeker/jobMatchingEngine.service',
-      'JobMatchingEngine'
-    );
-    if (!jobMatchSvc) throw new Error('JobMatchingEngine unavailable');
+  /**
+   * @param {string} userId
+   * @param {object} context
+   * @returns {Promise<object>}
+   */
+  async run(userId, context = {}) {
+    if (!jobMatchingEngine?.getJobMatches) {
+      throw new Error('JobMatchingEngine unavailable');
+    }
 
-    let result      = null;
+    let result = null;
     let scoringMode = 'keyword';
 
-    // ── Semantic matching (feature-flagged) ───────────────────────────────────
-    if (process.env.FEATURE_SEMANTIC_MATCHING === 'true') {
+    const semanticEnabled =
+      String(process.env.FEATURE_SEMANTIC_MATCHING).toLowerCase() === 'true';
+
+    // ──────────────────────────────────────────────────────────────────────────
+    // Semantic matching (feature-flagged)
+    // ──────────────────────────────────────────────────────────────────────────
+    if (
+      semanticEnabled &&
+      semanticJobMatchingEngine?.getSemanticJobRecommendations &&
+      skillGraphEngine?.getUserSkillGraph
+    ) {
       try {
-        const semanticSvc    = this._require('../../../engines/semanticJobMatching.engine', 'SemanticJobMatchingEngine');
-        const skillGraphSvc  = this._require('../../../modules/jobSeeker/skillGraphEngine.service', 'SkillGraphEngine');
+        result = await this._runSemanticMatching(
+          userId,
+          context
+        );
 
-        if (semanticSvc && skillGraphSvc) {
-          // Get skill graph to build user vector profile
-          const graph = await skillGraphSvc.getUserSkillGraph(userId).catch(() => null);
-
-          // Get a wider candidate set for semantic ranking
-          const rawMatches = await jobMatchSvc.getJobMatches(userId, { limit: 50, minScore: 0 });
-          const candidates  = (rawMatches?.recommended_jobs || []).map(j => ({
-            id:            j.id    || j.roleId || j.title,
-            title:         j.title,
-            description:   j.description || '',
-            skills:        j.role_specific_skills || j.missing_skills || [],
-            company:       j.company  || null,
-            location:      j.location || null,
-            yearsRequired: j.yearsRequired || 0,
-            industry:      j.sector   || j.industry || null,
-          }));
-
-          const userProfile = {
-            userId,
-            skills:          graph?.existing_skills  || [],
-            yearsExperience: context?.years_experience || 0,
-            industry:        graph?.industry          || context?.industry || '',
-          };
-
-          const semanticResult = await semanticSvc.getSemanticJobRecommendations(
-            userProfile, candidates, { topN: 10, minScore: 30 }
-          );
-
-          if (semanticResult?.recommended_jobs?.length > 0) {
-            result      = semanticResult;
-            scoringMode = 'semantic';
-          }
+        if (result?.recommended_jobs?.length) {
+          scoringMode = 'semantic';
+        } else {
+          result = null;
         }
       } catch (err) {
-        logger.warn('[JobMatchingAgent] Semantic fallback to keyword matching', { userId, err: err.message });
+        logger.warn('[JobMatchingAgent] Semantic fallback to keyword matching', {
+          userId,
+          error: err instanceof Error ? err.message : 'Unknown semantic error',
+        });
+
+        result = null;
       }
     }
 
-    // ── Keyword matching (primary or fallback) ────────────────────────────────
+    // ──────────────────────────────────────────────────────────────────────────
+    // Keyword matching
+    // ──────────────────────────────────────────────────────────────────────────
     if (!result) {
-      result = await jobMatchSvc.getJobMatches(userId, { limit: 10, minScore: 20 });
+      result = await jobMatchingEngine.getJobMatches(userId, {
+        limit: 10,
+        minScore: 20,
+      });
     }
 
-    // Normalise jobs array
-    const jobs = (result?.recommended_jobs || []).slice(0, 10).map(j => ({
-      title:          j.title,
-      company:        j.company        || null,
-      sector:         j.sector         || j.industry || null,
-      match_score:    Math.round(j.match_score    || j.score || 0),
-      semantic_score: j.semantic_score !== undefined ? Math.round(j.semantic_score) : null,
-      missing_skills: (j.missing_skills || []).slice(0, 5),
-      salary:         j.salary         || null,
-      description:    j.description    || null,
-    }));
-
+    const jobs = this._normalizeJobs(result?.recommended_jobs);
     const topMatch = jobs[0] || null;
 
     return {
-      recommended_jobs:  jobs,
-      top_match:         topMatch,
-      total_evaluated:   result?.total_roles_evaluated || 0,
-      user_skills_count: result?.user_skills_count     || 0,
-      scoring_mode:      scoringMode,
-      summary:           topMatch
+      recommended_jobs: jobs,
+      top_match: topMatch,
+      total_evaluated: Number(result?.total_roles_evaluated || 0),
+      user_skills_count: Number(result?.user_skills_count || 0),
+      scoring_mode: scoringMode,
+      summary: topMatch
         ? `Your top match is "${topMatch.title}" with a ${topMatch.match_score}% fit score.`
         : 'No strong role matches found yet. Add more skills to your profile.',
     };
   }
 
-  _require(path, name) {
-    try { return require(path); }
-    catch (err) {
-      logger.warn(`[JobMatchingAgent] ${name} unavailable`, { err: err.message });
+  // ────────────────────────────────────────────────────────────────────────────
+  // Internal semantic flow
+  // ────────────────────────────────────────────────────────────────────────────
+
+  async _runSemanticMatching(userId, context = {}) {
+    const graph = await skillGraphEngine
+      .getUserSkillGraph(userId)
+      .catch(() => null);
+
+    const rawMatches = await jobMatchingEngine.getJobMatches(userId, {
+      limit: 50,
+      minScore: 0,
+    });
+
+    const candidates = (rawMatches?.recommended_jobs || [])
+      .map((job) => this._mapCandidate(job))
+      .filter(Boolean);
+
+    if (!candidates.length) {
       return null;
     }
+
+    const userProfile = {
+      userId,
+      skills: Array.isArray(graph?.existing_skills)
+        ? graph.existing_skills
+        : [],
+      yearsExperience: Number(
+        context?.years_experience ??
+          context?.yearsExperience ??
+          0
+      ),
+      industry:
+        graph?.industry ||
+        context?.industry ||
+        '',
+    };
+
+    return semanticJobMatchingEngine.getSemanticJobRecommendations(
+      userProfile,
+      candidates,
+      {
+        topN: 10,
+        minScore: 30,
+      }
+    );
+  }
+
+  _mapCandidate(job) {
+    if (!job?.title) return null;
+
+    return {
+      id: job.id || job.roleId || job.title,
+      title: job.title,
+      description: job.description || '',
+      skills: Array.isArray(job.role_specific_skills)
+        ? job.role_specific_skills
+        : Array.isArray(job.missing_skills)
+          ? job.missing_skills
+          : [],
+      company: job.company || null,
+      location: job.location || null,
+      yearsRequired: Number(job.yearsRequired || 0),
+      industry: job.sector || job.industry || null,
+    };
+  }
+
+  _normalizeJobs(recommendedJobs = []) {
+    return (Array.isArray(recommendedJobs) ? recommendedJobs : [])
+      .slice(0, 10)
+      .map((job) => ({
+        title: job?.title || null,
+        company: job?.company || null,
+        sector: job?.sector || job?.industry || null,
+        match_score: this._safeScore(job?.match_score ?? job?.score),
+        semantic_score:
+          job?.semantic_score != null
+            ? this._safeScore(job.semantic_score)
+            : null,
+        missing_skills: Array.isArray(job?.missing_skills)
+          ? job.missing_skills.slice(0, 5)
+          : [],
+        salary: job?.salary || null,
+        description: job?.description || null,
+      }))
+      .filter((job) => job.title);
+  }
+
+  _safeScore(value) {
+    const numeric = Number(value || 0);
+    return Math.max(0, Math.min(100, Math.round(numeric)));
+  }
+}
+
+/**
+ * Safe cold-start module resolution.
+ * Done once at module load instead of every request.
+ */
+function safeRequire(path, name) {
+  try {
+    return require(path);
+  } catch (err) {
+    logger.warn(`[JobMatchingAgent] ${name} unavailable`, {
+      error: err instanceof Error ? err.message : 'Unknown require error',
+    });
+    return null;
   }
 }
 
 module.exports = JobMatchingAgent;
-
-
-
-
-
-
-
-
-

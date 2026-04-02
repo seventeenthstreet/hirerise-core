@@ -1,74 +1,114 @@
 'use strict';
 
 /**
- * syncLock.repository.js — Job Sync Distributed Lock (Supabase)
- * MIGRATED: Firestore syncLocks → Supabase sync_locks table
+ * syncLock.repository.js — Supabase Distributed Atomic Lock
+ * Race-safe for multi-instance production
  */
 
 const logger = require('../../../../utils/logger');
 
-function getSupabase() { return require('../../../../core/supabaseClient'); }
+function getSupabase() {
+  return require('../../../../config/supabase');
+}
+
 const LOCK_ID = 'jobSync';
 const LOCK_TIMEOUT_MINUTES = 30;
 
 class SyncLockRepository {
-
   async acquireLock(lockedBy) {
-    if (!lockedBy) throw new Error('Invalid lockedBy value for sync lock');
-    const supabase = getSupabase();
-
-    // Read current lock
-    // HARDENING T2: .single() → .maybeSingle() — no lock row on first run
-    // HARDENING T7: destructure error
-    const { data: current, error: readError } = await supabase
-      .from('sync_locks').select('*').eq('lock_id', LOCK_ID).maybeSingle();
-    if (readError) return { acquired: false, reason: readError.message };
-
-    const now = new Date();
-
-    if (current?.status === 'running') {
-      const lockedAt = current.locked_at ? new Date(current.locked_at) : null;
-      if (lockedAt) {
-        const diffMinutes = (now.getTime() - lockedAt.getTime()) / (1000 * 60);
-        if (diffMinutes <= LOCK_TIMEOUT_MINUTES) {
-          return { acquired: false, reason: `Already locked by ${current.locked_by}` };
-        }
-        logger.warn('[SyncLock] Stale lock detected — taking over', { previousLockedBy: current.locked_by });
-      }
+    if (!lockedBy) {
+      throw new Error('Invalid lockedBy value for sync lock');
     }
 
-    const { error } = await supabase.from('sync_locks').upsert({
-      lock_id:   LOCK_ID,
-      status:    'running',
-      locked_by: lockedBy,
-      locked_at: now.toISOString(),
-    }, { onConflict: 'lock_id' });
+    const supabase = getSupabase();
+    const now = new Date();
+    const staleBefore = new Date(
+      now.getTime() - LOCK_TIMEOUT_MINUTES * 60 * 1000
+    ).toISOString();
 
-    if (error) return { acquired: false, reason: error.message };
-    logger.info('[SyncLock] Lock acquired', { lockedBy });
+    // Atomic conditional lock acquisition
+    const { data, error } = await supabase
+      .from('sync_locks')
+      .update({
+        status: 'running',
+        locked_by: lockedBy,
+        locked_at: now.toISOString(),
+        released_at: null,
+      })
+      .eq('lock_id', LOCK_ID)
+      .or(`status.eq.idle,locked_at.lt.${staleBefore}`)
+      .select('lock_id')
+      .maybeSingle();
+
+    if (error) {
+      logger.error('[SyncLock.acquireLock] failed', {
+        error: error.message,
+      });
+
+      return {
+        acquired: false,
+        reason: error.message,
+      };
+    }
+
+    // If no row updated, lock is already active
+    if (!data) {
+      const status = await this.getStatus();
+
+      return {
+        acquired: false,
+        reason: `Already locked by ${status.locked_by || 'another worker'}`,
+      };
+    }
+
+    logger.info('[SyncLock] Lock acquired', {
+      lockedBy,
+    });
+
     return { acquired: true };
   }
 
   async releaseLock(lockedBy) {
     const supabase = getSupabase();
-    // HARDENING T7: destructure and throw on error
-    const { error } = await supabase.from('sync_locks').update({
-      status:       'idle',
-      locked_by:    null,
-      locked_at:    null,
-      released_at:  new Date().toISOString(),
-    }).eq('lock_id', LOCK_ID);
-    if (error) throw error;
+
+    const { error } = await supabase
+      .from('sync_locks')
+      .update({
+        status: 'idle',
+        locked_by: null,
+        locked_at: null,
+        released_at: new Date().toISOString(),
+      })
+      .eq('lock_id', LOCK_ID);
+
+    if (error) {
+      logger.error('[SyncLock.releaseLock] failed', {
+        error: error.message,
+      });
+
+      throw error;
+    }
+
     logger.info('[SyncLock] Lock released', { lockedBy });
   }
 
   async getStatus() {
     const supabase = getSupabase();
-    // HARDENING T2: .single() → .maybeSingle() — no lock row on fresh deploy
-    // HARDENING T7: destructure and handle error
-    const { data, error } = await supabase.from('sync_locks').select('*').eq('lock_id', LOCK_ID).maybeSingle();
-    if (error) throw error;
-    return data || { lock_id: LOCK_ID, status: 'idle' };
+
+    const { data, error } = await supabase
+      .from('sync_locks')
+      .select('*')
+      .eq('lock_id', LOCK_ID)
+      .maybeSingle();
+
+    if (error) {
+      throw error;
+    }
+
+    return data || {
+      lock_id: LOCK_ID,
+      status: 'idle',
+    };
   }
 }
 

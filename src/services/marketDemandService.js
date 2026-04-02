@@ -19,7 +19,7 @@
  */
 
 const { getSecret } = require('../modules/secrets');
-const supabase = require('../config/supabase');
+const { supabase } = require('../config/supabase');
 const logger = require('../utils/logger');
 
 // ─── Constants ────────────────────────────────────────────────────────────────

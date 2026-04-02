@@ -3,116 +3,159 @@
 /**
  * adminImport.controller.js — HTTP handler factory for CSV entity imports.
  *
- * Returns an Express request handler that:
- *   1. Validates the uploaded file exists and is a CSV
- *   2. Extracts admin identity from JWT (never from body)
- *   3. Delegates to adminImport.service
- *   4. Returns the ImportResult envelope the frontend expects:
- *      { success, created, updated, failed, rows, total, importedAt }
- *
- * @module modules/admin/import/adminImport.controller
+ * Supabase optimized version:
+ * - Removes Firebase-specific uid dependency
+ * - Uses Supabase JWT identity shape
+ * - Hardens file validation
+ * - Improves response consistency
+ * - Adds safer logging metadata
  */
 
-const { asyncHandler }     = require('../../../utils/helpers');
-const { importEntityCSV }  = require('./adminImport.service');
-const { getImportStatus }  = require('./importDependency.service');
+const { asyncHandler } = require('../../../utils/helpers');
+const { importEntityCSV } = require('./adminImport.service');
+const { getImportStatus } = require('./importDependency.service');
 const { AppError, ErrorCodes } = require('../../../middleware/errorHandler');
 const logger = require('../../../utils/logger');
 
 const ALLOWED_MIMES = new Set([
-  'text/csv', 'text/plain', 'application/csv', 'application/vnd.ms-excel',
+  'text/csv',
+  'text/plain',
+  'application/csv',
+  'application/vnd.ms-excel',
 ]);
 
+function getFileExtension(filename = '') {
+  const match = filename.toLowerCase().match(/\.[^.]+$/);
+  return match ? match[0] : '';
+}
+
+function getAuthenticatedAdmin(req) {
+  const adminId =
+    req.user?.id ||          // Supabase standard
+    req.user?.sub ||         // JWT fallback
+    req.auth?.user?.id ||    // middleware fallback
+    null;
+
+  if (!adminId) {
+    throw new AppError(
+      'Authenticated admin identity missing.',
+      401,
+      null,
+      ErrorCodes.AUTH_ERROR
+    );
+  }
+
+  return {
+    adminId,
+    agency:
+      req.user?.agency ||
+      req.user?.user_metadata?.agency ||
+      req.user?.app_metadata?.agency ||
+      null,
+  };
+}
+
 /**
- * adminImportController(entityType)
- *
- * Factory that returns a bound asyncHandler for the given entity type.
- *
- * @param {string} entityType   Internal entity key passed to the service
- *   e.g. 'skills', 'roles', 'jobFamilies', 'educationLevels', 'salaryBenchmarks'
+ * Factory for entity CSV import handlers
  */
 function adminImportController(entityType) {
   return asyncHandler(async (req, res) => {
-
-    // ── File presence & MIME guard ─────────────────────────────────────────
-    if (!req.file) {
+    // ───────────────────────────────────────────────────────────
+    // Validate uploaded file
+    // ───────────────────────────────────────────────────────────
+    if (!req.file?.buffer) {
       throw new AppError(
-        'No file uploaded. Send a CSV in the "file" field of a multipart/form-data request.',
-        400, null, ErrorCodes.VALIDATION_ERROR
-      );
-    }
-
-    const ext = (req.file.originalname || '').toLowerCase().match(/\.[^.]+$/)?.[0] || '';
-    if (!ALLOWED_MIMES.has(req.file.mimetype) && ext !== '.csv') {
-      throw new AppError(
-        `CSV file required. Received: ${req.file.mimetype || 'unknown'}`,
+        'No CSV file uploaded. Send a file in multipart/form-data field "file".',
         400,
-        { received: req.file.mimetype, filename: req.file.originalname },
-        'INVALID_FILE'
+        null,
+        ErrorCodes.VALIDATION_ERROR
       );
     }
 
-    // ── Identity always from JWT ───────────────────────────────────────────
-    const adminId = req.user.uid;
-    const agency  = req.user.agency ?? null;
+    const filename = req.file.originalname || 'unknown.csv';
+    const extension = getFileExtension(filename);
+    const mimeType = req.file.mimetype || '';
+
+    const isValidCSV =
+      ALLOWED_MIMES.has(mimeType) || extension === '.csv';
+
+    if (!isValidCSV) {
+      throw new AppError(
+        `CSV file required. Received: ${mimeType || 'unknown'}`,
+        400,
+        {
+          filename,
+          receivedMime: mimeType,
+        },
+        ErrorCodes.VALIDATION_ERROR
+      );
+    }
+
+    // ───────────────────────────────────────────────────────────
+    // Extract Supabase admin identity
+    // ───────────────────────────────────────────────────────────
+    const { adminId, agency } = getAuthenticatedAdmin(req);
 
     logger.info('[AdminImport] Import request received', {
       entityType,
-      filename:  req.file.originalname,
-      sizeBytes: req.file.size,
+      filename,
+      sizeBytes: req.file.size || req.file.buffer.length,
       adminId,
       agency,
     });
 
-    // ── Delegate to service ────────────────────────────────────────────────
+    // ───────────────────────────────────────────────────────────
+    // Delegate import to service
+    // ───────────────────────────────────────────────────────────
     const result = await importEntityCSV({
-      buffer:     req.file.buffer,
+      buffer: req.file.buffer,
       entityType,
       adminId,
       agency,
     });
 
-    // ── Response envelope (matches frontend ImportResult type) ─────────────
-    // { success, created, updated, failed, total, rows, importedAt }
-    return res.status(result.failed > 0 && result.created > 0 ? 207 : 200).json({
-      success:    true,
-      created:    result.created,
-      updated:    result.updated,
-      skipped:    result.skipped,
-      errors:     result.failed,
-      failed:     result.failed,
-      total:      result.total,
-      rows:       result.rows,
-      importedAt: result.importedAt,
-      nextStep:   result.nextStep ?? null,
+    const hasPartialFailure =
+      result.failed > 0 && (result.created > 0 || result.updated > 0);
+
+    // ───────────────────────────────────────────────────────────
+    // Frontend-compatible response envelope
+    // ───────────────────────────────────────────────────────────
+    return res.status(hasPartialFailure ? 207 : 200).json({
+      success: true,
+      created: result.created || 0,
+      updated: result.updated || 0,
+      skipped: result.skipped || 0,
+      failed: result.failed || 0,
+      errors: result.failed || 0,
+      total: result.total || 0,
+      rows: result.rows || [],
+      importedAt: result.importedAt || new Date().toISOString(),
+      nextStep: result.nextStep ?? null,
       meta: {
         entityType,
-        filename:          req.file.originalname,
+        filename,
         importedByAdminId: adminId,
-        sourceAgency:      agency,
+        sourceAgency: agency,
       },
     });
   });
 }
 
 /**
- * importStatusController
  * GET /admin/import/status
  *
- * Returns the current state of all ordered import steps so the frontend
- * can render the step indicator and lock/unlock each step accordingly.
+ * Returns import workflow step state
  */
 const importStatusController = asyncHandler(async (_req, res) => {
   const steps = await getImportStatus();
-  return res.status(200).json({ success: true, data: steps });
+
+  return res.status(200).json({
+    success: true,
+    data: steps || [],
+  });
 });
 
-module.exports = { adminImportController, importStatusController };
-
-
-
-
-
-
-
-
+module.exports = {
+  adminImportController,
+  importStatusController,
+};

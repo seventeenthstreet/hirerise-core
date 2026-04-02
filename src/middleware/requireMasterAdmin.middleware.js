@@ -1,81 +1,95 @@
 'use strict';
 
 /**
- * requireMasterAdmin.middleware.js — MASTER_ADMIN Role Guard
- *
- * Only users with role === 'MASTER_ADMIN' (exact, case-sensitive) may pass.
- * Regular ADMIN, DATA_MANAGER, ANALYST are all rejected with HTTP 403.
- *
- * Usage in server.js:
- *   const { requireMasterAdmin } = require('./middleware/requireMasterAdmin.middleware');
- *   app.use(`${API_PREFIX}/master/apis`, authenticate, requireMasterAdmin, masterRoutes);
- *
- * To grant MASTER_ADMIN to a user (run once from admin script):
- *   await getAuth().setCustomUserClaims(uid, { role: 'MASTER_ADMIN' });
- *
- * JWT token must include:
- *   { userId, role: 'MASTER_ADMIN' }
- *
- * Supported roles hierarchy:
- *   MASTER_ADMIN  → can access /master/* AND /admin/*
- *   ADMIN         → can access /admin/* only
- *   DATA_MANAGER  → limited admin access (future)
- *   ANALYST       → read-only analytics (future)
+ * requireMasterAdmin.middleware.js (Production Optimized)
  */
 
+const crypto = require('crypto');
 const logger = require('../utils/logger');
+
+// ─────────────────────────────────────────────────────────────────────────────
+// CONFIG
+// ─────────────────────────────────────────────────────────────────────────────
 
 const MASTER_ADMIN_ROLE = 'MASTER_ADMIN';
 
-/**
- * requireMasterAdmin
- *
- * Must be used AFTER authenticate middleware.
- * authenticate populates req.user from the verified auth token.
- *
- * @type {import('express').RequestHandler}
- */
+// ─────────────────────────────────────────────────────────────────────────────
+// HELPERS
+// ─────────────────────────────────────────────────────────────────────────────
+
+function getRequestId(req) {
+  return (
+    req.correlationId || // ✅ align with global tracing
+    req.headers['x-correlation-id'] ||
+    req.headers['x-request-id'] ||
+    crypto.randomUUID()
+  );
+}
+
+function normalizeRoles(roles) {
+  if (!Array.isArray(roles)) return [];
+  return roles.filter(r => typeof r === 'string');
+}
+
+function isMasterAdmin(user) {
+  const role = typeof user.role === 'string' ? user.role : '';
+  const roles = normalizeRoles(user.roles);
+
+  return role === MASTER_ADMIN_ROLE || roles.includes(MASTER_ADMIN_ROLE);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// MIDDLEWARE
+// ─────────────────────────────────────────────────────────────────────────────
+
 const requireMasterAdmin = (req, res, next) => {
+  const requestId = getRequestId(req);
   const user = req.user;
 
+  // ── Auth check ─────────────────────────────────────────
   if (!user) {
     return res.status(401).json({
-      success:   false,
-      errorCode: 'UNAUTHORIZED',
-      message:   'Authentication required.',
+      success: false,
+      error: {
+        code: 'UNAUTHORIZED',
+        message: 'Authentication required.',
+      },
+      requestId,
       timestamp: new Date().toISOString(),
     });
   }
 
-  const isMasterAdmin =
-    user.role === MASTER_ADMIN_ROLE ||
-    (user.roles ?? []).includes(MASTER_ADMIN_ROLE);
+  const allowed = isMasterAdmin(user);
 
-  if (!isMasterAdmin) {
-    logger.warn('[Auth] Unauthorized MASTER_ADMIN access attempt', {
-      uid:        user.uid,
-      role:       user.role,
-      path:       req.originalUrl,
-      ip:         req.ip,
+  // ── Access check ───────────────────────────────────────
+  if (!allowed) {
+    logger.warn('[RequireMasterAdmin] Access denied', {
+      requestId,
+      correlationId: req.correlationId, // ✅ observability
+      userId: user.uid,
+      role: user.role,
+      roles: user.roles,
+      path: req.originalUrl,
+      method: req.method,
+      ip: req.ip,
     });
 
     return res.status(403).json({
-      success:   false,
-      errorCode: 'FORBIDDEN',
-      message:   'MASTER_ADMIN privileges required.',
+      success: false,
+      error: {
+        code: 'FORBIDDEN',
+        message: 'MASTER_ADMIN privileges required.',
+      },
+      requestId,
       timestamp: new Date().toISOString(),
     });
   }
 
-  next();
+  return next();
 };
 
+// ─────────────────────────────────────────────────────────────────────────────
+// EXPORT
+// ─────────────────────────────────────────────────────────────────────────────
+
 module.exports = { requireMasterAdmin };
-
-
-
-
-
-
-
-

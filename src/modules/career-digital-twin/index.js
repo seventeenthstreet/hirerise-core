@@ -3,30 +3,25 @@
 /**
  * modules/career-digital-twin/index.js
  *
- * Barrel export for the Career Digital Twin module.
- * Import this file to access the public-facing service and router.
+ * Public module barrel for Career Digital Twin.
  *
- * Usage in server.js:
+ * Exposes:
+ * - router
+ * - service
+ * - simulation engine
+ *
+ * Safe for server.js mounting:
  *
  *   const { digitalTwinRouter } = require('./modules/career-digital-twin');
  *   app.use(`${API_PREFIX}/career`, authenticate, digitalTwinRouter);
  */
 
-const digitalTwinRouter  = require('./routes/digitalTwin.routes');
+const digitalTwinRouter = require('./routes/digitalTwin.routes');
 const digitalTwinService = require('./services/digitalTwin.service');
-const engine             = require('../../engines/career-digital-twin.engine');
+const careerDigitalTwinEngine = require('../../engines/career-digital-twin.engine');
 
-module.exports = {
+module.exports = Object.freeze({
   digitalTwinRouter,
   digitalTwinService,
-  engine,
-};
-
-
-
-
-
-
-
-
-
+  engine: careerDigitalTwinEngine,
+});

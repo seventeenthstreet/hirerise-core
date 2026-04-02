@@ -46,7 +46,7 @@
  *   subscriptionEvents: [userId ASC, createdAt DESC]
  *   subscriptionEvents: [provider ASC, externalEventId ASC]  (idempotency)
  */
-const supabase = require('../../config/supabase');
+const { supabase } = require('../../config/supabase');
 const {
   AppError,
   ErrorCodes

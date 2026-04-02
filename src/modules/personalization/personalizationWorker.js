@@ -32,7 +32,7 @@ const { Queue, Worker, MetricsTime } = require('bullmq');
 const logger       = require('../../utils/logger');
 const engine       = require('../../engines/aiPersonalization.engine');
 const cacheManager = require('../../core/cache/cache.manager');
-const supabase     = require('../../core/supabaseClient');
+const supabase     = require('../../config/supabase');
 
 // ─── Queue name ───────────────────────────────────────────────────────────────
 

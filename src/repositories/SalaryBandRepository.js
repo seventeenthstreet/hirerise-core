@@ -1,6 +1,8 @@
 'use strict';
 
 const BaseRepository = require('./BaseRepository');
+const { supabase } = require('../config/supabase');
+
 const { AppError, ErrorCodes } = require('../middleware/errorHandler');
 
 class SalaryBandRepository extends BaseRepository {
@@ -8,7 +10,11 @@ class SalaryBandRepository extends BaseRepository {
     super('salaryBands');
   }
 
+  // ─────────────────────────────────────────────────────────
+  // Find by Role ID
+  // ─────────────────────────────────────────────────────────
   async findByRoleId(roleId) {
+
     if (!roleId) {
       throw new AppError(
         'roleId is required',
@@ -21,62 +27,71 @@ class SalaryBandRepository extends BaseRepository {
     return await this.findById(roleId);
   }
 
+  // ─────────────────────────────────────────────────────────
+  // Legacy find
+  // ─────────────────────────────────────────────────────────
   async findByRoleIdLegacy(roleId) {
+
     const result = await this.find(
       [{ field: 'roleId', op: '==', value: roleId }],
       { limit: 1 }
     );
 
-    return result.docs.length > 0 ? result.docs[0] : null;
+    return result?.length > 0 ? result[0] : null;
   }
 
+  // ─────────────────────────────────────────────────────────
+  // FIXED: Transaction → Safe Update
+  // ─────────────────────────────────────────────────────────
   async updateWithTransaction(id, updates, userId = 'system') {
-    return await this.runInTransaction(async (transaction) => {
-      const docRef = this.collection.doc(id);
-      const snapshot = await transaction.get(docRef);
 
-      if (!snapshot.exists) {
-        throw new AppError(
-          'Salary band not found',
-          404,
-          { id },
-          ErrorCodes.NOT_FOUND
-        );
-      }
+    // 1. Read existing record
+    const { data: existing, error: readError } = await supabase
+      .from('salaryBands')
+      .select('*')
+      .eq('id', id)
+      .maybeSingle();
 
-      const currentData = snapshot.data();
+    if (readError) throw readError;
 
-      if (currentData.softDeleted) {
-        throw new AppError(
-          'Cannot update soft deleted salary band',
-          409,
-          { id },
-          ErrorCodes.CONFLICT
-        );
-      }
+    if (!existing) {
+      throw new AppError(
+        'Salary band not found',
+        404,
+        { id },
+        ErrorCodes.NOT_FOUND
+      );
+    }
 
-      const metadata = this._getUpdateMetadata(userId);
+    if (existing.softDeleted) { // ⚠️ snake_case: soft_deleted
+      throw new AppError(
+        'Cannot update soft deleted salary band',
+        409,
+        { id },
+        ErrorCodes.CONFLICT
+      );
+    }
 
-      transaction.update(docRef, {
+    // 2. Metadata (same logic preserved)
+    const metadata = this._getUpdateMetadata(userId);
+
+    // 3. Update
+    const { error: updateError } = await supabase
+      .from('salaryBands')
+      .update({
         ...updates,
-        ...metadata,
-      });
+        ...metadata
+      })
+      .eq('id', id);
 
-      return {
-        ...currentData,
-        ...updates,
-      };
-    });
+    if (updateError) throw updateError;
+
+    // 4. Return merged result (same behavior)
+    return {
+      ...existing,
+      ...updates
+    };
   }
 }
 
 module.exports = SalaryBandRepository;
-
-
-
-
-
-
-
-
-

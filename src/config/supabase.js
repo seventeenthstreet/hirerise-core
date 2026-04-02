@@ -1,121 +1,149 @@
 'use strict';
 
 /**
- * src/config/supabase.js — Canonical Supabase client singleton
- *
- * Single source of truth for all server-side Supabase access.
- * Replaces:
- *   - src/config/supabase.js      (the migration stub)
- *   - src/core/supabaseClient.js  (the root-level one-off)
- *   - src/core/supabase.js        (the Firestore-compat shim)
- *
- * Usage (raw Supabase):
- *   const supabase = require('../config/supabase');
- *   const { data, error } = await supabase.from('users').select('*').eq('id', userId);
- *
- * Usage (Firestore-compat, for legacy modules):
- *   const { db, FieldValue, Timestamp } = require('../config/supabase');
- *   await db.collection('users').doc(id).get();
- *
- * Environment variables required:
- *   SUPABASE_URL              — Supabase project URL
- *   SUPABASE_SERVICE_ROLE_KEY — service-role key (server-side only, never expose to client)
+ * supabase.js (FINAL - PRODUCTION SAFE)
  */
 
 const { createClient } = require('@supabase/supabase-js');
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Supabase client singleton
-// ─────────────────────────────────────────────────────────────────────────────
+let logger;
+try {
+  logger = require('../utils/logger').logger || require('../utils/logger');
+} catch {
+  logger = console;
+}
 
-let _client = null;
+// ─────────────────────────────────────────────
+// ENV
+// ─────────────────────────────────────────────
+
+const SUPABASE_URL =
+  process.env.SUPABASE_URL || process.env.NEXT_PUBLIC_SUPABASE_URL;
+
+const SUPABASE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
+
+const TIMEOUT_MS = parseInt(process.env.SUPABASE_TIMEOUT_MS || '10000');
+
+// ─────────────────────────────────────────────
+// VALIDATION
+// ─────────────────────────────────────────────
+
+if (!SUPABASE_URL || !SUPABASE_KEY) {
+  logger.error('[Supabase] Missing env', {
+    hasUrl: !!SUPABASE_URL,
+    hasKey: !!SUPABASE_KEY,
+  });
+
+  throw new Error('Supabase configuration missing');
+}
+
+// ─────────────────────────────────────────────
+// CLIENT SINGLETON
+// ─────────────────────────────────────────────
+
+let client = null;
 
 function getClient() {
-  if (_client) return _client;
+  if (client) return client;
 
-  const url = process.env.SUPABASE_URL || process.env.NEXT_PUBLIC_SUPABASE_URL;
-  const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
-
-  if (!url || !key) {
-    throw new Error(
-      '[Supabase] Missing environment variables. ' +
-      'Set SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY before starting the server.'
-    );
-  }
-
-  _client = createClient(url, key, {
+  client = createClient(SUPABASE_URL, SUPABASE_KEY, {
     auth: {
-      persistSession:   false,
+      persistSession: false,
       autoRefreshToken: false,
+    },
+    global: {
+      fetch: async (url, options) => {
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), TIMEOUT_MS);
+
+        try {
+          return await fetch(url, {
+            ...options,
+            signal: controller.signal,
+          });
+        } finally {
+          clearTimeout(timeout);
+        }
+      },
     },
   });
 
-  return _client;
+  logger.info('[Supabase] Client initialized');
+
+  return client;
 }
 
-/**
- * The default export is a Proxy so callers can write:
- *
- *   const supabase = require('../config/supabase');
- *   supabase.from('users').select(...)
- *
- * rather than:
- *
- *   const { getClient } = require('../config/supabase');
- *   getClient().from('users').select(...)
- */
-const supabaseProxy = new Proxy({}, {
-  get(_, prop) {
-    // Allow named exports to be accessed directly without going through the client
-    if (prop === 'FieldValue') return FieldValue;
-    if (prop === 'Timestamp')  return Timestamp;
-    if (prop === 'db')         return require('../core/supabaseDbShim.js').db;
+// ─────────────────────────────────────────────
+// RETRY WRAPPER
+// ─────────────────────────────────────────────
 
-    const client = getClient();
-    const val    = client[prop];
-    return typeof val === 'function' ? val.bind(client) : val;
-  },
-});
+async function withRetry(fn, retries = 2) {
+  let lastError;
 
-// ─────────────────────────────────────────────────────────────────────────────
-// FieldValue stubs  (also available from supabaseDbShim — kept here for
-// modules that import directly from config/supabase)
-// ─────────────────────────────────────────────────────────────────────────────
+  for (let i = 0; i <= retries; i++) {
+    try {
+      return await fn();
+    } catch (err) {
+      lastError = err;
+
+      logger.warn('[Supabase Retry]', {
+        attempt: i + 1,
+        message: err?.message,
+      });
+
+      if (i < retries) {
+        await new Promise(r => setTimeout(r, 200 * (i + 1)));
+      }
+    }
+  }
+
+  throw lastError;
+}
+
+// ─────────────────────────────────────────────
+// HEALTH CHECK (FIXED)
+// ─────────────────────────────────────────────
+
+async function verifyConnection() {
+  try {
+    const db = getClient();
+
+    const { error } = await db
+      .from('health_check') // ✅ safe table
+      .select('id')
+      .limit(1);
+
+    if (error) throw error;
+
+    logger.info('[Supabase] Connection verified');
+
+  } catch (err) {
+    logger.error('[Supabase] Connection failed', {
+      message: err?.message,
+    });
+
+    // Fail fast only in production
+    if (process.env.NODE_ENV === 'production') {
+      throw err;
+    }
+  }
+}
+
+// ─────────────────────────────────────────────
+// FIREBASE COMPAT HELPERS
+// ─────────────────────────────────────────────
 
 const FieldValue = {
-  /** ISO timestamp string, tagged so the shim can detect it */
-  serverTimestamp() {
-    return new Date().toISOString();
-  },
-
-  /** Increment sentinel — handled by supabaseDbShim.resolveFieldValues */
-  increment(n) {
-    return { __increment: n };
-  },
-
-  /** Array union — returns items as array */
-  arrayUnion(...items) {
-    return { __arrayUnion: items.flat() };
-  },
-
-  /** Array remove sentinel */
-  arrayRemove(...items) {
-    return { __arrayRemove: items.flat() };
-  },
-
-  /** Delete field sentinel */
-  delete() {
-    return { __deleteField: true };
-  },
+  serverTimestamp: () => new Date().toISOString(),
+  increment: (n) => ({ __increment: n }),
+  arrayUnion: (...items) => ({ __arrayUnion: items.flat() }),
+  arrayRemove: (...items) => ({ __arrayRemove: items.flat() }),
+  delete: () => ({ __deleteField: true }),
 };
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Timestamp stubs
-// ─────────────────────────────────────────────────────────────────────────────
 
 class Timestamp {
   constructor(seconds, nanoseconds = 0) {
-    this.seconds     = seconds;
+    this.seconds = seconds;
     this.nanoseconds = nanoseconds;
   }
 
@@ -123,40 +151,32 @@ class Timestamp {
     return new Date(this.seconds * 1000);
   }
 
-  toMillis() {
-    return this.seconds * 1000 + Math.floor(this.nanoseconds / 1e6);
-  }
-
-  toISOString() {
-    return this.toDate().toISOString();
-  }
-
   static now() {
     return Timestamp.fromDate(new Date());
   }
 
   static fromDate(date) {
-    const d = date instanceof Date ? date : new Date(date);
-    return new Timestamp(Math.floor(d.getTime() / 1000), (d.getTime() % 1000) * 1e6);
-  }
-
-  static fromMillis(ms) {
-    return new Timestamp(Math.floor(ms / 1000), (ms % 1000) * 1e6);
+    const d = new Date(date);
+    return new Timestamp(
+      Math.floor(d.getTime() / 1000),
+      (d.getTime() % 1000) * 1e6
+    );
   }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Exports
-// ─────────────────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────
+// STARTUP CHECK
+// ─────────────────────────────────────────────
 
-// Named exports for destructuring:
-//   const { FieldValue, Timestamp, db } = require('../config/supabase');
-supabaseProxy.FieldValue = FieldValue;
-supabaseProxy.Timestamp  = Timestamp;
+verifyConnection();
 
-module.exports = supabaseProxy;
+// ─────────────────────────────────────────────
+// EXPORT
+// ─────────────────────────────────────────────
 
-// Allow explicit re-import for callers that need the raw class
-module.exports.FieldValue = FieldValue;
-module.exports.Timestamp  = Timestamp;
-module.exports.getClient  = getClient;
+module.exports = {
+  getClient,
+  withRetry,
+  FieldValue,
+  Timestamp,
+};

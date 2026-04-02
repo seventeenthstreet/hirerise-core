@@ -20,7 +20,7 @@
  *   createdAt  → created_at
  */
 
-const supabase = require('../config/supabase');
+const { supabase } = require('../config/supabase');
 const logger   = require('./logger');
 
 /**

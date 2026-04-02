@@ -1,12 +1,15 @@
 'use strict';
 
-const supabase = require('../../../core/supabaseClient');
+const { supabase } = require('../../../config/supabase');
 const { v4: uuidv4 } = require('uuid');
 const logger = require('../../../utils/logger');
 
 const TABLE = 'distributed_locks';
 
-// Test stub
+// ─────────────────────────────────────────────
+// TEST MODE
+// ─────────────────────────────────────────────
+
 if (process.env.NODE_ENV === 'test') {
   class MockLockService {
     async acquire()               { return { release: async () => true }; }
@@ -18,84 +21,95 @@ if (process.env.NODE_ENV === 'test') {
 
   class LockService {
 
-    async acquire(resource, ttl = 30000) {
+    // ─────────────────────────────────────────────
+    // ACQUIRE (SAFE + RETRY)
+    // ─────────────────────────────────────────────
+    async acquire(resource, ttl = 30000, retries = 3) {
       const lockId = uuidv4();
       const now = new Date();
       const expiresAt = new Date(Date.now() + ttl);
 
-      // Try insert (atomic due to PK constraint)
-      const { error } = await supabase
-        .from(TABLE)
-        .insert({
-          resource,
-          lock_id: lockId,
-          expires_at: expiresAt.toISOString(),
-          acquired_at: now.toISOString(),
-        });
+      for (let attempt = 0; attempt <= retries; attempt++) {
+        try {
+          // 🔥 Try insert (fast path)
+          const { error } = await supabase
+            .from(TABLE)
+            .insert({
+              resource,
+              lock_id: lockId,
+              expires_at: expiresAt.toISOString(),
+              acquired_at: now.toISOString(),
+            });
 
-      if (error) {
-        // Check if expired → overwrite
-        const { data: existing } = await supabase
-          .from(TABLE)
-          .select('*')
-          .eq('resource', resource)
-          .maybeSingle();
-
-        if (existing) {
-          const expiry = new Date(existing.expires_at);
-
-          if (expiry > now) {
-            throw new Error('RESOURCE_LOCKED');
+          if (!error) {
+            logger.debug('[LockService] Lock acquired (insert)', { resource, lockId });
+            return { resource, lockId, expiresAt };
           }
 
-          // expired → overwrite
-          const { error: updateError } = await supabase
+          // 🔥 Try takeover if expired (ATOMIC)
+          const { data, error: updateError } = await supabase
             .from(TABLE)
             .update({
               lock_id: lockId,
               expires_at: expiresAt.toISOString(),
               acquired_at: now.toISOString(),
             })
-            .eq('resource', resource);
+            .eq('resource', resource)
+            .lt('expires_at', new Date().toISOString()) // 🔥 critical fix
+            .select()
+            .maybeSingle();
 
-          if (updateError) {
-            throw new Error(updateError.message);
+          if (!updateError && data) {
+            logger.debug('[LockService] Lock acquired (takeover)', { resource, lockId });
+            return { resource, lockId, expiresAt };
           }
-        } else {
-          throw new Error(error.message);
+
+          // 🔁 Retry with backoff
+          if (attempt < retries) {
+            await new Promise(r => setTimeout(r, 100 * (attempt + 1)));
+            continue;
+          }
+
+          throw new Error('RESOURCE_LOCKED');
+
+        } catch (err) {
+          if (attempt >= retries) throw err;
         }
       }
-
-      logger.debug('[LockService] Lock acquired', { resource, lockId });
-
-      return { resource, lockId, expiresAt };
     }
 
+    // ─────────────────────────────────────────────
+    // RELEASE (SAFE)
+    // ─────────────────────────────────────────────
     async release(lock) {
       if (!lock?.lockId || !lock?.resource) return;
-
-      const { data } = await supabase
-        .from(TABLE)
-        .select('*')
-        .eq('resource', lock.resource)
-        .maybeSingle();
-
-      if (!data) return;
-
-      if (data.lock_id !== lock.lockId) return;
 
       await supabase
         .from(TABLE)
         .delete()
-        .eq('resource', lock.resource);
+        .eq('resource', lock.resource)
+        .eq('lock_id', lock.lockId); // 🔥 ensure ownership
 
       logger.debug('[LockService] Lock released', { resource: lock.resource });
     }
 
-    async executeWithLock(resource, fn, ttl = 30000) {
+    // ─────────────────────────────────────────────
+    // EXECUTE WITH LOCK (SAFE)
+    // ─────────────────────────────────────────────
+    async executeWithLock(resource, fn, ttl = 30000, timeoutMs = 10000) {
       const lock = await this.acquire(resource, ttl);
+
       try {
-        return await fn();
+        // 🔥 Timeout protection
+        const result = await Promise.race([
+          fn(),
+          new Promise((_, reject) =>
+            setTimeout(() => reject(new Error('LOCK_EXEC_TIMEOUT')), timeoutMs)
+          )
+        ]);
+
+        return result;
+
       } finally {
         await this.release(lock);
       }
@@ -104,8 +118,3 @@ if (process.env.NODE_ENV === 'test') {
 
   module.exports = new LockService();
 }
-
-
-
-
-

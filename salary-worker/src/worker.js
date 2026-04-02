@@ -1,4 +1,3 @@
-import { initializeApp }    from 'firebase-admin/app';
 import { loadConfig }       from '../../shared/config/index.js';
 import { logger }           from '../../shared/logger/index.js';
 import { createSubscriber } from '../../shared/pubsub/index.js';
@@ -8,7 +7,8 @@ import { handleSalaryBenchmarkRequested }
 process.env.SERVICE_NAME = 'salary-worker';
 
 const config = loadConfig('salary-worker');
-initializeApp();
+
+// ❌ Firebase removed — no initializeApp()
 
 logger.info('Salary worker starting', {
   subscription:  config.pubsub.salarySubscription,
@@ -24,13 +24,21 @@ const subscription = createSubscriber(
   },
 );
 
-const shutdown = (signal) => {
+// Graceful shutdown (improved)
+const shutdown = async (signal) => {
   logger.info(`${signal} received, closing subscription`);
-  subscription.close().then(() => {
+
+  try {
+    await subscription.close();
     logger.info('Subscription closed, exiting');
     process.exit(0);
-  });
-  setTimeout(() => process.exit(1), 15_000).unref();
+  } catch (err) {
+    logger.error('Error during shutdown', {
+      message: err?.message,
+      stack: err?.stack,
+    });
+    process.exit(1);
+  }
 };
 
 process.on('SIGTERM', () => shutdown('SIGTERM'));

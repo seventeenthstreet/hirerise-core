@@ -1,9 +1,9 @@
-name,jobFamilyId,level,track,description
-Software Engineer,software_engineering,L3,individual_contributor,Entry-level software engineer
-Senior Software Engineer,software_engineering,L5,individual_contributor,Senior individual contributor
-Staff Engineer,software_engineering,L6,individual_contributor,Cross-team technical leadership
-Engineering Manager,software_engineering,L6,management,People manager for engineering teams
-Director of Engineering,software_engineering,L7,management,Engineering director leading multiple teams
-Product Manager,product_management,L4,individual_contributor,Core product manager
-Senior Product Manager,product_management,L5,individual_contributor,Senior PM with ownership of key areas
-Director of Product,product_management,L7,management,Product director overseeing PM org
+role_id,name,job_family_id,level,level_index,track,description
+software_engineer_l3,Software Engineer,software_engineering,L3,3,individual_contributor,Entry-level software engineer
+senior_software_engineer_l5,Senior Software Engineer,software_engineering,L5,5,individual_contributor,Senior individual contributor
+staff_engineer_l6,Staff Engineer,software_engineering,L6,6,individual_contributor,Cross-team technical leadership
+engineering_manager_l6,Engineering Manager,software_engineering,L6,6,management,People manager for engineering teams
+director_engineering_l7,Director of Engineering,software_engineering,L7,7,management,Engineering director leading multiple teams
+product_manager_l4,Product Manager,product_management,L4,4,individual_contributor,Core product manager
+senior_product_manager_l5,Senior Product Manager,product_management,L5,5,individual_contributor,Senior PM with ownership of key areas
+director_product_l7,Director of Product,product_management,L7,7,management,Product director overseeing PM org

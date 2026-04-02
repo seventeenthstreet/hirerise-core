@@ -1,34 +1,6 @@
 'use strict';
 
-/**
- * conversionAggregate.repository.js
- *
- * FIXED: Converted from Firestore to native Supabase.
- *
- * Removed:
- *   - db.collection() / this._ref() Firestore doc refs
- *   - this._db.runTransaction() / tx.get() / tx.set() / tx.update()
- *   - snap.exists / snap.data()
- *   - FieldValue.serverTimestamp()
- *   - admin?.firestore?.FieldValue fallback
- *
- * Replaced with:
- *   - supabase.from('conversion_aggregates') queries
- *   - { data, error } destructuring on every query
- *   - supabase.from().upsert() for incrementAndUpdate (replaces transaction)
- *   - ISO strings for all timestamps
- *
- * NOTE on atomicity:
- *   The original runTransaction() was used to safely increment eventCounts.
- *   Supabase does not expose client-side transactions. The safe replacement is
- *   a Postgres RPC for true atomic counter increments, but since computeScoresFn
- *   is a caller-supplied JS function it cannot run inside a DB transaction.
- *   The pattern here (read → compute → upsert) is the same best-effort
- *   approach that was already in use via the Firestore shim. If strict
- *   atomicity is required, extract the scoring logic into a Postgres function.
- */
-
-const supabase = require('../../../config/supabase');
+const { supabase } = require('../../../config/supabase');
 const logger = require('../utils/conversion.logger');
 const { HARD_COUNTER_LIMIT, SCORE_VERSION } = require('../utils/eventWeights.config');
 
@@ -43,7 +15,6 @@ class ConversionAggregateRepository {
 
   async getAggregate(userId) {
     try {
-      // FIXED: { data, error } — removed this._ref(userId).get() / snap.exists / snap.data()
       const { data, error } = await supabase
         .from(this._table)
         .select('*')
@@ -52,36 +23,24 @@ class ConversionAggregateRepository {
 
       if (error) throw error;
       return data ?? null;
+
     } catch (err) {
-      logger.error('ConversionAggregateRepository.getAggregate failed', {
-        userId,
-        error: err.message,
-      });
+      logger.error('getAggregate failed', { userId, error: err.message });
       throw err;
     }
   }
 
   // ---------------------------------------------------------------------------
-  // Counter Increment + Score Update
+  // Increment + Update
   // ---------------------------------------------------------------------------
 
-  /**
-   * incrementAndUpdate(userId, eventType, computeScoresFn)
-   *
-   * FIXED: replaced this._db.runTransaction() with read → compute → upsert.
-   *
-   * Reads the current aggregate, increments the eventType counter,
-   * calls computeScoresFn to derive new scores, then upserts the full row.
-   *
-   * computeScoresFn signature (unchanged from original):
-   *   (existingData, eventCounts) => {
-   *     engagementScore, monetizationScore, totalIntentScore,
-   *     isEngagementEvent, isMonetizationEvent
-   *   }
-   */
   async incrementAndUpdate(userId, eventType, computeScoresFn) {
     try {
-      // 1. Read current state
+      if (!eventType) {
+        throw new Error('Invalid eventType');
+      }
+
+      // 1. Read
       const { data: existing, error: readError } = await supabase
         .from(this._table)
         .select('*')
@@ -90,12 +49,17 @@ class ConversionAggregateRepository {
 
       if (readError) throw readError;
 
-      // 2. Compute new counts and scores in JS (same logic as original)
-      const existingData  = existing ?? null;
-      const eventCounts   = { ...(existingData?.event_counts || existingData?.eventCounts || {}) };
-      const currentCount  = eventCounts[eventType] || 0;
+      const existingData = existing ?? null;
+
+      // ✅ FIXED: only snake_case
+      const eventCounts = {
+        ...(existingData?.event_counts || {})
+      };
+
+      const currentCount = eventCounts[eventType] || 0;
       eventCounts[eventType] = Math.min(currentCount + 1, HARD_COUNTER_LIMIT);
 
+      // 2. Compute scores
       const {
         engagementScore,
         monetizationScore,
@@ -106,36 +70,41 @@ class ConversionAggregateRepository {
 
       const now = new Date().toISOString();
 
-      // 3. Build upsert payload
-      // FIXED: replaced FieldValue.serverTimestamp() with ISO string timestamps
+      // 3. Payload
       const payload = {
-        user_id:            userId,
-        event_counts:       eventCounts,
-        engagement_score:   engagementScore,
+        user_id: userId,
+        event_counts: eventCounts,
+        engagement_score: engagementScore,
         monetization_score: monetizationScore,
         total_intent_score: totalIntentScore,
-        score_version:      SCORE_VERSION,
-        last_updated_at:    now,
-        last_event_at:      now,
+        score_version: SCORE_VERSION,
+        last_updated_at: now,
+        last_event_at: now,
       };
 
-      if (isEngagementEvent)    payload.last_engagement_event_at   = now;
-      if (isMonetizationEvent)  payload.last_monetization_event_at = now;
+      if (isEngagementEvent) {
+        payload.last_engagement_event_at = now;
+      }
 
-      // 4. Upsert — insert if no row exists, update if it does
-      // FIXED: replaced tx.set(ref, ...) / tx.update(ref, ...) with single upsert
-      const { error: upsertError } = await supabase
+      if (isMonetizationEvent) {
+        payload.last_monetization_event_at = now;
+      }
+
+      // 4. Upsert + return updated row
+      const { data, error } = await supabase
         .from(this._table)
-        .upsert([payload], { onConflict: 'user_id' });
+        .upsert([payload], { onConflict: 'user_id' })
+        .select()
+        .single();
 
-      if (upsertError) throw upsertError;
+      if (error) throw error;
 
-      logger.debug('ConversionAggregateRepository.incrementAndUpdate', {
-        userId,
-        eventType,
-      });
+      logger.debug('incrementAndUpdate success', { userId, eventType });
+
+      return data;
+
     } catch (err) {
-      logger.error('ConversionAggregateRepository.incrementAndUpdate failed', {
+      logger.error('incrementAndUpdate failed', {
         userId,
         eventType,
         error: err.message,
@@ -148,26 +117,27 @@ class ConversionAggregateRepository {
   // Manual Upsert
   // ---------------------------------------------------------------------------
 
-  /**
-   * upsertAggregate(userId, data)
-   *
-   * FIXED: replaced this._ref(userId).set({ merge: true }) with supabase upsert.
-   */
   async upsertAggregate(userId, data) {
     try {
-      // FIXED: removed FieldValue.serverTimestamp() — ISO string used instead
-      const { error } = await supabase
+      const payload = {
+        ...data,
+        user_id: userId,
+        score_version: SCORE_VERSION,
+        last_updated_at: new Date().toISOString(),
+      };
+
+      const { data: result, error } = await supabase
         .from(this._table)
-        .upsert([{
-          ...data,
-          user_id:         userId,
-          score_version:   SCORE_VERSION,
-          last_updated_at: new Date().toISOString(),
-        }], { onConflict: 'user_id' });
+        .upsert([payload], { onConflict: 'user_id' })
+        .select()
+        .single();
 
       if (error) throw error;
+
+      return result;
+
     } catch (err) {
-      logger.error('ConversionAggregateRepository.upsertAggregate failed', {
+      logger.error('upsertAggregate failed', {
         userId,
         error: err.message,
       });

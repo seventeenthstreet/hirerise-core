@@ -14,7 +14,7 @@
  */
 
 const crypto = require('crypto');
-const supabase = require('../config/supabase');
+const { supabase } = require('../config/supabase');
 const { AppError, ErrorCodes } = require('../middleware/errorHandler');
 const logger = require('../utils/logger');
 

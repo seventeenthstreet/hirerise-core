@@ -1,18 +1,21 @@
 'use strict';
 
 /**
- * conversionIntent.service.js
+ * src/modules/conversion/services/conversionIntent.service.js
  *
  * Returns time-decayed intent scores.
  *
- * - Uses Redis cache
- * - Applies dimension-specific exponential decay
- * - Recomputes total from decayed dimensions
- * - Prevents cache stampede
+ * Architecture:
+ * - Redis cache
+ * - in-flight request coalescing
+ * - dimension-specific exponential decay
+ * - Supabase TIMESTAMPTZ ISO string safe
+ * - cache stampede prevention
  */
 
 const conversionAggregateService = require('./conversionAggregate.service');
 const cacheProvider = require('../utils/conversionCache.provider');
+const logger = require('../utils/conversion.logger');
 
 const {
   DIMENSION_WEIGHTS,
@@ -20,42 +23,68 @@ const {
   MONETIZATION_DECAY_WINDOW_DAYS,
 } = require('../utils/eventWeights.config');
 
-const logger = require('../utils/conversion.logger');
+const MS_PER_DAY = 86_400_000;
 
 class ConversionIntentService {
-
   constructor() {
-    // Prevent cache stampede
+    // Prevent cache stampede / duplicate recomputation
     this._inFlight = new Map();
   }
 
   /**
-   * Returns decayed scores for user.
+   * Returns decayed scores for a user.
+   *
+   * @param {string} userId
+   * @returns {Promise<{
+   *   engagementScore:number,
+   *   monetizationScore:number,
+   *   totalIntentScore:number
+   * }>}
    */
   async getScores(userId) {
-
-    // 1️⃣ Cache hit
-    const cached = await cacheProvider.getScores(userId);
-    if (cached) {
-      logger.debug('conversionIntentService: cache hit', { userId });
-      return cached;
-    }
-
-    // 2️⃣ Prevent duplicate parallel recomputation
-    if (this._inFlight.has(userId)) {
-      return this._inFlight.get(userId);
-    }
-
-    const promise = this._computeAndCache(userId);
-    this._inFlight.set(userId, promise);
-
     try {
-      return await promise;
-    } finally {
-      this._inFlight.delete(userId);
+      if (!userId) {
+        throw new Error('userId is required');
+      }
+
+      // 1) cache hit
+      const cached = await cacheProvider.getScores(userId);
+
+      if (cached) {
+        logger.debug('conversionIntentService cache hit', {
+          userId,
+        });
+        return cached;
+      }
+
+      // 2) prevent duplicate parallel recomputation
+      if (this._inFlight.has(userId)) {
+        return this._inFlight.get(userId);
+      }
+
+      const promise = this._computeAndCache(userId);
+      this._inFlight.set(userId, promise);
+
+      try {
+        return await promise;
+      } finally {
+        this._inFlight.delete(userId);
+      }
+    } catch (error) {
+      logger.error('conversionIntentService.getScores failed', {
+        userId,
+        error: error.message,
+      });
+      throw error;
     }
   }
 
+  /**
+   * Returns only total intent score.
+   *
+   * @param {string} userId
+   * @returns {Promise<number>}
+   */
   async getTotalIntentScore(userId) {
     const scores = await this.getScores(userId);
     return scores.totalIntentScore;
@@ -72,7 +101,7 @@ class ConversionIntentService {
 
     await cacheProvider.setScores(userId, decayed);
 
-    logger.debug('conversionIntentService: computed + cached', {
+    logger.debug('conversionIntentService computed and cached', {
       userId,
       decayed,
     });
@@ -81,10 +110,16 @@ class ConversionIntentService {
   }
 
   /**
-   * Applies dimension-specific decay.
+   * Applies dimension-specific exponential decay.
+   *
+   * @param {{
+   *   engagementScore:number,
+   *   monetizationScore:number,
+   *   lastEngagementEventAt:string|null,
+   *   lastMonetizationEventAt:string|null
+   * }} raw
    */
   _applyDecay(raw) {
-
     const engagementFactor = this._decayFactor(
       raw.lastEngagementEventAt,
       ENGAGEMENT_DECAY_WINDOW_DAYS
@@ -108,7 +143,7 @@ class ConversionIntentService {
     const decayedTotal = Math.min(
       100,
       Math.round(
-        decayedEngagement   * DIMENSION_WEIGHTS.engagement +
+        decayedEngagement * DIMENSION_WEIGHTS.engagement +
         decayedMonetization * DIMENSION_WEIGHTS.monetization
       )
     );
@@ -121,26 +156,34 @@ class ConversionIntentService {
   }
 
   /**
-   * Exponential decay factor.
+   * Exponential decay factor from ISO timestamp.
+   *
+   * @param {string|null} lastEventAt
+   * @param {number} windowDays
+   * @returns {number}
    */
   _decayFactor(lastEventAt, windowDays) {
-    if (!lastEventAt) return 1;
+    if (!lastEventAt) {
+      return 1;
+    }
 
-    const msPerDay = 86_400_000;
-    const daysSince = (Date.now() - lastEventAt.getTime()) / msPerDay;
+    const timestamp = new Date(lastEventAt).getTime();
 
-    const clamped = Math.max(0, daysSince);
+    if (Number.isNaN(timestamp)) {
+      logger.warn(
+        'conversionIntentService invalid timestamp for decay',
+        {
+          lastEventAt,
+        }
+      );
+      return 1;
+    }
 
-    return Math.exp(-clamped / windowDays);
+    const daysSince = (Date.now() - timestamp) / MS_PER_DAY;
+    const clampedDays = Math.max(0, daysSince);
+
+    return Math.exp(-clampedDays / windowDays);
   }
 }
 
 module.exports = new ConversionIntentService();
-
-
-
-
-
-
-
-

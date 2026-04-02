@@ -386,7 +386,7 @@ const searchSkillsByName = async ({ query, category } = {}) => {
 
   // ── Strategy 1: Supabase cms_skills ILIKE ────────────────────────────────
   try {
-    const supabase = require('../core/supabaseClient');
+    const { supabase } = require('../config/supabase');
     let dbQuery = supabase
       .from('cms_skills')
       .select('id, name, category, aliases')
@@ -416,7 +416,7 @@ const searchSkillsByName = async ({ query, category } = {}) => {
 
   // ── Strategy 2: cms_skills without status filter (some rows may lack it) ─
   try {
-    const supabase = require('../core/supabaseClient');
+    const { supabase } = require('../config/supabase');
     let dbQuery = supabase
       .from('cms_skills')
       .select('id, name, category, aliases')

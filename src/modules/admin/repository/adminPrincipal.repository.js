@@ -19,7 +19,7 @@
 require('dotenv').config();
 
 function getSupabase() {
-  return require('../../../core/supabaseClient');
+  return require('../../../config/supabase');
 }
 
 const TABLE = 'admin_principals';

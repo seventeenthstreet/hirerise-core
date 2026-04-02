@@ -1,98 +1,116 @@
+'use strict';
+
 /**
- * deterministicCache.js
- * --------------------------------------------------------
- * Lightweight In-Memory Cache for Deterministic Scoring
- * --------------------------------------------------------
- * - Caches deterministic layer outputs only
- * - Supports TTL expiration
- * - Supports manual invalidation
- * - Non-blocking
- * - Swappable with Redis in future
- * --------------------------------------------------------
+ * Deterministic Cache (Production Optimized)
  */
 
 const crypto = require('crypto');
+const logger = require('../utils/logger');
 
-const DEFAULT_TTL_MS = 5 * 60 * 1000; // 5 minutes
+// ─────────────────────────────────────────────
+// 🔹 CONFIG
+// ─────────────────────────────────────────────
+
+const DEFAULT_TTL_MS = 5 * 60 * 1000;
+const MAX_ENTRIES = 5000;
+
+// ─────────────────────────────────────────────
+// 🔹 STABLE STRINGIFY (IMPORTANT FIX)
+// ─────────────────────────────────────────────
+
+function stableStringify(obj) {
+    if (obj === null || typeof obj !== 'object') {
+        return JSON.stringify(obj);
+    }
+
+    if (Array.isArray(obj)) {
+        return `[${obj.map(stableStringify).join(',')}]`;
+    }
+
+    return `{${Object.keys(obj)
+        .sort()
+        .map(key => `"${key}":${stableStringify(obj[key])}`)
+        .join(',')}}`;
+}
+
+// ─────────────────────────────────────────────
+// 🔹 CACHE CLASS
+// ─────────────────────────────────────────────
 
 class DeterministicCache {
     constructor() {
         this.store = new Map();
+        this.hits = 0;
+        this.misses = 0;
     }
 
-    /**
-     * Generate hash key from structured input
-     */
     generateKey(payload) {
-        const stringified = JSON.stringify(payload);
+        const stringified = stableStringify(payload);
         return crypto.createHash('sha256').update(stringified).digest('hex');
     }
 
-    /**
-     * Set cache value
-     */
     set(payload, value, ttl = DEFAULT_TTL_MS) {
         try {
+            if (this.store.size >= MAX_ENTRIES) {
+                this.evictOldest();
+            }
+
             const key = this.generateKey(payload);
             const expiry = Date.now() + ttl;
 
             this.store.set(key, {
                 value,
-                expiry
+                expiry,
+                createdAt: Date.now()
             });
 
             return key;
         } catch (err) {
-            console.error('DeterministicCache set error:', err.message);
+            logger.warn('DeterministicCache set error', { error: err.message });
             return null;
         }
     }
 
-    /**
-     * Get cache value
-     */
     get(payload) {
         try {
             const key = this.generateKey(payload);
             const entry = this.store.get(key);
 
-            if (!entry) return null;
-
-            if (Date.now() > entry.expiry) {
-                this.store.delete(key);
+            if (!entry) {
+                this.misses++;
                 return null;
             }
 
+            if (Date.now() > entry.expiry) {
+                this.store.delete(key);
+                this.misses++;
+                return null;
+            }
+
+            this.hits++;
             return entry.value;
         } catch (err) {
-            console.error('DeterministicCache get error:', err.message);
+            logger.warn('DeterministicCache get error', { error: err.message });
             return null;
         }
     }
 
-    /**
-     * Invalidate specific payload
-     */
     invalidate(payload) {
         try {
             const key = this.generateKey(payload);
             return this.store.delete(key);
         } catch (err) {
-            console.error('DeterministicCache invalidate error:', err.message);
+            logger.warn('DeterministicCache invalidate error', { error: err.message });
             return false;
         }
     }
 
-    /**
-     * Clear entire cache (use cautiously)
-     */
     clear() {
         this.store.clear();
+        this.hits = 0;
+        this.misses = 0;
     }
 
-    /**
-     * Cleanup expired entries (optional periodic job)
-     */
     cleanup() {
         const now = Date.now();
 
@@ -102,15 +120,22 @@ class DeterministicCache {
             }
         }
     }
+
+    evictOldest() {
+        const firstKey = this.store.keys().next().value;
+        if (firstKey) {
+            this.store.delete(firstKey);
+        }
+    }
+
+    getStats() {
+        return {
+            size: this.store.size,
+            hits: this.hits,
+            misses: this.misses,
+            hitRate: this.hits / (this.hits + this.misses || 1)
+        };
+    }
 }
 
 module.exports = new DeterministicCache();
-
-
-
-
-
-
-
-
-

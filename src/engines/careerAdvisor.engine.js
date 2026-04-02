@@ -1,260 +1,277 @@
 'use strict';
 
 /**
- * careerAdvisor.engine.js — AI Career Advisor Engine
- *
- * UPGRADE 3 — generates personalised career insights using:
- *   - User profile (skills, experience, industry, target role)
- *   - Skill graph (adjacent, missing, high-demand skills)
- *   - Labor market intelligence (market demand trends)
- *   - Semantic job match scores (best-fit roles)
- *
- * Uses Anthropic Claude (existing circuit-breaker infrastructure) to
- * generate a structured career insight object.
- *
- * Caching:
- *   - Redis key  : career:advice:<userId>
- *   - TTL        : 10 minutes (CACHE_TTL_SECONDS)
- *   - Invalidated when profile hash changes (MD5 of skills + experience)
- *
- * Integration:
- *   Route: GET /api/v1/career/advice
- *   Called by: careerAdvisor.controller.js (new file — see routes)
- *
- * @module src/engines/careerAdvisor.engine
+ * Career Advisor Engine (Supabase + AI Vector Enhanced)
  */
 
 const crypto       = require('crypto');
 const cacheManager = require('../core/cache/cache.manager');
-const supabase     = require('../core/supabaseClient');
+const supabase     = require('../config/supabase');
 const logger       = require('../utils/logger');
+const { getUserVector } = require('../services/userVector.service'); // ✅ NEW
 
-// ─── Config ───────────────────────────────────────────────────────────────────
+const CACHE_TTL_SECONDS = 600;
 
-const CACHE_TTL_SECONDS = 600;   // 10 minutes
-const MODEL             = process.env.ANTHROPIC_MODEL || 'claude-sonnet-4-20250514';
-const MAX_TOKENS        = 800;
-const TEMPERATURE       = 0.4;
+const MODEL       = process.env.ANTHROPIC_MODEL || 'claude-sonnet-4-20250514';
+const MAX_TOKENS  = 800;
+const TEMPERATURE = 0.4;
 
-const cache = cacheManager.getClient();
+const cache = cacheManager?.getClient?.();
 
-// ─── Anthropic client (reuses existing circuit-breaker registry) ──────────────
+// ─────────────────────────────────────────────
+// Anthropic
+// ─────────────────────────────────────────────
 
 function getAnthropic() {
   return require('../config/anthropic.client');
 }
 
-// ─── Cache wrapper ────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────
+// Profile Hash
+// ─────────────────────────────────────────────
 
-async function _cached(key, ttl, fn) {
-  try {
-    const hit = await cache.get(key);
-    if (hit) return JSON.parse(hit);
-  } catch (_) {}
-
-  const result = await fn();
-
-  try {
-    await cache.set(key, JSON.stringify(result), 'EX', ttl);
-  } catch (_) {}
-
-  return result;
+function profileHash(profile) {
+  return crypto
+    .createHash('md5')
+    .update(JSON.stringify({
+      skills: (profile.skills || []).sort(),
+      yearsExperience: profile.yearsExperience || 0,
+      targetRole: profile.targetRole || '',
+      industry: profile.industry || '',
+    }))
+    .digest('hex')
+    .slice(0, 8);
 }
 
-// ─── Profile hash ─────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────
+// Safe JSON Parse
+// ─────────────────────────────────────────────
 
-/**
- * Generate a short hash of the user profile snapshot.
- * Used to detect stale cached advice.
- */
-function _profileHash(profile) {
-  const payload = JSON.stringify({
-    skills:          (profile.skills || []).sort(),
-    yearsExperience: profile.yearsExperience || 0,
-    targetRole:      profile.targetRole || '',
-    industry:        profile.industry || '',
-  });
-  return crypto.createHash('md5').update(payload).digest('hex').slice(0, 8);
+function safeParseJSON(text) {
+  try {
+    const clean = text
+      .replace(/^```(?:json)?\s*/i, '')
+      .replace(/\s*```$/i, '')
+      .trim();
+
+    return JSON.parse(clean);
+  } catch {
+    return null;
+  }
 }
 
-// ─── Prompt builder ───────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────
+// Prompt Builder
+// ─────────────────────────────────────────────
 
-function _buildPrompt({ profile, skillGap, marketDemand, topJobMatches }) {
-  const skills          = (profile.skills || []).join(', ') || 'not specified';
-  const targetRole      = profile.targetRole || 'not specified';
-  const industry        = profile.industry   || 'not specified';
-  const experience      = profile.yearsExperience || 0;
-
-  const missingSkills   = (skillGap?.missing_high_demand || [])
-    .slice(0, 5)
-    .map(s => (typeof s === 'string' ? s : s?.name))
-    .filter(Boolean)
-    .join(', ') || 'none identified';
-
-  const adjacentSkills  = (skillGap?.adjacent_skills || []).slice(0, 5).join(', ') || 'none';
-
-  const topJobs         = (topJobMatches || [])
-    .slice(0, 3)
-    .map(j => `${j.title || j.role} (${j.match_score || j.matchScore}% match)`)
-    .join(', ') || 'no matches yet';
-
-  const demandSnippet   = (marketDemand?.trending || []).slice(0, 3).join(', ') || 'unavailable';
+function buildPrompt({ profile, skillGap, marketDemand, topJobMatches, vectorMeta }) {
+  const skills     = (profile.skills || []).join(', ') || 'not specified';
+  const experience = profile.yearsExperience || 0;
 
   return `You are a senior career strategist specialising in the Indian job market.
 
 USER PROFILE:
-- Current skills: ${skills}
+- Skills: ${skills}
 - Experience: ${experience} years
-- Target role: ${targetRole}
-- Industry: ${industry}
+- Target Role: ${profile.targetRole || 'not specified'}
+- Industry: ${profile.industry || 'not specified'}
 
-SKILL INTELLIGENCE:
-- High-demand skills they are missing: ${missingSkills}
-- Adjacent skills they could learn next: ${adjacentSkills}
+AI CONTEXT:
+- User vector available: ${vectorMeta ? 'YES' : 'NO'}
 
-JOB MARKET DATA:
-- Trending skills in market: ${demandSnippet}
-- Top job matches: ${topJobs}
+SKILL GAP:
+- Missing high-demand: ${(skillGap?.missing_high_demand || []).slice(0,5).join(', ') || 'none'}
+- Adjacent: ${(skillGap?.adjacent_skills || []).slice(0,5).join(', ') || 'none'}
 
-Generate a personalised career insight for this user. Be specific, actionable, and encouraging.
-Focus on realistic 1-3 year opportunities.
-Mention approximate salary upside if skill gaps are addressed (use Indian market rates).
+MARKET:
+- Trending: ${(marketDemand?.trending || []).slice(0,3).join(', ') || 'n/a'}
 
-Respond ONLY with a JSON object in this exact format — no preamble, no markdown:
+JOBS:
+- Matches: ${(topJobMatches || [])
+  .slice(0,3)
+  .map(j => `${j.title || j.role} (${j.match_score || j.matchScore}%)`)
+  .join(', ') || 'none'}
+
+Return STRICT JSON:
 {
-  "career_insight": "<2-3 sentence personalised insight>",
-  "key_opportunity": "<single most important next step>",
-  "salary_potential": "<salary range after skill upgrade, e.g. ₹8–12 LPA>",
-  "timeline": "<realistic timeline e.g. 6–18 months>",
-  "skills_to_prioritise": ["skill1", "skill2", "skill3"]
+  "career_insight": "",
+  "key_opportunity": "",
+  "salary_potential": "",
+  "timeline": "",
+  "skills_to_prioritise": []
 }`;
 }
 
-// ─── generateCareerAdvice ─────────────────────────────────────────────────────
+// ─────────────────────────────────────────────
+// Main Engine
+// ─────────────────────────────────────────────
 
-/**
- * Generate AI-powered career advice for a user.
- *
- * @param {{ user_id: string, profile: object, skillGap?: object, marketDemand?: object, topJobMatches?: object[] }} input
- * @returns {Promise<CareerAdviceResult>}
- */
-async function generateCareerAdvice({ userId, profile, skillGap, marketDemand, topJobMatches }) {
+async function generateCareerAdvice({
+  userId,
+  profile,
+  skillGap,
+  marketDemand,
+  topJobMatches
+}) {
   if (!userId || !profile) {
-    throw new Error('generateCareerAdvice: userId and profile are required');
+    throw new Error('userId and profile required');
   }
 
-  const hash     = _profileHash(profile);
+  const hash     = profileHash(profile);
   const cacheKey = `career:advice:${userId}`;
 
-  // Check Redis
+  // 🔥 NEW: get user vector (non-blocking safe usage)
+  let userVector = null;
   try {
-    const cached = await cache.get(cacheKey);
-    if (cached) {
-      const parsed = JSON.parse(cached);
-      // Invalidate if profile changed
-      if (parsed._profile_hash === hash) {
-        logger.debug('[CareerAdvisor] cache hit', { userId });
+    userVector = await getUserVector(userId, profile.skills || []);
+  } catch (err) {
+    logger.warn('[CareerAdvisor] user vector fetch failed', {
+      userId,
+      err: err.message
+    });
+  }
+
+  // ───────────── Redis Cache ─────────────
+
+  if (cache) {
+    try {
+      const cached = await cache.get(cacheKey);
+      if (cached) {
+        const parsed = JSON.parse(cached);
+        if (parsed._profile_hash === hash) {
+          logger.debug('[CareerAdvisor] Redis hit', { userId });
+          return parsed;
+        }
+      }
+    } catch (err) {
+      logger.warn('[Cache] Redis read failed', { err: err.message });
+    }
+  }
+
+  // ───────────── Supabase Cache ─────────────
+
+  try {
+    const { data } = await supabase
+      .from('career_advice_cache')
+      .select('advice_text, profile_hash, expires_at')
+      .eq('user_id', userId)
+      .maybeSingle();
+
+    if (
+      data &&
+      data.profile_hash === hash &&
+      (!data.expires_at || new Date(data.expires_at) > new Date())
+    ) {
+      const parsed = safeParseJSON(data.advice_text);
+      if (parsed) {
+        parsed._profile_hash = hash;
+
+        if (cache) {
+          await cache.set(cacheKey, JSON.stringify(parsed), 'EX', CACHE_TTL_SECONDS);
+        }
+
+        logger.debug('[CareerAdvisor] Supabase cache hit', { userId });
         return parsed;
       }
     }
-  } catch (_) {}
-
-  // Check Supabase persistent cache
-  const { data: dbCache } = await supabase
-    .from('career_advice_cache')
-    .select('advice_text, profile_hash, expires_at')
-    .eq('user_id', userId)
-    .maybeSingle();
-
-  if (dbCache && dbCache.profile_hash === hash && new Date(dbCache.expires_at) > new Date()) {
-    try {
-      const parsed = JSON.parse(dbCache.advice_text);
-      parsed._profile_hash = hash;
-      await cache.set(cacheKey, JSON.stringify(parsed), 'EX', CACHE_TTL_SECONDS);
-      return parsed;
-    } catch (_) {}
-  }
-
-  // Generate via Claude
-  logger.info('[CareerAdvisor] generating advice via Claude', { userId });
-
-  const anthropic = getAnthropic();
-  const prompt    = _buildPrompt({ profile, skillGap, marketDemand, topJobMatches });
-
-  let rawResponse;
-  try {
-    const message = await anthropic.messages.create({
-      model:       MODEL,
-      max_tokens:  MAX_TOKENS,
-      temperature: TEMPERATURE,
-      messages: [{ role: 'user', content: prompt }],
-    });
-    rawResponse = message.content?.[0]?.text || '';
   } catch (err) {
-    logger.error('[CareerAdvisor] Claude call failed', { userId, err: err.message });
-    // Fallback response
-    return _fallbackAdvice(profile);
+    logger.warn('[CareerAdvisor] Supabase cache read failed', {
+      userId,
+      err: err.message
+    });
   }
 
-  // Parse JSON response
-  let advice;
+  // ───────────── AI Generation ─────────────
+
+  logger.info('[CareerAdvisor] Generating via Claude', { userId });
+
+  let raw;
   try {
-    const clean = rawResponse
-      .replace(/^```(?:json)?\s*/i, '')
-      .replace(/\s*```$/i, '')
-      .trim();
-    advice = JSON.parse(clean);
-  } catch (_) {
-    logger.warn('[CareerAdvisor] failed to parse Claude JSON, using fallback', { userId });
-    return _fallbackAdvice(profile);
+    const anthropic = getAnthropic();
+
+    const res = await anthropic.messages.create({
+      model: MODEL,
+      max_tokens: MAX_TOKENS,
+      temperature: TEMPERATURE,
+      messages: [{
+        role: 'user',
+        content: buildPrompt({
+          profile,
+          skillGap,
+          marketDemand,
+          topJobMatches,
+          vectorMeta: !!userVector // 🔥 NEW
+        })
+      }]
+    });
+
+    raw = res.content?.[0]?.text || '';
+  } catch (err) {
+    logger.error('[CareerAdvisor] Claude failed', { userId, err: err.message });
+    return fallbackAdvice(profile);
+  }
+
+  const parsed = safeParseJSON(raw);
+  if (!parsed) {
+    logger.warn('[CareerAdvisor] Invalid JSON → fallback', { userId });
+    return fallbackAdvice(profile);
   }
 
   const result = {
-    ...advice,
+    ...parsed,
     _profile_hash: hash,
-    generated_at:  new Date().toISOString(),
+    generated_at: new Date().toISOString()
   };
 
-  // Cache in Redis
-  try { await cache.set(cacheKey, JSON.stringify(result), 'EX', CACHE_TTL_SECONDS); } catch (_) {}
+  // ───────────── Cache Write ─────────────
 
-  // Persist to Supabase
-  supabase.from('career_advice_cache').upsert({
-    user_id:       userId,
-    advice_text:   JSON.stringify(result),
-    profile_hash:  hash,
-  }, { onConflict: 'user_id' }).then(() => {}).catch(() => {});
+  if (cache) {
+    try {
+      await cache.set(cacheKey, JSON.stringify(result), 'EX', CACHE_TTL_SECONDS);
+    } catch (err) {
+      logger.warn('[Cache] Redis write failed', { err: err.message });
+    }
+  }
 
-  logger.info('[CareerAdvisor] advice generated and cached', { userId });
+  // Fire-and-forget DB write
+  supabase
+    .from('career_advice_cache')
+    .upsert({
+      user_id: userId,
+      advice_text: JSON.stringify(result),
+      profile_hash: hash,
+      expires_at: new Date(Date.now() + CACHE_TTL_SECONDS * 1000).toISOString()
+    }, { onConflict: 'user_id' })
+    .then(() => {})
+    .catch(() => {});
+
+  logger.info('[CareerAdvisor] Advice generated', { userId });
+
   return result;
 }
 
-// ─── Fallback ─────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────
+// Fallback
+// ─────────────────────────────────────────────
 
-function _fallbackAdvice(profile) {
-  const skills = (profile.skills || []).slice(0, 3).join(', ') || 'your current skills';
+function fallbackAdvice(profile) {
+  const skills = (profile.skills || []).slice(0, 3).join(', ') || 'your skills';
+
   return {
-    career_insight:        `Your profile with ${skills} shows a strong foundation. Continue building domain expertise and adding complementary technical skills to increase your market value.`,
-    key_opportunity:       'Identify 2-3 high-demand skills adjacent to your current expertise and pursue structured learning over the next 6 months.',
-    salary_potential:      'Potential salary improvement of 20–40% after targeted upskilling',
-    timeline:              '6–18 months',
-    skills_to_prioritise:  [],
-    _fallback:             true,
-    generated_at:          new Date().toISOString(),
+    career_insight: `Your experience with ${skills} gives you a solid base. Expanding into adjacent high-demand skills can significantly improve your career trajectory.`,
+    key_opportunity: 'Focus on 2–3 in-demand skills aligned with your current role.',
+    salary_potential: '20–40% growth possible',
+    timeline: '6–18 months',
+    skills_to_prioritise: [],
+    _fallback: true,
+    generated_at: new Date().toISOString()
   };
 }
 
-// ─── Exports ──────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────
+// Exports
+// ─────────────────────────────────────────────
 
 module.exports = {
-  generateCareerAdvice,
+  generateCareerAdvice
 };
-
-
-
-
-
-
-
-
-

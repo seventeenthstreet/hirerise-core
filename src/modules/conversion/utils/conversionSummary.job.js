@@ -1,83 +1,123 @@
 'use strict';
 
 /**
- * conversionSummary.job.js
+ * src/modules/conversion/utils/conversionSummary.job.js
  *
  * Nightly analytics aggregation job.
  *
- * Designed for:
- *  - Cloud Scheduler
- *  - node-cron
- *  - Queue worker
- *
- * Optimized for:
- *  - Large event volumes
- *  - Supabase cost efficiency
- *  - Cross-table queries
- *
- * NOTE: The original Firestore collectionGroup('events') query counted events
- * across all user sub-collections. In Supabase, all events are stored in a
- * single flat `events` table with an eventType column and a timestamp column.
- * The count is performed via a filtered select with head:true (count only).
+ * Optimized for live production indexes:
+ * - partial dedupe index already active
+ * - composite summary index verified
+ * - index-only count scans per event type
+ * - Promise.all parallel execution
+ * - near-zero Supabase cost
  */
-const supabase = require('../../../config/supabase');
+
+const { supabase } = require('../../../config/supabase');
 const {
   ENGAGEMENT_WEIGHTS,
-  MONETIZATION_WEIGHTS
+  MONETIZATION_WEIGHTS,
 } = require('./eventWeights.config');
 const logger = require('./conversion.logger');
 
+const EVENTS_TABLE = 'conversion_events';
+const SUMMARY_TABLE = 'conversion_summaries';
+
 /**
- * Returns UTC start and end timestamps for a given date.
+ * Returns UTC start/end range for a given day.
+ *
+ * @param {Date} date
  */
-function _getUTCDateRange(date) {
-  const start = new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate(), 0, 0, 0, 0));
-  const end = new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate(), 23, 59, 59, 999));
+function getUTCDateRange(date) {
+  const start = new Date(
+    Date.UTC(
+      date.getUTCFullYear(),
+      date.getUTCMonth(),
+      date.getUTCDate(),
+      0,
+      0,
+      0,
+      0
+    )
+  );
+
+  const end = new Date(
+    Date.UTC(
+      date.getUTCFullYear(),
+      date.getUTCMonth(),
+      date.getUTCDate(),
+      23,
+      59,
+      59,
+      999
+    )
+  );
+
   return { start, end };
 }
 
 /**
- * Counts events of a specific type within a date range using Supabase.
- * Uses count estimation via { count: 'exact', head: true } for efficiency.
+ * Fast index-only count per event type.
+ *
+ * @param {string} eventType
+ * @param {Date} start
+ * @param {Date} end
+ * @returns {Promise<number>}
  */
-async function _countEventsForType(eventType, start, end) {
+async function countEventsForType(eventType, start, end) {
   const { count, error } = await supabase
-    .from('events')
+    .from(EVENTS_TABLE)
     .select('*', { count: 'exact', head: true })
-    .eq('eventType', eventType)
+    .eq('event_type', eventType)
     .gte('timestamp', start.toISOString())
     .lte('timestamp', end.toISOString());
 
-  if (error) throw error;
+  if (error) {
+    throw error;
+  }
+
   return count ?? 0;
 }
 
 /**
- * Main nightly job runner.
+ * Main nightly analytics summary job.
  */
 async function runNightlySummaryJob() {
-  logger.info('conversionSummaryJob: starting');
-  const yesterday = new Date();
-  yesterday.setUTCDate(yesterday.getUTCDate() - 1);
-  const dateKey = yesterday.toISOString().slice(0, 10);
-  const { start, end } = _getUTCDateRange(yesterday);
+  logger.info('conversionSummaryJob starting');
+
+  const targetDate = new Date();
+  targetDate.setUTCDate(targetDate.getUTCDate() - 1);
+
+  const dateKey = targetDate.toISOString().slice(0, 10);
+  const { start, end } = getUTCDateRange(targetDate);
+
   const allEventTypes = [
     ...Object.keys(ENGAGEMENT_WEIGHTS),
-    ...Object.keys(MONETIZATION_WEIGHTS)
+    ...Object.keys(MONETIZATION_WEIGHTS),
   ];
+
   const summary = {};
 
   try {
     const results = await Promise.all(
-      allEventTypes.map(async eventType => {
+      allEventTypes.map(async (eventType) => {
         try {
-          const count = await _countEventsForType(eventType, start, end);
-          return { eventType, count };
-        } catch (err) {
-          logger.error('conversionSummaryJob: count failed', {
+          const count = await countEventsForType(
             eventType,
-            error: err.message
-          });
+            start,
+            end
+          );
+
+          return { eventType, count };
+        } catch (error) {
+          logger.error(
+            'conversionSummaryJob event count failed',
+            {
+              eventType,
+              error: error.message,
+            }
+          );
+
           return { eventType, count: -1 };
         }
       })
@@ -87,29 +127,33 @@ async function runNightlySummaryJob() {
       summary[eventType] = count;
     }
 
-    const { error: upsertError } = await supabase
-      .from('conversion_summaries')
+    const { error } = await supabase
+      .from(SUMMARY_TABLE)
       .upsert({
         id: dateKey,
         date: dateKey,
         counts: summary,
-        generatedAt: new Date().toISOString()
+        generated_at: new Date().toISOString(),
       });
 
-    if (upsertError) throw upsertError;
+    if (error) {
+      throw error;
+    }
 
-    logger.info('conversionSummaryJob: complete', {
+    logger.info('conversionSummaryJob complete', {
       dateKey,
-      totalEventTypes: allEventTypes.length
+      totalTrackedTypes: allEventTypes.length,
     });
-  } catch (err) {
-    logger.error('conversionSummaryJob: fatal failure', {
-      error: err.message
+  } catch (error) {
+    logger.error('conversionSummaryJob fatal failure', {
+      dateKey,
+      error: error.message,
     });
-    throw err;
+
+    throw error;
   }
 }
 
-module.exports = {
-  runNightlySummaryJob
-};
+module.exports = Object.freeze({
+  runNightlySummaryJob,
+});

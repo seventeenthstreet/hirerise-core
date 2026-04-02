@@ -319,7 +319,7 @@ async function setActiveResume(req, res, next) {
       message: 'resumeId is required'
     });
 
-    const supabase = require('../../../config/supabase');
+    const { supabase } = require('../../../config/supabase');
 
     // Verify the resume belongs to this user
     const { data: resumeData, error: resumeError } = await supabase

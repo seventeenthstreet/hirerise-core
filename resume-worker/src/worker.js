@@ -1,4 +1,3 @@
-import { initializeApp } from 'firebase-admin/app';
 import { loadConfig } from '../../shared/config/index.js';
 import { logger } from '../../shared/logger/index.js';
 import { createSubscriber } from '../../shared/pubsub/index.js';
@@ -7,7 +6,8 @@ import { handleResumeSubmitted } from './handlers/resume-submitted.handler.js';
 process.env.SERVICE_NAME = 'resume-worker';
 
 const config = loadConfig('resume-worker');
-initializeApp();
+
+// ❌ Firebase removed — no initializeApp()
 
 logger.info('Resume worker starting', {
   subscription: config.pubsub.resumeSubscription,
@@ -23,14 +23,20 @@ const subscription = createSubscriber(
   }
 );
 
-const shutdown = (signal) => {
+// Graceful shutdown
+const shutdown = async (signal) => {
   logger.info(`${signal} received, closing subscription`);
-  subscription.close().then(() => {
+
+  try {
+    await subscription.close();
     logger.info('Subscription closed, exiting');
     process.exit(0);
-  });
-  setTimeout(() => process.exit(1), 15000).unref();
+  } catch (err) {
+    logger.error('Error during shutdown', { error: err.message });
+    process.exit(1);
+  }
 };
 
+// Signals
 process.on('SIGTERM', () => shutdown('SIGTERM'));
 process.on('SIGINT', () => shutdown('SIGINT'));

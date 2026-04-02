@@ -1,137 +1,336 @@
 'use strict';
 
-const { asyncHandler }   = require('../../../utils/helpers');
+/**
+ * graphAdmin.controller.js
+ * Production Ready:
+ * - CSV import
+ * - Redis cache invalidation
+ * - cache warming
+ * - circular dependency removed
+ */
+
+const { asyncHandler } = require('../../../utils/helpers');
 const { AppError, ErrorCodes } = require('../../../middleware/errorHandler');
-let importGraphDataset, validateGraphIntegrity, getGraphMetrics, getImportLogs,
-    getDatasetStatuses, getGraphHealth, getGraphAlerts, getCareerGraphStats, GRAPH_DATASET_TYPES;
+const logger = require('../../../utils/logger');
+const { redis } = require('../../../config/redisClient');
+const { setCache } = require('../../../utils/cache.util');
+const supabase = require('../../../config/supabase');
+const { GRAPH_DATASET_TYPES } = require('./graph.constants');
+
+let importGraphDataset;
+let validateGraphIntegrity;
+let getGraphMetrics;
+let getImportLogs;
+let getDatasetStatuses;
+let getGraphHealth;
+let getGraphAlerts;
+let getCareerGraphStats;
+
 try {
   ({
-    importGraphDataset, validateGraphIntegrity, getGraphMetrics, getImportLogs,
-    getDatasetStatuses, getGraphHealth, getGraphAlerts, getCareerGraphStats, GRAPH_DATASET_TYPES,
+    importGraphDataset,
+    validateGraphIntegrity,
+    getGraphMetrics,
+    getImportLogs,
+    getDatasetStatuses,
+    getGraphHealth,
+    getGraphAlerts,
+    getCareerGraphStats,
   } = require('./graphImport.service'));
 } catch (e) {
-  const stub = async () => { throw new Error('Graph service unavailable: ' + e.message); };
-  importGraphDataset = validateGraphIntegrity = getGraphMetrics = getImportLogs =
-    getDatasetStatuses = getGraphHealth = getGraphAlerts = getCareerGraphStats = stub;
-  GRAPH_DATASET_TYPES = [
-    'roles', 'skills', 'role_skills', 'role_transitions',
-    'skill_relationships', 'role_education', 'role_salary_market', 'role_market_demand',
-  ];
-}
-const logger = require('../../../utils/logger');
+  const stub = async () => {
+    throw new Error(`Graph service unavailable: ${e.message}`);
+  };
 
-const ALLOWED_MIMES = new Set(['text/csv', 'text/plain', 'application/csv', 'application/vnd.ms-excel']);
+  importGraphDataset = stub;
+  validateGraphIntegrity = stub;
+  getGraphMetrics = stub;
+  getImportLogs = stub;
+  getDatasetStatuses = stub;
+  getGraphHealth = stub;
+  getGraphAlerts = stub;
+  getCareerGraphStats = stub;
+}
+
+const ALLOWED_MIMES = new Set([
+  'text/csv',
+  'text/plain',
+  'application/csv',
+  'application/vnd.ms-excel',
+]);
+
+const MAX_FILE_SIZE = 5 * 1024 * 1024;
+
+// ─────────────────────────────────────────────────────────────
+// Helpers
+// ─────────────────────────────────────────────────────────────
 
 function requireCSV(req) {
-  if (!req.file) throw new AppError('No file uploaded. Send a CSV in the "file" field.', 400, null, ErrorCodes.VALIDATION_ERROR);
-  const ext = (req.file.originalname || '').toLowerCase().endsWith('.csv');
-  if (!ALLOWED_MIMES.has(req.file.mimetype) && !ext) {
-    throw new AppError(`CSV file required. Received: ${req.file.mimetype}`, 400, null, 'INVALID_FILE');
+  if (!req.file) {
+    throw new AppError(
+      'No file uploaded.',
+      400,
+      null,
+      ErrorCodes.VALIDATION_ERROR
+    );
+  }
+
+  if (req.file.size > MAX_FILE_SIZE) {
+    throw new AppError(
+      'File too large (max 5MB)',
+      400,
+      null,
+      ErrorCodes.VALIDATION_ERROR
+    );
+  }
+
+  const name = (req.file.originalname || '').toLowerCase();
+  const isCSV = name.endsWith('.csv');
+
+  if (!ALLOWED_MIMES.has(req.file.mimetype) && !isCSV) {
+    throw new AppError(
+      `CSV required. Received: ${req.file.mimetype}`,
+      400,
+      null,
+      'INVALID_FILE'
+    );
   }
 }
 
-// POST /admin/graph/import/:datasetType  — full import with optional mode=append|replace
-const importDataset = asyncHandler(async (req, res) => {
-  requireCSV(req);
-  const { datasetType } = req.params;
-  const mode = ['append', 'replace'].includes(req.body?.mode) ? req.body.mode : 'append';
-
+function validateDatasetType(datasetType) {
   if (!GRAPH_DATASET_TYPES.includes(datasetType)) {
-    throw new AppError(`Unknown dataset type "${datasetType}". Supported: ${GRAPH_DATASET_TYPES.join(', ')}`, 400, null, ErrorCodes.VALIDATION_ERROR);
+    throw new AppError(
+      `Invalid dataset "${datasetType}"`,
+      400,
+      null,
+      ErrorCodes.VALIDATION_ERROR
+    );
+  }
+}
+
+function getMode(body) {
+  return ['append', 'replace'].includes(body?.mode)
+    ? body.mode
+    : 'append';
+}
+
+// ─────────────────────────────────────────────────────────────
+// Cache Helpers
+// ─────────────────────────────────────────────────────────────
+
+async function invalidateGraphCache(datasetType) {
+  try {
+    const keys = new Set();
+
+    if (
+      ['roles', 'role_transitions', 'role_skills'].includes(datasetType)
+    ) {
+      keys.add('graph:career');
+    }
+
+    if (
+      ['skills', 'skill_relationships', 'role_skills'].includes(datasetType)
+    ) {
+      keys.add('graph:skills');
+    }
+
+    if (!keys.size) return [];
+
+    await Promise.all([...keys].map((key) => redis.del(key)));
+
+    logger.info('[GraphCache] Invalidated', {
+      datasetType,
+      keys: [...keys],
+    });
+
+    return [...keys];
+  } catch (err) {
+    logger.warn('[GraphCache] Invalidation failed', {
+      datasetType,
+      error: err.message,
+    });
+    return [];
+  }
+}
+
+async function warmGraphCache(keys) {
+  try {
+    const tasks = [];
+
+    if (keys.includes('graph:career')) {
+      tasks.push((async () => {
+        const [{ data: roles = [] }, { data: transitions = [] }] =
+          await Promise.all([
+            supabase.from('roles').select('*').limit(5000),
+            supabase.from('role_transitions').select('*').limit(5000),
+          ]);
+
+        const payload = {
+          roles: roles.filter((r) => r.name || r.role_name),
+          transitions,
+          node_count: roles.length,
+          edge_count: transitions.length,
+        };
+
+        await setCache('graph:career', payload, 300);
+      })());
+    }
+
+    if (keys.includes('graph:skills')) {
+      tasks.push((async () => {
+        const [{ data: skills = [] }, { data: relationships = [] }] =
+          await Promise.all([
+            supabase.from('skills').select('*').limit(5000),
+            supabase.from('skill_relationships').select('*').limit(5000),
+          ]);
+
+        const payload = {
+          skills: skills.filter((s) => s.name || s.skill_name),
+          relationships,
+          node_count: skills.length,
+          edge_count: relationships.length,
+        };
+
+        await setCache('graph:skills', payload, 300);
+      })());
+    }
+
+    await Promise.all(tasks);
+
+    logger.info('[GraphCache] Warmed', { keys });
+  } catch (err) {
+    logger.warn('[GraphCache] Warming failed', {
+      error: err.message,
+    });
+  }
+}
+
+// ─────────────────────────────────────────────────────────────
+// Controllers
+// ─────────────────────────────────────────────────────────────
+
+const importDataset = asyncHandler(async (req, res) => {
+  const start = Date.now();
+
+  requireCSV(req);
+
+  const { datasetType } = req.params;
+  validateDatasetType(datasetType);
+
+  const mode = getMode(req.body);
+
+  let result;
+  let warmedKeys = [];
+
+  try {
+    result = await importGraphDataset({
+      buffer: req.file.buffer,
+      datasetType,
+      adminId: req.user.id,
+      preview: false,
+      mode,
+    });
+
+    const invalidatedKeys = await invalidateGraphCache(datasetType);
+
+    if (invalidatedKeys.length) {
+      await warmGraphCache(invalidatedKeys);
+      warmedKeys = invalidatedKeys;
+    }
+  } catch (err) {
+    logger.error('[GraphImport] Failed', {
+      datasetType,
+      error: err.message,
+      stack: err.stack,
+    });
+    throw err;
   }
 
-  const result = await importGraphDataset({
-    buffer:      req.file.buffer,
-    datasetType,
-    adminId:     req.user.uid,
-    preview:     false,
-    mode,
-  });
+  const duration = Date.now() - start;
+  const throughput =
+    Math.round((result?.imported || 0) / (duration / 1000)) || 0;
 
-  logger.info('[GraphAdmin] Import completed', {
-    datasetType, mode, processed: result.processed, imported: result.imported,
-    errors: result.errorCount, adminId: req.user.uid,
-  });
+  const status =
+    result?.errorCount > 0 && result?.imported > 0 ? 207 : 200;
 
-  const status = result.errorCount > 0 && result.imported > 0 ? 207 : 200;
-  res.status(status).json({ success: true, data: result });
+  res.status(status).json({
+    success: true,
+    meta: {
+      duration_ms: duration,
+      throughput_rows_per_sec: throughput,
+      cache_warmed: warmedKeys,
+    },
+    data: result,
+  });
 });
 
-// POST /admin/graph/preview/:datasetType — dry-run validation, returns all error categories
 const previewDataset = asyncHandler(async (req, res) => {
   requireCSV(req);
-  const { datasetType } = req.params;
-  const mode = ['append', 'replace'].includes(req.body?.mode) ? req.body.mode : 'append';
 
-  if (!GRAPH_DATASET_TYPES.includes(datasetType)) {
-    throw new AppError(`Unknown dataset type "${datasetType}"`, 400, null, ErrorCodes.VALIDATION_ERROR);
-  }
+  const { datasetType } = req.params;
+  validateDatasetType(datasetType);
+
+  const mode = getMode(req.body);
 
   const result = await importGraphDataset({
-    buffer:      req.file.buffer,
+    buffer: req.file.buffer,
     datasetType,
-    adminId:     req.user.uid,
-    preview:     true,
+    adminId: req.user.id,
+    preview: true,
     mode,
   });
 
   res.json({ success: true, data: result });
 });
 
-// GET /admin/graph/metrics
 const graphMetrics = asyncHandler(async (_req, res) => {
   const metrics = await getGraphMetrics();
   res.json({ success: true, data: metrics });
 });
 
-// GET /admin/graph/validate
 const validateGraph = asyncHandler(async (_req, res) => {
   const report = await validateGraphIntegrity();
   res.json({ success: true, data: report });
 });
 
-// GET /admin/graph/import-logs
 const importLogs = asyncHandler(async (req, res) => {
   const limit = parseInt(req.query.limit || '50', 10);
-  const logs  = await getImportLogs({ limit });
-  res.json({ success: true, data: { logs, count: logs.length } });
+  const logs = await getImportLogs({ limit });
+
+  res.json({
+    success: true,
+    data: { logs, count: logs.length },
+  });
 });
 
-// GET /admin/graph/dataset-statuses — Admin Data Import Center overview
 const datasetStatuses = asyncHandler(async (_req, res) => {
   const statuses = await getDatasetStatuses();
   res.json({ success: true, data: statuses });
 });
 
-// GET /admin/graph/health — coverage percentages per dataset
 const graphHealth = asyncHandler(async (_req, res) => {
-  try {
-    const health = await getGraphHealth();
-    res.json({ success: true, data: health });
-  } catch (err) {
-    logger.error('[GraphHealth] getGraphHealth failed', { error: err.message, stack: err.stack });
-    throw err;
-  }
+  const health = await getGraphHealth();
+  res.json({ success: true, data: health });
 });
 
-// GET /admin/graph/alerts — automatic graph issue detection
 const graphAlerts = asyncHandler(async (_req, res) => {
   const alerts = await getGraphAlerts();
   res.json({ success: true, data: alerts });
 });
 
-// GET /admin/graph/stats — career graph structural statistics
 const graphStats = asyncHandler(async (_req, res) => {
   const stats = await getCareerGraphStats();
   res.json({ success: true, data: stats });
 });
 
-module.exports = { importDataset, previewDataset, graphMetrics, validateGraph, importLogs, datasetStatuses, graphHealth, graphAlerts, graphStats };
-
-
-
-
-
-
-
-
+module.exports = {
+  importDataset,
+  previewDataset,
+  graphMetrics,
+  validateGraph,
+  importLogs,
+  datasetStatuses,
+  graphHealth,
+  graphAlerts,
+  graphStats,
+};

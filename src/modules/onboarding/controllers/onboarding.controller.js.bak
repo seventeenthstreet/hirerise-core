@@ -174,7 +174,7 @@ languages (spoken, not programming), professionalSummary, currentJobTitle, curre
 Return the same structure — null for fields you cannot confidently determine.`;
 
 async function _extractCvPersonalDetails(resumeText, userId) {
-  const logger = require('../../../utils/logger');
+  const logger = require('../../../../utils/logger');
 
   // ── Step 1: Local parser (zero cost, < 50ms) ──────────────────────────────
   let parsed;
@@ -299,7 +299,7 @@ async function validateCvFileEndpoint(req, res, next) {
     }
 
     const { classifyDocument } = require('../../services/cvClassifier.service');
-    const logger = require('../../../utils/logger');
+    const logger = require('../../../../utils/logger');
 
     // Extract text from the buffer (PDF + DOCX both supported)
     let text = '';
@@ -371,7 +371,7 @@ async function uploadCvDuringOnboarding(req, res, next) {
     // If classifier confidence is high enough and is_cv=false → reject early.
     try {
       const { classifyDocument } = require('../../services/cvClassifier.service');
-      const logger = require('../../../utils/logger');
+      const logger = require('../../../../utils/logger');
       let cvText = '';
       try {
         const ext = (req.file.originalname || '').split('.').pop()?.toLowerCase();
@@ -412,7 +412,7 @@ async function uploadCvDuringOnboarding(req, res, next) {
       }
     } catch (classifyErr) {
       // Non-fatal: if classifier fails, proceed with normal upload
-      require('../../../utils/logger').warn('[uploadCvDuringOnboarding] Classifier error — proceeding', {
+      require('../../../../utils/logger').warn('[uploadCvDuringOnboarding] Classifier error — proceeding', {
         userId, error: classifyErr.message,
       });
     }
@@ -452,7 +452,7 @@ async function uploadCvDuringOnboarding(req, res, next) {
         // Fallback: use parsedData already stored by uploadResume() if available
         const pd = docData?.parsedData || docData?.content?.parsedData;
         if (pd) {
-          const logger = require('../../../utils/logger');
+          const logger = require('../../../../utils/logger');
           logger.info('[OnboardingController] Using stored parsedData as fallback', { userId });
           if (pd.skills?.length)  extractedSkills = pd.skills.slice(0, 20).map(s => ({ name: String(s).trim(), proficiency: 'intermediate' }));
           extractedDetails = {
@@ -477,7 +477,7 @@ async function uploadCvDuringOnboarding(req, res, next) {
       }
     } catch (extractErr) {
       // Non-fatal — upload still succeeds, user fills in details manually
-      require('../../../utils/logger').warn('[OnboardingController] CV detail extraction fetch failed', {
+      require('../../../../utils/logger').warn('[OnboardingController] CV detail extraction fetch failed', {
         userId, resumeId: uploadResult.resumeId, error: extractErr.message,
       });
     }
@@ -732,7 +732,7 @@ async function completeOnboarding(req, res, next) {
 
     const { db } = require('../../../config/supabase');
     const { FieldValue } = require('../../../config/supabase');
-    const logger = require('../../../utils/logger');
+    const logger = require('../../../../utils/logger');
 
     const now = FieldValue.serverTimestamp();
     const batch = db.batch();

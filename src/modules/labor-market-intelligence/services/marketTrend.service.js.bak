@@ -15,7 +15,7 @@
  * Cache TTL: 1 hour (configurable via LMI_CACHE_TTL_MS env var)
  */
 
-const logger             = require('../../../utils/logger');
+const logger             = require('../../../../utils/logger');
 const jobCollector       = require('../collectors/jobCollector.service');
 const demandAnalysis     = require('../processors/demandAnalysis.service');
 const { db }             = require('../../../config/supabase');

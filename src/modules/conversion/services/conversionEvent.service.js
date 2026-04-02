@@ -1,13 +1,16 @@
 'use strict';
 
 /**
- * conversionEvent.service.js
+ * src/modules/conversion/services/conversionEvent.service.js
  *
  * Responsibilities:
  *  1. Validate eventType
- *  2. Idempotency guard
- *  3. Raw event audit write
- *  4. Fire-and-forget aggregate update
+ *  2. Raw event audit write (SQL dedupe-safe)
+ *  3. Fire-and-forget aggregate update
+ *
+ * NOTE:
+ * Database unique partial index is source of truth for deduplication.
+ * No application-side duplicate reads in critical write path.
  */
 
 const conversionEventRepository = require('../repositories/conversionEvent.repository');
@@ -32,7 +35,7 @@ class ConversionEventService {
    *
    * @param {string} userId
    * @param {string} eventType
-   * @param {object} metadata
+   * @param {Record<string, unknown>} metadata
    * @param {string|null} idempotencyKey
    *
    * @returns {Promise<{ recorded: boolean, eventId: string|null }>}
@@ -43,85 +46,75 @@ class ConversionEventService {
     metadata = {},
     idempotencyKey = null
   ) {
-    if (!userId || !eventType) {
-      throw new Error(
-        'conversionEventService.recordEvent: userId and eventType are required'
-      );
-    }
-
-    // -----------------------------------------------------------------------
-    // 1. Validate Event Type
-    // -----------------------------------------------------------------------
-
-    if (!this._allowedEvents.has(eventType)) {
-      logger.warn('conversionEventService: invalid eventType ignored', {
-        userId,
-        eventType,
-      });
-
-      return { recorded: false, eventId: null };
-    }
-
-    // -----------------------------------------------------------------------
-    // 2. Deduplication Guard
-    // -----------------------------------------------------------------------
-
-    if (idempotencyKey) {
-      const duplicate =
-        await conversionEventRepository.isDuplicate(
-          userId,
-          eventType,
-          idempotencyKey
+    try {
+      if (!userId || !eventType) {
+        throw new Error(
+          'conversionEventService.recordEvent: userId and eventType are required'
         );
+      }
 
-      if (duplicate) {
-        logger.warn('conversionEventService: duplicate dropped', {
-          userId,
-          eventType,
-          idempotencyKey,
-        });
+      // ---------------------------------------------------------------------
+      // 1) Validate event type
+      // ---------------------------------------------------------------------
+
+      if (!this._allowedEvents.has(eventType)) {
+        logger.warn(
+          'conversionEventService invalid eventType ignored',
+          {
+            userId,
+            eventType,
+          }
+        );
 
         return { recorded: false, eventId: null };
       }
-    }
 
-    // -----------------------------------------------------------------------
-    // 3. Raw Event Write (Audit Log)
-    // -----------------------------------------------------------------------
+      // ---------------------------------------------------------------------
+      // 2) Raw event write (SQL dedupe-safe)
+      // ---------------------------------------------------------------------
 
-    const eventId = await conversionEventRepository.recordEvent(
-      userId,
-      eventType,
-      metadata,
-      idempotencyKey
-    );
+      const eventId = await conversionEventRepository.recordEvent(
+        userId,
+        eventType,
+        metadata,
+        idempotencyKey
+      );
 
-    logger.info('conversionEventService: event recorded', {
-      userId,
-      eventType,
-      eventId,
-    });
-
-    // -----------------------------------------------------------------------
-    // 4. Fire-and-Forget Aggregate Update
-    // -----------------------------------------------------------------------
-
-    setImmediate(() => {
-      conversionAggregateService
-        .onEventRecorded(userId, eventType)
-        .catch((err) =>
-          logger.error(
-            'conversionEventService: aggregate update failed',
-            {
-              userId,
-              eventType,
-              error: err.message,
-            }
-          )
+      // duplicate writes become no-op in DB upsert path
+      if (!eventId && idempotencyKey) {
+        logger.debug(
+          'conversionEventService duplicate no-op handled by DB',
+          {
+            userId,
+            eventType,
+            idempotencyKey,
+          }
         );
-    });
 
-    return { recorded: true, eventId };
+        return { recorded: false, eventId: null };
+      }
+
+      logger.info('conversionEventService event recorded', {
+        userId,
+        eventType,
+        eventId,
+      });
+
+      // ---------------------------------------------------------------------
+      // 3) Fire-and-forget aggregate update
+      // ---------------------------------------------------------------------
+
+      this._deferAggregateUpdate(userId, eventType);
+
+      return { recorded: true, eventId };
+    } catch (error) {
+      logger.error('conversionEventService.recordEvent failed', {
+        userId,
+        eventType,
+        error: error.message,
+      });
+      throw error;
+    }
   }
 
   // ---------------------------------------------------------------------------
@@ -139,14 +132,34 @@ class ConversionEventService {
   async getRecentEvents(userId, limit = 50) {
     return conversionEventRepository.getRecentEvents(userId, limit);
   }
+
+  // ---------------------------------------------------------------------------
+  // Internal Helpers
+  // ---------------------------------------------------------------------------
+
+  _deferAggregateUpdate(userId, eventType) {
+    const run = () => {
+      conversionAggregateService
+        .onEventRecorded(userId, eventType)
+        .catch((error) => {
+          logger.error(
+            'conversionEventService aggregate update failed',
+            {
+              userId,
+              eventType,
+              error: error.message,
+            }
+          );
+        });
+    };
+
+    if (typeof queueMicrotask === 'function') {
+      queueMicrotask(run);
+      return;
+    }
+
+    setImmediate(run);
+  }
 }
 
 module.exports = new ConversionEventService();
-
-
-
-
-
-
-
-

@@ -1,234 +1,111 @@
 {
-  "_doc": "Example API responses for AI Career Opportunity Radar endpoints",
+  "_meta": {
+    "title": "AI Career Opportunity Radar API",
+    "version": "2.0.0",
+    "auth": "Supabase JWT (Authorization: Bearer <access_token>)",
+    "currency": "INR",
+    "salary_unit": "annual"
+  },
 
-  "GET /api/v1/career/opportunity-radar": {
-    "description": "Personalised opportunity radar for authenticated user",
-    "request": "GET /api/v1/career/opportunity-radar?limit=5&minOpportunityScore=60",
+  "GET /career/opportunity-radar": {
+    "description": "Personalized opportunity radar",
     "response": {
       "success": true,
       "data": {
+        "userId": "uuid",
+
         "emerging_opportunities": [
           {
+            "roleId": "uuid",
             "role": "Operations Analyst",
             "industry": "Operations & Finance",
+
             "opportunity_score": 88,
             "match_score": 72,
+
             "growth_trend": "High",
-            "average_salary": "₹12L",
             "is_emerging": false,
-            "skills_you_have": ["Excel", "Coordination", "Admin Management"],
-            "skills_to_learn": ["Power BI", "Process Optimization", "SQL"],
+
+            "salary": {
+              "min": 800000,
+              "max": 1400000,
+              "currency": "INR"
+            },
+
+            "skills_you_have": ["Excel", "Coordination"],
+            "skills_to_learn": ["Power BI", "SQL"],
+
             "score_breakdown": {
               "job_growth": 35,
               "salary_growth": 22,
               "skill_demand": 23,
               "industry_growth": 8
             }
-          },
-          {
-            "role": "Automation Consultant",
-            "industry": "Operations",
-            "opportunity_score": 91,
-            "match_score": 65,
-            "growth_trend": "Very High",
-            "average_salary": "₹18L",
-            "is_emerging": true,
-            "skills_you_have": ["Process Mapping", "Stakeholder Management"],
-            "skills_to_learn": ["RPA Tools", "Python", "Business Analysis", "Change Management"],
-            "score_breakdown": {
-              "job_growth": 35,
-              "salary_growth": 25,
-              "skill_demand": 23,
-              "industry_growth": 8
-            }
-          },
-          {
-            "role": "Growth Analyst",
-            "industry": "Marketing & Technology",
-            "opportunity_score": 79,
-            "match_score": 58,
-            "growth_trend": "High",
-            "average_salary": "₹12L",
-            "is_emerging": false,
-            "skills_you_have": ["Excel", "Data Analysis"],
-            "skills_to_learn": ["Google Analytics", "A/B Testing", "Python"],
-            "score_breakdown": {
-              "job_growth": 35,
-              "salary_growth": 20,
-              "skill_demand": 18,
-              "industry_growth": 6
-            }
-          },
-          {
-            "role": "AI Product Manager",
-            "industry": "Technology",
-            "opportunity_score": 89,
-            "match_score": 41,
-            "growth_trend": "Very High",
-            "average_salary": "₹22L",
-            "is_emerging": true,
-            "skills_you_have": ["Stakeholder Management"],
-            "skills_to_learn": ["AI/ML Fundamentals", "Prompt Engineering", "Data Analysis", "Product Management"],
-            "score_breakdown": {
-              "job_growth": 35,
-              "salary_growth": 25,
-              "skill_demand": 22,
-              "industry_growth": 7
-            }
           }
         ],
-        "user_skills_count": 7,
-        "target_role": "Operations Manager",
-        "industry": "Operations",
-        "total_signals_evaluated": 42
+
+        "meta": {
+          "total": 5,
+          "limit": 5,
+          "hasMore": false,
+          "generated_at": "ISO8601"
+        }
       }
     }
   },
 
-  "GET /api/v1/career/emerging-roles": {
-    "description": "Public catalogue of top emerging roles (not personalised)",
-    "request": "GET /api/v1/career/emerging-roles?emergingOnly=true&minScore=70&limit=5",
+  "GET /career/emerging-roles": {
+    "description": "Public emerging roles",
     "response": {
       "success": true,
       "data": {
         "roles": [
           {
+            "roleId": "uuid",
             "role": "MLOps Engineer",
             "industry": "Technology",
+
             "opportunity_score": 91,
             "growth_trend": "Very High",
-            "average_salary": "₹25L",
-            "demand_score": 91,
-            "emerging_score": 88,
             "is_emerging": true,
-            "required_skills": ["Python", "Docker", "Kubernetes", "ML Frameworks", "CI/CD", "Cloud Platforms"],
-            "score_breakdown": {
-              "job_growth": 35,
-              "salary_growth": 25,
-              "skill_demand": 23,
-              "industry_growth": 8
-            }
-          },
-          {
-            "role": "Prompt Engineer",
-            "industry": "Technology",
-            "opportunity_score": 88,
-            "growth_trend": "Very High",
-            "average_salary": "₹20L",
-            "demand_score": 86,
-            "emerging_score": 95,
-            "is_emerging": true,
-            "required_skills": ["LLM APIs", "Python", "NLP", "Technical Writing", "AI/ML Fundamentals"],
-            "score_breakdown": {
-              "job_growth": 35,
-              "salary_growth": 25,
-              "skill_demand": 21,
-              "industry_growth": 7
-            }
-          },
-          {
-            "role": "Automation Consultant",
-            "industry": "Operations",
-            "opportunity_score": 85,
-            "growth_trend": "Very High",
-            "average_salary": "₹18L",
-            "demand_score": 85,
-            "emerging_score": 80,
-            "is_emerging": true,
-            "required_skills": ["RPA Tools", "Process Mapping", "Python", "Business Analysis", "Change Management"],
-            "score_breakdown": {
-              "job_growth": 35,
-              "salary_growth": 25,
-              "skill_demand": 19,
-              "industry_growth": 6
-            }
-          },
-          {
-            "role": "Sustainability Manager",
-            "industry": "Consulting & Manufacturing",
-            "opportunity_score": 76,
-            "growth_trend": "High",
-            "average_salary": "₹16L",
-            "demand_score": 72,
-            "emerging_score": 85,
-            "is_emerging": true,
-            "required_skills": ["ESG Reporting", "Carbon Accounting", "Project Management", "Stakeholder Engagement", "Regulatory Compliance"],
-            "score_breakdown": {
-              "job_growth": 35,
-              "salary_growth": 18,
-              "skill_demand": 17,
-              "industry_growth": 6
-            }
-          },
-          {
-            "role": "Climate Risk Analyst",
-            "industry": "Finance & Insurance",
-            "opportunity_score": 73,
-            "growth_trend": "Emerging",
-            "average_salary": "₹18L",
-            "demand_score": 70,
-            "emerging_score": 82,
-            "is_emerging": true,
-            "required_skills": ["Risk Modelling", "ESG Frameworks", "Financial Analysis", "Python", "Data Visualization"],
-            "score_breakdown": {
-              "job_growth": 35,
-              "salary_growth": 22,
-              "skill_demand": 16,
-              "industry_growth": 0
-            }
+
+            "salary": {
+              "min": 2000000,
+              "max": 3000000,
+              "currency": "INR"
+            },
+
+            "required_skills": ["Python", "Docker"]
           }
         ],
-        "total": 5
+
+        "meta": {
+          "total": 5,
+          "limit": 5,
+          "generated_at": "ISO8601"
+        }
       }
     }
   },
 
-  "POST /api/v1/career/opportunity-radar/refresh": {
-    "description": "Admin-only: trigger signal refresh from LMI data",
-    "request": "POST /api/v1/career/opportunity-radar/refresh",
+  "POST /career/opportunity-radar/refresh": {
+    "description": "Admin-only refresh",
     "response": {
       "success": true,
       "data": {
-        "message": "Opportunity signals refreshed successfully",
+        "message": "Signals refreshed",
         "upserted": 18,
-        "total": 18,
         "duration_ms": 2341
       }
     }
   },
 
-  "scoring_formula_example": {
-    "description": "How opportunity_score is computed for 'Automation Consultant'",
-    "inputs": {
-      "growth_rate": 55,
-      "salary_growth_rate": 25,
-      "demand_score": 85,
-      "industry_growth": 40
-    },
-    "normalised": {
-      "job_growth_normalised":       55,
-      "salary_growth_normalised":    41,
-      "skill_demand_normalised":     85,
-      "industry_growth_normalised":  80
-    },
-    "weighted": {
-      "job_growth":      "0.35 × 55 = 19.25",
-      "salary_growth":   "0.25 × 41 = 10.25",
-      "skill_demand":    "0.25 × 85 = 21.25",
-      "industry_growth": "0.15 × 80 = 12.00"
-    },
-    "opportunity_score": 63,
-    "note": "Score is then rounded and capped at 99. Seed data has pre-calculated scores using known market values."
-  },
-
-  "match_score_example": {
-    "description": "How match_score is computed for user vs 'Operations Analyst'",
-    "user_skills": ["Excel", "Coordination", "Admin Management", "Communication", "Scheduling"],
-    "required_skills": ["Power BI", "SQL", "Process Optimization", "Excel", "Business Analysis", "Coordination"],
-    "direct_matches": ["Excel", "Coordination"],
-    "adjacent_matches": ["Admin Management (→ Business Analysis via SkillGraph)"],
-    "calculation": "(2 direct + 1×0.5 adjacent) / 6 required × 100 = 41.7% → boosted with profile context → 72",
-    "match_score": 72,
-    "skills_to_learn": ["Power BI", "SQL", "Process Optimization", "Business Analysis"]
+  "error_model": {
+    "success": false,
+    "error": {
+      "code": "ERROR_CODE",
+      "message": "Human readable message",
+      "retryable": true
+    }
   }
 }

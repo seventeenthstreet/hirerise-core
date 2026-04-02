@@ -1,11 +1,20 @@
-const { db, FieldValue } = require('../../../src/core/supabaseDbShim');
+'use strict';
+
+import { createClient } from '@supabase/supabase-js';
 import { publishEvent, EventTypes } from '../../../shared/pubsub/index.js';
 import { logger } from '../../../shared/logger/index.js';
 import { safeValidateEnvelope } from '../../../shared/validators/envelope.validator.js';
 import { claimEvent, releaseEvent } from '../../../shared/deduplication/index.js';
 import { ErrorCodes } from '../../../shared/errors/index.js';
 
+// ─── Supabase Admin (RLS BYPASS) ───────────────────────
 
+const supabaseAdmin = createClient(
+  process.env.SUPABASE_URL,
+  process.env.SUPABASE_SERVICE_ROLE_KEY
+);
+
+// ─── Templates ─────────────────────────────────────────
 
 const NOTIFICATION_TEMPLATES = {
   RESUME_SCORED: (data) => ({
@@ -14,12 +23,14 @@ const NOTIFICATION_TEMPLATES = {
     actionUrl: `/dashboard/resume/${data.resumeId}`,
     channels: ['in_app', 'push'],
   }),
+
   SALARY_READY: (data) => ({
     title: 'Salary benchmark ready',
     body: `Median salary: $${(data.salaryMedian ?? 0).toLocaleString()}`,
     actionUrl: `/dashboard/salary/${data.jobId}`,
     channels: ['in_app', 'push'],
   }),
+
   JOB_FAILED: (data) => ({
     title: 'Processing error',
     body: `A processing error occurred (${data.errorCode}). Please try again.`,
@@ -27,9 +38,6 @@ const NOTIFICATION_TEMPLATES = {
     channels: ['in_app'],
   }),
 
-  // PROMPT-2: fired by onboarding.service.js saveDraft() after 24h if user
-  // has not progressed past the draft step.
-  // data: { actionUrl, message } — both optional, sensible defaults below.
   ONBOARDING_DRAFT_REENGAGEMENT: (data) => ({
     title: 'Your career profile is waiting',
     body: data.message || 'Complete your profile to unlock your Career Health Score.',
@@ -38,8 +46,9 @@ const NOTIFICATION_TEMPLATES = {
   }),
 };
 
-export async function handleNotificationRequested(envelope, message) {
+// ─── Main Handler ─────────────────────────────────────
 
+export async function handleNotificationRequested(envelope, message) {
   const validated = safeValidateEnvelope(envelope, EventTypes.NOTIFICATION_REQUESTED);
   if (!validated) return;
 
@@ -55,19 +64,23 @@ export async function handleNotificationRequested(envelope, message) {
     deliveryAttempt: message.deliveryAttempt,
   });
 
-  // ─────────────────────────────────────────────
-  // Dedup
-  // ─────────────────────────────────────────────
+  if (!userId) {
+    childLogger.warn('Missing userId — skipping notification');
+    return;
+  }
+
+  // ─── Dedup ─────────────────────────────────────────
 
   const { claimed } = await claimEvent(eventId, { userId, notificationType });
+
   if (!claimed) {
     childLogger.info('Duplicate notification — skipped');
     return;
   }
 
   try {
-
     const templateFn = NOTIFICATION_TEMPLATES[notificationType];
+
     if (!templateFn) {
       childLogger.warn('No template for notification type');
       return;
@@ -76,46 +89,47 @@ export async function handleNotificationRequested(envelope, message) {
     const template = templateFn(data);
     const notificationId = `${userId}_${eventId}`;
 
-    // ─────────────────────────────────────────
-    // Write notification (idempotent)
-    // ─────────────────────────────────────────
+    // ─── Insert Notification ─────────────────────────
 
-    await db.collection('notifications').doc(notificationId).set({
-      notificationId,
-      userId,
-      notificationType,
-      title: template.title,
-      body: template.body,
-      actionUrl: template.actionUrl,
-      data,
-      read: false,
-      channels: template.channels,
-      createdAt: FieldValue.serverTimestamp(),
-      expiresAt: getExpiresAt(30),
-      deliveryStatus: {
-        in_app: 'delivered',
-        push: 'pending',
-      },
-    }, { merge: false });
+    const { error: insertError } = await supabaseAdmin
+      .from('notifications')
+      .insert({
+        id: notificationId,
+        user_id: userId,
+        notification_type: notificationType,
+        title: template.title,
+        body: template.body,
+        action_url: template.actionUrl,
+        data,
+        read: false,
+        channels: template.channels,
+        created_at: new Date().toISOString(),
+        expires_at: getExpiresAt(30),
+        delivery_status: {
+          in_app: 'delivered',
+          push: 'pending',
+        },
+      })
+      .select();
+
+    if (insertError) {
+      childLogger.error('Notification insert failed', insertError);
+      throw insertError;
+    }
 
     childLogger.info('Notification saved');
 
-    // ─────────────────────────────────────────
-    // Push delivery
-    // ─────────────────────────────────────────
+    // ─── Push Delivery ───────────────────────────────
 
     if (template.channels.includes('push')) {
       await deliverPushNotification(userId, template, notificationId, childLogger);
     }
 
   } catch (err) {
-
     childLogger.error('Notification processing failed', { err });
 
-    // 🔥 CRITICAL FIX: release dedup on retryable errors
-    await releaseEvent(eventId);
-
-    throw err; // nack
+    await releaseEvent(eventId); // allow retry
+    throw err;
   }
 }
 
@@ -125,52 +139,97 @@ export async function handleNotificationRequested(envelope, message) {
 
 async function deliverPushNotification(userId, template, notificationId, logger) {
 
-  const deliveryRef = db.collection('notificationDelivery')
-    .doc(`${notificationId}_push`);
+  // Check existing delivery status
+  const { data: existing, error: fetchError } = await supabaseAdmin
+    .from('notification_delivery')
+    .select('*')
+    .eq('id', `${notificationId}_push`)
+    .maybeSingle();
 
-  const deliverySnap = await deliveryRef.get();
+  if (fetchError) {
+    logger.error('Delivery fetch error', fetchError);
+    throw fetchError;
+  }
 
-  if (deliverySnap.exists && deliverySnap.data().status === 'sent') {
+  if (existing?.status === 'sent') {
     logger.info('Push already sent — skipping');
     return;
   }
 
   try {
+    // Fetch FCM token
+    const { data: tokenRow, error: tokenError } = await supabaseAdmin
+      .from('user_fcm_tokens')
+      .select('token')
+      .eq('user_id', userId)
+      .limit(1)
+      .maybeSingle();
 
-    const tokenSnap = await db.collection('userFcmTokens').doc(userId).get();
-    const fcmToken = tokenSnap.exists ? tokenSnap.data().token : null;
+    if (tokenError) {
+      logger.error('Token fetch error', tokenError);
+      throw tokenError;
+    }
+
+    const fcmToken = tokenRow?.token;
 
     if (!fcmToken) {
       logger.info('No FCM token — skipping push');
-      await deliveryRef.set({
-        status: 'no_token',
-        attemptedAt: FieldValue.serverTimestamp(),
-      });
+
+      await supabaseAdmin
+        .from('notification_delivery')
+        .upsert({
+          id: `${notificationId}_push`,
+          status: 'no_token',
+          attempted_at: new Date().toISOString(),
+        });
+
       return;
     }
 
+    // Simulate push send
     await simulateFcmSend(fcmToken);
 
-    await deliveryRef.set({
-      status: 'sent',
-      sentAt: FieldValue.serverTimestamp(),
-    });
-
-    await db.collection('notifications').doc(notificationId)
-      .update({
-        'deliveryStatus.push': 'delivered',
-        pushDeliveredAt: FieldValue.serverTimestamp(),
+    // Mark push sent
+    await supabaseAdmin
+      .from('notification_delivery')
+      .upsert({
+        id: `${notificationId}_push`,
+        status: 'sent',
+        sent_at: new Date().toISOString(),
       });
+
+    // ─── FIX: Merge JSON instead of overwrite ─────────
+
+    const { data: existingNotif } = await supabaseAdmin
+      .from('notifications')
+      .select('delivery_status')
+      .eq('id', notificationId)
+      .single();
+
+    const updatedStatus = {
+      ...(existingNotif?.delivery_status || {}),
+      push: 'delivered',
+    };
+
+    await supabaseAdmin
+      .from('notifications')
+      .update({
+        delivery_status: updatedStatus,
+        push_delivered_at: new Date().toISOString(),
+      })
+      .eq('id', notificationId);
 
     logger.info('Push delivered');
 
   } catch (err) {
-
     logger.error('Push failed', { err });
-
-    throw err; // handled by outer catch (dedup release)
+    throw err;
   }
 }
+
+// ─────────────────────────────────────────────
+// Helpers
+// ─────────────────────────────────────────────
 
 function simulateFcmSend() {
   return new Promise(res => setTimeout(res, 10));
@@ -179,5 +238,5 @@ function simulateFcmSend() {
 function getExpiresAt(days) {
   const d = new Date();
   d.setDate(d.getDate() + days);
-  return d;
+  return d.toISOString();
 }

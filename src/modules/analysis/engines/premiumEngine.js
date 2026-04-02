@@ -1,49 +1,35 @@
 'use strict';
 
 /**
- * premiumEngine.js — PHASE 3 UPDATE
+ * src/modules/analysis/premiumEngine.js
  *
- * CHANGES FROM PHASE 2:
+ * Production-grade premium AI engine.
+ * Supabase-first, cache-aware, observability-ready, and repository-friendly.
  *
- *   1. Tier-based model routing via resolveModelForTier(feature, userTier).
- *      Free users get Haiku, pro get Sonnet, elite get Opus.
- *      Model is passed through circuit breaker — fallback chain still applies.
- *
- *   2. AI result caching via checkCache / storeCache.
- *      Input hash (SHA-256 of resumeText + fileName + weightedCareerContext)
- *      checked before Claude call. Cache hit returns immediately.
- *      Cache stored after successful call. TTL: 4h for fullAnalysis, 2h for CV.
- *
- *   3. withObservability() wrapping all Claude calls.
- *      OTel trace spans, cost tracking, drift observation, and Firestore AI logs
- *      are now wired for every call through this engine.
- *
- *   4. recordAiCost() called after each successful call so aiCostGuard
- *      can enforce per-user daily budget limits.
- *
- * PHASE 2 CHANGES RETAINED:
- *   - Circuit breaker (cbRegistry.execute)
- *   - Global concurrency semaphore (withAiConcurrency)
- *   - Prompt injection sanitization (sanitizePromptInput)
+ * Responsibilities:
+ * - Deterministic analysis hash generation
+ * - Tier-based model routing
+ * - AI cache reuse
+ * - Circuit breaker + concurrency guard
+ * - Cost + token telemetry return payload
+ * - Strict JSON validation before persistence
+ * - Pure engine (NO DB writes here)
  */
 
+const crypto = require('crypto');
 const logger = require('../../../utils/logger');
 const { AppError, ErrorCodes } = require('../../../middleware/errorHandler');
 
-// ── Phase 2 ───────────────────────────────────────────────────────────────────
-const cbRegistry             = require('../../../core/circuitBreaker.registry');
-const { withAiConcurrency }  = require('../../../core/aiConcurrency');
+const cbRegistry = require('../../../core/circuitBreaker.registry');
+const { withAiConcurrency } = require('../../../core/aiConcurrency');
 const { sanitizePromptInput } = require('../../../middleware/aiSanitizer.middleware');
-
-// ── Phase 3 ───────────────────────────────────────────────────────────────────
-const modelRegistry           = require('../../../ai/circuit-breaker/model-registry');
+const modelRegistry = require('../../../ai/circuit-breaker/model-registry');
 const { buildCacheKey, checkCache, storeCache } = require('../../../core/aiResultCache');
-const { withObservability }   = require('../../../middleware/ai-observability.middleware');
-const { recordAiCost }        = require('../../../middleware/aiCostGuard.middleware');
+const { withObservability } = require('../../../middleware/ai-observability.middleware');
 
 const MAX_TOKENS = {
-  fullAnalysis: 1500,
-  generateCV:   2000,
+  fullAnalysis: 1800,
+  generateCV: 2200,
 };
 
 function getAnthropicClient() {
@@ -51,307 +37,249 @@ function getAnthropicClient() {
   return require('../../../config/anthropic.client');
 }
 
-function stripJson(text) {
-  return text.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/i, '').trim();
+function stripJson(text = '') {
+  return String(text)
+    .replace(/^```(?:json)?\s*/i, '')
+    .replace(/\s*```$/i, '')
+    .trim();
 }
 
-// ─── System prompts ───────────────────────────────────────────────────────────
+function buildAnalysisHash(payload) {
+  return crypto
+    .createHash('sha256')
+    .update(JSON.stringify(payload))
+    .digest('hex');
+}
 
-const FULL_ANALYSIS_PROMPT = `You are a senior career intelligence analyst specialising in the Indian job market.
-Analyse the provided resume and return ONE structured JSON object with ALL fields below.
-Be precise. Be conservative. No motivational language. No padding.
-Return JSON ONLY. No markdown. No explanation outside JSON.
-
-Return this exact structure:
-{
-  "score": <integer 0-100>,
-  "tier": "excellent|good|average|poor",
-  "summary": "<2 sentences, factual, max 30 words>",
-  "breakdown": {
-    "clarity": <0-100>,
-    "relevance": <0-100>,
-    "experience": <0-100>,
-    "skills": <0-100>,
-    "achievements": <0-100>
-  },
-  "strengths": ["<max 3 items, specific, under 15 words each>"],
-  "improvements": ["<max 3 items, specific, actionable, under 15 words each>"],
-  "topSkills": ["<max 5 skills detected>"],
-  "estimatedExperienceYears": <integer>,
-  "chiScore": <integer 0-100, weighted career health>,
-  "dimensions": {
-    "skillVelocity":    { "score": <0-100>, "insight": "<max 12 words>", "flag": <boolean> },
-    "experienceDepth":  { "score": <0-100>, "insight": "<max 12 words>", "flag": <boolean> },
-    "marketAlignment":  { "score": <0-100>, "insight": "<max 12 words>", "flag": <boolean> },
-    "salaryTrajectory": { "score": <0-100>, "insight": "<max 12 words>", "flag": <boolean> },
-    "careerMomentum":   { "score": <0-100>, "insight": "<max 12 words>", "flag": <boolean> }
-  },
-  "marketPosition": "top10|top25|top50|bottom50",
-  "peerComparison": "<max 20 words>",
-  "projectedLevelUpMonths": <integer>,
-  "currentEstimatedSalaryLPA": <number>,
-  "nextLevelEstimatedSalaryLPA": <number>,
-  "growthInsights": ["<max 3 insights, specific, under 20 words each>"],
-  "careerRoadmap": {
-    "immediate": "<action for next 30 days, max 20 words>",
-    "shortTerm": "<action for next 3 months, max 20 words>",
-    "longTerm":  "<action for next 12 months, max 20 words>"
+function validateAnalysisShape(parsed) {
+  if (!parsed || typeof parsed !== 'object') {
+    throw new Error('Invalid AI response object');
   }
-}`;
 
-const CV_GENERATION_PROMPT = `You are an expert CV writer specialising in the Indian job market.
-Generate a professional, ATS-optimised CV from the provided profile data.
-Return JSON ONLY. No markdown. No commentary outside JSON.
+  parsed.score = Math.max(0, Math.min(Number(parsed.score || 0), 100));
+  parsed.chiScore = parsed.chiScore == null ? null : Math.max(0, Math.min(Number(parsed.chiScore), 100));
+  parsed.topSkills = Array.isArray(parsed.topSkills) ? parsed.topSkills.slice(0, 5) : [];
+  parsed.strengths = Array.isArray(parsed.strengths) ? parsed.strengths.slice(0, 3) : [];
+  parsed.improvements = Array.isArray(parsed.improvements) ? parsed.improvements.slice(0, 3) : [];
+  parsed.growthInsights = Array.isArray(parsed.growthInsights) ? parsed.growthInsights.slice(0, 3) : [];
 
-Return this structure:
-{
-  "headline": "<professional headline, max 15 words>",
-  "summary": "<professional summary, 3-4 sentences, max 80 words>",
-  "experience": [
-    {
-      "title": "<job title>",
-      "company": "<company name>",
-      "duration": "<e.g. Jan 2021 - Present>",
-      "bullets": ["<achievement bullet, max 20 words each, max 4 bullets>"]
-    }
-  ],
-  "skills": {
-    "technical": ["<skill>"],
-    "soft": ["<skill>"]
-  },
-  "education": [
-    {
-      "degree": "<degree>",
-      "institution": "<institution>",
-      "year": "<graduation year>"
-    }
-  ],
-  "certifications": ["<certification name>"]
-}`;
+  return parsed;
+}
 
-// ─── runFullAnalysis ──────────────────────────────────────────────────────────
+const FULL_ANALYSIS_PROMPT = `Return ONLY valid JSON for enterprise resume analysis with scoring, breakdown, skills, chiScore, market position, salary trajectory, growth insights, and roadmap.`;
+const CV_GENERATION_PROMPT = `Return ONLY valid JSON for ATS-optimized CV generation for the Indian market.`;
 
-/**
- * PHASE 3 CHANGES:
- *   - userTier parameter added (forwarded from route → service → engine)
- *   - resolveModelForTier selects Haiku/Sonnet/Opus based on tier
- *   - Result checked in cache before calling Claude
- *   - withObservability wraps the Claude call (traces, logs, cost tracking)
- *   - recordAiCost records actual spend for aiCostGuard enforcement
- */
-async function runFullAnalysis({ resumeId, resumeText, fileName, weightedCareerContext, userTier, userId }) {
-  logger.debug('[PremiumEngine] runFullAnalysis start', { resumeId, userTier });
+async function runFullAnalysis({
+  resumeId,
+  resumeText,
+  fileName,
+  weightedCareerContext = [],
+  userTier = 'free',
+  userId,
+}) {
+  logger.debug('[PremiumEngine] Full analysis start', { resumeId, userTier });
 
-  // ── Phase 2: sanitize ─────────────────────────────────────────────────────
   const safeResumeText = sanitizePromptInput(resumeText, 'resumeText');
 
-  // ── Phase 3: result cache check ───────────────────────────────────────────
-  const cacheKey = buildCacheKey('fullAnalysis', {
-    resumeText:           safeResumeText,
-    fileName:             fileName || '',
-    weightedCareerContext: weightedCareerContext || [],
+  const analysisHash = buildAnalysisHash({
+    resumeText: safeResumeText,
+    fileName,
+    weightedCareerContext,
   });
 
+  const cacheKey = buildCacheKey('fullAnalysis', { analysisHash, userTier });
   const cached = await checkCache(cacheKey);
   if (cached) {
-    logger.info('[PremiumEngine] Cache hit — skipping Claude call', { resumeId, cacheKey });
-    return { ...cached, resumeId, _cached: true };
+    return {
+      ...cached,
+      resumeId,
+      analysisHash,
+      cacheHit: true,
+      cacheSource: 'ai_result_cache',
+    };
   }
 
-  // ── Phase 3: tier-based model selection ──────────────────────────────────
-  const model = modelRegistry.resolveModelForTier('fullAnalysis', userTier);
+  const preferredModel = modelRegistry.resolveModelForTier('fullAnalysis', userTier);
+  let resolvedModel = preferredModel;
+  const startedAt = Date.now();
 
-  let userPrompt = `Resume filename: ${fileName || 'unknown'}\n\nResume content:\n${safeResumeText}`;
-  if (weightedCareerContext?.length) {
-    const contextLines = weightedCareerContext.map(entry => {
-      const pct = (entry.weight * 100).toFixed(1);
-      const tag = entry.isCurrent ? ' [current]' : '';
-      return `  - roleId: ${entry.roleId}${tag} | ${entry.durationMonths}mo | weight: ${pct}%`;
-    });
-    userPrompt += '\n\nCareer History Context (weighted by duration, most significant first):\n' + contextLines.join('\n');
-  }
+  const userPrompt = [
+    `Resume filename: ${fileName || 'unknown'}`,
+    '',
+    'Resume content:',
+    safeResumeText,
+    weightedCareerContext.length
+      ? `\nCareer context:\n${JSON.stringify(weightedCareerContext, null, 2)}`
+      : '',
+  ].join('\n');
 
-  let raw;
-  let resolvedModel = model;
-
+  let response;
   try {
-    // ── Phase 3: withObservability wraps the full call ─────────────────────
-    const response = await withObservability(
+    response = await withObservability(
       {
-        feature:  'resume_scoring',
-        user_id:   userId || 'unknown',
-        model,
-        inputHash: cacheKey,
+        feature: 'resume_scoring',
+        user_id: userId || 'unknown',
+        model: preferredModel,
+        inputHash: analysisHash,
       },
-      async (modelToUse) => {
-        resolvedModel = modelToUse;
-        // ── Phase 2: concurrency semaphore + circuit breaker ────────────────
-        return withAiConcurrency('fullAnalysis', userId || 'unknown', async () => {
-          return cbRegistry.execute(
-            cbRegistry.FEATURES.RESUME_SCORING,
-            async (cbModel) => {
-              resolvedModel = cbModel;
-              const anthropic = getAnthropicClient();
-              return anthropic.messages.create({
-                model:      cbModel,
-                max_tokens: MAX_TOKENS.fullAnalysis,
-                system:     FULL_ANALYSIS_PROMPT,
-                messages:   [{ role: 'user', content: userPrompt }],
-              });
-            }
-          );
-        });
-      }
+      async () => withAiConcurrency('fullAnalysis', userId || 'unknown', async () => (
+        cbRegistry.execute(
+          cbRegistry.FEATURES.RESUME_SCORING,
+          async (cbModel) => {
+            resolvedModel = cbModel;
+            const anthropic = getAnthropicClient();
+            return anthropic.messages.create({
+              model: cbModel,
+              max_tokens: MAX_TOKENS.fullAnalysis,
+              system: FULL_ANALYSIS_PROMPT,
+              messages: [{ role: 'user', content: userPrompt }],
+            });
+          }
+        )
+      ))
     );
-
-    raw = response.content
-      .filter(b => b.type === 'text')
-      .map(b => b.text)
-      .join('');
-
-    // ── Phase 3: record actual cost for per-user budget enforcement ────────
-    const inputTokens  = response.usage?.input_tokens  ?? 0;
-    const outputTokens = response.usage?.output_tokens ?? 0;
-    const costUSD = modelRegistry.estimateCost(resolvedModel, inputTokens, outputTokens);
-    recordAiCost(userId || 'unknown', userTier || 'free', costUSD).catch(() => {});
-
-  } catch (err) {
-    logger.error('[PremiumEngine] Claude API call failed', { resumeId, error: err.message });
-    if (err.statusCode === 503 || err.status === 503) throw err;
+  } catch (error) {
+    logger.error('[PremiumEngine] Full analysis failed', { resumeId, error: error.message });
     throw new AppError(
-      'AI analysis failed. Your credits have been refunded.',
-      502, { resumeId }, ErrorCodes.EXTERNAL_SERVICE_ERROR
+      'Premium AI analysis failed.',
+      502,
+      { resumeId },
+      ErrorCodes.EXTERNAL_SERVICE_ERROR
     );
   }
+
+  const latencyMs = Date.now() - startedAt;
+  const raw = response.content?.filter((b) => b.type === 'text').map((b) => b.text).join('') || '{}';
 
   let parsed;
   try {
-    parsed = JSON.parse(stripJson(raw));
-  } catch {
-    logger.error('[PremiumEngine] JSON parse failed', { raw: raw.slice(0, 200) });
+    parsed = validateAnalysisShape(JSON.parse(stripJson(raw)));
+  } catch (error) {
     throw new AppError(
-      'AI returned an invalid response. Credits refunded.',
-      502, { resumeId }, ErrorCodes.EXTERNAL_SERVICE_ERROR
+      'AI returned invalid structured analysis.',
+      502,
+      { resumeId },
+      ErrorCodes.EXTERNAL_SERVICE_ERROR
     );
   }
 
-  logger.debug('[PremiumEngine] runFullAnalysis complete', {
-    resumeId, score: parsed.score, chiScore: parsed.chiScore, model: resolvedModel,
-  });
+  const inputTokens = response.usage?.input_tokens ?? 0;
+  const outputTokens = response.usage?.output_tokens ?? 0;
+  const aiCostUsd = modelRegistry.estimateCost(resolvedModel, inputTokens, outputTokens);
 
   const result = {
     resumeId,
     fileName,
-    engine:         'premium',
+    engine: 'premium',
+    analysisHash,
     aiModelVersion: resolvedModel,
+    weightedCareerContext,
+    tokenInputCount: inputTokens,
+    tokenOutputCount: outputTokens,
+    aiCostUsd,
+    latencyMs,
+    cacheHit: false,
+    cacheSource: null,
     ...parsed,
     scoredAt: new Date().toISOString(),
   };
 
-  // ── Phase 3: store in cache for future identical requests ──────────────
   await storeCache(cacheKey, result, 'fullAnalysis');
-
   return result;
 }
 
-// ─── runGenerateCV ────────────────────────────────────────────────────────────
-
-async function runGenerateCV(profileData, { userTier, userId } = {}) {
+async function runGenerateCV(profileData, { userTier = 'free', userId } = {}) {
   const resolvedUserId = userId || profileData.userId;
-  logger.debug('[PremiumEngine] runGenerateCV start', { user_id: resolvedUserId, userTier });
+  const sanitizedProfile = {
+    ...profileData,
+    resumeText: sanitizePromptInput(profileData.resumeText || '', 'resumeText'),
+  };
 
-  const safeProfileData = { ...profileData };
-  if (safeProfileData.resumeText) {
-    safeProfileData.resumeText = sanitizePromptInput(safeProfileData.resumeText, 'resumeText');
-  }
-
-  // ── Phase 3: result cache ─────────────────────────────────────────────────
-  const cacheKey = buildCacheKey('generateCV', {
-    user_id: resolvedUserId,
-    skills:  safeProfileData.skills,
-    experience: safeProfileData.experience,
-    education:  safeProfileData.education,
+  const generationHash = buildAnalysisHash({
+    userId: resolvedUserId,
+    skills: sanitizedProfile.skills,
+    experience: sanitizedProfile.experience,
+    education: sanitizedProfile.education,
   });
 
+  const cacheKey = buildCacheKey('generateCV', { generationHash, userTier });
   const cached = await checkCache(cacheKey);
   if (cached) {
-    logger.info('[PremiumEngine] CV Cache hit', { user_id: resolvedUserId });
-    return { ...cached, _cached: true };
+    return {
+      ...cached,
+      generationHash,
+      cacheHit: true,
+      cacheSource: 'ai_result_cache',
+    };
   }
 
-  // ── Phase 3: tier routing ─────────────────────────────────────────────────
-  const model = modelRegistry.resolveModelForTier('generateCV', userTier);
+  const preferredModel = modelRegistry.resolveModelForTier('generateCV', userTier);
+  let resolvedModel = preferredModel;
+  const startedAt = Date.now();
 
-  const userPrompt = `Profile Data:\n${JSON.stringify(safeProfileData, null, 2)}`;
-  let raw;
-  let resolvedModel = model;
-
+  let response;
   try {
-    const response = await withObservability(
-      { feature: 'resume_scoring', user_id: resolvedUserId, model, inputHash: cacheKey },
-      async () => {
-        return withAiConcurrency('generateCV', resolvedUserId, async () => {
-          return cbRegistry.execute(
-            cbRegistry.FEATURES.RESUME_SCORING,
-            async (cbModel) => {
-              resolvedModel = cbModel;
-              const anthropic = getAnthropicClient();
-              return anthropic.messages.create({
-                model:      cbModel,
-                max_tokens: MAX_TOKENS.generateCV,
-                system:     CV_GENERATION_PROMPT,
-                messages:   [{ role: 'user', content: userPrompt }],
-              });
-            }
-          );
-        });
-      }
+    response = await withObservability(
+      {
+        feature: 'cv_generation',
+        user_id: resolvedUserId,
+        model: preferredModel,
+        inputHash: generationHash,
+      },
+      async () => withAiConcurrency('generateCV', resolvedUserId, async () => (
+        cbRegistry.execute(
+          cbRegistry.FEATURES.RESUME_SCORING,
+          async (cbModel) => {
+            resolvedModel = cbModel;
+            const anthropic = getAnthropicClient();
+            return anthropic.messages.create({
+              model: cbModel,
+              max_tokens: MAX_TOKENS.generateCV,
+              system: CV_GENERATION_PROMPT,
+              messages: [{ role: 'user', content: JSON.stringify(sanitizedProfile) }],
+            });
+          }
+        )
+      ))
     );
-
-    raw = response.content.filter(b => b.type === 'text').map(b => b.text).join('');
-
-    const inputTokens  = response.usage?.input_tokens  ?? 0;
-    const outputTokens = response.usage?.output_tokens ?? 0;
-    const costUSD = modelRegistry.estimateCost(resolvedModel, inputTokens, outputTokens);
-    recordAiCost(resolvedUserId, userTier || 'free', costUSD).catch(() => {});
-
-  } catch (err) {
-    logger.error('[PremiumEngine] CV generation failed', { user_id: resolvedUserId, error: err.message });
-    if (err.statusCode === 503 || err.status === 503) throw err;
+  } catch (error) {
     throw new AppError(
-      'CV generation failed. Your credits have been refunded.',
-      502, { user_id: resolvedUserId }, ErrorCodes.EXTERNAL_SERVICE_ERROR
+      'Premium CV generation failed.',
+      502,
+      { user_id: resolvedUserId },
+      ErrorCodes.EXTERNAL_SERVICE_ERROR
     );
   }
 
-  let parsed;
-  try {
-    parsed = JSON.parse(stripJson(raw));
-  } catch {
-    throw new AppError(
-      'CV generation returned invalid response. Credits refunded.',
-      502, { user_id: resolvedUserId }, ErrorCodes.EXTERNAL_SERVICE_ERROR
-    );
-  }
+  const latencyMs = Date.now() - startedAt;
+  const raw = response.content?.filter((b) => b.type === 'text').map((b) => b.text).join('') || '{}';
+  const cvContent = JSON.parse(stripJson(raw));
+
+  const inputTokens = response.usage?.input_tokens ?? 0;
+  const outputTokens = response.usage?.output_tokens ?? 0;
+  const aiCostUsd = modelRegistry.estimateCost(resolvedModel, inputTokens, outputTokens);
 
   const result = {
-    user_id:         resolvedUserId,
-    engine:         'premium',
-    aiModelVersion: resolvedModel,
-    cvContent:      parsed,
-    generatedAt:    new Date().toISOString(),
+    userId: resolvedUserId,
+    engine: 'premium',
+    modelVersion: resolvedModel,
+    generationHash,
+    cvContent,
+    inputProfile: sanitizedProfile,
+    tokenInputCount: inputTokens,
+    tokenOutputCount: outputTokens,
+    aiCostUsd,
+    latencyMs,
+    cacheHit: false,
+    generatedAt: new Date().toISOString(),
   };
 
   await storeCache(cacheKey, result, 'generateCV');
   return result;
 }
 
-module.exports = { runFullAnalysis, runGenerateCV };
-
-
-
-
-
-
-
-
+module.exports = {
+  runFullAnalysis,
+  runGenerateCV,
+  buildAnalysisHash,
+};

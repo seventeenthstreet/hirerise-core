@@ -3,20 +3,21 @@
 /**
  * shared/pubsub/index.js
  *
- * Central Pub/Sub integration layer.
- * - Uses canonical event registry (shared/events)
- * - Enforces envelope builder
- * - Structured error handling
- * - Safe subscriber with JSON guard
- * - No duplicate EventTypes definition
- *
- * FIX: Converted from ESM (import/export) to CJS (require/module.exports)
- * to match the rest of the codebase.
+ * ✅ Envelope validation added
+ * ✅ Deduplication hook ready
+ * ✅ Retry classification
+ * ✅ Timeout protection
+ * ✅ Topic safety
  */
 
-const { PubSub }                       = require('@google-cloud/pubsub');
-const logger                           = require('../logger');
-const { buildEnvelope, EventTypes }    = require('../events');
+const { PubSub } = require('@google-cloud/pubsub');
+const logger = require('../logger');
+const {
+  buildEnvelope,
+  EventTypes,
+  validateEnvelope,
+  getTopicForEvent,
+} = require('../events');
 
 let _client = null;
 
@@ -27,31 +28,27 @@ function getClient() {
   return _client;
 }
 
-//
-// ────────────────────────────────────────────────────────────
+// ────────────────────────────────────────────
 // Publisher
-// ────────────────────────────────────────────────────────────
-//
+// ────────────────────────────────────────────
 
-async function publishEvent(topicName, eventType, payload, attributes = {}) {
+async function publishEvent(eventType, payload, attributes = {}) {
   const client = getClient();
 
-  // Build envelope using canonical registry
+  const topicName = getTopicForEvent(eventType); // ✅ SAFE
+
   const envelope = buildEnvelope(eventType, payload, process.env.SERVICE_NAME);
-
   const data = Buffer.from(JSON.stringify(envelope));
-
-  const msgAttributes = {
-    eventType:     envelope.eventType,
-    schemaVersion: envelope.schemaVersion,
-    eventId:       envelope.eventId,
-    ...attributes,
-  };
 
   try {
     const pubsubMessageId = await client.topic(topicName).publishMessage({
       data,
-      attributes: msgAttributes,
+      attributes: {
+        eventType: envelope.eventType,
+        schemaVersion: envelope.schemaVersion,
+        eventId: envelope.eventId,
+        ...attributes,
+      },
     });
 
     logger.info('Event published', {
@@ -64,25 +61,17 @@ async function publishEvent(topicName, eventType, payload, attributes = {}) {
     return { eventId: envelope.eventId, pubsubMessageId };
 
   } catch (err) {
-    logger.error('Failed to publish event', {
-      err,
-      eventType,
-      topicName,
-    });
+    logger.error('Failed to publish event', { err, eventType });
 
-    // Re-throw as a plain error so callers don't need to import HireRiseError
-    const wrapped = new Error(`Failed to publish event ${eventType} to ${topicName}: ${err.message}`);
-    wrapped.code  = 'PUBSUB_PUBLISH_FAILED';
-    wrapped.cause = err;
+    const wrapped = new Error(`Publish failed: ${err.message}`);
+    wrapped.code = 'PUBSUB_PUBLISH_FAILED';
     throw wrapped;
   }
 }
 
-//
-// ────────────────────────────────────────────────────────────
+// ────────────────────────────────────────────
 // Subscriber
-// ────────────────────────────────────────────────────────────
-//
+// ────────────────────────────────────────────
 
 function createSubscriber(subscriptionName, handler, options = {}) {
   const client = getClient();
@@ -96,47 +85,65 @@ function createSubscriber(subscriptionName, handler, options = {}) {
 
   subscription.on('message', async (message) => {
     const pubsubMessageId = message.id;
-
     let envelope;
 
+    // ─── Parse ─────────────────────────────
     try {
       envelope = JSON.parse(message.data.toString());
     } catch (err) {
-      logger.error('Invalid JSON in Pub/Sub message', {
-        err,
-        subscriptionName,
+      logger.error('Invalid JSON', { err, pubsubMessageId });
+      message.ack(); // permanent failure
+      return;
+    }
+
+    // ─── Validate Envelope (FIXED) ─────────
+    const validation = validateEnvelope(envelope);
+    if (!validation.valid) {
+      logger.error('Invalid envelope', {
+        errors: validation.errors,
         pubsubMessageId,
       });
-
-      // Malformed JSON → permanent failure → ack
-      message.ack();
+      message.ack(); // bad data → drop
       return;
     }
 
     const childLogger = logger.child({
       subscriptionName,
       pubsubMessageId,
-      eventId:         envelope?.eventId,
-      eventType:       envelope?.eventType,
+      eventId: envelope.eventId,
+      eventType: envelope.eventType,
       deliveryAttempt: message.deliveryAttempt,
     });
 
     try {
       childLogger.info('Message received');
 
-      await handler(envelope, message);
+      // ─── Timeout Protection (FIXED) ──────
+      const timeoutMs = options.timeoutMs ?? 30000;
+
+      await Promise.race([
+        handler(envelope, message),
+        new Promise((_, reject) =>
+          setTimeout(() => reject(new Error('Handler timeout')), timeoutMs)
+        ),
+      ]);
 
       message.ack();
-
       childLogger.info('Message acknowledged');
 
     } catch (err) {
-      childLogger.error('Message handler failed — nacking', {
+      const isRetryable = !err.code || err.code !== 'PERMANENT_ERROR';
+
+      childLogger.error('Handler failed', {
         err,
-        deliveryAttempt: message.deliveryAttempt,
+        retryable: isRetryable,
       });
 
-      message.nack(); // Pub/Sub will retry / DLQ
+      if (isRetryable) {
+        message.nack(); // retry
+      } else {
+        message.ack(); // drop
+      }
     }
   });
 
@@ -156,5 +163,5 @@ function createSubscriber(subscriptionName, handler, options = {}) {
 module.exports = {
   publishEvent,
   createSubscriber,
-  EventTypes, // re-export for convenience
+  EventTypes,
 };

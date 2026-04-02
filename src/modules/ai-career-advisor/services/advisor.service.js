@@ -1,26 +1,52 @@
 'use strict';
 
 /**
- * services/advisor.service.js (Supabase version)
+ * @file src/modules/ai-career-advisor/services/advisor.service.js
+ * @description
+ * Production-grade AI Career Advisor service.
+ *
+ * Optimized for:
+ * - Supabase row-safe retrieval
+ * - lower prompt token cost
+ * - dynamic response sizing
+ * - non-blocking persistence
+ * - future abort propagation
  */
 
-const logger    = require('../../../utils/logger');
+const logger = require('../../../utils/logger');
 const anthropic = require('../../../config/anthropic.client');
-const supabase  = require('../../../config/supabase');
+const { supabase } = require('../../../config/supabase');
 
 const { COLLECTIONS } = require('../../education-intelligence/models/student.model');
 const marketTrendService = require('../../labor-market-intelligence/services/marketTrend.service');
-const { buildSystemPrompt, buildConversationMessages } = require('../prompts/advisorPrompt.builder');
-const { CONVERSATIONS_COLLECTION, buildConversationDoc } = require('../models/conversation.model');
+const {
+  buildSystemPrompt,
+  buildConversationMessages,
+} = require('../prompts/advisorPrompt.builder');
+const {
+  CONVERSATIONS_COLLECTION,
+  buildConversationDoc,
+} = require('../models/conversation.model');
 
-// ─── Config ─────────────────────────────────────────────
+const MODEL = 'claude-sonnet-4-20250514';
+const HISTORY_LIMIT = 6;
 
-const MODEL         = 'claude-sonnet-4-20250514';
-const MAX_TOKENS    = 1024;
-const HISTORY_LIMIT = 20;
+// ─────────────────────────────────────────────────────────────────────────────
+// Token sizing
+// ─────────────────────────────────────────────────────────────────────────────
+function getMaxTokens(message) {
+  const text = String(message || '').toLowerCase();
 
-// ─── Data loaders ───────────────────────────────────────
+  if (text.includes('salary') || text.includes('roi')) return 320;
+  if (text.includes('career path') || text.includes('roadmap')) return 600;
+  if (text.includes('stream') || text.includes('subject')) return 400;
 
+  return 450;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Student context
+// ─────────────────────────────────────────────────────────────────────────────
 async function loadStudentContext(studentId) {
   try {
     const [
@@ -31,103 +57,149 @@ async function loadStudentContext(studentId) {
       simulationRes,
       cognitiveRes,
     ] = await Promise.all([
-      supabase.from(COLLECTIONS.STUDENTS).select('*').eq('id', studentId).maybeSingle(),
-      supabase.from(COLLECTIONS.STREAM_SCORES).select('*').eq('id', studentId).maybeSingle(),
-      supabase.from(COLLECTIONS.CAREER_PREDICTIONS).select('*').eq('id', studentId).maybeSingle(),
-      supabase.from(COLLECTIONS.EDUCATION_ROI).select('*').eq('id', studentId).maybeSingle(),
-      supabase.from(COLLECTIONS.CAREER_SIMULATIONS).select('*').eq('id', studentId).maybeSingle(),
-      supabase.from(COLLECTIONS.COGNITIVE).select('*').eq('id', studentId).maybeSingle(),
+      supabase
+        .from(COLLECTIONS.STUDENTS)
+        .select('id, name, grade, interests')
+        .eq('id', studentId)
+        .maybeSingle(),
+
+      supabase
+        .from(COLLECTIONS.STREAM_SCORES)
+        .select('*')
+        .eq('student_id', studentId)
+        .maybeSingle(),
+
+      supabase
+        .from(COLLECTIONS.CAREER_PREDICTIONS)
+        .select('*')
+        .eq('student_id', studentId)
+        .maybeSingle(),
+
+      supabase
+        .from(COLLECTIONS.EDUCATION_ROI)
+        .select('*')
+        .eq('student_id', studentId)
+        .maybeSingle(),
+
+      supabase
+        .from(COLLECTIONS.CAREER_SIMULATIONS)
+        .select('*')
+        .eq('user_id', studentId)
+        .maybeSingle(),
+
+      supabase
+        .from(COLLECTIONS.COGNITIVE)
+        .select(`
+          analytical_score,
+          logical_score,
+          memory_score,
+          communication_score,
+          creativity_score,
+          profile_label,
+          strengths
+        `)
+        .eq('student_id', studentId)
+        .maybeSingle(),
     ]);
 
-    const student          = studentRes.data || null;
-    const streamResult     = streamRes.data || null;
-    const careerResult     = careerRes.data || null;
-    const roiResult        = roiRes.data || null;
-    const simulationResult = simulationRes.data || null;
-    const cognitiveDoc     = cognitiveRes.data || null;
+    const cognitiveDoc = cognitiveRes.data || null;
 
-    const cognitiveResult = cognitiveDoc ? {
-      scores: {
-        analytical_score:    cognitiveDoc.analytical_score,
-        logical_score:       cognitiveDoc.logical_score,
-        memory_score:        cognitiveDoc.memory_score,
-        communication_score: cognitiveDoc.communication_score,
-        creativity_score:    cognitiveDoc.creativity_score,
-      },
-      profile_label: cognitiveDoc.profile_label || null,
-      strengths:     cognitiveDoc.strengths || [],
-    } : null;
-
-    return { student, streamResult, cognitiveResult, careerResult, roiResult, simulationResult };
-
+    return {
+      student: studentRes.data || null,
+      streamResult: streamRes.data || null,
+      careerResult: careerRes.data || null,
+      roiResult: roiRes.data || null,
+      simulationResult: simulationRes.data || null,
+      cognitiveResult: cognitiveDoc
+        ? {
+            scores: {
+              analytical_score: cognitiveDoc.analytical_score,
+              logical_score: cognitiveDoc.logical_score,
+              memory_score: cognitiveDoc.memory_score,
+              communication_score: cognitiveDoc.communication_score,
+              creativity_score: cognitiveDoc.creativity_score,
+            },
+            profile_label: cognitiveDoc.profile_label || null,
+            strengths: cognitiveDoc.strengths || [],
+          }
+        : null,
+    };
   } catch (err) {
-    logger.error({ studentId, err: err.message }, '[AdvisorService] loadStudentContext failed');
+    logger.error('[AdvisorService] loadStudentContext failed', {
+      studentId,
+      error: err.message,
+    });
     throw err;
   }
 }
 
-// ─── Conversation history ───────────────────────────────
-
+// ─────────────────────────────────────────────────────────────────────────────
+// History
+// ─────────────────────────────────────────────────────────────────────────────
 async function loadConversationHistory(studentId) {
   try {
     const { data, error } = await supabase
       .from(CONVERSATIONS_COLLECTION)
-      .select('*')
+      .select('user_message, ai_response, created_at')
       .eq('student_id', studentId)
-      .order('created_at', { ascending: true })
+      .order('created_at', { ascending: false })
       .limit(HISTORY_LIMIT);
 
     if (error) throw error;
-
-    return data || [];
+    return (data || []).reverse();
   } catch (err) {
-    logger.warn({ studentId, err: err.message }, '[AdvisorService] Failed to load conversation history');
+    logger.warn('[AdvisorService] Failed to load conversation history', {
+      studentId,
+      error: err.message,
+    });
     return [];
   }
 }
 
-// ─── Save conversation ──────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// Save async
+// ─────────────────────────────────────────────────────────────────────────────
+function saveConversationTurn(studentId, userMessage, aiResponse) {
+  const doc = buildConversationDoc(studentId, userMessage, aiResponse);
 
-async function saveConversationTurn(studentId, userMessage, aiResponse) {
-  try {
-    const doc = buildConversationDoc(studentId, userMessage, aiResponse);
-
-    const { error } = await supabase
-      .from(CONVERSATIONS_COLLECTION)
-      .insert([
-        {
-          ...doc,
-          created_at: new Date(),
-        },
-      ]);
-
-    if (error) throw error;
-
-  } catch (err) {
-    logger.warn({ studentId, err: err.message }, '[AdvisorService] Failed to save conversation turn');
-  }
+  supabase
+    .from(CONVERSATIONS_COLLECTION)
+    .insert([
+      {
+        ...doc,
+        created_at: new Date().toISOString(),
+      },
+    ])
+    .then(() => {})
+    .catch((err) => {
+      logger.warn('[AdvisorService] Failed to save conversation turn', {
+        studentId,
+        error: err.message,
+      });
+    });
 }
 
-// ─── Welcome message ────────────────────────────────────
-
+// ─────────────────────────────────────────────────────────────────────────────
+// Welcome
+// ─────────────────────────────────────────────────────────────────────────────
 function buildWelcomeMessage(student) {
-  const name = student && student.name ? `, ${student.name.split(' ')[0]}` : '';
+  const name = student?.name
+    ? `, ${student.name.split(' ')[0]}`
+    : '';
+
   return (
     `Hello${name}! 👋 I'm your AI Career Advisor.\n\n` +
-    `I've reviewed your stream analysis, cognitive profile, career success predictions, ` +
+    `I've reviewed your stream analysis, cognitive profile, career predictions, ` +
     `education ROI scores, and market demand signals.\n\n` +
-    `Ask me anything about your career path. For example:\n` +
-    `• "Which stream is best for me?"\n` +
-    `• "Which career gives the highest salary for my profile?"\n` +
-    `• "Is Computer Science better than Commerce for me?"\n` +
-    `• "What skills should I start learning now?"`
+    `Ask me anything about your career path.`
   );
 }
 
-// ─── Main chat ──────────────────────────────────────────
-
-async function chat(studentId, userMessage) {
-  logger.info({ studentId }, '[AdvisorService] Chat request received');
+// ─────────────────────────────────────────────────────────────────────────────
+// Main chat
+// ─────────────────────────────────────────────────────────────────────────────
+async function chat(studentId, userMessage, opts = {}) {
+  logger.info('[AdvisorService] Chat request', { studentId });
 
   const [studentContext, history, marketData] = await Promise.all([
     loadStudentContext(studentId),
@@ -143,32 +215,38 @@ async function chat(studentId, userMessage) {
     throw err;
   }
 
-  const systemPrompt = buildSystemPrompt({ ...studentContext, marketData });
-  const messages     = buildConversationMessages(history, userMessage);
+  const systemPrompt = buildSystemPrompt({
+    ...studentContext,
+    marketData,
+  });
 
-  let aiResponse;
+  const messages = buildConversationMessages(history, userMessage);
+
+  let aiResponse =
+    'I am temporarily unavailable. Please try again shortly.';
 
   try {
     const completion = await anthropic.messages.create({
       model: MODEL,
-      max_tokens: MAX_TOKENS,
+      max_tokens: getMaxTokens(userMessage),
       system: systemPrompt,
       messages,
+      signal: opts.signal,
     });
 
-    aiResponse = completion.content
-      .filter(b => b.type === 'text')
-      .map(b => b.text)
-      .join('');
-
-  } catch (err) {
-    logger.error({ studentId, err: err.message }, '[AdvisorService] Claude API failed');
-
     aiResponse =
-      'I am temporarily unavailable. Please try again shortly.';
+      completion?.content
+        ?.filter((block) => block.type === 'text')
+        ?.map((block) => block.text)
+        ?.join('') || aiResponse;
+  } catch (err) {
+    logger.error('[AdvisorService] Claude API failed', {
+      studentId,
+      error: err.message,
+    });
   }
 
-  await saveConversationTurn(studentId, userMessage, aiResponse);
+  saveConversationTurn(studentId, userMessage, aiResponse);
 
   return {
     response: aiResponse,
@@ -176,14 +254,13 @@ async function chat(studentId, userMessage) {
   };
 }
 
-// ─── Welcome endpoint ───────────────────────────────────
-
+// ─────────────────────────────────────────────────────────────────────────────
+// Welcome
+// ─────────────────────────────────────────────────────────────────────────────
 async function getWelcome(studentId) {
-  // HARDENING T2: .single() → .maybeSingle() — student may not exist
-  // HARDENING T7: destructure error and throw on failure
   const { data, error } = await supabase
     .from(COLLECTIONS.STUDENTS)
-    .select('*')
+    .select('name')
     .eq('id', studentId)
     .maybeSingle();
 
@@ -191,15 +268,20 @@ async function getWelcome(studentId) {
 
   return {
     message: buildWelcomeMessage(data),
-    studentName: data ? data.name : null,
+    studentName: data?.name || null,
   };
 }
 
-// ─── History endpoint ───────────────────────────────────
-
+// ─────────────────────────────────────────────────────────────────────────────
+// History
+// ─────────────────────────────────────────────────────────────────────────────
 async function getHistory(studentId) {
   const history = await loadConversationHistory(studentId);
   return { conversations: history };
 }
 
-module.exports = { chat, getWelcome, getHistory };
+module.exports = {
+  chat,
+  getWelcome,
+  getHistory,
+};

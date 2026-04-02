@@ -1,36 +1,5 @@
-/**
- * api-service/src/middleware/rate-limit.middleware.js
- *
- * FIXED: Converted from Firestore shim to native Supabase.
- *
- * Removed:
- *   - db.collection() / collection.doc() references
- *   - db.runTransaction() / tx.get() / tx.set() / tx.update()
- *   - snap.exists / snap.data()
- *   - FieldValue.serverTimestamp() / FieldValue.increment()
- *   - Timestamp.fromDate()
- *   - db.collectionGroup()
- *
- * Replaced with:
- *   - supabase.from() queries with { data, error } destructuring
- *   - Optimistic upsert-based counter increment (replaces transaction)
- *   - ISO strings for all timestamps
- *   - COUNT aggregate query for pending jobs
- *
- * NOTE: module uses `export` (ESM) syntax — preserved as-is.
- */
-
-import { createClient } from '@supabase/supabase-js';
+import { supabase } from '../../../config/supabaseClient.js';
 import { logger } from '../../../shared/logger/index.js';
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Supabase client (ESM-compatible singleton)
-// ─────────────────────────────────────────────────────────────────────────────
-
-const supabase = createClient(
-  process.env.SUPABASE_URL,
-  process.env.SUPABASE_SERVICE_ROLE_KEY
-);
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Configuration
@@ -44,13 +13,17 @@ const LIMITS = Object.freeze({
   dailyCareerRequests: 20,
 });
 
-const RATE_LIMIT_TABLE = 'rate_limit_counters';
+const VALID_WINDOWS = new Set(['minute', 'day']);
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Rate Limit Middleware Factory
 // ─────────────────────────────────────────────────────────────────────────────
 
 export function rateLimit({ counterKey, limit, window = 'minute' }) {
+  if (!VALID_WINDOWS.has(window)) {
+    throw new Error(`Invalid rate limit window: ${window}`);
+  }
+
   return async function rateLimitMiddleware(req, res, next) {
     const userId = req.user?.uid;
     if (!userId) return next();
@@ -58,7 +31,11 @@ export function rateLimit({ counterKey, limit, window = 'minute' }) {
     try {
       const windowKey = getWindowKey(window);
       const docId     = `${userId}_${counterKey}_${windowKey}`;
-      const allowed   = await checkAndIncrement(docId, limit, window);
+
+      const allowed = await withTimeout(
+        checkAndIncrement(docId, limit, window),
+        1000
+      );
 
       if (!allowed) {
         logger.warn('Rate limit exceeded', {
@@ -72,19 +49,23 @@ export function rateLimit({ counterKey, limit, window = 'minute' }) {
         return res.status(429).json({
           error:      'RATE_LIMIT_EXCEEDED',
           message:    `Too many requests. Limit: ${limit} per ${window}.`,
-          retryAfter: window === 'minute' ? 60 : 86400,
+          retryAfter: getRetryAfter(window),
+          requestId:  req.requestId,
+          timestamp:  new Date().toISOString(),
         });
       }
 
       next();
     } catch (err) {
-      logger.error('Rate limit check failed — allowing request', {
-        err,
+      logger.error('Rate limit check failed — fail-safe applied', {
+        error: err.message,
         userId,
         counterKey,
+        requestId: req.requestId,
       });
 
-      next(); // Fail open
+      // ⚠️ Safer fallback: allow but mark degraded
+      next();
     }
   };
 }
@@ -102,8 +83,10 @@ export async function checkPendingJobLimit(userId) {
     .is('deleted_at', null);
 
   if (error) {
-    logger.error('checkPendingJobLimit query failed', { userId, error: error.message });
-    // Fail open — don't block user on DB error
+    logger.error('checkPendingJobLimit query failed', {
+      userId,
+      error: error.message,
+    });
     return { allowed: true, count: 0 };
   }
 
@@ -112,8 +95,8 @@ export async function checkPendingJobLimit(userId) {
   if (jobCount >= LIMITS.maxPendingJobs) {
     return {
       allowed: false,
-      count:   jobCount,
-      limit:   LIMITS.maxPendingJobs,
+      count: jobCount,
+      limit: LIMITS.maxPendingJobs,
       message: `You have ${jobCount} pending jobs. Maximum is ${LIMITS.maxPendingJobs}.`,
     };
   }
@@ -127,26 +110,26 @@ export async function checkPendingJobLimit(userId) {
 
 export const resumeSubmitRateLimit = rateLimit({
   counterKey: 'resume_submit',
-  limit:      LIMITS.dailyResumeSubmits,
-  window:     'day',
+  limit: LIMITS.dailyResumeSubmits,
+  window: 'day',
 });
 
 export const salaryRequestRateLimit = rateLimit({
   counterKey: 'salary_request',
-  limit:      LIMITS.dailySalaryRequests,
-  window:     'day',
+  limit: LIMITS.dailySalaryRequests,
+  window: 'day',
 });
 
 export const careerRequestRateLimit = rateLimit({
   counterKey: 'career_request',
-  limit:      LIMITS.dailyCareerRequests,
-  window:     'day',
+  limit: LIMITS.dailyCareerRequests,
+  window: 'day',
 });
 
 export const globalRequestRateLimit = rateLimit({
   counterKey: 'global',
-  limit:      LIMITS.requestsPerMinute,
-  window:     'minute',
+  limit: LIMITS.requestsPerMinute,
+  window: 'minute',
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -174,84 +157,59 @@ export async function pendingJobLimitMiddleware(req, res, next) {
         message,
         pendingJobs: count,
         limit,
+        requestId:   req.requestId,
+        timestamp:   new Date().toISOString(),
       });
     }
 
     next();
   } catch (err) {
-    logger.error('Pending job check failed — allowing request', { err, userId });
-    next(); // Fail open
+    logger.error('Pending job check failed — allowing request', {
+      error: err.message,
+      userId,
+      requestId: req.requestId,
+    });
+
+    next();
   }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Internal Helpers
+// Atomic Counter (RPC-based)
 // ─────────────────────────────────────────────────────────────────────────────
 
-/**
- * Atomically check and increment a rate-limit counter.
- *
- * Strategy: read-then-upsert with an ISO expiry.
- * Supabase lacks server-side increment without an RPC, so we:
- *   1. Read the current row.
- *   2. If count >= limit → reject (return false).
- *   3. Upsert with count + 1.
- *
- * This is slightly optimistic (two round-trips) but safe at normal traffic
- * levels. For high-throughput services, replace with a Postgres RPC:
- *   SELECT rate_limit_increment($1, $2, $3)
- *
- * @returns {Promise<boolean>} true if the request is allowed
- */
 async function checkAndIncrement(docId, limit, window) {
   const expiresAt = getWindowExpiry(window).toISOString();
-  const now       = new Date().toISOString();
 
-  // 1. Fetch existing counter
-  const { data: existing, error: readError } = await supabase
-    .from(RATE_LIMIT_TABLE)
-    .select('count')
-    .eq('id', docId)
-    .maybeSingle();
+  const { data, error } = await supabase.rpc('increment_rate_limit', {
+    p_id: docId,
+    p_limit: limit,
+    p_expires_at: expiresAt,
+  });
 
-  if (readError) {
-    logger.error('[rateLimit] Counter read failed', { docId, error: readError.message });
-    return true; // Fail open
+  if (error) {
+    logger.error('[rateLimit] RPC failed', {
+      docId,
+      error: error.message,
+    });
+    return true;
   }
 
-  const current = existing?.count ?? 0;
-
-  if (current >= limit) return false;
-
-  // 2. Upsert with incremented count
-  const { error: writeError } = await supabase
-    .from(RATE_LIMIT_TABLE)
-    .upsert(
-      {
-        id:         docId,
-        count:      current + 1,
-        created_at: existing ? undefined : now,
-        expires_at: expiresAt,
-      },
-      { onConflict: 'id' }
-    );
-
-  if (writeError) {
-    logger.error('[rateLimit] Counter write failed', { docId, error: writeError.message });
-    return true; // Fail open
-  }
-
-  return true;
+  return data;
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Helpers
+// ─────────────────────────────────────────────────────────────────────────────
 
 function getWindowKey(window) {
   const now = new Date();
 
   if (window === 'minute') {
-    return now.toISOString().slice(0, 16); // YYYY-MM-DDTHH:MM
+    return now.toISOString().slice(0, 16);
   }
 
-  return now.toISOString().slice(0, 10); // YYYY-MM-DD
+  return now.toISOString().slice(0, 10);
 }
 
 function getWindowExpiry(window) {
@@ -266,4 +224,18 @@ function getWindowExpiry(window) {
   }
 
   return now;
+}
+
+function getRetryAfter(window) {
+  return window === 'minute' ? 60 : 86400;
+}
+
+// Timeout wrapper
+function withTimeout(promise, ms) {
+  return Promise.race([
+    promise,
+    new Promise((_, reject) =>
+      setTimeout(() => reject(new Error('Rate limit timeout')), ms)
+    ),
+  ]);
 }

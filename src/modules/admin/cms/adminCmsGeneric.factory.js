@@ -16,7 +16,7 @@ const { body, param, query } = require('express-validator');
 const express = require('express');
 const logger  = require('../../../utils/logger');
 
-function getSupabase() { return require('../../../core/supabaseClient'); }
+function getSupabase() { return require('../../../config/supabase'); }
 
 // Map datasetType → Supabase table name
 const TABLE_MAP = {

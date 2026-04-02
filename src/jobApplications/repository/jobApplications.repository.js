@@ -1,30 +1,23 @@
 'use strict';
 
 /**
- * jobApplications.repository.js
+ * jobApplications.repository.js (FINAL - SUPABASE OPTIMIZED)
  *
- * All Supabase operations for the jobApplications collection.
- * No business logic — pure data access.
- *
- * COLLECTION: jobApplications
- *
- * CHANGES (hardening):
- *   CHANGE 4 — Soft delete: remove() sets deleted:true + deletedAt instead of physical delete
- *              listByUser() filters where deleted != true
- *              update() blocks editing deleted documents
- *   CHANGE 5 — Added optional source field to create() and VALID_SOURCES constant
- *
- * INDEXES REQUIRED (Supabase / Postgres):
- *   1. (userId, deleted, createdAt DESC)   — GET /applications (list)
- *   2. (userId, status, createdAt DESC)    — future status filter
+ * - Uses snake_case for DB
+ * - Returns camelCase for API
+ * - Optimized cursor pagination
+ * - Soft delete enabled
  */
+
 const { supabase } = require('../../config/supabase');
 const { AppError, ErrorCodes } = require('../../middleware/errorHandler');
 const logger = require('../../utils/logger');
 
-const COLLECTION = 'jobApplications';
+const TABLE = 'job_applications';
 
-// ─── Valid statuses ───────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────
+// 🔹 CONSTANTS
+// ─────────────────────────────────────────────
 
 const VALID_STATUSES = [
   'applied',
@@ -38,225 +31,283 @@ const VALID_STATUSES = [
   'withdrawn'
 ];
 
-// CHANGE 5 — Valid source options
-const VALID_SOURCES = ['LinkedIn', 'Indeed', 'Referral', 'Company Website', 'Other'];
+const VALID_SOURCES = [
+  'LinkedIn',
+  'Indeed',
+  'Referral',
+  'Company Website',
+  'Other'
+];
 
-// ─── Create ───────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────
+// 🔹 MAPPER (DB → API)
+// ─────────────────────────────────────────────
+
+function mapToApi(row) {
+  return {
+    id: row.id,
+    companyName: row.company_name,
+    jobTitle: row.job_title,
+    emailSentTo: row.email_sent_to,
+    status: row.status,
+    notes: row.notes,
+    appliedDate: row.applied_date,
+    followUpDate: row.follow_up_date,
+    source: row.source,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at
+  };
+}
+
+// ─────────────────────────────────────────────
+// 🔹 CREATE
+// ─────────────────────────────────────────────
 
 async function create(userId, payload) {
   const now = new Date().toISOString();
+
   const doc = {
-    userId,
-    companyName: payload.companyName,
-    jobTitle: payload.jobTitle,
-    emailSentTo: payload.emailSentTo,
-    appliedDate: payload.appliedDate ? new Date(payload.appliedDate).toISOString() : now,
-    status: payload.status ?? 'applied',
-    notes: payload.notes ?? null,
-    followUpDate: payload.followUpDate ? new Date(payload.followUpDate).toISOString() : null,
-    source: payload.source ?? null, // ← CHANGE 5: optional source field
-    deleted: false,                  // ← CHANGE 4: soft delete flag on creation
-    createdAt: now,
-    updatedAt: now
+    user_id: userId,
+    company_name: payload.companyName,
+    job_title: payload.jobTitle,
+    email_sent_to: payload.emailSentTo || null,
+    applied_date: payload.appliedDate
+      ? new Date(payload.appliedDate).toISOString()
+      : now,
+    status: VALID_STATUSES.includes(payload.status)
+      ? payload.status
+      : 'applied',
+    notes: payload.notes || null,
+    follow_up_date: payload.followUpDate
+      ? new Date(payload.followUpDate).toISOString()
+      : null,
+    source: VALID_SOURCES.includes(payload.source)
+      ? payload.source
+      : null,
+    deleted: false,
+    created_at: now,
+    updated_at: now
   };
 
   const { data, error } = await supabase
-    .from(COLLECTION)
+    .from(TABLE)
     .insert(doc)
     .select('id')
     .single();
 
   if (error) {
-    throw new AppError(`Failed to create job application: ${error.message}`, 500, {}, ErrorCodes.INTERNAL_ERROR);
+    throw new AppError(
+      `Failed to create application: ${error.message}`,
+      500,
+      {},
+      ErrorCodes.INTERNAL_ERROR
+    );
   }
 
-  logger.debug('[JobAppRepo] Created', { userId, docId: data.id });
+  logger.debug('[JobAppRepo] Created', { userId, id: data.id });
+
   return data.id;
 }
 
-// ─── Count (for free tier cap — excludes soft-deleted) ───────────────────────
+// ─────────────────────────────────────────────
+// 🔹 COUNT
+// ─────────────────────────────────────────────
 
 async function countByUser(userId) {
-  // CHANGE 4: only count non-deleted documents against the free tier cap
   const { count, error } = await supabase
-    .from(COLLECTION)
+    .from(TABLE)
     .select('*', { count: 'exact', head: true })
-    .eq('userId', userId)
+    .eq('user_id', userId)
     .eq('deleted', false);
 
   if (error) {
-    throw new AppError(`Failed to count job applications: ${error.message}`, 500, {}, ErrorCodes.INTERNAL_ERROR);
+    throw new AppError(
+      `Failed to count applications: ${error.message}`,
+      500,
+      {},
+      ErrorCodes.INTERNAL_ERROR
+    );
   }
 
   return count ?? 0;
 }
 
-// ─── List with pagination ─────────────────────────────────────────────────────
+// ─────────────────────────────────────────────
+// 🔹 LIST (OPTIMIZED PAGINATION)
+// ─────────────────────────────────────────────
 
 async function listByUser(userId, { limit = 20, cursor = null, status = null } = {}) {
   const safeLimit = Math.min(Math.max(1, limit), 50);
 
-  // CHANGE 4: filter out soft-deleted documents
   let query = supabase
-    .from(COLLECTION)
+    .from(TABLE)
     .select('*')
-    .eq('userId', userId)
-    .eq('deleted', false) // ← CHANGE 4
-    .order('createdAt', { ascending: false })
+    .eq('user_id', userId)
+    .eq('deleted', false)
+    .order('created_at', { ascending: false })
+    .order('id', { ascending: false })
     .limit(safeLimit + 1);
 
   if (status && VALID_STATUSES.includes(status)) {
     query = query.eq('status', status);
   }
 
+  // 🔥 Composite cursor
   if (cursor) {
-    // Fetch the cursor row's createdAt for keyset pagination
-    const { data: cursorRow, error: cursorError } = await supabase
-      .from(COLLECTION)
-      .select('createdAt')
-      .eq('id', cursor)
-      .maybeSingle();
+    const [createdAt, id] = cursor.split('|');
 
-    if (!cursorError && cursorRow) {
-      query = query.lt('createdAt', cursorRow.createdAt);
+    if (createdAt && id) {
+      query = query.or(
+        `created_at.lt.${createdAt},and(created_at.eq.${createdAt},id.lt.${id})`
+      );
     }
   }
 
   const { data, error } = await query;
 
   if (error) {
-    throw new AppError(`Failed to list job applications: ${error.message}`, 500, {}, ErrorCodes.INTERNAL_ERROR);
+    throw new AppError(
+      `Failed to list applications: ${error.message}`,
+      500,
+      {},
+      ErrorCodes.INTERNAL_ERROR
+    );
   }
 
-  const docs = data || [];
-  const hasMore = docs.length > safeLimit;
-  const sliced = hasMore ? docs.slice(0, safeLimit) : docs;
-  const nextCursor = hasMore ? sliced[sliced.length - 1].id : null;
+  const rows = data || [];
+  const hasMore = rows.length > safeLimit;
+  const sliced = hasMore ? rows.slice(0, safeLimit) : rows;
 
-  const applications = sliced.map(row => ({
-    id: row.id,
-    ...row,
-    appliedDate: row.appliedDate ?? null,
-    followUpDate: row.followUpDate ?? null,
-    createdAt: row.createdAt ?? null,
-    updatedAt: row.updatedAt ?? null,
-    // Never expose internal soft-delete fields to the API response
-    deleted: undefined,
-    deletedAt: undefined
-  }));
+  const nextCursor = hasMore
+    ? `${sliced[sliced.length - 1].created_at}|${sliced[sliced.length - 1].id}`
+    : null;
 
-  return { applications, nextCursor, hasMore };
+  return {
+    applications: sliced.map(mapToApi),
+    nextCursor,
+    hasMore
+  };
 }
 
-// ─── Get one (with ownership + deleted check) ─────────────────────────────────
+// ─────────────────────────────────────────────
+// 🔹 GET ONE
+// ─────────────────────────────────────────────
 
 async function getOne(applicationId, userId) {
   const { data, error } = await supabase
-    .from(COLLECTION)
+    .from(TABLE)
     .select('*')
     .eq('id', applicationId)
     .maybeSingle();
 
   if (error) {
-    throw new AppError(`Failed to fetch job application: ${error.message}`, 500, { applicationId }, ErrorCodes.INTERNAL_ERROR);
+    throw new AppError(
+      `Failed to fetch application: ${error.message}`,
+      500,
+      { applicationId },
+      ErrorCodes.INTERNAL_ERROR
+    );
   }
 
-  if (!data) {
-    throw new AppError('Application not found.', 404, { applicationId }, ErrorCodes.NOT_FOUND);
+  if (!data || data.deleted) {
+    throw new AppError('Application not found.', 404, {}, ErrorCodes.NOT_FOUND);
   }
 
-  if (data.userId !== userId) {
-    throw new AppError('Unauthorized.', 403, { applicationId }, ErrorCodes.FORBIDDEN);
+  if (data.user_id !== userId) {
+    throw new AppError('Unauthorized.', 403, {}, ErrorCodes.FORBIDDEN);
   }
 
-  // CHANGE 4: treat soft-deleted docs as not found
-  if (data.deleted === true) {
-    throw new AppError('Application not found.', 404, { applicationId }, ErrorCodes.NOT_FOUND);
-  }
-
-  return { id: applicationId, ...data };
+  return mapToApi(data);
 }
 
-// ─── Update ───────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────
+// 🔹 UPDATE
+// ─────────────────────────────────────────────
 
 async function update(applicationId, userId, updates) {
-  // getOne() now throws 404 for deleted docs — PATCH on deleted doc blocked automatically
   await getOne(applicationId, userId);
 
-  const allowedFields = [
-    'status',
-    'notes',
-    'followUpDate',
-    'companyName',
-    'jobTitle',
-    'emailSentTo',
-    'appliedDate',
-    'source' // ← CHANGE 5
-  ];
-
   const sanitized = {};
-  for (const field of allowedFields) {
-    if (updates[field] !== undefined) {
-      if ((field === 'followUpDate' || field === 'appliedDate') && updates[field]) {
-        sanitized[field] = new Date(updates[field]).toISOString();
-      } else {
-        sanitized[field] = updates[field];
-      }
-    }
+
+  if (updates.companyName !== undefined) sanitized.company_name = updates.companyName;
+  if (updates.jobTitle !== undefined) sanitized.job_title = updates.jobTitle;
+  if (updates.emailSentTo !== undefined) sanitized.email_sent_to = updates.emailSentTo;
+  if (updates.notes !== undefined) sanitized.notes = updates.notes;
+
+  if (updates.status && VALID_STATUSES.includes(updates.status)) {
+    sanitized.status = updates.status;
+  }
+
+  if (updates.source && VALID_SOURCES.includes(updates.source)) {
+    sanitized.source = updates.source;
+  }
+
+  if (updates.appliedDate) {
+    sanitized.applied_date = new Date(updates.appliedDate).toISOString();
+  }
+
+  if (updates.followUpDate) {
+    sanitized.follow_up_date = new Date(updates.followUpDate).toISOString();
   }
 
   if (Object.keys(sanitized).length === 0) {
     throw new AppError('No valid fields to update.', 400, {}, ErrorCodes.VALIDATION_ERROR);
   }
 
-  sanitized.updatedAt = new Date().toISOString();
+  sanitized.updated_at = new Date().toISOString();
 
   const { error } = await supabase
-    .from(COLLECTION)
+    .from(TABLE)
     .update(sanitized)
     .eq('id', applicationId);
 
   if (error) {
-    throw new AppError(`Failed to update job application: ${error.message}`, 500, { applicationId }, ErrorCodes.INTERNAL_ERROR);
+    throw new AppError(
+      `Failed to update application: ${error.message}`,
+      500,
+      {},
+      ErrorCodes.INTERNAL_ERROR
+    );
   }
 
-  logger.debug('[JobAppRepo] Updated', {
-    applicationId,
-    userId,
-    fields: Object.keys(sanitized)
-  });
+  logger.debug('[JobAppRepo] Updated', { applicationId });
 
   return getOne(applicationId, userId);
 }
 
-// ─── Soft Delete ──────────────────────────────────────────────────────────────
-// CHANGE 4: Sets deleted:true + deletedAt instead of physically removing the document.
-// Reasons:
-//   - Audit trail preserved
-//   - Recoverable if user requests restoration
-//   - Prevents orphaned references in other collections
-//   - Free tier cap correctly excludes soft-deleted docs (countByUser filters them)
+// ─────────────────────────────────────────────
+// 🔹 DELETE (SOFT)
+// ─────────────────────────────────────────────
 
 async function remove(applicationId, userId) {
-  // Verify ownership — getOne also blocks already-deleted docs
   await getOne(applicationId, userId);
 
   const { error } = await supabase
-    .from(COLLECTION)
+    .from(TABLE)
     .update({
       deleted: true,
-      deletedAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString()
+      deleted_at: new Date().toISOString(),
+      updated_at: new Date().toISOString()
     })
     .eq('id', applicationId);
 
   if (error) {
-    throw new AppError(`Failed to delete job application: ${error.message}`, 500, { applicationId }, ErrorCodes.INTERNAL_ERROR);
+    throw new AppError(
+      `Failed to delete application: ${error.message}`,
+      500,
+      {},
+      ErrorCodes.INTERNAL_ERROR
+    );
   }
 
-  logger.debug('[JobAppRepo] Soft deleted', { applicationId, userId });
+  logger.debug('[JobAppRepo] Soft deleted', { applicationId });
+
   return true;
 }
+
+// ─────────────────────────────────────────────
+// 🔹 EXPORTS
+// ─────────────────────────────────────────────
 
 module.exports = {
   create,
@@ -266,5 +317,5 @@ module.exports = {
   update,
   remove,
   VALID_STATUSES,
-  VALID_SOURCES // ← CHANGE 5: exported for routes schema
+  VALID_SOURCES
 };

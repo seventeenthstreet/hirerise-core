@@ -1,101 +1,99 @@
 'use strict';
 
-/**
- * jobMatchFreeEngine.js
- *
- * Rule-based JD analysis for free tier users.
- * Zero AI cost. Runs unlimited times.
- *
- * STRATEGY:
- *   Free result must feel genuinely useful — not a fake gate.
- *   Users should see a real match score and real keyword gaps.
- *   But strategic interpretation, alignment summary, and tailored CV
- *   are null → shown as blurred premium sections on the frontend.
- *
- *   This creates the right conversion psychology:
- *   "I can see there are 4 missing keywords, but I don't know how to fix them."
- *   → natural pull toward premium.
- *
- * Output shape mirrors premium engine exactly. Null = locked in UI.
- */
-
 const logger = require('../../utils/logger');
 
-// Common technical and soft skill keywords by domain
-const SKILL_PATTERNS = [
-  // Engineering
-  'python', 'javascript', 'typescript', 'java', 'go', 'rust', 'c\\+\\+',
-  'react', 'node', 'vue', 'angular', 'next\\.?js',
-  'sql', 'postgresql', 'mongodb', 'redis', 'elasticsearch',
-  'aws', 'gcp', 'azure', 'docker', 'kubernetes', 'terraform',
-  'ci/cd', 'devops', 'git', 'rest api', 'graphql', 'microservices',
-  'machine learning', 'deep learning', 'nlp', 'data science',
-  // Finance / Accounting
-  'tally', 'sap', 'gst', 'tds', 'excel', 'power bi', 'tableau',
-  'accounts payable', 'accounts receivable', 'reconciliation', 'audit',
-  // Management
-  'project management', 'agile', 'scrum', 'jira', 'stakeholder',
-  'p&l', 'budgeting', 'forecasting', 'team lead', 'cross-functional',
-  // Soft skills with weight
-  'communication', 'leadership', 'problem.solving', 'analytical',
+const SKILL_DEFINITIONS = [
+  { keyword: 'python', weight: 3 },
+  { keyword: 'javascript', weight: 3 },
+  { keyword: 'typescript', weight: 3 },
+  { keyword: 'java', weight: 3 },
+  { keyword: 'react', weight: 3 },
+  { keyword: 'node', weight: 3 },
+  { keyword: 'sql', weight: 3 },
+  { keyword: 'postgresql', weight: 3, aliases: ['postgres'] },
+  { keyword: 'mongodb', weight: 3 },
+  { keyword: 'docker', weight: 3 },
+  { keyword: 'kubernetes', weight: 4 },
+  { keyword: 'aws', weight: 4 },
+  { keyword: 'graphql', weight: 3 },
+  { keyword: 'machine learning', weight: 4 },
+  { keyword: 'power bi', weight: 2 },
+  { keyword: 'tableau', weight: 2 },
+  { keyword: 'communication', weight: 1 },
+  { keyword: 'leadership', weight: 1 },
+  { keyword: 'problem solving', weight: 1 },
 ];
 
-function extractKeywords(text) {
-  const lower    = (text || '').toLowerCase();
-  const matched  = new Set();
+function normalizeText(text) {
+  return String(text || '').toLowerCase();
+}
 
-  for (const pattern of SKILL_PATTERNS) {
-    const re = new RegExp(`\\b${pattern}\\b`, 'i');
-    if (re.test(lower)) matched.add(pattern.replace(/\\b|\\/g, '').replace(/\\.\\?/g, ''));
+function extractKeywords(text) {
+  const lower = normalizeText(text);
+  const matched = [];
+
+  for (const skill of SKILL_DEFINITIONS) {
+    const variants = [skill.keyword, ...(skill.aliases || [])];
+
+    const hasMatch = variants.some((variant) =>
+      lower.includes(variant.toLowerCase())
+    );
+
+    if (hasMatch) matched.push(skill);
   }
 
-  return [...matched];
+  return matched;
 }
 
-function scoreMatch(resumeKeywords, jdKeywords) {
-  if (!jdKeywords.length) return 50; // no parseable JD keywords → neutral score
-  const matched = jdKeywords.filter(k => resumeKeywords.includes(k));
-  return Math.round((matched.length / jdKeywords.length) * 100);
+function scoreMatch(resumeSkills, jdSkills) {
+  if (!jdSkills.length) return 50;
+
+  const totalWeight = jdSkills.reduce(
+    (sum, skill) => sum + skill.weight,
+    0
+  );
+
+  const matchedWeight = jdSkills
+    .filter((jdSkill) =>
+      resumeSkills.some((r) => r.keyword === jdSkill.keyword)
+    )
+    .reduce((sum, skill) => sum + skill.weight, 0);
+
+  return Math.round((matchedWeight / totalWeight) * 100);
 }
 
-/**
- * runJobMatchFree({ resumeText, jobDescription })
- *
- * @returns object — matchScore, presentKeywords, missingKeywords,
- *                   premium fields are null
- */
 function runJobMatchFree({ resumeText, jobDescription }) {
-  logger.debug('[JobMatchFreeEngine] Running keyword match');
+  logger.debug('[JobMatchFreeEngine] Running weighted keyword match');
 
-  const resumeKeywords  = extractKeywords(resumeText);
-  const jdKeywords      = extractKeywords(jobDescription);
-  const matchScore      = scoreMatch(resumeKeywords, jdKeywords);
-  const presentKeywords = jdKeywords.filter(k => resumeKeywords.includes(k));
-  const missingKeywords = jdKeywords.filter(k => !resumeKeywords.includes(k));
+  const resumeSkills = extractKeywords(resumeText);
+  const jdSkills = extractKeywords(jobDescription);
+
+  const matchScore = scoreMatch(resumeSkills, jdSkills);
+
+  const presentKeywords = jdSkills
+    .filter((jdSkill) =>
+      resumeSkills.some((r) => r.keyword === jdSkill.keyword)
+    )
+    .map((skill) => skill.keyword);
+
+  const missingKeywords = jdSkills
+    .filter(
+      (jdSkill) =>
+        !resumeSkills.some((r) => r.keyword === jdSkill.keyword)
+    )
+    .map((skill) => skill.keyword)
+    .slice(0, 5);
 
   return {
-    engine:     'free',
+    engine: 'free',
     matchScore,
-
-    // Visible to free users — real, useful
     presentKeywords,
-    missingKeywords: missingKeywords.slice(0, 5), // cap at 5 for free
-
-    // Null = blurred premium sections on frontend
-    alignmentSummary:        null,  // requires premium
-    improvementSuggestions:  null,  // requires premium
-    tailoredCV:              null,  // requires premium
-
+    missingKeywords,
+    alignmentSummary: null,
+    improvementSuggestions: null,
+    tailoredCV: null,
     analysedAt: new Date().toISOString(),
   };
 }
 
 module.exports = { runJobMatchFree };
-
-
-
-
-
-
-
-

@@ -1,10 +1,13 @@
 'use strict';
 
 /**
- * jobApplications.controller.js
+ * jobApplications.controller.js (Supabase Optimized)
  *
- * Thin controller — no business logic, no Firestore.
- * Receives validated req.body/params/query, calls service, formats response.
+ * Principles:
+ * - No DB logic (delegated to service)
+ * - Uses Supabase auth user id (req.user.id)
+ * - Clean pagination inputs (cursor-based)
+ * - No redundant parsing / unsafe defaults
  */
 
 const {
@@ -14,103 +17,150 @@ const {
   deleteApplication,
 } = require('../jobApplications.service');
 
+// ─────────────────────────────────────────────
+// 🔹 SAFE USER ID (Supabase-first)
+// ─────────────────────────────────────────────
+
 function _safeUserId(req) {
-  return req?.user?.uid ?? req?.user?.id ?? null;
+  // Supabase → req.user.id
+  // fallback for legacy tokens if any
+  return req?.user?.id ?? req?.user?.uid ?? null;
 }
 
-// ─── POST /applications ───────────────────────────────────────────────────────
+// ─────────────────────────────────────────────
+// 🔹 CREATE APPLICATION
+// ─────────────────────────────────────────────
 
 async function create(req, res, next) {
   try {
     const userId = _safeUserId(req);
-    if (!userId) return res.status(401).json({ success: false, message: 'Unauthorized' });
+    if (!userId) {
+      return res.status(401).json({
+        success: false,
+        message: 'Unauthorized',
+      });
+    }
 
-    const tier   = req.user.plan ?? 'free';
-    const result = await addApplication(userId, tier, req.body);
+    const tier = req.user?.plan || 'free';
+
+    const { id } = await addApplication(userId, tier, req.body);
 
     return res.status(201).json({
       success: true,
-      data: { id: result.id },
+      data: { id },
     });
   } catch (err) {
-    return next(err);
+    next(err);
   }
 }
 
-// ─── GET /applications ────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────
+// 🔹 LIST APPLICATIONS (Cursor Pagination)
+// ─────────────────────────────────────────────
 
 async function list(req, res, next) {
   try {
     const userId = _safeUserId(req);
-    if (!userId) return res.status(401).json({ success: false, message: 'Unauthorized' });
+    if (!userId) {
+      return res.status(401).json({
+        success: false,
+        message: 'Unauthorized',
+      });
+    }
 
-    const tier   = req.user.plan ?? 'free';
-    const limit  = parseInt(req.query.limit  || '20', 10);
+    const tier = req.user?.plan || 'free';
+
+    const limit = Math.min(parseInt(req.query.limit, 10) || 20, 100); // hard cap
     const cursor = req.query.cursor || null;
     const status = req.query.status || null;
 
-    const result = await getApplications(userId, tier, { limit, cursor, status });
+    const { applications, hasMore, nextCursor } =
+      await getApplications(userId, tier, {
+        limit,
+        cursor,
+        status,
+      });
 
     return res.status(200).json({
       success: true,
       data: {
-        applications: result.applications,
+        applications,
         pagination: {
-          hasMore:    result.hasMore,
-          nextCursor: result.nextCursor,
+          hasMore,
+          nextCursor,
           limit,
         },
       },
     });
   } catch (err) {
-    return next(err);
+    next(err);
   }
 }
 
-// ─── PATCH /applications/:id ──────────────────────────────────────────────────
+// ─────────────────────────────────────────────
+// 🔹 UPDATE APPLICATION
+// ─────────────────────────────────────────────
 
 async function update(req, res, next) {
   try {
-    const userId        = _safeUserId(req);
-    if (!userId) return res.status(401).json({ success: false, message: 'Unauthorized' });
+    const userId = _safeUserId(req);
+    if (!userId) {
+      return res.status(401).json({
+        success: false,
+        message: 'Unauthorized',
+      });
+    }
 
     const applicationId = req.params.id;
-    const updated       = await updateApplication(applicationId, userId, req.body);
+
+    const application = await updateApplication(
+      applicationId,
+      userId,
+      req.body
+    );
 
     return res.status(200).json({
       success: true,
-      data: { application: updated },
+      data: { application },
     });
   } catch (err) {
-    return next(err);
+    next(err);
   }
 }
 
-// ─── DELETE /applications/:id ─────────────────────────────────────────────────
+// ─────────────────────────────────────────────
+// 🔹 DELETE APPLICATION
+// ─────────────────────────────────────────────
 
 async function remove(req, res, next) {
   try {
-    const userId        = _safeUserId(req);
-    if (!userId) return res.status(401).json({ success: false, message: 'Unauthorized' });
+    const userId = _safeUserId(req);
+    if (!userId) {
+      return res.status(401).json({
+        success: false,
+        message: 'Unauthorized',
+      });
+    }
 
     const applicationId = req.params.id;
+
     await deleteApplication(applicationId, userId);
 
     return res.status(200).json({
       success: true,
-      data:    { deleted: true, id: applicationId },
+      data: {
+        deleted: true,
+        id: applicationId,
+      },
     });
   } catch (err) {
-    return next(err);
+    next(err);
   }
 }
 
-module.exports = { create, list, update, remove };
-
-
-
-
-
-
-
-
+module.exports = {
+  create,
+  list,
+  update,
+  remove,
+};

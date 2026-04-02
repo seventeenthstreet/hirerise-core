@@ -17,7 +17,7 @@
 
 const { db }        = require('../../../config/supabase');
 const { FieldValue } = require('../../../config/supabase');
-const logger        = require('../../../utils/logger');
+const logger        = require('../../../../utils/logger');
 const { COLLECTIONS, buildSkillDemandDoc, buildCareerScoreDoc } = require('../models/jobMarket.model');
 const { aggregateSkillCounts } = require('./skillExtraction.service');
 

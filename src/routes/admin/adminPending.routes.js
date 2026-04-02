@@ -17,7 +17,7 @@ const { requireContributor } = require('../../middleware/requireContributor.midd
 const { asyncHandler }       = require('../../utils/helpers');
 const logger                 = require('../../utils/logger');
 
-function getSupabase() { return require('../../core/supabaseClient'); }
+function getSupabase() { return require('../../config/supabase'); }
 
 const router = express.Router();
 const SUPPORTED_ENTITY_TYPES = ['skill', 'role', 'jobFamily', 'educationLevel', 'salaryBenchmark'];

@@ -1,7 +1,7 @@
 'use strict';
 
 const logger    = require('../utils/logger');
-const supabase  = require('../core/supabaseClient');
+const supabase  = require('../config/supabase');
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 

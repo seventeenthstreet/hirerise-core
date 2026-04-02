@@ -1,137 +1,179 @@
 'use strict';
 
 /**
- * eventWeights.config.js
+ * src/config/eventWeights.config.js
  *
- * Single source of truth for all scoring weights and behavioral constants.
- * No weight logic must live inside services.
- * This file must remain pure configuration.
+ * Single source of truth for:
+ * - scoring constants
+ * - behavioral thresholds
+ * - cache TTLs
+ * - dedupe windows
+ * - decay windows
+ *
+ * This file MUST remain:
+ * - pure
+ * - deterministic
+ * - side-effect free (except startup validation)
+ * - database agnostic
+ *
+ * No business logic should live here.
  */
+
+/* -------------------------------------------------------------------------- */
+/*                              INTERNAL HELPERS                              */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Deep freezes nested config objects to prevent runtime mutation.
+ *
+ * @template T
+ * @param {T} obj
+ * @returns {Readonly<T>}
+ */
+function deepFreeze(obj) {
+  if (!obj || typeof obj !== 'object' || Object.isFrozen(obj)) {
+    return obj;
+  }
+
+  for (const key of Object.getOwnPropertyNames(obj)) {
+    const value = obj[key];
+    if (value && typeof value === 'object') {
+      deepFreeze(value);
+    }
+  }
+
+  return Object.freeze(obj);
+}
+
+/**
+ * Ensures a numeric config value is valid.
+ *
+ * @param {string} name
+ * @param {number} value
+ * @param {{ min?: number, max?: number }} [options]
+ */
+function assertNumber(name, value, options = {}) {
+  const { min = Number.NEGATIVE_INFINITY, max = Number.POSITIVE_INFINITY } = options;
+
+  if (!Number.isFinite(value)) {
+    throw new TypeError(`${name} must be a finite number. Received: ${value}`);
+  }
+
+  if (value < min || value > max) {
+    throw new RangeError(
+      `${name} must be between ${min} and ${max}. Received: ${value}`
+    );
+  }
+}
 
 /* -------------------------------------------------------------------------- */
 /*                             SCORE VERSIONING                               */
 /* -------------------------------------------------------------------------- */
+
 /**
- * Increment this when scoring logic materially changes.
- * Allows analytics segmentation + safe migrations.
+ * Increment when scoring logic materially changes.
+ * Enables:
+ * - analytics segmentation
+ * - score backfills
+ * - safe A/B migrations
  */
 const SCORE_VERSION = 2;
 
 /* -------------------------------------------------------------------------- */
 /*                         ENGAGEMENT-DIMENSION WEIGHTS                       */
 /* -------------------------------------------------------------------------- */
-/**
- * Measures feature adoption and platform engagement depth.
- */
-const ENGAGEMENT_WEIGHTS = Object.freeze({
-  resume_uploaded:            20,
-  resume_scored:              10,
-  skill_test_started:         15,
+
+const ENGAGEMENT_WEIGHTS = {
+  resume_uploaded: 20,
+  resume_scored: 10,
+  skill_test_started: 15,
   profile_completion_updated: 12,
 
-  // FIX G-05: Onboarding funnel events
-  // Zero scoring weight — these are pure audit trail events that enable
-  // funnel analytics (drop-off by step, time-to-complete, A/B testing).
-  // The analytics team can assign weights without touching onboarding code.
-  onboarding_step_completed:  0,   // fired at each step completion
-  onboarding_completed:       0,   // fired when both tracks complete
-});
+  // Onboarding funnel analytics events
+  onboarding_step_completed: 0,
+  onboarding_completed: 0,
+};
 
 /* -------------------------------------------------------------------------- */
 /*                       MONETIZATION-DIMENSION WEIGHTS                       */
 /* -------------------------------------------------------------------------- */
-/**
- * Measures purchase and commercial intent signals.
- */
-const MONETIZATION_WEIGHTS = Object.freeze({
+
+const MONETIZATION_WEIGHTS = {
   salary_locked_feature_clicked: 25,
-  pricing_page_viewed:           15,
-  subscription_started:          30,
-  salary_report_viewed:          12,
-});
+  pricing_page_viewed: 15,
+  subscription_started: 30,
+  salary_report_viewed: 12,
+};
 
 /* -------------------------------------------------------------------------- */
 /*                          DIMENSION BLENDING WEIGHTS                        */
 /* -------------------------------------------------------------------------- */
+
 /**
- * Used to compute totalIntentScore:
- * total = engagementScore * engagementWeight
- *       + monetizationScore * monetizationWeight
- *
- * MUST sum to 1.0
+ * totalIntentScore =
+ *   engagementScore * engagement
+ * + monetizationScore * monetization
  */
-const DIMENSION_WEIGHTS = Object.freeze({
-  engagement:   0.6,
+const DIMENSION_WEIGHTS = {
+  engagement: 0.6,
   monetization: 0.4,
-});
+};
 
 /* -------------------------------------------------------------------------- */
 /*                             COUNTER CONTROLS                               */
 /* -------------------------------------------------------------------------- */
-/**
- * Maximum repetitions per event contributing to score.
- * Prevents score inflation.
- */
-const MAX_EVENT_REPETITIONS = 3;
 
-/**
- * Hard ceiling for stored counters in aggregate document.
- * Prevents unbounded growth over time.
- * This does NOT affect scoring cap.
- */
+const MAX_EVENT_REPETITIONS = 3;
 const HARD_COUNTER_LIMIT = 10;
 
 /* -------------------------------------------------------------------------- */
 /*                               CACHE CONFIG                                 */
 /* -------------------------------------------------------------------------- */
-/**
- * Score cache TTL in seconds.
- * Used by conversionCache.provider.js
- */
-const SCORE_CACHE_TTL_SECONDS = 5 * 60; // 5 minutes
+
+const SCORE_CACHE_TTL_SECONDS = 5 * 60;
 
 /* -------------------------------------------------------------------------- */
 /*                               TIME DECAY                                   */
 /* -------------------------------------------------------------------------- */
-/**
- * Separate decay windows allow dimension-specific decay.
- * Engagement usually decays faster than monetization.
- */
-const ENGAGEMENT_DECAY_WINDOW_DAYS   = 7;
-const MONETIZATION_DECAY_WINDOW_DAYS = 10;
 
-/**
- * If you want unified decay instead, keep them equal.
- */
+const ENGAGEMENT_DECAY_WINDOW_DAYS = 7;
+const MONETIZATION_DECAY_WINDOW_DAYS = 10;
 
 /* -------------------------------------------------------------------------- */
 /*                           IDEMPOTENCY / DEDUPE                             */
 /* -------------------------------------------------------------------------- */
-/**
- * Duplicate events within this window are ignored.
- */
-const DEDUP_WINDOW_MS = 10_000; // 10 seconds
+
+const DEDUP_WINDOW_MS = 10_000;
 
 /* -------------------------------------------------------------------------- */
-/*                               VALIDATION                                    */
+/*                               STARTUP VALIDATION                           */
 /* -------------------------------------------------------------------------- */
 
-/**
- * Ensures dimension weights sum to 1.0
- */
-(function validateDimensionWeights() {
-  const sum =
-    (DIMENSION_WEIGHTS.engagement || 0) +
-    (DIMENSION_WEIGHTS.monetization || 0);
+(function validateConfig() {
+  const weightSum =
+    (DIMENSION_WEIGHTS.engagement ?? 0) +
+    (DIMENSION_WEIGHTS.monetization ?? 0);
 
-  if (Math.abs(sum - 1) > 0.0001) {
+  if (Math.abs(weightSum - 1) > 0.0001) {
     throw new Error(
-      `Invalid DIMENSION_WEIGHTS: must sum to 1.0, received ${sum}`
+      `Invalid DIMENSION_WEIGHTS: must sum to 1.0, received ${weightSum}`
     );
   }
+
+  assertNumber('SCORE_VERSION', SCORE_VERSION, { min: 1 });
+  assertNumber('MAX_EVENT_REPETITIONS', MAX_EVENT_REPETITIONS, { min: 1 });
+  assertNumber('HARD_COUNTER_LIMIT', HARD_COUNTER_LIMIT, { min: 1 });
+  assertNumber('SCORE_CACHE_TTL_SECONDS', SCORE_CACHE_TTL_SECONDS, { min: 1 });
+  assertNumber('ENGAGEMENT_DECAY_WINDOW_DAYS', ENGAGEMENT_DECAY_WINDOW_DAYS, { min: 1 });
+  assertNumber('MONETIZATION_DECAY_WINDOW_DAYS', MONETIZATION_DECAY_WINDOW_DAYS, { min: 1 });
+  assertNumber('DEDUP_WINDOW_MS', DEDUP_WINDOW_MS, { min: 1 });
 })();
 
-module.exports = Object.freeze({
+/* -------------------------------------------------------------------------- */
+/*                                   EXPORTS                                  */
+/* -------------------------------------------------------------------------- */
+
+module.exports = deepFreeze({
   SCORE_VERSION,
 
   ENGAGEMENT_WEIGHTS,
@@ -148,11 +190,3 @@ module.exports = Object.freeze({
 
   DEDUP_WINDOW_MS,
 });
-
-
-
-
-
-
-
-

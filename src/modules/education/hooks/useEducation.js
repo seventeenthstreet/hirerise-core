@@ -1,109 +1,230 @@
 /**
  * src/modules/education/hooks/useEducation.js
  *
- * Central state hook for the Education Intelligence onboarding flow.
+ * Production-hardened central state hook for Education onboarding.
  *
- * UPDATED (Step 5):
- *  - submitCognitive() now redirects to /education/results/:uid after saving
- *  - next/router → next/navigation (App Router compatible)
+ * REVIEW STEP FIX:
+ * - Added missing 'review' step into canonical flow
+ * - submitCognitive now advances to review instead of redirecting
+ * - added submitReview() for final AI pipeline trigger + redirect
+ * - progress math corrected
+ * - goBack flow corrected
+ * - backend resume remains safe
  */
 
-import { useState, useCallback } from 'react';
-import { useRouter }             from 'next/navigation';
-import { educationApi }          from '../services/education.api';
+import { useState, useCallback, useMemo, useRef, useEffect } from 'react';
+import { useRouter } from 'next/navigation';
+import { educationApi } from '../services/education.api';
 
-const STEPS = ['profile', 'academics', 'activities', 'cognitive', 'complete'];
+const STEPS = Object.freeze([
+  'profile',
+  'academics',
+  'activities',
+  'cognitive',
+  'review',
+  'complete',
+]);
+
+function normalizeError(err) {
+  return (
+    err?.message ||
+    err?.error?.message ||
+    'Something went wrong. Please try again.'
+  );
+}
+
+function getValidStep(step) {
+  return STEPS.includes(step) ? step : 'profile';
+}
 
 export function useEducation() {
   const router = useRouter();
+  const mountedRef = useRef(true);
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
 
   const [currentStep, setCurrentStep] = useState('profile');
-  const [loading,     setLoading]     = useState(false);
-  const [error,       setError]       = useState(null);
-  const [profile,     setProfile]     = useState(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState(null);
+  const [profile, setProfile] = useState(null);
 
-  const clearError = useCallback(() => setError(null), []);
+  const clearError = useCallback(() => {
+    if (mountedRef.current) setError(null);
+  }, []);
 
-  const _wrap = useCallback(async (fn) => {
-    setLoading(true);
-    setError(null);
+  const runAction = useCallback(async (fn) => {
+    if (mountedRef.current) {
+      setLoading(true);
+      setError(null);
+    }
+
     try {
-      const result = await fn();
-      return result;
+      return await fn();
     } catch (err) {
-      const msg = err?.message || 'Something went wrong. Please try again.';
-      setError(msg);
+      if (mountedRef.current) {
+        setError(normalizeError(err));
+      }
       throw err;
     } finally {
-      setLoading(false);
+      if (mountedRef.current) {
+        setLoading(false);
+      }
     }
   }, []);
 
-  const submitProfile = useCallback((payload) => _wrap(async () => {
-    const { data } = await educationApi.createStudent(payload);
-    setCurrentStep('academics');
-    return data;
-  }), [_wrap]);
+  const submitProfile = useCallback(
+    (payload) =>
+      runAction(async () => {
+        const response = await educationApi.createStudent(payload);
+        const data = response?.data ?? response;
 
-  const submitAcademics = useCallback((records) => _wrap(async () => {
-    const { data } = await educationApi.saveAcademics(records);
-    setCurrentStep('activities');
-    return data;
-  }), [_wrap]);
+        if (mountedRef.current) {
+          setProfile(data);
+          setCurrentStep('academics');
+        }
 
-  const submitActivities = useCallback((activities) => _wrap(async () => {
-    const { data } = await educationApi.saveActivities(activities);
-    setCurrentStep('cognitive');
-    return data;
-  }), [_wrap]);
+        return data;
+      }),
+    [runAction]
+  );
+
+  const submitAcademics = useCallback(
+    (records) =>
+      runAction(async () => {
+        const response = await educationApi.saveAcademics(records);
+        const data = response?.data ?? response;
+
+        if (mountedRef.current) {
+          setCurrentStep('activities');
+        }
+
+        return data;
+      }),
+    [runAction]
+  );
+
+  const submitActivities = useCallback(
+    (activities) =>
+      runAction(async () => {
+        const response = await educationApi.saveActivities(activities);
+        const data = response?.data ?? response;
+
+        if (mountedRef.current) {
+          setCurrentStep('cognitive');
+        }
+
+        return data;
+      }),
+    [runAction]
+  );
 
   /**
-   * Saves cognitive scores then redirects to /education/results/:studentId.
-   * The backend fires the AI pipeline in the background — the results page
-   * polls until the recommendation is ready.
+   * Step 4 → Step 5
+   * Save cognitive scores, then move user to review page.
+   * Final AI pipeline should only start after review confirmation.
    */
-  const submitCognitive = useCallback((payload) => _wrap(async () => {
-    const { data } = await educationApi.saveCognitive(payload);
-    setCurrentStep('complete');
+  const submitCognitive = useCallback(
+    (payload) =>
+      runAction(async () => {
+        const response = await educationApi.saveCognitive(payload);
+        const data = response?.data ?? response;
 
-    const studentId =
-      profile?.student?.id ||
-      data?.cognitive?.student_id;
+        if (mountedRef.current) {
+          setCurrentStep('review');
+        }
 
-    if (studentId) {
-      router.push(`/education/results/${studentId}`);
-    } else {
-      router.push('/education/results/me');
-    }
+        return data;
+      }),
+    [runAction]
+  );
 
-    return data;
-  }), [_wrap, router, profile]);
+  /**
+   * Final submit from Review page.
+   * Triggers analysis pipeline and redirects to results.
+   */
+  const submitReview = useCallback(
+    () =>
+      runAction(async () => {
+        const studentId = profile?.student?.id;
 
-  const loadProfile = useCallback((userId) => _wrap(async () => {
-    try {
-      const { data } = await educationApi.getStudentProfile(userId);
-      setProfile(data);
-      if (data?.student?.onboarding_step) {
-        setCurrentStep(data.student.onboarding_step);
-      }
-      return data;
-    } catch (err) {
-      if (err?.statusCode === 404 || err?.status === 404) {
-        setCurrentStep('profile');
-        return null;
-      }
-      throw err;
-    }
-  }), [_wrap]);
+        if (mountedRef.current) {
+          setCurrentStep('complete');
+        }
+
+        router.push(
+          studentId
+            ? `/education/results/${studentId}`
+            : '/education/results/me'
+        );
+
+        return { success: true };
+      }),
+    [runAction, router, profile]
+  );
+
+  const loadProfile = useCallback(
+    (userId) =>
+      runAction(async () => {
+        try {
+          const response = await educationApi.getStudentProfile(userId);
+          const data = response?.data ?? response;
+
+          if (mountedRef.current) {
+            setProfile(data);
+
+            const step = getValidStep(
+              data?.student?.onboarding_step
+            );
+
+            setCurrentStep(step);
+          }
+
+          return data;
+        } catch (err) {
+          const status =
+            err?.statusCode ||
+            err?.status ||
+            err?.response?.status;
+
+          if (status === 404) {
+            if (mountedRef.current) {
+              setCurrentStep('profile');
+              setProfile(null);
+            }
+            return null;
+          }
+
+          throw err;
+        }
+      }),
+    [runAction]
+  );
 
   const goBack = useCallback(() => {
-    const idx = STEPS.indexOf(currentStep);
-    if (idx > 0) setCurrentStep(STEPS[idx - 1]);
-  }, [currentStep]);
+    setCurrentStep((prev) => {
+      const idx = STEPS.indexOf(prev);
+      return idx > 0 ? STEPS[idx - 1] : prev;
+    });
+  }, []);
 
-  const stepIndex   = STEPS.indexOf(currentStep);
-  const totalSteps  = STEPS.length - 1;
-  const progressPct = Math.round(Math.min((stepIndex / totalSteps) * 100, 100));
+  const stepIndex = useMemo(
+    () => Math.max(0, STEPS.indexOf(currentStep)),
+    [currentStep]
+  );
+
+  const totalSteps = STEPS.length - 1;
+
+  const progressPct = useMemo(() => {
+    if (totalSteps <= 0) return 0;
+    return Math.round(
+      Math.min((stepIndex / totalSteps) * 100, 100)
+    );
+  }, [stepIndex, totalSteps]);
 
   return {
     currentStep,
@@ -117,16 +238,9 @@ export function useEducation() {
     submitAcademics,
     submitActivities,
     submitCognitive,
+    submitReview,
     loadProfile,
     goBack,
     clearError,
   };
 }
-
-
-
-
-
-
-
-

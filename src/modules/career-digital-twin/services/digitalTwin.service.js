@@ -3,309 +3,301 @@
 /**
  * modules/career-digital-twin/services/digitalTwin.service.js
  *
- * Orchestration layer for the Career Digital Twin Engine.
- *
- * Responsibilities:
- *   1. Validate and normalise the incoming user profile.
- *   2. Check Redis / in-memory cache for a warm simulation result.
- *   3. If cache miss → call CareerDigitalTwinEngine.simulateCareerPaths().
- *   4. Optionally enrich with AI-generated narrative (includeNarrative flag).
- *   5. Persist result to Supabase (career_simulations table).
- *   6. Write result to cache with 30-minute TTL.
- *   7. Return shaped response to the controller.
- *
- * Cache strategy:
- *   Key:  digital_twin:{userId}:{roleSlug}
- *   TTL:  1800 seconds (30 minutes)
- *   Store: Redis when CACHE_PROVIDER=redis, else in-memory
- *
- * Supabase persistence:
- *   Table: career_simulations
- *   One row per (userId, simulation run). Old runs are not deleted —
- *   history is preserved for the career timeline feature.
- *
- * @module modules/career-digital-twin/services/digitalTwin.service
+ * Career Digital Twin orchestration layer.
  */
-
-'use strict';
 
 const logger = require('../../../utils/logger');
 const anthropic = require('../../../config/anthropic.client');
-const supabase = require('../../../core/supabaseClient');
+const { supabase } = require('../../../config/supabase');
 const cacheManager = require('../../../core/cache/cache.manager');
 const engine = require('../../../engines/career-digital-twin.engine');
-const { buildSimulationDoc } = require('../models/simulation.model');
-const { buildNarrativeMessages } = require('../prompts/twinPrompt.builder');
 
-// ─── Config ───────────────────────────────────────────────────────────────────
+const {
+  TABLE,
+  buildSimulationRow,
+} = require('../models/simulation.model');
 
-const COLLECTION = 'career_simulations';
-const CACHE_TTL_SEC = parseInt(process.env.DIGITAL_TWIN_CACHE_TTL_SEC || '1800', 10); // 30 min
+const {
+  buildNarrativeMessages,
+} = require('../prompts/twinPrompt.builder');
+
+const CACHE_TTL_SEC = Number.parseInt(
+  process.env.DIGITAL_TWIN_CACHE_TTL_SEC || '1800',
+  10
+);
+
 const AI_MAX_TOKENS = 1500;
 const NARRATIVE_MODEL = 'claude-sonnet-4-20250514';
-
-// ─── Cache helpers ────────────────────────────────────────────────────────────
+const DEFAULT_HISTORY_LIMIT = 10;
 
 /**
- * Build a deterministic, safe cache key for a user + role combination.
- * Spaces and special chars are replaced so Redis key constraints are met.
- *
- * @param {string} userId
- * @param {string} role
- * @returns {string}
+ * Safe cache key generator.
  */
-function _cacheKey(userId, role) {
-  const slug = (role || 'unknown')
+function buildCacheKey(userId, role) {
+  const safeUserId = String(userId || 'anonymous');
+  const slug = String(role || 'unknown')
     .toLowerCase()
     .replace(/[^a-z0-9]/g, '_')
     .slice(0, 60);
-  return `digital_twin:${userId}:${slug}`;
+
+  return `digital_twin:${safeUserId}:${slug}`;
 }
 
 /**
- * Attempt to read a cached simulation result.
- * Returns null on any cache error so callers always get a result.
- *
- * @param {string} key
- * @returns {Promise<Object|null>}
+ * Best-effort cache read.
  */
-async function _cacheGet(key) {
+async function cacheGet(key) {
   try {
     const cache = cacheManager.getClient();
     const raw = await cache.get(key);
-    if (raw) {
-      const parsed = typeof raw === 'string' ? JSON.parse(raw) : raw;
-      logger.debug('[DigitalTwinService] Cache HIT', { key });
-      return parsed;
+
+    if (!raw) {
+      return null;
     }
-  } catch (err) {
-    logger.warn('[DigitalTwinService] Cache GET error (non-fatal)', {
+
+    const parsed =
+      typeof raw === 'string' ? JSON.parse(raw) : raw;
+
+    logger.debug('[DigitalTwinService] cache:get:hit', { key });
+
+    return parsed;
+  } catch (error) {
+    logger.warn('[DigitalTwinService] cache:get:failed', {
       key,
-      err: err.message
-    });
-  }
-  return null;
-}
-
-/**
- * Write a simulation result to cache.
- * Silently swallows errors — a cache write failure should never block a response.
- *
- * @param {string} key
- * @param {Object} value
- * @returns {Promise<void>}
- */
-async function _cacheSet(key, value) {
-  try {
-    const cache = cacheManager.getClient();
-    await cache.set(key, JSON.stringify(value), CACHE_TTL_SEC);
-    logger.debug('[DigitalTwinService] Cache SET', { key, ttl: CACHE_TTL_SEC });
-  } catch (err) {
-    logger.warn('[DigitalTwinService] Cache SET error (non-fatal)', {
-      key,
-      err: err.message
-    });
-  }
-}
-
-// ─── AI narrative enrichment ──────────────────────────────────────────────────
-
-/**
- * Optionally enrich simulation paths with AI-generated narrative summaries.
- * Returns the original paths unchanged on any AI failure — never throws.
- *
- * @param {Object}   userProfile
- * @param {Object[]} careerPaths
- * @returns {Promise<Object[]>}  careerPaths with optional .narrative field added
- */
-async function _enrichWithNarratives(userProfile, careerPaths) {
-  if (!anthropic) {
-    logger.warn('[DigitalTwinService] AI client unavailable, skipping narratives');
-    return careerPaths;
-  }
-  try {
-    const { system, messages } = buildNarrativeMessages(userProfile, careerPaths);
-    const response = await anthropic.messages.create({
-      model: NARRATIVE_MODEL,
-      max_tokens: AI_MAX_TOKENS,
-      temperature: 0.4,
-      system,
-      messages
-    });
-    const raw = response.content?.[0]?.text || '';
-    // Strip possible markdown fences before parsing
-    const clean = raw.replace(/```json|```/g, '').trim();
-    const parsed = JSON.parse(clean);
-    const narrativeMap = new Map(
-      (parsed.narratives || []).map(n => [n.strategy_id, n])
-    );
-    return careerPaths.map(p => {
-      const n = narrativeMap.get(p.strategy_id);
-      if (!n) return p;
-      return {
-        ...p,
-        narrative: n.summary || null,
-        key_milestone: n.key_milestone || null
-      };
-    });
-  } catch (err) {
-    logger.warn('[DigitalTwinService] Narrative enrichment failed (non-fatal)', {
-      err: err.message
-    });
-    return careerPaths; // graceful degradation
-  }
-}
-
-// ─── Supabase persistence ─────────────────────────────────────────────────────
-
-/**
- * Persist a simulation result to Supabase.
- * Non-blocking — awaited but errors are swallowed so they never block the API.
- *
- * @param {string} userId
- * @param {Object} simulationResult
- * @returns {Promise<string|null>}  Inserted row ID or null on failure
- */
-async function _persist(userId, simulationResult) {
-  try {
-    const doc = buildSimulationDoc(userId, simulationResult);
-    const { data, error } = await supabase
-      .from(COLLECTION)
-      .insert(doc)
-      .select('id')
-      .single();
-    if (error) throw error;
-    logger.info('[DigitalTwinService] Simulation persisted', {
-      userId,
-      docId: data?.id
-    });
-    return data?.id || null;
-  } catch (err) {
-    logger.warn('[DigitalTwinService] Supabase persist failed (non-fatal)', {
-      userId,
-      err: err.message
+      error: error.message,
     });
     return null;
   }
 }
 
-// ─── Public API ───────────────────────────────────────────────────────────────
+/**
+ * Best-effort cache write.
+ */
+async function cacheSet(key, value) {
+  try {
+    const cache = cacheManager.getClient();
+    await cache.set(key, JSON.stringify(value), CACHE_TTL_SEC);
+
+    logger.debug('[DigitalTwinService] cache:set:success', {
+      key,
+      ttl: CACHE_TTL_SEC,
+    });
+  } catch (error) {
+    logger.warn('[DigitalTwinService] cache:set:failed', {
+      key,
+      error: error.message,
+    });
+  }
+}
 
 /**
- * runSimulation({ userId, userProfile, marketData, includeNarrative, forceRefresh })
- *
- * Main entry point. Checks cache, runs engine, optionally adds AI narratives,
- * persists to Supabase, writes to cache, and returns the simulation result.
- *
- * @param {Object}  params
- * @param {string}  params.userId              — user ID
- * @param {Object}  params.userProfile         — { role, skills[], experience_years, industry }
- * @param {Object}  [params.marketData]        — optional market enrichment data
- * @param {boolean} [params.includeNarrative]  — if true, add AI-written path summaries
- * @param {boolean} [params.forceRefresh]      — if true, skip cache read
- *
- * @returns {Promise<Object>}
- *   { career_paths, meta, cached, simulation_id? }
+ * Safe JSON extraction from AI response.
  */
+function extractJsonPayload(rawText) {
+  const text = String(rawText || '').trim();
+
+  const firstBrace = text.indexOf('{');
+  const lastBrace = text.lastIndexOf('}');
+
+  if (firstBrace === -1 || lastBrace === -1) {
+    throw new Error('No JSON object found in AI response');
+  }
+
+  return JSON.parse(text.slice(firstBrace, lastBrace + 1));
+}
+
+/**
+ * Optional AI narrative enrichment.
+ */
+async function enrichWithNarratives(userProfile, careerPaths) {
+  if (!anthropic || !Array.isArray(careerPaths) || careerPaths.length === 0) {
+    return careerPaths;
+  }
+
+  try {
+    const { system, messages } = buildNarrativeMessages(
+      userProfile,
+      careerPaths
+    );
+
+    const response = await anthropic.messages.create({
+      model: NARRATIVE_MODEL,
+      max_tokens: AI_MAX_TOKENS,
+      temperature: 0.4,
+      system,
+      messages,
+    });
+
+    const rawText = Array.isArray(response?.content)
+      ? response.content
+          .map((block) => block?.text || '')
+          .join('\n')
+      : '';
+
+    const parsed = extractJsonPayload(rawText);
+
+    const narrativeMap = new Map(
+      Array.isArray(parsed?.narratives)
+        ? parsed.narratives.map((item) => [
+            item.strategy_id,
+            item,
+          ])
+        : []
+    );
+
+    return careerPaths.map((path) => {
+      const narrative = narrativeMap.get(path.strategy_id);
+
+      if (!narrative) {
+        return path;
+      }
+
+      return {
+        ...path,
+        narrative: narrative.summary ?? null,
+        key_milestone: narrative.key_milestone ?? null,
+      };
+    });
+  } catch (error) {
+    logger.warn('[DigitalTwinService] narrative:failed', {
+      error: error.message,
+    });
+
+    return careerPaths;
+  }
+}
+
+/**
+ * Persist simulation row.
+ */
+async function persistSimulation(userId, simulationResult) {
+  try {
+    const row = buildSimulationRow(userId, simulationResult);
+
+    const { data, error } = await supabase
+      .from(TABLE)
+      .insert([row])
+      .select('id')
+      .single();
+
+    if (error) {
+      throw error;
+    }
+
+    logger.info('[DigitalTwinService] persist:success', {
+      userId,
+      simulationId: data?.id,
+    });
+
+    return data?.id ?? null;
+  } catch (error) {
+    logger.warn('[DigitalTwinService] persist:failed', {
+      userId,
+      error: error.message,
+    });
+
+    return null;
+  }
+}
+
 async function runSimulation({
   userId,
   userProfile,
   marketData = {},
   includeNarrative = false,
-  forceRefresh = false
+  forceRefresh = false,
 }) {
-  const key = _cacheKey(userId, userProfile.role);
+  const cacheKey = buildCacheKey(userId, userProfile?.role);
 
-  // ── Cache read ────────────────────────────────────────────────────────────
   if (!forceRefresh) {
-    const cached = await _cacheGet(key);
+    const cached = await cacheGet(cacheKey);
+
     if (cached) {
-      return { ...cached, cached: true };
+      return {
+        ...cached,
+        cached: true,
+      };
     }
   }
 
-  // ── Engine run ────────────────────────────────────────────────────────────
-  logger.info('[DigitalTwinService] Running simulation (cache miss)', {
+  logger.info('[DigitalTwinService] simulation:start', {
     userId,
-    role: userProfile.role
+    role: userProfile?.role,
   });
-  const simulationResult = await engine.simulateCareerPaths(userProfile, marketData);
 
-  // ── Optional AI narrative enrichment ──────────────────────────────────────
+  const simulationResult =
+    await engine.simulateCareerPaths(userProfile, marketData);
+
   if (includeNarrative) {
-    simulationResult.career_paths = await _enrichWithNarratives(
+    simulationResult.career_paths = await enrichWithNarratives(
       userProfile,
       simulationResult.career_paths
     );
   }
 
-  // ── Persist to Supabase (non-blocking intent, awaited for row ID) ──────────
-  const simulationId = await _persist(userId, simulationResult);
+  const simulationId = await persistSimulation(
+    userId,
+    simulationResult
+  );
 
-  // ── Cache write ───────────────────────────────────────────────────────────
   const response = {
     ...simulationResult,
     simulation_id: simulationId,
-    cached: false
+    cached: false,
   };
-  await _cacheSet(key, response);
+
+  await cacheSet(cacheKey, response);
+
   return response;
 }
 
-/**
- * getStoredSimulations(userId, limit?)
- *
- * Fetch past simulation records for a user from Supabase.
- * Used by GET /api/career/simulations.
- *
- * @param {string} userId
- * @param {number} [limit=10]
- * @returns {Promise<Object[]>}
- */
-async function getStoredSimulations(userId, limit = 10) {
-  try {
-    const { data, error } = await supabase
-      .from(COLLECTION)
-      .select('*')
-      .eq('user_id', userId)
-      .order('created_at', { ascending: false })
-      .limit(limit);
+async function getStoredSimulations(
+  userId,
+  limit = DEFAULT_HISTORY_LIMIT
+) {
+  const safeLimit = Number.isFinite(limit) ? limit : DEFAULT_HISTORY_LIMIT;
 
-    if (error) throw error;
-    return (data || []).map(row => ({
-      ...row,
-      created_at: row.created_at || null
-    }));
-  } catch (err) {
-    logger.error('[DigitalTwinService] getStoredSimulations failed', {
+  const { data, error } = await supabase
+    .from(TABLE)
+    .select('*')
+    .eq('user_id', userId)
+    .order('created_at', { ascending: false })
+    .limit(safeLimit);
+
+  if (error) {
+    logger.error('[DigitalTwinService] history:failed', {
       userId,
-      err: err.message
+      error: error.message,
     });
-    throw err;
+    throw error;
   }
+
+  return Array.isArray(data) ? data : [];
 }
 
-/**
- * invalidateUserCache(userId, role?)
- *
- * Bust the cache for a user (e.g. after they update their profile).
- * If role is omitted, only a specific key cannot be computed — pass role
- * or call engine.invalidateCache() for a global flush.
- *
- * @param {string}  userId
- * @param {string}  [role]
- * @returns {Promise<void>}
- */
 async function invalidateUserCache(userId, role) {
-  if (!role) return; // can't bust without a key
-  const key = _cacheKey(userId, role);
+  if (!role) {
+    return;
+  }
+
+  const key = buildCacheKey(userId, role);
+
   try {
     const cache = cacheManager.getClient();
-    await cache.delete(key);
-    logger.info('[DigitalTwinService] User cache invalidated', { userId, key });
-  } catch (err) {
-    logger.warn('[DigitalTwinService] Cache invalidation failed (non-fatal)', {
-      err: err.message
+
+    if (typeof cache.del === 'function') {
+      await cache.del(key);
+    } else if (typeof cache.delete === 'function') {
+      await cache.delete(key);
+    }
+
+    logger.info('[DigitalTwinService] cache:invalidate:success', {
+      userId,
+      key,
+    });
+  } catch (error) {
+    logger.warn('[DigitalTwinService] cache:invalidate:failed', {
+      error: error.message,
     });
   }
 }
@@ -313,5 +305,5 @@ async function invalidateUserCache(userId, role) {
 module.exports = {
   runSimulation,
   getStoredSimulations,
-  invalidateUserCache
+  invalidateUserCache,
 };

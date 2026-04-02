@@ -1,105 +1,60 @@
-role,next_role,years_to_next,industry
-Junior Accountant,Senior Accountant,2,Finance
-Senior Accountant,Finance Manager,3,Finance
-Finance Manager,Finance Director,4,Finance
-Finance Director,Chief Financial Officer,5,Finance
-Accountant,Senior Accountant,3,Finance
-Senior Accountant,Accounting Manager,4,Finance
-Accounting Manager,Finance Controller,3,Finance
-Finance Controller,Chief Financial Officer,4,Finance
-Junior Data Analyst,Data Analyst,2,Technology
-Data Analyst,Senior Data Analyst,3,Technology
-Senior Data Analyst,Lead Data Analyst,2,Technology
-Lead Data Analyst,Data Science Manager,3,Technology
-Data Science Manager,Head of Data,3,Technology
-Head of Data,Chief Data Officer,4,Technology
-Junior Data Scientist,Data Scientist,2,Technology
-Data Scientist,Senior Data Scientist,3,Technology
-Senior Data Scientist,Lead Data Scientist,2,Technology
-Lead Data Scientist,Data Science Manager,2,Technology
+from_role,to_role,years_to_next,role_family
 Junior Software Engineer,Software Engineer,2,Technology
 Software Engineer,Senior Software Engineer,3,Technology
-Senior Software Engineer,Lead Engineer,3,Technology
-Lead Engineer,Engineering Manager,3,Technology
+Senior Software Engineer,Staff Engineer,3,Technology
+Staff Engineer,Principal Engineer,3,Technology
+Principal Engineer,Engineering Manager,3,Technology
 Engineering Manager,Director of Engineering,4,Technology
 Director of Engineering,VP of Engineering,4,Technology
 VP of Engineering,Chief Technology Officer,4,Technology
-Junior Frontend Developer,Frontend Developer,2,Technology
-Frontend Developer,Senior Frontend Developer,3,Technology
-Senior Frontend Developer,Lead Frontend Developer,2,Technology
-Lead Frontend Developer,Engineering Manager,3,Technology
-Junior Backend Developer,Backend Developer,2,Technology
-Backend Developer,Senior Backend Developer,3,Technology
-Senior Backend Developer,Lead Backend Developer,2,Technology
-Lead Backend Developer,Engineering Manager,3,Technology
-Junior Full Stack Developer,Full Stack Developer,2,Technology
-Full Stack Developer,Senior Full Stack Developer,3,Technology
-Senior Full Stack Developer,Lead Full Stack Developer,2,Technology
-Lead Full Stack Developer,Engineering Manager,3,Technology
-Junior DevOps Engineer,DevOps Engineer,2,Technology
-DevOps Engineer,Senior DevOps Engineer,3,Technology
-Senior DevOps Engineer,Lead DevOps Engineer,2,Technology
-Lead DevOps Engineer,DevOps Manager,3,Technology
-DevOps Manager,VP of Infrastructure,4,Technology
+
+Junior Data Analyst,Data Analyst,2,Technology
+Data Analyst,Senior Data Analyst,3,Technology
+Senior Data Analyst,Data Scientist,2,Technology
+Data Scientist,Senior Data Scientist,3,Technology
+Senior Data Scientist,Machine Learning Engineer,2,Technology
+
+Machine Learning Engineer,Senior Machine Learning Engineer,3,Technology
+Senior Machine Learning Engineer,Lead ML Engineer,2,Technology
+Lead ML Engineer,ML Engineering Manager,3,Technology
+
 Junior Product Manager,Product Manager,2,Management
 Product Manager,Senior Product Manager,3,Management
-Senior Product Manager,Principal Product Manager,2,Management
-Principal Product Manager,Director of Product,3,Management
+Senior Product Manager,Director of Product,3,Management
 Director of Product,VP of Product,4,Management
 VP of Product,Chief Product Officer,4,Management
+
 Junior UX Designer,UX Designer,2,Technology
 UX Designer,Senior UX Designer,3,Technology
 Senior UX Designer,Lead UX Designer,2,Technology
 Lead UX Designer,Design Manager,3,Technology
 Design Manager,Head of Design,3,Technology
 Head of Design,Chief Design Officer,4,Technology
-Junior Business Analyst,Business Analyst,2,Management
-Business Analyst,Senior Business Analyst,3,Management
-Senior Business Analyst,Lead Business Analyst,2,Management
-Lead Business Analyst,Business Analysis Manager,3,Management
-Business Analysis Manager,Director of Strategy,4,Management
-Junior HR Executive,HR Executive,2,HR
-HR Executive,Senior HR Executive,3,HR
-Senior HR Executive,HR Manager,3,HR
-HR Manager,Senior HR Manager,2,HR
-Senior HR Manager,HR Director,4,HR
-HR Director,Chief Human Resources Officer,4,HR
-Junior Marketing Executive,Marketing Executive,2,Marketing
-Marketing Executive,Senior Marketing Executive,3,Marketing
-Senior Marketing Executive,Marketing Manager,3,Marketing
+
+DevOps Engineer,Senior DevOps Engineer,3,Technology
+Senior DevOps Engineer,Lead DevOps Engineer,2,Technology
+Lead DevOps Engineer,DevOps Manager,3,Technology
+DevOps Manager,VP of Infrastructure,4,Technology
+
+Backend Engineer,Senior Software Engineer,3,Technology
+Frontend Engineer,Senior Software Engineer,3,Technology
+Full Stack Engineer,Senior Software Engineer,3,Technology
+
+QA Engineer,Senior QA Engineer,3,Technology
+Senior QA Engineer,QA Lead,2,Technology
+QA Lead,QA Manager,3,Technology
+
+Security Engineer,Senior Security Engineer,3,Technology
+Senior Security Engineer,Security Lead,2,Technology
+Security Lead,Security Manager,3,Technology
+
+Junior Marketing Analyst,Marketing Analyst,2,Marketing
+Marketing Analyst,Growth Manager,3,Marketing
+Growth Manager,Marketing Manager,3,Marketing
 Marketing Manager,Senior Marketing Manager,2,Marketing
 Senior Marketing Manager,Marketing Director,4,Marketing
 Marketing Director,Chief Marketing Officer,4,Marketing
-Sales Executive,Senior Sales Executive,2,Sales
-Senior Sales Executive,Sales Manager,3,Sales
-Sales Manager,Senior Sales Manager,2,Sales
-Senior Sales Manager,Sales Director,4,Sales
-Sales Director,VP of Sales,4,Sales
-VP of Sales,Chief Revenue Officer,4,Sales
-Junior Project Manager,Project Manager,2,Management
-Project Manager,Senior Project Manager,3,Management
-Senior Project Manager,Programme Manager,3,Management
-Programme Manager,Portfolio Manager,3,Management
-Portfolio Manager,Director of PMO,4,Management
-Junior Machine Learning Engineer,Machine Learning Engineer,2,Technology
-Machine Learning Engineer,Senior Machine Learning Engineer,3,Technology
-Senior Machine Learning Engineer,Lead ML Engineer,2,Technology
-Lead ML Engineer,ML Engineering Manager,3,Technology
-ML Engineering Manager,Head of AI,3,Technology
-Head of AI,Chief AI Officer,4,Technology
-Junior Data Engineer,Data Engineer,2,Technology
-Data Engineer,Senior Data Engineer,3,Technology
-Senior Data Engineer,Lead Data Engineer,2,Technology
-Lead Data Engineer,Data Engineering Manager,3,Technology
-Data Engineering Manager,Head of Data Engineering,3,Technology
-Junior Cloud Engineer,Cloud Engineer,2,Technology
-Cloud Engineer,Senior Cloud Engineer,3,Technology
-Senior Cloud Engineer,Cloud Architect,3,Technology
-Cloud Architect,Principal Cloud Architect,3,Technology
-Principal Cloud Architect,Head of Cloud,4,Technology
-Junior Cybersecurity Analyst,Cybersecurity Analyst,2,Technology
-Cybersecurity Analyst,Senior Cybersecurity Analyst,3,Technology
-Senior Cybersecurity Analyst,Security Lead,2,Technology
-Security Lead,Security Manager,3,Technology
-Security Manager,Head of Cybersecurity,4,Technology
-Head of Cybersecurity,Chief Information Security Officer,4,Technology
+
+Product Marketing Manager,Senior Product Marketing Manager,3,Marketing
+Senior Product Marketing Manager,Director of Product Marketing,4,Marketing
+Director of Product Marketing,VP of Marketing,4,Marketing

@@ -1,225 +1,282 @@
 'use strict';
 
 /**
- * careerCopilot.controller.js + careerCopilot.routes.js
+ * @file src/modules/career-copilot/careerCopilot.routes.js
+ * @description
+ * Production-grade controller + routes for grounded Career Copilot.
  *
- * Combined controller + routes for the grounded Career Copilot.
- *
- * Endpoints:
- *   POST /api/v1/copilot/chat              — grounded chat (job seeker path)
- *   GET  /api/v1/copilot/welcome           — welcome message with data availability
- *   GET  /api/v1/copilot/history/:conversationId — conversation history
- *   GET  /api/v1/copilot/context           — debug: show retrieved context (dev only)
- *
- * Integration with existing advisor routes:
- *   The existing /api/v1/advisor/chat/:studentId remains UNTOUCHED for the
- *   student/education path. This Copilot serves the job-seeker path.
- *
- * Mount in server.js (one line):
- *   app.use(`${API_PREFIX}/copilot`, authenticate,
- *     require('./modules/career-copilot/careerCopilot.routes'));
- *
- * @module src/modules/career-copilot/careerCopilot.controller
- * @module src/modules/career-copilot/careerCopilot.routes
+ * Optimized for:
+ * - low-latency route handling
+ * - consistent response envelopes
+ * - safer auth extraction
+ * - debug endpoint hardening
+ * - future abort propagation readiness
  */
 
-// ══════════════════════════════════════════════════════════════════════════════
-// CONTROLLER
-// ══════════════════════════════════════════════════════════════════════════════
+const { Router } = require('express');
+const { body, param } = require('express-validator');
 
-'use strict';
+const logger = require('../../../utils/logger');
+const { validate } = require('../../../middleware/requestValidator');
 
-const logger          = require('../../../utils/logger');
-const copilotService  = require('../careerCopilot.service');
-const ragRetriever    = require('../retrieval/ragRetriever');
+const copilotService = require('../careerCopilot.service');
+const ragRetriever = require('../retrieval/ragRetriever');
 
-// ─── Response helpers ─────────────────────────────────────────────────────────
+const router = Router();
 
-const ok   = (res, data)              => res.status(200).json({ success: true,  data });
-const bad  = (res, msg, code = 400)   => res.status(code).json({ success: false, error: msg });
+const MAX_MESSAGE_LENGTH = 2000;
+const MAX_CONVERSATION_ID_LENGTH = 100;
 
-function _userId(req) {
-  return req.user?.uid || req.user?.id || null;
+// ─────────────────────────────────────────────────────────────────────────────
+// Response helpers
+// ─────────────────────────────────────────────────────────────────────────────
+function ok(res, data) {
+  res.set('Cache-Control', 'no-store');
+  return res.status(200).json({
+    success: true,
+    data,
+  });
 }
 
-// ─── POST /copilot/chat ───────────────────────────────────────────────────────
+function bad(res, message, code = 400) {
+  res.set('Cache-Control', 'no-store');
+  return res.status(code).json({
+    success: false,
+    error: message,
+  });
+}
 
-/**
- * Grounded chat endpoint.
- *
- * Body:
- *   message         {string}  required — user's question (1-2000 chars)
- *   conversation_id {string}  optional — pass to maintain session context
- *   force_refresh   {boolean} optional — bypass context cache (default false)
- *
- * Response:
- *   {
- *     response:          string   — AI answer (grounded in platform data)
- *     data_sources:      string[] — which engines were used
- *     confidence:        number   — 0-1 quality score
- *     data_completeness: number   — fraction of sources available
- *     signal_strength:   string   — 'high'|'medium'|'low'|'insufficient'
- *     was_grounded:      boolean
- *     refused:           boolean  — true if insufficient data
- *     conversation_id:   string   — session ID for follow-up questions
- *   }
- */
+// ─────────────────────────────────────────────────────────────────────────────
+// Auth helper
+// ─────────────────────────────────────────────────────────────────────────────
+function getUserId(req) {
+  return req.user?.id || req.user?.uid || null;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Helpers
+// ─────────────────────────────────────────────────────────────────────────────
+function normalizeConversationId(body = {}) {
+  return (
+    body.conversation_id ||
+    body.conversationId ||
+    undefined
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// POST /copilot/chat
+// ─────────────────────────────────────────────────────────────────────────────
 async function chat(req, res) {
-  const userId = _userId(req);
+  const userId = getUserId(req);
   if (!userId) return bad(res, 'Unauthenticated', 401);
 
-  // Accept both snake_case (conversation_id) and camelCase (conversationId) from the client.
-  // The frontend dashboard sends conversationId; the canonical key is conversation_id.
-  const {
-    message,
-    conversation_id: _conv_snake,
-    conversationId:  _conv_camel,
-    force_refresh,
-  } = req.body;
-  const conversation_id = _conv_snake || _conv_camel || undefined;
+  const rawMessage = req.body?.message;
 
-  if (!message || typeof message !== 'string') {
+  if (typeof rawMessage !== 'string') {
     return bad(res, '"message" is required and must be a string');
   }
 
-  const trimmed = message.trim();
-  if (trimmed.length === 0)    return bad(res, '"message" cannot be empty');
-  if (trimmed.length > 2000)   return bad(res, '"message" must not exceed 2000 characters');
+  const message = rawMessage.trim();
 
-  // Load user name for personalised prompts
-  let userName = req.user?.displayName || req.user?.name || null;
+  if (!message) {
+    return bad(res, '"message" cannot be empty');
+  }
+
+  if (message.length > MAX_MESSAGE_LENGTH) {
+    return bad(
+      res,
+      `"message" must not exceed ${MAX_MESSAGE_LENGTH} characters`
+    );
+  }
+
+  const conversationId = normalizeConversationId(req.body);
+
+  const userName =
+    req.user?.displayName ||
+    req.user?.name ||
+    null;
+
+  let clientDisconnected = false;
+  req.on('close', () => {
+    clientDisconnected = true;
+  });
 
   try {
-    const result = await copilotService.chat(userId, trimmed, {
-      conversationId: conversation_id || undefined,
+    const result = await copilotService.chat(userId, message, {
+      conversationId,
       userName,
-      forceRefresh:   force_refresh === true,
+      forceRefresh: req.body?.force_refresh === true,
+      signal: req.signal, // future abort propagation ready
     });
 
-    ok(res, result);
+    if (clientDisconnected) {
+      logger.warn('[CopilotController] Client disconnected before response', {
+        userId,
+      });
+      return;
+    }
+
+    return ok(res, result);
   } catch (err) {
-    logger.error('[CopilotController] chat error', { userId, err: err.message });
-    bad(res, 'Failed to generate response. Please try again.', 500);
+    logger.error('[CopilotController] chat error', {
+      userId,
+      error: err.message,
+    });
+
+    return bad(res, 'Failed to generate response. Please try again.', 500);
   }
 }
 
-// ─── GET /copilot/welcome ─────────────────────────────────────────────────────
-
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /copilot/welcome
+// ─────────────────────────────────────────────────────────────────────────────
 async function welcome(req, res) {
-  const userId = _userId(req);
+  const userId = getUserId(req);
   if (!userId) return bad(res, 'Unauthenticated', 401);
 
   try {
     const result = await copilotService.getWelcome(userId);
-    ok(res, result);
+    return ok(res, result);
   } catch (err) {
-    logger.error('[CopilotController] welcome error', { userId, err: err.message });
-    bad(res, 'Failed to load welcome message', 500);
+    logger.error('[CopilotController] welcome error', {
+      userId,
+      error: err.message,
+    });
+
+    return bad(res, 'Failed to load welcome message', 500);
   }
 }
 
-// ─── GET /copilot/history/:conversationId ────────────────────────────────────
-
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /copilot/history/:conversationId
+// ─────────────────────────────────────────────────────────────────────────────
 async function history(req, res) {
-  const userId         = _userId(req);
-  const conversationId = req.params.conversationId;
-  if (!userId)         return bad(res, 'Unauthenticated', 401);
-  if (!conversationId) return bad(res, 'conversationId is required');
+  const userId = getUserId(req);
+  const conversationId = req.params?.conversationId;
+
+  if (!userId) return bad(res, 'Unauthenticated', 401);
+  if (!conversationId) {
+    return bad(res, 'conversationId is required');
+  }
 
   try {
-    const result = await copilotService.getHistory(userId, conversationId);
-    ok(res, result);
+    const result = await copilotService.getHistory(
+      userId,
+      conversationId
+    );
+
+    return ok(res, result);
   } catch (err) {
-    bad(res, 'Failed to load history', 500);
+    logger.error('[CopilotController] history error', {
+      userId,
+      conversationId,
+      error: err.message,
+    });
+
+    return bad(res, 'Failed to load history', 500);
   }
 }
 
-// ─── GET /copilot/context (dev/debug only) ────────────────────────────────────
-
-/**
- * Returns the raw retrieved context for the authenticated user.
- * Only available in non-production environments.
- * Useful for debugging what data the Copilot has access to.
- */
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /copilot/context (dev only)
+// ─────────────────────────────────────────────────────────────────────────────
 async function debugContext(req, res) {
   if (process.env.NODE_ENV === 'production') {
     return bad(res, 'Not available in production', 403);
   }
 
-  const userId = _userId(req);
+  const userId = getUserId(req);
   if (!userId) return bad(res, 'Unauthenticated', 401);
 
   try {
-    const context = await ragRetriever.retrieveContext(userId, { forceRefresh: true });
-    ok(res, {
-      data_sources_used:  context.data_sources_used,
-      data_completeness:  context.data_completeness,
-      confidence_score:   context.confidence_score,
-      is_sufficient:      context.is_sufficient,
-      retrieval_ms:       context.retrieval_ms,
-      // Summarise each source (don't expose full data in debug endpoint)
+    const context = await ragRetriever.retrieveContext(userId, {
+      forceRefresh: true,
+    });
+
+    return ok(res, {
+      data_sources_used: context.data_sources_used,
+      data_completeness: context.data_completeness,
+      confidence_score: context.confidence_score,
+      is_sufficient: context.is_sufficient,
+      retrieval_ms: context.retrieval_ms,
       sources_summary: {
-        user_profile:            context.user_profile ? '✓' : '✗',
-        chi_score:               context.chi_score    ? `✓ (${context.chi_score?.chi_score})` : '✗',
-        skill_gaps:              context.skill_gaps   ? `✓ (${(context.skill_gaps?.missing_high_demand||[]).length} gaps)` : '✗',
-        job_matches:             context.job_matches  ? `✓ (${(context.job_matches?.top_matches||[]).length} matches)` : '✗',
-        opportunity_radar:       context.opportunity_radar ? `✓ (${(context.opportunity_radar?.emerging_opportunities||[]).length} opps)` : '✗',
-        risk_analysis:           context.risk_analysis ? `✓ (${context.risk_analysis?.risk_level})` : '✗',
-        salary_benchmarks:       context.salary_benchmarks ? '✓' : '✗',
-        personalization_profile: context.personalization_profile ? `✓ (${context.personalization_profile?.total_events} events)` : '✗',
+        user_profile: context.user_profile ? '✓' : '✗',
+        chi_score: context.chi_score
+          ? `✓ (${context.chi_score?.chi_score})`
+          : '✗',
+        skill_gaps: context.skill_gaps
+          ? `✓ (${(context.skill_gaps?.missing_high_demand || []).length} gaps)`
+          : '✗',
+        job_matches: context.job_matches
+          ? `✓ (${(context.job_matches?.top_matches || []).length} matches)`
+          : '✗',
+        opportunity_radar: context.opportunity_radar
+          ? `✓ (${(context.opportunity_radar?.emerging_opportunities || []).length} opps)`
+          : '✗',
+        risk_analysis: context.risk_analysis
+          ? `✓ (${context.risk_analysis?.risk_level})`
+          : '✗',
+        salary_benchmarks: context.salary_benchmarks ? '✓' : '✗',
+        personalization_profile: context.personalization_profile
+          ? `✓ (${context.personalization_profile?.total_events || 0} events)`
+          : '✗',
       },
     });
   } catch (err) {
-    bad(res, 'Failed to retrieve context', 500);
+    logger.error('[CopilotController] context debug error', {
+      userId,
+      error: err.message,
+    });
+
+    return bad(res, 'Failed to retrieve context', 500);
   }
 }
 
-const controller = { chat, welcome, history, debugContext };
-
-// ══════════════════════════════════════════════════════════════════════════════
-// ROUTES
-// ══════════════════════════════════════════════════════════════════════════════
-
-const { Router } = require('express');
-const { body }   = require('express-validator');
-const { validate } = require('../../../middleware/requestValidator');
-const router = Router();
-
+// ─────────────────────────────────────────────────────────────────────────────
+// Validators
+// ─────────────────────────────────────────────────────────────────────────────
 const chatValidators = [
   body('message')
-    .isString().trim().notEmpty()
-    .isLength({ max: 2000 })
-    .withMessage('message must be a non-empty string up to 2000 characters'),
-  // Accept both key spellings — snake_case is canonical, camelCase is sent by the dashboard
+    .isString()
+    .trim()
+    .notEmpty()
+    .isLength({ max: MAX_MESSAGE_LENGTH })
+    .withMessage(
+      `message must be a non-empty string up to ${MAX_MESSAGE_LENGTH} characters`
+    ),
+
   body('conversation_id')
     .optional({ nullable: true })
-    .isString().trim().isLength({ max: 100 }),
+    .isString()
+    .trim()
+    .isLength({ max: MAX_CONVERSATION_ID_LENGTH }),
+
   body('conversationId')
     .optional({ nullable: true })
-    .isString().trim().isLength({ max: 100 }),
+    .isString()
+    .trim()
+    .isLength({ max: MAX_CONVERSATION_ID_LENGTH }),
+
   body('force_refresh')
     .optional({ nullable: true })
-    .isBoolean(),
+    .isBoolean()
+    .toBoolean(),
 ];
 
-// POST /copilot/chat — grounded conversation
-router.post('/chat', validate(chatValidators), controller.chat);
+const historyValidators = [
+  param('conversationId')
+    .isString()
+    .trim()
+    .isLength({ min: 1, max: MAX_CONVERSATION_ID_LENGTH }),
+];
 
-// GET /copilot/welcome — data-aware welcome message
-router.get('/welcome', controller.welcome);
-
-// GET /copilot/history/:conversationId — conversation history
-router.get('/history/:conversationId', controller.history);
-
-// GET /copilot/context — debug context view (non-production only)
-router.get('/context', controller.debugContext);
+// ─────────────────────────────────────────────────────────────────────────────
+// Routes
+// ─────────────────────────────────────────────────────────────────────────────
+router.post('/chat', validate(chatValidators), chat);
+router.get('/welcome', welcome);
+router.get('/history/:conversationId', validate(historyValidators), history);
+router.get('/context', debugContext);
 
 module.exports = router;
-
-
-
-
-
-
-
-

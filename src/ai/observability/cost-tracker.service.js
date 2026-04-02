@@ -3,80 +3,85 @@
 const observabilityRepo = require('../../repositories/ai-observability.repository');
 const OBSERVABILITY_CONFIG = require('../../config/observability.config');
 const alertService = require('./alert.service');
+const logger = require('../../utils/logger');
 
-/**
- * CostTracker — AI cost intelligence module.
- *
- * Tracks and aggregates cost per:
- *  - Individual call (real-time token-based calculation)
- *  - Feature per day
- *  - User per day
- *  - Monthly rollup
- *
- * Budget alerts are triggered when monthly totals exceed configured thresholds.
- *
- * Model rate table is in observability.config.js — update rates there.
- */
 class CostTracker {
-  /**
-   * Record cost for a completed AI call.
-   * Called by orchestrator after each inference.
-   *
-   * @param {Object} params
-   * @param {string} params.userId
-   * @param {string} params.feature
-   * @param {string} params.model
-   * @param {number} params.tokensInput
-   * @param {number} params.tokensOutput
-   * @returns {number} cost in USD
-   */
-  async track(params) {
-    const { userId, feature, model, tokensInput = 0, tokensOutput = 0 } = params;
 
-    const cost = this.calculateCost(model, tokensInput, tokensOutput);
+  // ─────────────────────────────────────────────
+  // TRACK COST
+  // ─────────────────────────────────────────────
+
+  async track(params) {
+    const {
+      userId,
+      feature,
+      model,
+      tokensInput = 0,
+      tokensOutput = 0,
+    } = params;
+
+    // ✅ validation
+    const input = Math.max(0, Number(tokensInput) || 0);
+    const output = Math.max(0, Number(tokensOutput) || 0);
+
+    const cost = this.calculateCost(model, input, output);
     const dateStr = new Date().toISOString().split('T')[0];
 
-    // Upsert per-user/feature/day cost entry
-    await observabilityRepo.upsertCostEntry(userId, feature, dateStr, {
-      totalCostUSD: cost,
-      inputTokens: tokensInput,
-      outputTokens: tokensOutput,
-    }).catch(err => {
-      console.error('[CostTracker] Failed to write cost entry:', err.message);
+    // ✅ timeout protection
+    await Promise.race([
+      observabilityRepo.upsertCostEntry(userId, feature, dateStr, {
+        totalCostUSD: cost,
+        inputTokens: input,
+        outputTokens: output,
+      }),
+      new Promise((_, reject) =>
+        setTimeout(() => reject(new Error('timeout')), 2000)
+      ),
+    ]).catch(err => {
+      logger.error('[CostTracker] write failed', { error: err.message });
     });
 
-    // Check budget (sampled: 1 in 20 calls to reduce overhead)
-    if (Math.random() < 0.05) {
+    // ✅ deterministic sampling (5%)
+    if (this._shouldSample(userId)) {
       this._checkBudgetThresholds(userId, feature).catch(() => {});
     }
 
     return cost;
   }
 
-  /**
-   * Calculate USD cost from token counts.
-   * Rates are per 1000 tokens.
-   */
+  // ─────────────────────────────────────────────
+  // COST CALCULATION
+  // ─────────────────────────────────────────────
+
   calculateCost(model, tokensInput, tokensOutput) {
-    const rates = OBSERVABILITY_CONFIG.modelRates[model]
-      || OBSERVABILITY_CONFIG.modelRates['default'];
+    const rates =
+      OBSERVABILITY_CONFIG.modelRates[model] ||
+      OBSERVABILITY_CONFIG.modelRates['default'];
 
     const inputCost = (tokensInput / 1000) * rates.input;
     const outputCost = (tokensOutput / 1000) * rates.output;
+
     return +(inputCost + outputCost).toFixed(6);
   }
 
-  /**
-   * Get cost summary for dashboard.
-   * Returns breakdown by feature and user for the current month.
-   */
+  // ─────────────────────────────────────────────
+  // MONTHLY SUMMARY
+  // ─────────────────────────────────────────────
+
   async getMonthlySummary(monthStr) {
     if (!monthStr) {
       const now = new Date();
       monthStr = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`;
     }
 
-    const entries = await observabilityRepo.getMonthlyCostSummary(monthStr);
+    let entries;
+
+    try {
+      entries = await observabilityRepo.getMonthlyCostSummary(monthStr);
+    } catch (err) {
+      logger.error('[CostTracker] summary fetch failed', { error: err.message });
+      return { month: monthStr, status: 'error' };
+    }
 
     const byFeature = {};
     const byUser = {};
@@ -86,36 +91,43 @@ class CostTracker {
     for (const entry of entries) {
       const cost = entry.totalCostUSD || 0;
       const tokens = (entry.inputTokens || 0) + (entry.outputTokens || 0);
+
       totalCostUSD += cost;
       totalTokens += tokens;
 
-      // By feature
       if (!byFeature[entry.feature]) {
-        byFeature[entry.feature] = { totalCostUSD: 0, totalTokens: 0, callCount: 0 };
+        byFeature[entry.feature] = {
+          totalCostUSD: 0,
+          totalTokens: 0,
+          callCount: 0,
+        };
       }
+
       byFeature[entry.feature].totalCostUSD += cost;
       byFeature[entry.feature].totalTokens += tokens;
       byFeature[entry.feature].callCount += entry.callCount || 0;
 
-      // By user (top consumers — aggregate)
       if (entry.userId) {
         if (!byUser[entry.userId]) {
-          byUser[entry.userId] = { totalCostUSD: 0, totalTokens: 0 };
+          byUser[entry.userId] = {
+            totalCostUSD: 0,
+            totalTokens: 0,
+          };
         }
+
         byUser[entry.userId].totalCostUSD += cost;
         byUser[entry.userId].totalTokens += tokens;
       }
     }
 
-    // Round all values
     Object.values(byFeature).forEach(f => {
       f.totalCostUSD = +f.totalCostUSD.toFixed(4);
     });
+
     Object.values(byUser).forEach(u => {
       u.totalCostUSD = +u.totalCostUSD.toFixed(4);
     });
 
-    // Sort top users by cost
     const topUsers = Object.entries(byUser)
       .sort(([, a], [, b]) => b.totalCostUSD - a.totalCostUSD)
       .slice(0, 20)
@@ -135,6 +147,10 @@ class CostTracker {
     };
   }
 
+  // ─────────────────────────────────────────────
+  // BUDGET CHECK
+  // ─────────────────────────────────────────────
+
   _budgetStatus(costUSD) {
     if (costUSD >= OBSERVABILITY_CONFIG.budget.monthlyCriticalUSD) return 'CRITICAL';
     if (costUSD >= OBSERVABILITY_CONFIG.budget.monthlyWarningUSD) return 'WARNING';
@@ -144,7 +160,15 @@ class CostTracker {
   async _checkBudgetThresholds(userId, feature) {
     const now = new Date();
     const monthStr = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`;
-    const entries = await observabilityRepo.getMonthlyCostSummary(monthStr);
+
+    let entries;
+
+    try {
+      entries = await observabilityRepo.getMonthlyCostSummary(monthStr);
+    } catch (err) {
+      logger.error('[CostTracker] budget fetch failed', { error: err.message });
+      return;
+    }
 
     const totalCost = entries.reduce((s, e) => s + (e.totalCostUSD || 0), 0);
 
@@ -157,7 +181,6 @@ class CostTracker {
         detail: {
           month: monthStr,
           totalCostUSD: +totalCost.toFixed(2),
-          threshold: OBSERVABILITY_CONFIG.budget.monthlyCriticalUSD,
         },
       });
     } else if (totalCost >= OBSERVABILITY_CONFIG.budget.monthlyWarningUSD) {
@@ -169,19 +192,25 @@ class CostTracker {
         detail: {
           month: monthStr,
           totalCostUSD: +totalCost.toFixed(2),
-          threshold: OBSERVABILITY_CONFIG.budget.monthlyWarningUSD,
         },
       });
     }
   }
+
+  // ─────────────────────────────────────────────
+  // SAMPLING
+  // ─────────────────────────────────────────────
+
+  _shouldSample(key = '') {
+    let hash = 0;
+
+    for (let i = 0; i < key.length; i++) {
+      hash = (hash << 5) - hash + key.charCodeAt(i);
+      hash |= 0;
+    }
+
+    return Math.abs(hash % 20) === 0; // ~5%
+  }
 }
 
 module.exports = new CostTracker();
-
-
-
-
-
-
-
-

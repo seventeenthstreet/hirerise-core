@@ -24,7 +24,7 @@
  * }
  */
 
-const logger = require('../../utils/logger');
+const logger = require('../utils/logger');
 
 // ─── AI system prompt (matches the task spec exactly) ─────────────────────────
 

@@ -1,13 +1,17 @@
 'use strict';
 
 /**
- * conversionCache.provider.js
+ * src/modules/conversion/utils/conversionCache.provider.js
  *
  * Centralized cache abstraction for conversion intent scores.
- * Services MUST NOT implement their own caching.
  *
- * Production: Redis
- * Dev/Test: In-memory fallback with TTL
+ * Architecture:
+ * - Redis in production
+ * - in-memory TTL fallback in dev/test
+ * - versioned cache keys
+ * - payload validation
+ * - safe Redis client compatibility
+ * - bounded local cache
  */
 
 const logger = require('./conversion.logger');
@@ -23,80 +27,88 @@ const {
 let redisClient = null;
 let redisAvailable = false;
 
-/**
- * Attempt to load Redis only in production.
- */
-if (process.env.NODE_ENV === 'production') {
-  try {
-    // Adjust path if your shared redis client lives elsewhere
-    redisClient = require('../../../../shared/redis.client');
+const REDIS_CANDIDATE_PATHS = [
+  '../../../utils/redis.client',
+  '../../../shared/redis.client',
+  '../../../../shared/redis.client',
+];
 
-    if (redisClient) {
-      redisAvailable = true;
-      logger.info('conversionCache.provider: Redis caching enabled');
+if (process.env.NODE_ENV === 'production') {
+  for (const path of REDIS_CANDIDATE_PATHS) {
+    try {
+      // eslint-disable-next-line global-require, import/no-dynamic-require
+      redisClient = require(path);
+
+      if (redisClient) {
+        redisAvailable = true;
+        logger.info('conversionCache.provider Redis caching enabled', {
+          path,
+        });
+        break;
+      }
+    } catch {
+      // try next candidate
     }
-  } catch (err) {
-    redisAvailable = false;
-    logger.error('conversionCache.provider: Redis client load failed', {
-      error: err.message,
-    });
+  }
+
+  if (!redisAvailable) {
+    logger.warn(
+      'conversionCache.provider Redis unavailable, using local fallback'
+    );
   }
 }
 
 // ---------------------------------------------------------------------------
-// In-Memory Fallback (Dev/Test Only)
+// In-Memory Fallback (Dev/Test)
 // ---------------------------------------------------------------------------
 
-/**
- * Map<string, { value: string, expiresAt: number }>
- */
-const _localCache = new Map();
-
-/**
- * Prevent unbounded growth in development.
- */
+const localCache = new Map();
 const LOCAL_CACHE_MAX_ENTRIES = 1000;
 
 /**
- * Clean expired entries (lightweight sweep).
+ * Lightweight TTL sweep + bounded size eviction.
  */
-function _cleanupLocalCache() {
+function cleanupLocalCache() {
   const now = Date.now();
-  for (const [key, entry] of _localCache.entries()) {
+
+  for (const [key, entry] of localCache.entries()) {
     if (entry.expiresAt <= now) {
-      _localCache.delete(key);
+      localCache.delete(key);
     }
   }
 
-  if (_localCache.size > LOCAL_CACHE_MAX_ENTRIES) {
-    // Remove oldest entry (naive eviction)
-    const firstKey = _localCache.keys().next().value;
-    _localCache.delete(firstKey);
+  while (localCache.size > LOCAL_CACHE_MAX_ENTRIES) {
+    const oldestKey = localCache.keys().next().value;
+    localCache.delete(oldestKey);
   }
 }
 
-function _localGet(key) {
-  const entry = _localCache.get(key);
-  if (!entry) return null;
+function localGet(key) {
+  const entry = localCache.get(key);
+
+  if (!entry) {
+    return null;
+  }
 
   if (Date.now() > entry.expiresAt) {
-    _localCache.delete(key);
+    localCache.delete(key);
     return null;
   }
 
   return entry.value;
 }
 
-function _localSet(key, value, ttlSeconds) {
-  _cleanupLocalCache();
-  _localCache.set(key, {
+function localSet(key, value, ttlSeconds) {
+  cleanupLocalCache();
+
+  localCache.set(key, {
     value,
     expiresAt: Date.now() + ttlSeconds * 1000,
   });
 }
 
-function _localDel(key) {
-  _localCache.delete(key);
+function localDel(key) {
+  localCache.delete(key);
 }
 
 // ---------------------------------------------------------------------------
@@ -105,18 +117,15 @@ function _localDel(key) {
 
 const NAMESPACE = 'hirerise:conversion:score:';
 
-/**
- * Includes SCORE_VERSION to allow safe scoring upgrades.
- */
-function _key(userId) {
+function keyFor(userId) {
   return `${NAMESPACE}v${SCORE_VERSION}:${userId}`;
 }
 
 // ---------------------------------------------------------------------------
-// Safe JSON Parse
+// Safe Payload Parse
 // ---------------------------------------------------------------------------
 
-function _safeParse(raw, userId) {
+function safeParse(raw, userId) {
   try {
     const parsed = JSON.parse(raw);
 
@@ -129,11 +138,12 @@ function _safeParse(raw, userId) {
     }
 
     return parsed;
-  } catch (err) {
-    logger.warn('conversionCache.provider: invalid cache payload', {
+  } catch (error) {
+    logger.warn('conversionCache.provider invalid cache payload', {
       userId,
-      error: err.message,
+      error: error.message,
     });
+
     return null;
   }
 }
@@ -142,98 +152,99 @@ function _safeParse(raw, userId) {
 // Public API
 // ---------------------------------------------------------------------------
 
-/**
- * Get cached scores.
- * @param {string} userId
- * @returns {Promise<{ engagementScore: number, monetizationScore: number, totalIntentScore: number }|null>}
- */
 async function getScores(userId) {
-  const key = _key(userId);
+  if (!userId) {
+    throw new Error('userId is required');
+  }
+
+  const key = keyFor(userId);
 
   try {
-    let raw = null;
+    const raw = redisAvailable
+      ? await redisClient.get(key)
+      : localGet(key);
 
-    if (redisAvailable) {
-      raw = await redisClient.get(key);
-    } else {
-      raw = _localGet(key);
+    if (!raw) {
+      return null;
     }
 
-    if (!raw) return null;
-
-    return _safeParse(raw, userId);
-  } catch (err) {
+    return safeParse(raw, userId);
+  } catch (error) {
     logger.warn('conversionCache.provider.getScores failed', {
       userId,
-      error: err.message,
+      error: error.message,
     });
+
     return null;
   }
 }
 
-/**
- * Set cached scores.
- * @param {string} userId
- * @param {{ engagementScore: number, monetizationScore: number, totalIntentScore: number }} scores
- * @param {number} ttlSeconds
- */
 async function setScores(
   userId,
   scores,
   ttlSeconds = SCORE_CACHE_TTL_SECONDS
 ) {
-  const key = _key(userId);
+  if (!userId) {
+    throw new Error('userId is required');
+  }
+
+  const key = keyFor(userId);
 
   try {
     const value = JSON.stringify(scores);
 
     if (redisAvailable) {
-      // Support both node-redis v4 and ioredis style
+      // node-redis v4
       if (typeof redisClient.set === 'function') {
-        await redisClient.set(key, value, 'EX', ttlSeconds);
+        try {
+          await redisClient.set(key, value, {
+            EX: ttlSeconds,
+          });
+          return;
+        } catch {
+          // fallback to ioredis style
+          await redisClient.set(key, value, 'EX', ttlSeconds);
+          return;
+        }
       }
-    } else {
-      _localSet(key, value, ttlSeconds);
     }
-  } catch (err) {
+
+    localSet(key, value, ttlSeconds);
+  } catch (error) {
     logger.warn('conversionCache.provider.setScores failed', {
       userId,
-      error: err.message,
+      error: error.message,
     });
   }
 }
 
-/**
- * Invalidate cache after aggregate update.
- * @param {string} userId
- */
 async function invalidateScores(userId) {
-  const key = _key(userId);
+  if (!userId) {
+    throw new Error('userId is required');
+  }
+
+  const key = keyFor(userId);
 
   try {
     if (redisAvailable) {
       await redisClient.del(key);
-    } else {
-      _localDel(key);
+      return;
     }
-  } catch (err) {
-    logger.warn('conversionCache.provider.invalidateScores failed', {
-      userId,
-      error: err.message,
-    });
+
+    localDel(key);
+  } catch (error) {
+    logger.warn(
+      'conversionCache.provider.invalidateScores failed',
+      {
+        userId,
+        error: error.message,
+      }
+    );
   }
 }
 
-module.exports = {
+module.exports = Object.freeze({
   getScores,
   setScores,
   invalidateScores,
-};
-
-
-
-
-
-
-
-
+});

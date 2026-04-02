@@ -25,7 +25,7 @@ const logger = require('../../../utils/logger');
 
 // Lazy-load supabase to avoid issues in test mode
 function getSupabase() {
-  return require('../../../core/supabaseClient');
+  const { supabase } = require('../../../config/supabase'); return supabase;
 }
 
 // ─── Cache ────────────────────────────────────────────────────────────────────
@@ -191,11 +191,3 @@ module.exports = {
   lookupRoleSkills,
   normalise,
 };
-
-
-
-
-
-
-
-

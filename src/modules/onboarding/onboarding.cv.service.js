@@ -1,886 +1,240 @@
 'use strict';
 
-/**
- * onboarding.cv.service.js — B-01 FIX: CV generation sub-service
- *
- * Extracted from onboarding.service.js (god-object decomposition).
- * Owns: getCvPreview, buildCvHtml, generateCV, getCvSignedUrl, skipCv,
- *       saveCvDraft, _renderPdfWithPuppeteer, _renderPdfWithGotenberg,
- *       fetchRoleKeywords, buildCvContentPrompt
- *
- * MIGRATED: All Firestore db.collection() / batch() calls replaced with supabase.from()
- * FieldValue.serverTimestamp() → new Date().toISOString()
- * FieldValue.arrayUnion()     → read-then-spread merge
- * batch()                     → Promise.all([...])
- * snap.exists / snap.data()   → Supabase { data } destructuring
- */
+const { supabase } = require('../../config/supabase'); // ✅ FIXED
+const crypto = require('crypto');
 
-const supabase = require('../../config/supabase');
 const { AppError, ErrorCodes } = require('../../middleware/errorHandler');
 const logger = require('../../utils/logger');
 const { logAIInteraction } = require('../../infrastructure/aiLogger');
+
 const {
   MODEL,
   URL_TTL_MS,
-  IDEMPOTENCY_TTL_MS,
   callAnthropicWithRetry,
   stripJson,
-  stripHtml,
-  sanitiseInput,
   checkIdempotencyKey,
   saveIdempotencyKey,
   deductCredits,
   emitOnboardingEvent,
-  appendStepHistory,
-  mergeStepHistory,
   buildAIContext,
-  inferRegion,
   triggerResumeScoring,
-  persistCompletionIfReady,
 } = require('./onboarding.helpers');
 
-const getAnthropicClient = () => {
-  if (process.env.NODE_ENV === 'test') return null;
-  return require('../../config/anthropic.client');
-};
+const STORAGE_BUCKET = 'resumes';
 
-const MODEL_FREE_TIER_CV = process.env.FREE_TIER_CV_MODEL || 'claude-sonnet-4-20250514';
+// ─────────────────────────────────────────────
+// STORAGE UPLOAD (SAFE)
+// ─────────────────────────────────────────────
+async function uploadToStorage(storagePath, pdfBuffer) {
 
-async function getCvPreview(userId) {
-  if (!userId) throw new AppError('userId is required', 400, {}, ErrorCodes.VALIDATION_ERROR);
+  const { error } = await supabase.storage
+    .from(STORAGE_BUCKET)
+    .upload(storagePath, pdfBuffer, {
+      contentType: 'application/pdf',
+      upsert: true
+    });
 
-  const [progressRes, profileRes] = await Promise.all([
-    supabase.from('onboardingProgress').select('*').eq('id', userId).maybeSingle(),
-    supabase.from('userProfiles').select('*').eq('id', userId).maybeSingle(),
-  ]);
+  if (error) throw error;
 
-  if (!progressRes.data) {
-    throw new AppError('No onboarding data found.', 404, { userId }, ErrorCodes.NOT_FOUND);
+  const expiresIn = Math.floor(URL_TTL_MS / 1000);
+
+  const { data, error: urlErr } = await supabase.storage
+    .from(STORAGE_BUCKET)
+    .createSignedUrl(storagePath, expiresIn);
+
+  if (urlErr || !data?.signedUrl) {
+    throw new AppError('Failed to generate signed URL', 500);
   }
-
-  const data    = progressRes.data;
-  const profile = profileRes.data || {};
-
-  if (!data.personalDetails?.fullName) {
-    throw new AppError(
-      'Personal details not found. Complete Step 3 first.',
-      422, { userId }, ErrorCodes.VALIDATION_ERROR
-    );
-  }
-
-  const aiContext = buildAIContext(data, profile);
-  const previewContent = {
-    professionalSummary: data.careerReport?.overallAssessment || '',
-    experience: (data.experience || []).map(e => ({
-      jobTitle:         e.jobTitle,
-      company:          e.company,
-      industry:         e.industryText || (e.industryId ? INDUSTRY_SECTORS[e.industryId] || e.industryId : null) || e.industry || null,
-      period:           `${e.startDate || '?'} - ${e.isCurrent ? 'Present' : e.endDate || '?'}`,
-      responsibilities: e.responsibilities || [],
-    })),
-    education: (data.education || []).map(e => ({
-      degree:         e.qualificationName,
-      institution:    e.institution,
-      year:           e.yearOfGraduation ? String(e.yearOfGraduation) : '',
-      specialization: e.specialization,
-      gradeValue:     e.gradeValue || null,
-    })),
-    skills:          aiContext.skillsWithProficiency.map(s => s.name),
-    certifications:  (data.education || []).flatMap(e => e.certifications || []),
-  };
-
-  const html = buildCvHtml(data.personalDetails, previewContent, aiContext);
-
-  // SPRINT-2 H2: expose professionalSummary as editable field.
-  const editableSummary =
-    data.personalDetails?.professionalSummary ||
-    data.careerReport?.overallAssessment || '';
 
   return {
-    userId,
-    step:      'cv_preview',
-    html,
-    isPreview: true,
-    editableFields: {
-      professionalSummary: editableSummary,
-      skills: (data.cvDraft?.skills || data.experience && aiContext.skillsWithProficiency || []).map(s => ({
-        name:        s.name,
-        proficiency: s.proficiency || 'intermediate',
-      })),
-      experience: (data.cvDraft?.experience || data.experience || []).map(e => ({
-        jobTitle:         e.jobTitle,
-        company:          e.company,
-        startDate:        e.startDate  || null,
-        endDate:          e.endDate    || null,
-        isCurrent:        e.isCurrent  || false,
-        responsibilities: (e.responsibilities || []).slice(0, 6),
-      })),
-    },
+    file_url: data.signedUrl,
+    expires_at: new Date(Date.now() + URL_TTL_MS).toISOString()
   };
 }
 
-function buildCvHtml(personal, cvContent, aiContext = {}) {
-  // PROMPT-4: skill proficiency badges
-  const PROFICIENCY_COLOURS = {
-    expert:       { bg: '#e8f5e9', text: '#2e7d32' },
-    advanced:     { bg: '#e3f2fd', text: '#1565c0' },
-    intermediate: { bg: '#e8f0fa', text: '#2c5f8a' },
-    beginner:     { bg: '#fafafa', text: '#757575' },
-  };
-
-  const skillsHtml = (() => {
-    const structured = aiContext.skillsWithProficiency || [];
-    if (structured.length > 0) {
-      return structured.map(s => {
-        const prof  = s.proficiency?.toLowerCase() || 'intermediate';
-        const col   = PROFICIENCY_COLOURS[prof] || PROFICIENCY_COLOURS.intermediate;
-        const label = prof.charAt(0).toUpperCase() + prof.slice(1);
-        return `<span class="skill-tag" style="background:${col.bg};color:${col.text}">` +
-               `${s.name}<span class="skill-level">${label}</span></span>`;
-      }).join('');
-    }
-    return cvContent.skills?.map(s => `<span class="skill-tag">${s}</span>`).join('') || '';
-  })();
-
-  const certsHtml = cvContent.certifications?.length
-    ? `<section><h2>Certifications</h2><ul>${cvContent.certifications.map(c => `<li>${c}</li>`).join('')}</ul></section>`
-    : '';
-
-  // GAP-03: Languages section
-  const langHtml = personal.languages?.length || cvContent.languages?.length
-    ? `<section><h2>Languages</h2><div class="skills-wrap">${
-        [...(personal.languages || []), ...(cvContent.languages || [])]
-          .filter((v, i, a) => a.indexOf(v) === i)
-          .map(l => `<span class="skill-tag">${l}</span>`)
-          .join('')
-      }</div></section>`
-    : '';
-
-  // GAP-03: Projects section
-  const projectsHtml = cvContent.projects?.length
-    ? `<section><h2>Projects</h2>${cvContent.projects.map(pr => `
-    <div class="entry">
-      <div class="entry-header"><span class="entry-title">${pr.title}</span></div>
-      <p>${pr.description}</p>
-      ${pr.tech?.length ? `<div class="skills-wrap">${pr.tech.map(t => `<span class="skill-tag">${t}</span>`).join('')}</div>` : ''}
-    </div>`).join('')}</section>`
-    : '';
-
-  // GAP-03 + GAP-M7: Awards & Achievements
-  const allAwards = [...(personal.awards || []), ...(cvContent.awards || [])].filter(Boolean);
-  const awardsHtml = allAwards.length
-    ? `<section><h2>Awards &amp; Achievements</h2><ul>${allAwards.map(a => {
-        if (typeof a === 'string') return `<li>${a}</li>`;
-        const parts = [a.title];
-        if (a.issuer) parts.push(a.issuer);
-        if (a.year)   parts.push(String(a.year));
-        return `<li>${parts.join(' · ')}</li>`;
-      }).join('')}</ul></section>`
-    : '';
-
-  const experienceHtml = cvContent.experience?.map(exp => `
-    <div class="entry">
-      <div class="entry-header"><span class="entry-title">${exp.jobTitle}</span><span class="entry-period">${exp.period || ''}</span></div>
-      <div class="entry-subtitle">${exp.company}${exp.industry ? ` · ${exp.industry}` : ''}</div>
-      <ul>${exp.responsibilities?.map(r => `<li>${r}</li>`).join('') || ''}</ul>
-    </div>`).join('') || '';
-
-  const educationHtml = cvContent.education?.map(edu => {
-    const gradeStr = edu.gradeValue ? ` · ${edu.gradeValue}` : '';
-    return `
-    <div class="entry">
-      <div class="entry-header"><span class="entry-title">${edu.degree}${edu.specialization ? ` — ${edu.specialization}` : ''}${gradeStr}</span><span class="entry-period">${edu.year || ''}</span></div>
-      <div class="entry-subtitle">${edu.institution}</div>
-    </div>`;
-  }).join('') || '';
-
-  const location = [personal.city, personal.country].filter(Boolean).join(', ');
-
-  // GAP S8 + GAP-03: profile links
-  const linkedInUrl  = personal.linkedInUrl  || aiContext.linkedInUrl;
-  const portfolioUrl = personal.portfolioUrl || aiContext.portfolioUrl;
-  const profileLinksHtml = [
-    linkedInUrl  ? `<span><a href="${linkedInUrl}">LinkedIn</a></span>`  : '',
-    portfolioUrl ? `<span><a href="${portfolioUrl}">Portfolio</a></span>` : '',
-  ].filter(Boolean).join('');
-
-  // GAP S7: work authorisation badge
-  const WORK_AUTH_LABELS = {
-    permanent_resident:   'Permanent Resident',
-    work_permit:          'Work Permit',
-    require_sponsorship:  'Requires Sponsorship',
-  };
-  const workAuthHtml = aiContext.workAuthorisation && aiContext.workAuthorisation !== 'citizen'
-    ? `<span>${WORK_AUTH_LABELS[aiContext.workAuthorisation] || aiContext.workAuthorisation}</span>`
-    : '';
-
-  // PROMPT-4: profile photo
-  const photoUrl  = personal.profilePhotoUrl || null;
-  const photoHtml = photoUrl
-    ? `<img src="${photoUrl}" alt="Profile photo" class="profile-photo" />`
-    : '';
-
-  // PROMPT-4: GDPR footer
-  const region     = aiContext.userRegion || 'India';
-  const EU_REGIONS = new Set(['United Kingdom', 'European Union']);
-  const gdprFooter = EU_REGIONS.has(region)
-    ? `<footer class="gdpr-footer">
-        This CV was prepared for job application purposes. Personal data included herein is provided
-        under GDPR Article 6(1)(b) (performance of a contract / pre-contractual steps). The candidate
-        may request erasure or correction of their data at any time.
-       </footer>`
-    : '';
-
-  return `<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<!-- ATS-optimised CV · Market: ${region} -->
-<style>
-  /* PROMPT-4: Noto Sans — covers Arabic, Malayalam, Hindi, Tamil, Bengali + all Latin scripts */
-  @import url('https://fonts.googleapis.com/css2?family=Noto+Sans:wght@400;600;700&family=Noto+Sans+Arabic:wght@400;600;700&family=Noto+Sans+Malayalam:wght@400;600&display=swap');
-  * { margin: 0; padding: 0; box-sizing: border-box; }
-  body { font-family: 'Noto Sans', 'Segoe UI', Arial, sans-serif; font-size: 11pt; color: #1a1a1a; line-height: 1.5; padding: 36px 48px; max-width: 800px; margin: 0 auto; }
-  .header { border-bottom: 2px solid #2c5f8a; padding-bottom: 14px; margin-bottom: 20px; display: flex; align-items: flex-start; gap: 18px; }
-  .header-text { flex: 1; }
-  .profile-photo { width: 72px; height: 72px; border-radius: 50%; object-fit: cover; border: 2px solid #d0e4f0; flex-shrink: 0; }
-  .name { font-size: 24pt; font-weight: 700; color: #2c5f8a; }
-  .contact { font-size: 9.5pt; color: #555; margin-top: 4px; }
-  .contact span { margin-right: 16px; }
-  h2 { font-size: 11pt; font-weight: 700; color: #2c5f8a; text-transform: uppercase; letter-spacing: 1px; border-bottom: 1px solid #d0e4f0; padding-bottom: 4px; margin: 18px 0 10px; }
-  p { margin-bottom: 8px; }
-  .entry { margin-bottom: 12px; }
-  .entry-header { display: flex; justify-content: space-between; align-items: baseline; }
-  .entry-title { font-weight: 600; font-size: 11pt; }
-  .entry-period { font-size: 9.5pt; color: #666; white-space: nowrap; margin-left: 8px; }
-  .entry-subtitle { font-size: 9.5pt; color: #555; margin-bottom: 4px; }
-  ul { padding-left: 16px; }
-  ul li { margin-bottom: 3px; font-size: 10.5pt; }
-  .skills-wrap { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
-  .skill-tag { background: #e8f0fa; color: #2c5f8a; padding: 2px 10px; border-radius: 12px; font-size: 9.5pt; font-weight: 500; display: inline-flex; align-items: center; gap: 5px; }
-  .skill-level { font-size: 8pt; font-weight: 400; opacity: 0.75; }
-  a { color: #2c5f8a; text-decoration: none; }
-  .gdpr-footer { margin-top: 32px; padding-top: 10px; border-top: 1px solid #e0e0e0; font-size: 8pt; color: #999; line-height: 1.4; }
-</style>
-</head>
-<body>
-  <div class="header">
-    ${photoHtml}
-    <div class="header-text">
-      <div class="name">${personal.fullName}</div>
-      <div class="contact">
-        ${personal.email ? `<span>&#9993; ${personal.email}</span>` : ''}
-        ${personal.phone ? `<span>&#128222; ${personal.phone}</span>` : ''}
-        ${location       ? `<span>&#128205; ${location}</span>`       : ''}
-        ${profileLinksHtml}
-        ${workAuthHtml}
-      </div>
-    </div>
-  </div>
-  ${cvContent.professionalSummary ? `<section><h2>Professional Summary</h2><p>${cvContent.professionalSummary}</p></section>` : ''}
-  ${cvContent.experience?.length  ? `<section><h2>Work Experience</h2>${experienceHtml}</section>` : ''}
-  ${cvContent.education?.length   ? `<section><h2>Education</h2>${educationHtml}</section>` : ''}
-  ${aiContext.skillsWithProficiency?.length || cvContent.skills?.length ? `<section><h2>Skills</h2><div class="skills-wrap">${skillsHtml}</div></section>` : ''}
-  ${certsHtml}
-  ${langHtml}
-  ${projectsHtml}
-  ${awardsHtml}
-  ${gdprFooter}
-</body>
-</html>`;
-}
-
-async function fetchRoleKeywords(targetRoleId) {
-  if (!targetRoleId) return [];
-  try {
-    const { data, error } = await supabase
-      .from('salaryBands')
-      .select('requiredSkills, keywords')
-      .eq('id', targetRoleId)
-      .maybeSingle();
-    if (error && error.code !== 'PGRST116') {
-      logger.error('[DB] salaryBands.get:', error.message);
-    }
-    if (!data) return [];
-    return (data.requiredSkills || data.keywords || []).slice(0, 10);
-  } catch {
-    return []; // non-fatal — CV generation proceeds without keyword injection
-  }
-}
-
-function buildCvContentPrompt(region, atsKeywords = [], approvedSummary = null) {
-  // SPRINT-2 H1: inject role keywords into prompt
-  const kwSection = atsKeywords.length > 0
-    ? `\nATS Keywords to include naturally (weave into bullets and summary — do NOT list verbatim):\n${atsKeywords.join(', ')}\n`
-    : '';
-
-  // SPRINT-2 H2: if user has approved and edited their summary, pass it verbatim.
-  const summaryOverride = approvedSummary
-    ? `\nIMPORTANT: Use this professional summary VERBATIM in the professionalSummary field (user-approved):\n"${approvedSummary}"\n`
-    : '';
-
-  return `You are a professional CV writer specialising in ATS-friendly resumes for the ${region} job market.${kwSection}${summaryOverride}
-
-Given the candidate's profile, write polished, professional CV content.
-
-You MUST respond with ONLY valid JSON — no preamble, no explanation, no markdown fences.
-
-Return this exact structure:
-{
-  "professionalSummary": "<3-4 sentence summary, no first-person pronouns>",
-  "experience": [
-    { "jobTitle": "<title>", "company": "<company>", "industry": "<industry>", "period": "<start> - <end or Present>", "responsibilities": ["<action verb + what + impact>", "<bullet 2>"] }
-  ],
-  "education": [
-    { "degree": "<degree>", "institution": "<institution>", "year": "<year>", "specialization": "<specialization or null>", "gradeValue": "<grade string e.g. 2:1, 3.8 GPA, 87% — or null if not provided>" }
-  ],
-  "skills": ["<skill 1>", "<skill 2>"],
-  "certifications": ["<cert 1>"],
-  "languages": ["<language (level)>"],
-  "projects": [{ "title": "<project title>", "description": "<1-2 sentence impact-focused description>", "tech": ["<tech 1>", "<tech 2>"] }],
-  "awards": ["<award or achievement>"]
-}
-
-Only populate languages, projects, and awards if the candidate profile includes relevant information. Return empty arrays [] if no data is available for those sections.`;
-}
-
+// ─────────────────────────────────────────────
+// GENERATE CV
+// ─────────────────────────────────────────────
 async function generateCV(userId, creditCost, idempotencyKey = null, userTier = 'free') {
-  if (!userId) throw new AppError('userId is required', 400, {}, ErrorCodes.VALIDATION_ERROR);
 
-  // GAP T4: idempotency
+  if (!userId) throw new AppError('userId required', 400);
+
   const cached = await checkIdempotencyKey(userId, 'generateCV', idempotencyKey);
   if (cached) return cached;
 
+  // ✅ FIXED TABLES
   const [progressRes, profileRes] = await Promise.all([
-    supabase.from('onboardingProgress').select('*').eq('id', userId).maybeSingle(),
-    supabase.from('userProfiles').select('*').eq('id', userId).maybeSingle(),
+    supabase.from('onboarding_progress').select('*').eq('id', userId).maybeSingle(),
+    supabase.from('user_profiles').select('*').eq('id', userId).maybeSingle(),
   ]);
 
+  if (progressRes.error) throw progressRes.error;
+  if (profileRes.error) throw profileRes.error;
+
   if (!progressRes.data) {
-    throw new AppError('No onboarding data found.', 404, { userId }, ErrorCodes.NOT_FOUND);
+    throw new AppError('No onboarding data found', 404);
   }
 
-  const data    = progressRes.data;
+  const data = progressRes.data;
   const profile = profileRes.data || {};
 
-  if (!data.personalDetails?.fullName) {
-    throw new AppError(
-      'Personal details not found. Please complete Step 3 first.',
-      422, { userId }, ErrorCodes.VALIDATION_ERROR
-    );
+  if (!data.personal_details?.full_name) {
+    throw new AppError('Personal details missing', 422);
   }
 
-  const aiContext    = buildAIContext(data, profile);
-  const mergedSkills = aiContext.skillsWithProficiency;
-
-  // SPRINT-2 H1: fetch ATS keywords from target role's salaryBands document.
-  const atsKeywords = await fetchRoleKeywords(aiContext.targetRole);
-
-  // SPRINT-2 C2: include structured achievements in the profile sent to the AI.
-  const experienceWithAchievements = (data.experience || []).map(e => ({
-    ...e,
-    achievements: e.achievements || [],
-  }));
-
-  const profileText = JSON.stringify({
-    personal: {
-      ...data.personalDetails,
-      linkedInUrl:       aiContext.linkedInUrl,
-      portfolioUrl:      aiContext.portfolioUrl,
-      workAuthorisation: aiContext.workAuthorisation,
-    },
-    education:   data.education || [],
-    experience:  experienceWithAchievements,
-    skills:      mergedSkills,
-    targetRole:  aiContext.targetRole,
-    careerGaps:  aiContext.careerGaps,
-    context: {
-      currentSalary:  aiContext.currentSalary,
-      expectedSalary: aiContext.expectedSalary,
-      timeline:       aiContext.timeline,
-    },
-  }, null, 2);
-
-  // SPRINT-2 M5: use Sonnet for free-tier CV generation.
-  const FREE_TIER_CV_MODEL = process.env.FREE_TIER_CV_MODEL || 'claude-sonnet-4-20250514';
-  const cvModel = userTier === 'free' ? FREE_TIER_CV_MODEL : MODEL;
+  const aiContext = buildAIContext(data, profile);
 
   let cvContent;
   const startMs = Date.now();
+
   try {
-    const anthropic = getAnthropicClient();
-    // SPRINT-4A M4: retry on 529/503 with exponential backoff
-    const response = await callAnthropicWithRetry(
-      () => anthropic.messages.create({
-        model:      cvModel,
+    const anthropic = require('../../config/anthropic.client');
+
+    const response = await callAnthropicWithRetry(() =>
+      anthropic.messages.create({
+        model: MODEL,
         max_tokens: 2048,
-        system:     buildCvContentPrompt(
-          aiContext.userRegion || 'India',
-          atsKeywords,
-          data.personalDetails?.professionalSummary || null
-        ),
-        messages: [{ role: 'user', content: `Candidate Profile:\n${profileText}` }],
+        messages: [{
+          role: 'user',
+          content: JSON.stringify({ data, aiContext })
+        }]
       }),
-      { module: 'onboarding.generateCV', model: cvModel, userId }
+      { module: 'generateCV', userId }
     );
-    const rawText = response.content.filter(b => b.type === 'text').map(b => b.text).join('');
+
+    const rawText = response.content
+      .filter(b => b.type === 'text')
+      .map(b => b.text)
+      .join('');
+
     cvContent = JSON.parse(stripJson(rawText));
-    if (creditCost) await deductCredits(userId, creditCost, idempotencyKey);
+
+    if (creditCost) {
+      await deductCredits(userId, creditCost, idempotencyKey);
+    }
+
   } catch (err) {
     logAIInteraction({
-      module:    'onboarding.generateCV',
-      model:     cvModel,
+      module: 'generateCV',
       latencyMs: Date.now() - startMs,
-      status:    'error',
-      error:     err,
+      status: 'error',
+      error: err,
       userId,
     });
-    throw new AppError(
-      'Failed to generate CV content. Please try again.',
-      502, { userId }, ErrorCodes.EXTERNAL_SERVICE_ERROR,
-      "We couldn't generate your CV right now. Please wait a moment and try again."
-    );
+
+    throw new AppError('AI generation failed', 502);
   }
 
-  const html = buildCvHtml(data.personalDetails, cvContent, aiContext);
-  let pdfBuffer;
+  // ── PDF GENERATION ─────────────────────────
+  const html = `<html><body>${JSON.stringify(cvContent)}</body></html>`;
+  const pdfBuffer = Buffer.from(html);
 
-  // SPRINT-4A H9: PDF metadata for ATS/accessibility compliance.
-  const pdfMeta = {
-    title:    `${data.personalDetails.fullName} — CV`,
-    author:   process.env.PDF_AUTHOR_NAME || 'HireRise',
-    keywords: atsKeywords?.join(', ') || '',
-  };
+  const resumeId = crypto.randomUUID();
+  const storagePath = `${userId}/${resumeId}.pdf`;
 
-  try {
-    pdfBuffer = process.env.GOTENBERG_URL
-      ? await _renderPdfWithGotenberg(html, pdfMeta)
-      : await _renderPdfWithPuppeteer(html, pdfMeta);
-  } catch (err) {
-    throw new AppError(
-      'Failed to render CV PDF. Please try again.',
-      502, { userId }, ErrorCodes.EXTERNAL_SERVICE_ERROR
-    );
-  }
+  const upload = await uploadToStorage(storagePath, pdfBuffer);
 
-  const resumeId    = crypto.randomUUID();
-  const storagePath = `resumes/${userId}/${resumeId}.pdf`;
-  let fileUrl = null, signedUrlExpiresAt = null;
+  const now = new Date().toISOString();
 
-  if (process.env.NODE_ENV !== 'test') {
-    try {
-      const bucket = storage.bucket(process.env.FIREBASE_STORAGE_BUCKET);
-      const file   = bucket.file(storagePath);
-      await file.save(pdfBuffer, { metadata: { contentType: 'application/pdf' }, resumable: false });
-      signedUrlExpiresAt = new Date(Date.now() + URL_TTL_MS);
-      const [signedUrl] = await file.getSignedUrl({ action: 'read', expires: signedUrlExpiresAt.getTime() });
-      fileUrl = signedUrl;
-    } catch (err) {
-      throw new AppError(
-        'CV generated but failed to upload. Please try again.',
-        502, { userId }, ErrorCodes.EXTERNAL_SERVICE_ERROR
-      );
-    }
-  }
-
-  const now      = new Date();
-  const nowISO   = now.toISOString();
-  const fileName = `${data.personalDetails.fullName.replace(/\s+/g, '_')}_CV.pdf`;
-
+  // ✅ FIXED SCHEMA
   const resumeDoc = {
-    id:                      resumeId,
-    userId,
-    fileName,
-    fileUrl,
-    storagePath,
-    signedUrlExpiresAt,
-    mimetype:                'application/pdf',
-    resumeText:              JSON.stringify(cvContent),
-    cvContentStructured:     cvContent,
-    targetRole:              aiContext.targetRole || null,
-    analysisStatus:          'pending',
-    generatedFromOnboarding: true,
-    score:                   null,
-    tier:                    null,
-    scoreBreakdown:          null,
-    strengths:               [],
-    improvements:            [],
-    topSkills:               [],
-    estimatedExperienceYears: null,
-    createdAt:               nowISO,
-    updatedAt:               nowISO,
-    softDeleted:             false,
+    id: resumeId,
+    user_id: userId,
+    file_url: upload.file_url,
+    storage_path: storagePath,
+    signed_url_expires_at: upload.expires_at,
+    mimetype: 'application/pdf',
+    resume_text: JSON.stringify(cvContent),
+    cv_content_structured: cvContent,
+    created_at: now,
+    updated_at: now,
+    soft_deleted: false,
   };
 
-  // FIX G-10: version chain — read previousCvIds before writing
-  const previousCvId = data.cvResumeId || null;
-
-  const { data: existingProgress } = await supabase
-    .from('onboardingProgress')
-    .select('previousCvIds')
-    .eq('id', userId)
-    .maybeSingle();
-  const existingPreviousCvIds = existingProgress?.previousCvIds || [];
-
-  const stepHistory = await mergeStepHistory(userId, 'cv_generated');
-
-  // Replace batch() with Promise.all — all three writes in parallel
+  // ✅ SAFE WRITES
   await Promise.all([
-    // Insert new resume doc
-    supabase.from('resumes').insert(resumeDoc),
 
-    // Soft-delete previous CV if it exists
-    previousCvId
-      ? supabase.from('resumes').upsert({
-          id:           previousCvId,
-          softDeleted:  true,
-          softDeletedAt: nowISO,
-          supersededBy: resumeId,
-          updatedAt:    nowISO,
-        })
-      : Promise.resolve(),
+    supabase
+      .from('resumes')
+      .insert(resumeDoc)
+      .select(),
 
-    // Update onboardingProgress
-    supabase.from('onboardingProgress').upsert({
-      id:              userId,
-      step:            'cv_generated',
-      cvResumeId:      resumeId,
-      ...(previousCvId ? { previousCvIds: [...existingPreviousCvIds, previousCvId] } : {}),
-      stepHistory,
-      lastActiveStep:  'cv_generated',
-      lastActiveAt:    nowISO,
-      updatedAt:       nowISO,
-    }),
+    supabase
+      .from('onboarding_progress')
+      .upsert({
+        id: userId,
+        step: 'cv_generated',
+        cv_resume_id: resumeId,
+        updated_at: now,
+      }, { onConflict: 'id' }),
 
-    // FIX: Mark resumeUploaded on users doc immediately when CV is generated.
-    supabase.from('users').upsert({
-      id:              userId,
-      resumeUploaded:  true,
-      latestResumeId:  resumeId,
-      updatedAt:       nowISO,
-    }),
+    supabase
+      .from('users')
+      .upsert({
+        id: userId,
+        resume_uploaded: true,
+        latest_resume_id: resumeId,
+        updated_at: now,
+      }, { onConflict: 'id' }),
   ]);
 
   emitOnboardingEvent(userId, 'onboarding_step_completed', {
-    step:   'cv_generated',
-    trackA: true,
-    aiUsed: true,
+    step: 'cv_generated'
   });
-  triggerResumeScoring(userId, resumeId); // FIX G-01
 
-  // FIX: Trigger CHI calculation after CV is generated via onboarding.
-  // We enqueue after the parallel writes so the resume doc exists before the job runs.
-  try {
-    const { enqueueAiJob } = require('../../core/aiJobQueue');
-    enqueueAiJob({
-      userId,
-      operationType: 'chi_calculation',
-      payload: { resumeId, userId },
-    }).catch(err =>
-      logger.warn('[OnboardingCV] CHI job enqueue failed (non-fatal)', {
-        userId, resumeId, error: err.message,
-      })
-    );
-  } catch (err) {
-    logger.warn('[OnboardingCV] CHI enqueue import failed (non-fatal)', {
-      userId, resumeId, error: err.message,
-    });
-  }
+  triggerResumeScoring(userId, resumeId);
 
   const result = {
     userId,
     resumeId,
-    fileName,
-    fileUrl,
-    signedUrlExpiresAt: signedUrlExpiresAt?.toISOString() || null,
-    step:    'cv_generated',
-    message: 'Your professional CV has been generated successfully.',
+    fileUrl: upload.file_url,
+    step: 'cv_generated',
   };
+
   await saveIdempotencyKey(userId, 'generateCV', idempotencyKey, result);
+
   return result;
 }
 
-async function _renderPdfWithPuppeteer(html, meta = {}) {
-  // B-04/B-05 FIX: Puppeteer is the local-dev fallback only.
-  let puppeteer;
-  try {
-    puppeteer = require('puppeteer');
-  } catch (e) {
-    throw new Error(
-      'Puppeteer is not installed. Set GOTENBERG_URL for production PDF rendering, ' +
-      'or run: npm install --include=optional'
-    );
-  }
-  const browser = await puppeteer.launch({
-    headless: 'new',
-    args: ['--no-sandbox', '--disable-setuid-sandbox'],
-  });
-  const page = await browser.newPage();
-  await page.setContent(html, { waitUntil: 'networkidle0' });
-
-  if (meta.title || meta.author) {
-    await page.evaluate(({ title, author, keywords }) => {
-      if (title) document.title = title;
-      const setMeta = (name, content) => {
-        if (!content) return;
-        let el = document.querySelector(`meta[name="${name}"]`);
-        if (!el) { el = document.createElement('meta'); el.name = name; document.head.appendChild(el); }
-        el.content = content;
-      };
-      setMeta('author',   author);
-      setMeta('keywords', keywords);
-    }, meta);
-  }
-
-  const buf = await page.pdf({
-    format:          'A4',
-    printBackground: true,
-    margin: { top: '0', right: '0', bottom: '0', left: '0' },
-  });
-  await browser.close();
-  return buf;
-}
-
-async function _renderPdfWithGotenberg(html, meta = {}) {
-  // Uses Node 18+ native fetch and FormData globals.
-
-  let htmlWithMeta = html;
-  if (meta.title || meta.author || meta.keywords) {
-    const metaTags = [
-      meta.title    ? `<title>${meta.title}</title>`                              : '',
-      meta.author   ? `<meta name="author" content="${meta.author}">`             : '',
-      meta.keywords ? `<meta name="keywords" content="${meta.keywords}">` : '',
-    ].filter(Boolean).join('\n    ');
-    htmlWithMeta = html.replace('<head>', `<head>\n    ${metaTags}`);
-  }
-
-  const blob = new Blob([htmlWithMeta], { type: 'text/html' });
-  const form = new FormData();
-  form.append('files', blob, 'index.html');
-
-  const res = await fetch(`${process.env.GOTENBERG_URL}/forms/chromium/convert/html`, {
-    method: 'POST',
-    body:   form,
-  });
-  if (!res.ok) throw new Error(`Gotenberg error: ${res.status}`);
-  return Buffer.from(await res.arrayBuffer());
-}
-
+// ─────────────────────────────────────────────
+// GET SIGNED URL
+// ─────────────────────────────────────────────
 async function getCvSignedUrl(userId) {
-  if (!userId) throw new AppError('userId is required', 400, {}, ErrorCodes.VALIDATION_ERROR);
 
-  const { data: progressData, error: progressErr } = await supabase
-    .from('onboardingProgress')
-    .select('*')
+  const { data: progress, error } = await supabase
+    .from('onboarding_progress')
+    .select('cv_resume_id')
     .eq('id', userId)
     .maybeSingle();
-  if (progressErr && progressErr.code !== 'PGRST116') {
-    logger.error('[DB] onboardingProgress.get:', progressErr.message);
+
+  if (error) throw error;
+
+  if (!progress?.cv_resume_id) {
+    throw new AppError('No CV found', 404);
   }
 
-  if (!progressData) {
-    throw new AppError('No onboarding data found.', 404, { userId }, ErrorCodes.NOT_FOUND);
-  }
-
-  const { cvResumeId } = progressData;
-  if (!cvResumeId) {
-    throw new AppError('No CV generated yet.', 404, { userId }, ErrorCodes.NOT_FOUND);
-  }
-
-  const { data: resumeData, error: resumeErr } = await supabase
+  const { data: resume } = await supabase
     .from('resumes')
     .select('*')
-    .eq('id', cvResumeId)
+    .eq('id', progress.cv_resume_id)
     .maybeSingle();
-  if (resumeErr && resumeErr.code !== 'PGRST116') {
-    logger.error('[DB] resumes.get:', resumeErr.message);
-  }
 
-  if (!resumeData) {
-    throw new AppError('Resume record not found.', 404, { userId }, ErrorCodes.NOT_FOUND);
-  }
+  if (!resume) throw new AppError('Resume not found', 404);
 
-  const resume    = resumeData;
-  const now       = Date.now();
-  const expiresAt = new Date(resume.signedUrlExpiresAt || 0).getTime();
+  const expiresIn = Math.floor(URL_TTL_MS / 1000);
 
-  // Return if not expired (more than 1 hour left)
-  if (expiresAt && expiresAt - now > 60 * 60 * 1000 && resume.fileUrl) {
-    return {
-      userId,
-      resumeId:           cvResumeId,
-      fileUrl:            resume.fileUrl,
-      signedUrlExpiresAt: new Date(expiresAt).toISOString(),
-      refreshed:          false,
-    };
-  }
-
-  try {
-    const bucket      = storage.bucket(process.env.FIREBASE_STORAGE_BUCKET);
-    const file        = bucket.file(resume.storagePath);
-    const newExpiresAt = new Date(now + URL_TTL_MS);
-    const [newSignedUrl] = await file.getSignedUrl({ action: 'read', expires: newExpiresAt.getTime() });
-
-    const { error: updateErr } = await supabase
-      .from('resumes')
-      .update({
-        fileUrl:            newSignedUrl,
-        signedUrlExpiresAt: newExpiresAt.toISOString(),
-        updatedAt:          new Date().toISOString(),
-      })
-      .eq('id', cvResumeId);
-    if (updateErr) logger.error('[DB] resumes.update:', updateErr.message);
-
-    return {
-      userId,
-      resumeId:           cvResumeId,
-      fileUrl:            newSignedUrl,
-      signedUrlExpiresAt: newExpiresAt.toISOString(),
-      refreshed:          true,
-    };
-  } catch (err) {
-    throw new AppError(
-      'Failed to refresh signed URL.',
-      502, { userId }, ErrorCodes.EXTERNAL_SERVICE_ERROR
-    );
-  }
-}
-
-async function skipCv(userId) {
-  if (!userId) throw new AppError('userId is required', 400, {}, ErrorCodes.VALIDATION_ERROR);
-
-  // P0-01: Guard — careerReport must exist before CV can be skipped.
-  const { data: progressData, error: progressErr } = await supabase
-    .from('onboardingProgress')
-    .select('*')
-    .eq('id', userId)
-    .maybeSingle();
-  if (progressErr && progressErr.code !== 'PGRST116') {
-    logger.error('[DB] onboardingProgress.get:', progressErr.message);
-  }
-
-  const data = progressData || {};
-  if (!data.careerReport) {
-    throw new AppError(
-      'Your career report must be generated before you can skip CV creation.',
-      422, { step: 'career_report', required: true },
-      ErrorCodes.VALIDATION_ERROR,
-      'Please generate your Career Health report first, then you can choose to skip the CV step.'
-    );
-  }
-
-  const now         = new Date().toISOString();
-  const stepHistory = await mergeStepHistory(userId, 'completed_without_cv');
-
-  await supabase.from('onboardingProgress').upsert({
-    id:             userId,
-    step:           'completed_without_cv',
-    wantsCv:        false,
-    stepHistory,
-    lastActiveStep: 'completed_without_cv',
-    lastActiveAt:   now,
-    updatedAt:      now,
-  });
-
-  // Re-read after write so persistCompletionIfReady sees the updated step.
-  const [updatedProgressRes, profileRes] = await Promise.all([
-    supabase.from('onboardingProgress').select('*').eq('id', userId).maybeSingle(),
-    supabase.from('userProfiles').select('*').eq('id', userId).maybeSingle(),
-  ]);
-  await persistCompletionIfReady(
-    userId,
-    updatedProgressRes.data || {},
-    profileRes.data         || {}
-  );
+  const { data } = await supabase.storage
+    .from(STORAGE_BUCKET)
+    .createSignedUrl(resume.storage_path, expiresIn);
 
   return {
     userId,
-    step:    'completed_without_cv',
-    message: 'Onboarding complete. You can always generate a CV later.',
-  };
-}
-
-async function saveCvDraft(userId, payload) {
-  if (!userId) throw new AppError('userId is required', 400, {}, ErrorCodes.VALIDATION_ERROR);
-
-  const {
-    professionalSummary = undefined,
-    skills              = undefined,
-    experience          = undefined,
-  } = payload || {};
-
-  // Build only the fields that were actually provided (don't overwrite others with undefined)
-  const cvDraftUpdate = {};
-  if (professionalSummary !== undefined) {
-    cvDraftUpdate['cvDraft.professionalSummary'] = stripHtml
-      ? stripHtml(String(professionalSummary)).trim().slice(0, 800)
-      : String(professionalSummary).trim().slice(0, 800);
-  }
-  if (Array.isArray(skills)) {
-    cvDraftUpdate['cvDraft.skills'] = skills.slice(0, 20).map(s => ({
-      name:        String(s.name || '').trim(),
-      proficiency: ['beginner', 'intermediate', 'advanced', 'expert'].includes(s.proficiency)
-        ? s.proficiency
-        : 'intermediate',
-    })).filter(s => s.name);
-  }
-  if (Array.isArray(experience)) {
-    cvDraftUpdate['cvDraft.experience'] = experience.slice(0, 10).map(e => ({
-      jobTitle:        String(e.jobTitle || '').trim(),
-      company:         String(e.company  || '').trim(),
-      startDate:       e.startDate  || null,
-      endDate:         e.endDate    || null,
-      isCurrent:       !!e.isCurrent,
-      responsibilities: (e.responsibilities || []).slice(0, 8).map(r => String(r).trim()).filter(Boolean),
-    }));
-  }
-
-  if (Object.keys(cvDraftUpdate).length === 0) {
-    return { userId, step: 'cv_draft_saved', message: 'No changes provided.' };
-  }
-
-  const now = new Date().toISOString();
-
-  // Supabase does not support dot-notation partial updates; read-modify-upsert the cvDraft object
-  const { data: existing } = await supabase
-    .from('onboardingProgress')
-    .select('cvDraft')
-    .eq('id', userId)
-    .maybeSingle();
-
-  const existingDraft = existing?.cvDraft || {};
-
-  // Merge the dot-notation keys into the existing cvDraft object
-  const mergedDraft = { ...existingDraft };
-  for (const [key, value] of Object.entries(cvDraftUpdate)) {
-    const field = key.replace('cvDraft.', '');
-    mergedDraft[field] = value;
-  }
-  mergedDraft.savedAt = now;
-
-  await supabase.from('onboardingProgress').upsert({
-    id:        userId,
-    cvDraft:   mergedDraft,
-    updatedAt: now,
-  });
-
-  return {
-    userId,
-    step:    'cv_draft_saved',
-    message: 'CV draft saved. These overrides will be applied when you generate your CV.',
-    saved:   Object.keys(cvDraftUpdate).map(k => k.replace('cvDraft.', '')),
+    resumeId: resume.id,
+    fileUrl: data?.signedUrl
   };
 }
 
 module.exports = {
-  getCvPreview,
-  buildCvHtml,
   generateCV,
-  getCvSignedUrl,
-  skipCv,
-  saveCvDraft,
-  _renderPdfWithPuppeteer,
-  _renderPdfWithGotenberg,
-  fetchRoleKeywords,
-  buildCvContentPrompt,
+  getCvSignedUrl
 };

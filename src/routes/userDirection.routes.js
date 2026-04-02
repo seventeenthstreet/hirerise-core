@@ -17,7 +17,7 @@ const express = require('express');
 const {
   body
 } = require('express-validator');
-const supabase = require('../config/supabase');
+const { supabase } = require('../config/supabase');
 const {
   validate
 } = require('../middleware/requestValidator');

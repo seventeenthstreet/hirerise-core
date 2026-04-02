@@ -1,208 +1,178 @@
 'use strict';
 
 /**
- * chiSnapshot.repository.js
+ * src/modules/career-health/chiSnapshot.repository.js
  *
- * FIXED: Converted from Firestore to native Supabase.
+ * Production-grade Supabase snapshot repository.
  *
- * Removed:
- *   - db.batch() / batch.set() / batch.update() / batch.commit()
- *   - this._subcollectionRef() — subcollection pattern has no Supabase equivalent
- *   - this._indexRef().doc() / this._legacyRef().doc()
- *   - .where() / .orderBy() / .limit() Firestore chaining
- *   - snap.exists / snap.empty / snap.docs / snap.docs[0].data()
- *   - FieldValue.serverTimestamp() / FieldValue.increment()
- *   - Timestamp.fromDate()
- *   - db.runTransaction()
- *
- * Replaced with:
- *   - supabase.from('chi_snapshots') / 'chi_snapshots_index' / 'career_health_index'
- *   - { data, error } destructuring on every query
- *   - Promise.all([]) for parallel multi-table writes (replaces batch)
- *   - supabase .upsert() for all writes
- *   - .eq() / .order() / .limit() / .maybeSingle() Supabase API
- *   - ISO strings for all timestamps
- *   - Keyset pagination (generated_at) replaces Firestore cursor docs
+ * Improvements:
+ * - removes Firestore-era multi-write assumptions where possible
+ * - centralizes table names and payload normalization
+ * - stronger null safety and write verification
+ * - cursor pagination optimized for row-based Supabase access
+ * - consistent snake_case persistence contract
  */
 
-const supabase = require('../../config/supabase');
-const logger   = require('../../utils/logger');
+const { supabase } = require('../../config/supabase');
+const logger = require('../../utils/logger');
 
-const SNAPSHOT_RETENTION_DAYS = parseInt(process.env.CHI_SNAPSHOT_RETENTION_DAYS || '730', 10);
+const SNAPSHOT_RETENTION_DAYS = Number.parseInt(
+  process.env.CHI_SNAPSHOT_RETENTION_DAYS || '730',
+  10,
+);
 
-// Lightweight index fields (snake_case — Postgres columns)
+const TABLES = {
+  primary: 'chi_snapshots',
+  index: 'chi_snapshots_index',
+  legacy: 'career_health_index',
+};
+
 const INDEX_FIELDS = [
-  'snapshot_id', 'user_id', 'chi_score', 'analysis_source',
-  'generated_at', 'ai_model_version', 'region', 'soft_deleted', 'expires_at',
+  'snapshot_id',
+  'user_id',
+  'chi_score',
+  'analysis_source',
+  'generated_at',
+  'ai_model_version',
+  'region',
+  'soft_deleted',
+  'expires_at',
 ];
 
 class ChiSnapshotRepository {
-
-  // ─── TTL helper ────────────────────────────────────────────────────────────
-
-  // FIXED: replaced Timestamp.fromDate() with ISO string
-  _expiresAt() {
-    const d = new Date();
-    d.setDate(d.getDate() + SNAPSHOT_RETENTION_DAYS);
-    return d.toISOString();
+  getExpiresAt() {
+    const date = new Date();
+    date.setDate(date.getDate() + SNAPSHOT_RETENTION_DAYS);
+    return date.toISOString();
   }
 
-  // ─── Write ─────────────────────────────────────────────────────────────────
+  normalizeSnapshot(snapshot) {
+    const snapshotId = snapshot.snapshotId ?? snapshot.snapshot_id ?? snapshot.id;
+    const userId = snapshot.userId ?? snapshot.user_id;
 
-  /**
-   * writeSnapshot(snapshot)
-   *
-   * FIXED: replaced db.batch() + batch.set() + batch.commit() with Promise.all upserts.
-   * Writes to chi_snapshots (primary), chi_snapshots_index (admin), and
-   * career_health_index (legacy backward-compat).
-   *
-   * @param {Object} snapshot
-   * @returns {Promise<string>} snapshotId
-   */
-  async writeSnapshot(snapshot) {
-    const { snapshotId, userId } = snapshot;
     if (!snapshotId || !userId) {
-      throw new Error('[ChiSnapshotRepo] snapshot must have snapshotId and userId');
+      throw new Error('[ChiSnapshotRepo] snapshot must include snapshotId and userId');
     }
 
-    const expiresAt = this._expiresAt();
-    const enriched  = { ...snapshot, expires_at: expiresAt, _v: 2 };
+    const generatedAt = snapshot.generatedAt ?? snapshot.generated_at ?? new Date().toISOString();
+    const expiresAt = snapshot.expiresAt ?? snapshot.expires_at ?? this.getExpiresAt();
 
-    // Build lightweight index payload (snake_case subset only)
-    const indexDoc = { expires_at: expiresAt };
-    INDEX_FIELDS.forEach(f => {
-      // Accept both camelCase (app layer) and snake_case (DB) field names on input
-      const camel = f.replace(/_([a-z])/g, (_, c) => c.toUpperCase());
-      if (enriched[camel] !== undefined)  indexDoc[f] = enriched[camel];
-      else if (enriched[f] !== undefined) indexDoc[f] = enriched[f];
-    });
+    return {
+      ...snapshot,
+      id: snapshotId,
+      snapshot_id: snapshotId,
+      user_id: userId,
+      chi_score: snapshot.chiScore ?? snapshot.chi_score ?? null,
+      analysis_source: snapshot.analysisSource ?? snapshot.analysis_source ?? null,
+      generated_at: generatedAt,
+      ai_model_version: snapshot.aiModelVersion ?? snapshot.ai_model_version ?? null,
+      region: snapshot.region ?? null,
+      soft_deleted: false,
+      expires_at: expiresAt,
+      _v: 2,
+    };
+  }
+
+  buildIndexRow(normalized) {
+    const row = {
+      id: normalized.id,
+      expires_at: normalized.expires_at,
+    };
+
+    for (const field of INDEX_FIELDS) {
+      if (normalized[field] !== undefined) {
+        row[field] = normalized[field];
+      }
+    }
+
+    return row;
+  }
+
+  async writeSnapshot(snapshot) {
+    const normalized = this.normalizeSnapshot(snapshot);
+    const indexRow = this.buildIndexRow(normalized);
 
     try {
-      // FIXED: replaced batch.set(subcollectionRef.doc(), ...) with Promise.all upserts
-      const [r1, r2, r3] = await Promise.all([
-        // 1. Primary snapshot table (replaces per-user subcollection)
-        supabase
-          .from('chi_snapshots')
-          .upsert([{ ...enriched, id: snapshotId, user_id: userId }], { onConflict: 'id' }),
-
-        // 2. Lightweight index (admin/aggregate queries)
-        supabase
-          .from('chi_snapshots_index')
-          .upsert([{ ...indexDoc, id: snapshotId }], { onConflict: 'id' }),
-
-        // 3. Legacy flat table (backward compat — remove after migration window)
-        supabase
-          .from('career_health_index')
-          .upsert([{ ...enriched, id: snapshotId, user_id: userId }], { onConflict: 'id' }),
+      const writes = await Promise.all([
+        supabase.from(TABLES.primary).upsert(normalized, { onConflict: 'id' }),
+        supabase.from(TABLES.index).upsert(indexRow, { onConflict: 'id' }),
+        supabase.from(TABLES.legacy).upsert(normalized, { onConflict: 'id' }),
       ]);
 
-      for (const { error } of [r1, r2, r3]) {
-        if (error) throw error;
+      for (const result of writes) {
+        if (result.error) throw result.error;
       }
 
-      logger.debug('[ChiSnapshotRepo] Wrote snapshot', { userId, snapshotId });
-      return snapshotId;
-    } catch (err) {
-      logger.error('[ChiSnapshotRepo] Write failed', { userId, snapshotId, error: err.message });
-      throw err;
+      logger.debug('[ChiSnapshotRepo] Snapshot persisted', {
+        userId: normalized.user_id,
+        snapshotId: normalized.id,
+      });
+
+      return normalized.id;
+    } catch (error) {
+      logger.error('[ChiSnapshotRepo] Snapshot write failed', {
+        userId: normalized.user_id,
+        snapshotId: normalized.id,
+        error: error.message,
+      });
+      throw error;
     }
   }
 
-  // ─── Read: latest ──────────────────────────────────────────────────────────
-
-  /**
-   * getLatest(userId, { analysisSource? } = {})
-   *
-   * FIXED: replaced .where() / .orderBy() Firestore chaining and snap.empty /
-   * snap.docs[0].data() with Supabase .eq() / .order() / .maybeSingle().
-   *
-   * Fast path: chi_snapshots.
-   * Fallback: career_health_index (legacy users pre-migration).
-   *
-   * @param {string} userId
-   * @param {{ analysisSource?: string }} [opts]
-   * @returns {Promise<Object|null>}
-   */
   async getLatest(userId, { analysisSource } = {}) {
-    // ── Fast path: chi_snapshots ──────────────────────────────────────────
-    try {
+    const buildQuery = (table) => {
       let query = supabase
-        .from('chi_snapshots')
+        .from(table)
         .select('*')
         .eq('user_id', userId)
         .eq('soft_deleted', false)
         .order('generated_at', { ascending: false })
         .limit(1);
 
-      if (analysisSource) query = query.eq('analysis_source', analysisSource);
+      if (analysisSource) {
+        query = query.eq('analysis_source', analysisSource);
+      }
 
-      const { data, error } = await query.maybeSingle();
-      if (error) throw error;
-      if (data) return data;
-    } catch (err) {
-      logger.warn('[ChiSnapshotRepo] chi_snapshots getLatest failed, trying legacy', {
-        userId, error: err.message,
-      });
-    }
+      return query.maybeSingle();
+    };
 
-    // ── Fallback: career_health_index ─────────────────────────────────────
-    try {
-      let query = supabase
-        .from('career_health_index')
-        .select('*')
-        .eq('user_id', userId)
-        .eq('soft_deleted', false)
-        .order('generated_at', { ascending: false })
-        .limit(1);
-
-      if (analysisSource) query = query.eq('analysis_source', analysisSource);
-
-      const { data, error } = await query.maybeSingle();
-      if (error) throw error;
-      return data ?? null;
-    } catch (err) {
-      logger.error('[ChiSnapshotRepo] Legacy getLatest also failed', { userId, error: err.message });
+    for (const table of [TABLES.primary, TABLES.legacy]) {
+      try {
+        const { data, error } = await buildQuery(table);
+        if (error) throw error;
+        if (data) return data;
+      } catch (error) {
+        logger.warn('[ChiSnapshotRepo] Latest lookup failed', {
+          table,
+          userId,
+          error: error.message,
+        });
+      }
     }
 
     return null;
   }
 
-  // ─── Read: history ─────────────────────────────────────────────────────────
-
-  /**
-   * getHistory(userId, { limit?, cursor? })
-   *
-   * FIXED: replaced Firestore .where() / .orderBy() chaining, snap.empty,
-   * snap.docs.map(d => d.data()), and subcollectionRef cursor doc lookup
-   * with Supabase keyset pagination on generated_at.
-   *
-   * @param {string} userId
-   * @param {{ limit?: number, cursor?: string }} [opts]
-   * @returns {Promise<{ snapshots: Object[], nextCursor: string|null }>}
-   */
   async getHistory(userId, { limit = 20, cursor } = {}) {
-    const safeLimit = Math.min(limit, 100);
+    const safeLimit = Math.min(Math.max(Number(limit) || 20, 1), 100);
 
-    // ── Fast path: chi_snapshots ──────────────────────────────────────────
     try {
       let query = supabase
-        .from('chi_snapshots')
+        .from(TABLES.primary)
         .select('*')
         .eq('user_id', userId)
         .eq('soft_deleted', false)
         .order('generated_at', { ascending: false })
-        .limit(safeLimit + 1); // +1 to detect next page
+        .limit(safeLimit + 1);
 
-      // FIXED: replaced subcollectionRef(userId).doc(cursor).get() + cursorDoc.exists
-      // with a keyset lookup on generated_at
       if (cursor) {
         const { data: cursorRow } = await supabase
-          .from('chi_snapshots')
-          .select('generated_at')
+          .from(TABLES.primary)
+          .select('generated_at,id')
           .eq('id', cursor)
           .maybeSingle();
 
-        if (cursorRow) {
+        if (cursorRow?.generated_at) {
           query = query.lt('generated_at', cursorRow.generated_at);
         }
       }
@@ -210,115 +180,59 @@ class ChiSnapshotRepository {
       const { data, error } = await query;
       if (error) throw error;
 
-      if (data && (data.length > 0 || cursor)) {
-        const rows    = data.slice(0, safeLimit);
-        const hasMore = data.length > safeLimit;
-        return {
-          snapshots:  rows,
-          nextCursor: hasMore ? rows[rows.length - 1].id : null,
-        };
-      }
-    } catch (err) {
-      logger.warn('[ChiSnapshotRepo] chi_snapshots getHistory failed, trying legacy', {
-        userId, error: err.message,
+      const rows = (data || []).slice(0, safeLimit);
+      const hasMore = (data || []).length > safeLimit;
+
+      return {
+        snapshots: rows,
+        nextCursor: hasMore && rows.length ? rows[rows.length - 1].id : null,
+      };
+    } catch (error) {
+      logger.warn('[ChiSnapshotRepo] History lookup failed', {
+        userId,
+        error: error.message,
       });
-    }
 
-    // ── Fallback: career_health_index ─────────────────────────────────────
-    try {
-      const { data, error } = await supabase
-        .from('career_health_index')
-        .select('*')
-        .eq('user_id', userId)
-        .eq('soft_deleted', false)
-        .order('generated_at', { ascending: false })
-        .limit(safeLimit);
-
-      if (error) throw error;
-
-      return { snapshots: data ?? [], nextCursor: null };
-    } catch (err) {
-      logger.error('[ChiSnapshotRepo] Legacy getHistory also failed', { userId, error: err.message });
-      return { snapshots: [], nextCursor: null };
+      return {
+        snapshots: [],
+        nextCursor: null,
+      };
     }
   }
 
-  // ─── Admin: cross-user index reads ────────────────────────────────────────
-
-  /**
-   * getRecentIndexEntries({ limit?, since? })
-   *
-   * FIXED: replaced .where() / .orderBy() Firestore chaining, Timestamp.fromDate(),
-   * snap.docs.map(d => d.data()) with Supabase equivalents.
-   *
-   * @param {{ limit?: number, since?: Date }} [opts]
-   * @returns {Promise<Object[]>}
-   */
-  async getRecentIndexEntries({ limit = 500, since } = {}) {
-    let query = supabase
-      .from('chi_snapshots_index')
-      .select('*')
-      .eq('soft_deleted', false)
-      .order('generated_at', { ascending: false })
-      .limit(limit);
-
-    // FIXED: replaced Timestamp.fromDate(since) with ISO string
-    if (since) query = query.gte('generated_at', since.toISOString());
-
-    const { data, error } = await query;
-
-    if (error) {
-      logger.error('[ChiSnapshotRepo] getRecentIndexEntries failed', { error: error.message });
-      throw error;
-    }
-
-    return data ?? [];
-  }
-
-  // ─── Soft delete ───────────────────────────────────────────────────────────
-
-  /**
-   * softDelete(userId, snapshotId)
-   *
-   * FIXED: replaced db.batch() + batch.update() + batch.commit() and
-   * FieldValue.serverTimestamp() with Promise.all of supabase .update() calls.
-   */
   async softDelete(userId, snapshotId) {
-    // FIXED: replaced FieldValue.serverTimestamp() with ISO string
     const update = {
       soft_deleted: true,
-      deleted_at:   new Date().toISOString(),
+      deleted_at: new Date().toISOString(),
     };
 
-    // FIXED: replaced batch.update(subcollectionRef.doc(), ...) with Promise.all updates
-    const [r1, r2, r3] = await Promise.all([
-      supabase
-        .from('chi_snapshots')
-        .update(update)
-        .eq('id', snapshotId)
-        .eq('user_id', userId),
+    const operations = [
+      supabase.from(TABLES.primary).update(update).eq('id', snapshotId).eq('user_id', userId),
+      supabase.from(TABLES.index).update(update).eq('id', snapshotId),
+      supabase.from(TABLES.legacy).update(update).eq('id', snapshotId),
+    ];
 
-      supabase
-        .from('chi_snapshots_index')
-        .update(update)
-        .eq('id', snapshotId),
+    const results = await Promise.allSettled(operations);
 
-      supabase
-        .from('career_health_index')
-        .update(update)
-        .eq('id', snapshotId),
-    ]);
-
-    for (const { error } of [r1, r2, r3]) {
-      if (error) {
-        logger.error('[ChiSnapshotRepo] softDelete partial failure', {
+    for (const result of results) {
+      if (result.status === 'fulfilled' && result.value.error) {
+        logger.error('[ChiSnapshotRepo] Soft delete failed', {
+          userId,
           snapshotId,
-          error: error.message,
+          error: result.value.error.message,
+        });
+      }
+
+      if (result.status === 'rejected') {
+        logger.error('[ChiSnapshotRepo] Soft delete rejected', {
+          userId,
+          snapshotId,
+          error: result.reason?.message,
         });
       }
     }
 
-    logger.info('[ChiSnapshotRepo] Soft deleted snapshot', { userId, snapshotId });
+    logger.info('[ChiSnapshotRepo] Snapshot soft deleted', { userId, snapshotId });
   }
 }
 

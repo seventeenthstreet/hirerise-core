@@ -1,42 +1,56 @@
 'use strict';
 
 /**
- * conversion.logger.js
+ * src/modules/conversion/utils/conversion.logger.js
  *
  * Scoped logger wrapper for the Conversion module.
  *
- * - Uses shared app logger if available (Winston / Pino / Bunyan).
- * - Falls back safely to console in development.
- * - Never throws if logger methods are missing.
- * - Normalizes metadata to prevent logging crashes.
- *
- * To swap logger implementation:
- *   Change only the baseLogger resolution block below.
+ * Features:
+ * - safe shared logger resolution
+ * - supports Winston / Pino / Bunyan / custom logger
+ * - console fallback
+ * - circular-safe metadata normalization
+ * - bounded metadata size
+ * - never throws
+ * - production-safe debug/trace support
  */
 
-let baseLogger;
+let baseLogger = null;
 
-/**
- * Resolve shared logger safely.
- */
-try {
-  // Adjust this path to match your app structure.
-  baseLogger = require('../../../../shared/logger');
-} catch {
+const LOGGER_CANDIDATE_PATHS = [
+  '../../../utils/logger',
+  '../../../shared/logger',
+  '../../../../shared/logger',
+];
+
+for (const path of LOGGER_CANDIDATE_PATHS) {
+  try {
+    // eslint-disable-next-line global-require, import/no-dynamic-require
+    baseLogger = require(path);
+    break;
+  } catch {
+    // try next candidate
+  }
+}
+
+if (!baseLogger) {
   baseLogger = console;
 }
 
 const PREFIX = '[conversion]';
+const MAX_META_KEYS = 50;
 
 /**
- * Ensure logger method exists.
+ * Resolve logger method safely.
+ *
+ * @param {string} method
+ * @returns {(message:string, meta?:object)=>void}
  */
-function _resolveMethod(method) {
+function resolveMethod(method) {
   if (baseLogger && typeof baseLogger[method] === 'function') {
     return baseLogger[method].bind(baseLogger);
   }
 
-  // Fallback hierarchy
   if (typeof console[method] === 'function') {
     return console[method].bind(console);
   }
@@ -45,14 +59,23 @@ function _resolveMethod(method) {
 }
 
 /**
- * Prevent logging from crashing due to circular references.
+ * Prevent logging crashes from circular or huge metadata.
+ *
+ * @param {unknown} meta
+ * @returns {Record<string, unknown>}
  */
-function _safeMeta(meta) {
-  if (!meta || typeof meta !== 'object') return {};
+function safeMeta(meta) {
+  if (!meta || typeof meta !== 'object') {
+    return {};
+  }
 
   try {
-    JSON.stringify(meta);
-    return meta;
+    const entries = Object.entries(meta).slice(0, MAX_META_KEYS);
+    const bounded = Object.fromEntries(entries);
+
+    JSON.stringify(bounded);
+
+    return bounded;
   } catch {
     return { note: 'meta_unserializable' };
   }
@@ -60,58 +83,65 @@ function _safeMeta(meta) {
 
 /**
  * Standardized log execution.
+ *
+ * @param {'info'|'warn'|'error'|'debug'|'trace'} method
+ * @param {string} message
+ * @param {object} meta
  */
-function _log(method, message, meta) {
+function log(method, message, meta = {}) {
   try {
-    const logMethod = _resolveMethod(method);
-    const normalizedMeta = _safeMeta(meta);
+    const logMethod = resolveMethod(method);
+    const normalizedMeta = safeMeta(meta);
 
-    logMethod(`${PREFIX} ${message}`, normalizedMeta);
-  } catch (err) {
-    // Absolute safety fallback — logging must never crash app
+    logMethod(`${PREFIX} ${message}`, {
+      timestamp: new Date().toISOString(),
+      ...normalizedMeta,
+    });
+  } catch (error) {
+    // absolute safety fallback
     console.error('[conversion] logger failure', {
+      timestamp: new Date().toISOString(),
       originalMessage: message,
-      error: err.message,
+      error: error.message,
     });
   }
 }
 
-const logger = {
+const logger = Object.freeze({
   /**
-   * Informational logs (non-error lifecycle events)
+   * Informational lifecycle events
    */
   info(message, meta = {}) {
-    _log('info', message, meta);
+    log('info', message, meta);
   },
 
   /**
-   * Warnings (non-fatal recoverable issues)
+   * Recoverable warnings
    */
   warn(message, meta = {}) {
-    _log('warn', message, meta);
+    log('warn', message, meta);
   },
 
   /**
-   * Errors (unexpected runtime failures)
+   * Unexpected failures
    */
   error(message, meta = {}) {
-    _log('error', message, meta);
+    log('error', message, meta);
   },
 
   /**
-   * Debug logs (should be filtered in production)
+   * Debug logs
    */
   debug(message, meta = {}) {
-    _log('debug', message, meta);
+    log('debug', message, meta);
   },
-};
+
+  /**
+   * Ultra-verbose trace logs
+   */
+  trace(message, meta = {}) {
+    log('trace', message, meta);
+  },
+});
 
 module.exports = logger;
-
-
-
-
-
-
-
-
