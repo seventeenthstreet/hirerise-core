@@ -1,65 +1,134 @@
 'use strict';
 
 /**
- * modules/marketIntelligence/marketIntelligence.controller.js
+ * src/modules/marketIntelligence/marketIntelligence.controller.js
  *
- * Thin HTTP layer — delegates all logic to marketIntelligence.service.js.
- * Credentials are NEVER logged or returned in responses.
+ * Thin HTTP controller layer for Market Intelligence.
+ * Business logic remains exclusively inside the service layer.
+ *
+ * Supabase migration notes:
+ * - No Firebase dependencies remain
+ * - No Firestore snapshot assumptions
+ * - Controller remains storage-agnostic
+ * - Safe for row-based Supabase services
  */
 
 const svc = require('./marketIntelligence.service');
+const logger = require('../../utils/logger');
 
-/** POST /api/v1/admin/market-intelligence/config */
-async function saveConfig(req, res, next) {
-  try {
-    const adminUid = req.user?.uid || req.user?.id;
-    const result   = await svc.saveConfig(req.body, adminUid);
-    res.status(200).json({ success: true, ...result });
-  } catch (err) { next(err); }
+/**
+ * Standard async controller wrapper.
+ * Ensures consistent Express error forwarding.
+ *
+ * @param {Function} fn
+ * @returns {Function}
+ */
+function asyncHandler(fn) {
+  return function wrappedController(req, res, next) {
+    Promise.resolve(fn(req, res, next)).catch(next);
+  };
 }
 
-/** POST /api/v1/admin/market-intelligence/test */
-async function testConnection(req, res, next) {
-  try {
-    const result = await svc.testConnection();
-    res.status(200).json({ success: true, ...result });
-  } catch (err) { next(err); }
+/**
+ * Extract authenticated actor ID safely.
+ * Supports multiple auth middleware strategies.
+ *
+ * @param {import('express').Request} req
+ * @returns {string|null}
+ */
+function getActorId(req) {
+  return req?.user?.uid || req?.user?.id || null;
 }
 
-/** GET /api/v1/admin/market-intelligence/status */
-async function getStatus(req, res, next) {
-  try {
-    const result = await svc.getStatus();
-    res.status(200).json({ success: true, ...result });
-  } catch (err) { next(err); }
+/**
+ * Standard success response helper.
+ *
+ * @param {import('express').Response} res
+ * @param {object} payload
+ * @param {number} [statusCode=200]
+ */
+function sendSuccess(res, payload, statusCode = 200) {
+  return res.status(statusCode).json({
+    success: true,
+    ...payload,
+  });
 }
 
-/** GET /api/v1/admin/market-intelligence/data-sources */
-async function getDataSources(req, res, next) {
-  try {
-    const result = await svc.getDataSources();
-    res.status(200).json({ success: true, ...result });
-  } catch (err) { next(err); }
-}
+/**
+ * POST /api/v1/admin/market-intelligence/config
+ */
+const saveConfig = asyncHandler(async (req, res) => {
+  const adminUid = getActorId(req);
 
-/** POST /api/v1/admin/market-intelligence/fetch */
-async function fetchDemand(req, res, next) {
-  try {
-    const { role, country = 'in' } = req.body;
-    if (!role || typeof role !== 'string') {
-      return res.status(400).json({ success: false, error: 'role is required.' });
-    }
-    const result = await svc.fetchDemand(role.trim(), country);
-    res.status(200).json({ success: true, ...result });
-  } catch (err) { next(err); }
-}
+  logger.info('Saving market intelligence config', {
+    actorId: adminUid,
+  });
 
-module.exports = { saveConfig, testConnection, getStatus, getDataSources, fetchDemand };
+  const result = await svc.saveConfig(req.body, adminUid);
 
+  return sendSuccess(res, result);
+});
 
+/**
+ * POST /api/v1/admin/market-intelligence/test
+ */
+const testConnection = asyncHandler(async (_req, res) => {
+  const result = await svc.testConnection();
+  return sendSuccess(res, result);
+});
 
+/**
+ * GET /api/v1/admin/market-intelligence/status
+ */
+const getStatus = asyncHandler(async (_req, res) => {
+  const result = await svc.getStatus();
+  return sendSuccess(res, result);
+});
 
+/**
+ * GET /api/v1/admin/market-intelligence/data-sources
+ */
+const getDataSources = asyncHandler(async (_req, res) => {
+  const result = await svc.getDataSources();
+  return sendSuccess(res, result);
+});
 
+/**
+ * POST /api/v1/admin/market-intelligence/fetch
+ */
+const fetchDemand = asyncHandler(async (req, res) => {
+  const role =
+    typeof req.body?.role === 'string'
+      ? req.body.role.trim()
+      : '';
 
+  const country =
+    typeof req.body?.country === 'string' && req.body.country.trim()
+      ? req.body.country.trim().toLowerCase()
+      : 'in';
 
+  if (!role) {
+    return res.status(400).json({
+      success: false,
+      error: 'role is required.',
+    });
+  }
 
+  logger.info('Fetching market demand', {
+    role,
+    country,
+    actorId: getActorId(req),
+  });
+
+  const result = await svc.fetchDemand(role, country);
+
+  return sendSuccess(res, result);
+});
+
+module.exports = {
+  saveConfig,
+  testConnection,
+  getStatus,
+  getDataSources,
+  fetchDemand,
+};

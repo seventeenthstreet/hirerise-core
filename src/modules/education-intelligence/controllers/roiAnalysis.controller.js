@@ -1,14 +1,5 @@
 'use strict';
 
-/**
- * controllers/roiAnalysis.controller.js
- *
- * HTTP handler for the Education ROI Engine endpoint.
- *
- * Endpoints:
- *   POST /api/v1/education/roi-analysis/:studentId  — run ERE, store + return
- *   GET  /api/v1/education/roi-analysis/:studentId  — return stored results
- */
 const { supabase } = require('../../../config/supabase');
 const logger = require('../../../utils/logger');
 const repository = require('../repositories/student.repository');
@@ -16,27 +7,87 @@ const CareerSuccessEngine = require('../engines/careerSuccess.engine');
 const EducationROIEngine = require('../engines/educationROI.engine');
 const { COLLECTIONS } = require('../models/student.model');
 
-// ─── POST /api/v1/education/roi-analysis/:studentId ───────────────────────────
+function getAuthenticatedUserId(req) {
+  return req.user?.id || req.user?.uid || null;
+}
+
+function isAdmin(req) {
+  return req.user?.admin === true;
+}
+
+function isValidStudentId(studentId) {
+  return (
+    typeof studentId === 'string' &&
+    studentId.trim().length > 0
+  );
+}
+
+/**
+ * Atomic UPSERT for ROI options.
+ * Requires UNIQUE(student_id, education_path)
+ */
+async function replaceROIOptions(studentId, options) {
+  const rows = options.map((option) => ({
+    student_id: studentId,
+    education_path: option.path,
+    duration_years: option.duration_years,
+    estimated_cost: option.estimated_cost,
+    expected_salary: option.expected_salary,
+    roi_score: option.roi_score,
+    roi_level: option.roi_level,
+    matched_careers: option.matched_careers ?? []
+  }));
+
+  const { error } = await supabase
+    .from(COLLECTIONS.EDUCATION_ROI)
+    .upsert(rows, {
+      onConflict: 'student_id,education_path'
+    });
+
+  if (error) {
+    logger.error(
+      {
+        studentId,
+        error: error.message
+      },
+      '[ROIController] Failed to persist ROI options'
+    );
+    throw error;
+  }
+}
 
 async function analyzeROI(req, res, next) {
   try {
-    const requestingUid = req.user.uid;
-    const studentId = req.params.studentId;
-    if (requestingUid !== studentId && !req.user.admin) {
+    const requestingUserId = getAuthenticatedUserId(req);
+    const studentId = req.params?.studentId;
+
+    if (!isValidStudentId(studentId)) {
+      return res.status(400).json({
+        success: false,
+        errorCode: 'INVALID_STUDENT_ID',
+        message: 'studentId path parameter must be a non-empty string.'
+      });
+    }
+
+    if (requestingUserId !== studentId && !isAdmin(req)) {
       return res.status(403).json({
         success: false,
         errorCode: 'FORBIDDEN',
         message: 'You may only request ROI analysis for your own profile.'
       });
     }
-    logger.info({ studentId }, '[ROIController] ROI analysis requested');
 
-    // ── Fetch prerequisites ────────────────────────────────────────────────
+    logger.info(
+      { studentId, requestingUserId },
+      '[ROIController] ROI analysis requested'
+    );
+
     const [student, cognitive, streamScores] = await Promise.all([
       repository.getStudent(studentId),
       repository.getCognitive(studentId),
       repository.getStreamScores(studentId)
     ]);
+
     if (!student) {
       return res.status(404).json({
         success: false,
@@ -44,70 +95,79 @@ async function analyzeROI(req, res, next) {
         message: 'Student profile not found. Complete onboarding first.'
       });
     }
+
     if (!cognitive) {
       return res.status(422).json({
         success: false,
         errorCode: 'COGNITIVE_MISSING',
-        message: 'Complete the cognitive assessment before running ROI analysis.'
+        message:
+          'Complete the cognitive assessment before running ROI analysis.'
       });
     }
-    const recommendedStream = streamScores?.recommended_stream ?? 'engineering';
 
-    // ── Run Career Success Engine to get probabilities ─────────────────────
-    const context = { studentId, student, cognitive };
-    const careerResult = await CareerSuccessEngine.analyze(context, recommendedStream);
+    const recommendedStream =
+      streamScores?.recommended_stream ?? 'engineering';
 
-    // ── Run Education ROI Engine ───────────────────────────────────────────
-    const roiResult = await EducationROIEngine.analyze(careerResult, recommendedStream);
+    const careerResult = await CareerSuccessEngine.analyze(
+      {
+        studentId,
+        student,
+        cognitive
+      },
+      recommendedStream
+    );
 
-    // ── Persist results (replace previous) ────────────────────────────────
-    // Delete existing ROI rows for this student then bulk insert new ones
-    const now = new Date().toISOString();
+    const roiResult = await EducationROIEngine.analyze(
+      careerResult,
+      recommendedStream
+    );
 
-    await supabase
-      .from(COLLECTIONS.EDUCATION_ROI)
-      .delete()
-      .eq('student_id', studentId);
-
-    const roiToInsert = roiResult.education_options.map(option => ({
-      student_id: studentId,
-      education_path: option.path,
-      duration_years: option.duration_years,
-      estimated_cost: option.estimated_cost,
-      expected_salary: option.expected_salary,
-      roi_score: option.roi_score,
-      roi_level: option.roi_level,
-      matched_careers: option.matched_careers,
-      created_at: now
-    }));
-
-    if (roiToInsert.length > 0) {
-      const { error: insertError } = await supabase
-        .from(COLLECTIONS.EDUCATION_ROI)
-        .insert(roiToInsert);
-      if (insertError) throw insertError;
-    }
+    await replaceROIOptions(
+      studentId,
+      roiResult.education_options
+    );
 
     logger.info(
-      { studentId, count: roiResult.education_options.length },
+      {
+        studentId,
+        count: roiResult.education_options.length
+      },
       '[ROIController] ROI results stored'
     );
+
     return res.status(200).json({
       success: true,
-      data: { education_options: roiResult.education_options }
+      data: {
+        education_options: roiResult.education_options
+      }
     });
-  } catch (err) {
-    next(err);
+  } catch (error) {
+    logger.error(
+      {
+        studentId: req.params?.studentId,
+        error: error.message
+      },
+      '[ROIController] ROI analysis failed'
+    );
+
+    return next(error);
   }
 }
 
-// ─── GET /api/v1/education/roi-analysis/:studentId ────────────────────────────
-
 async function getROI(req, res, next) {
   try {
-    const requestingUid = req.user.uid;
-    const studentId = req.params.studentId;
-    if (requestingUid !== studentId && !req.user.admin) {
+    const requestingUserId = getAuthenticatedUserId(req);
+    const studentId = req.params?.studentId;
+
+    if (!isValidStudentId(studentId)) {
+      return res.status(400).json({
+        success: false,
+        errorCode: 'INVALID_STUDENT_ID',
+        message: 'studentId path parameter must be a non-empty string.'
+      });
+    }
+
+    if (requestingUserId !== studentId && !isAdmin(req)) {
       return res.status(403).json({
         success: false,
         errorCode: 'FORBIDDEN',
@@ -117,13 +177,21 @@ async function getROI(req, res, next) {
 
     const { data, error } = await supabase
       .from(COLLECTIONS.EDUCATION_ROI)
-      .select('education_path, duration_years, estimated_cost, expected_salary, roi_score, roi_level, matched_careers')
+      .select(`
+        education_path,
+        duration_years,
+        estimated_cost,
+        expected_salary,
+        roi_score,
+        roi_level,
+        matched_careers
+      `)
       .eq('student_id', studentId)
       .order('roi_score', { ascending: false });
 
     if (error) throw error;
 
-    if (!data || data.length === 0) {
+    if (!data?.length) {
       return res.status(404).json({
         success: false,
         errorCode: 'ROI_NOT_FOUND',
@@ -131,22 +199,30 @@ async function getROI(req, res, next) {
       });
     }
 
-    const education_options = data.map(d => ({
-      path: d.education_path,
-      duration_years: d.duration_years,
-      estimated_cost: d.estimated_cost,
-      expected_salary: d.expected_salary,
-      roi_score: d.roi_score,
-      roi_level: d.roi_level,
-      matched_careers: d.matched_careers ?? []
-    }));
-
     return res.status(200).json({
       success: true,
-      data: { education_options }
+      data: {
+        education_options: data.map((d) => ({
+          path: d.education_path,
+          duration_years: d.duration_years,
+          estimated_cost: d.estimated_cost,
+          expected_salary: d.expected_salary,
+          roi_score: d.roi_score,
+          roi_level: d.roi_level,
+          matched_careers: d.matched_careers ?? []
+        }))
+      }
     });
-  } catch (err) {
-    next(err);
+  } catch (error) {
+    logger.error(
+      {
+        studentId: req.params?.studentId,
+        error: error.message
+      },
+      '[ROIController] Fetch failed'
+    );
+
+    return next(error);
   }
 }
 

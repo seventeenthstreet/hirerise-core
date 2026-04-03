@@ -1,118 +1,147 @@
 'use strict';
 
 /**
- * models/jobMarket.model.js
+ * src/modules/labor-market-intelligence/models/jobMarket.model.js
  *
- * Firestore collection names and document shape builders for the
- * Labor Market Intelligence module.
+ * Canonical SQL table registry + row builders for
+ * Labor Market Intelligence (LMI).
  *
- * Collections (all prefixed lmi_ to stay isolated):
- *   lmi_job_market_data     — raw job postings (real or mock)
- *   lmi_skill_demand        — aggregated skill demand scores
- *   lmi_career_market_scores — per-career market intelligence scores
- *   lmi_ingestion_runs      — audit log of collector runs
+ * This file is the single source of truth for:
+ * - Supabase table names
+ * - insert/upsert row normalization
+ * - analytics-safe field coercion
+ *
+ * IMPORTANT:
+ * Keep CAREER_SCORES aligned with:
+ *   lmi_career_market_scores
+ * to prevent fallback-only reads in marketTrend.service.js
  */
 
-const COLLECTIONS = {
-  JOB_MARKET:     'lmi_job_market_data',
-  SKILL_DEMAND:   'lmi_skill_demand',
-  CAREER_SCORES:  'lmi_career_market_scores',
-  INGESTION_RUNS: 'lmi_ingestion_runs',
-};
-
-// ─── Document builders ────────────────────────────────────────────────────────
+const TABLES = Object.freeze({
+  JOB_MARKET: 'lmi_job_market_data',
+  SKILL_DEMAND: 'lmi_skill_demand',
+  CAREER_SCORES: 'lmi_career_market_scores',
+  INGESTION_RUNS: 'lmi_ingestion_runs'
+});
 
 /**
- * lmi_job_market_data/{autoId}
- *
- *   job_title    — string
- *   company      — string
- *   location     — string
- *   salary_min   — number (INR annual)
- *   salary_max   — number (INR annual)
- *   skills       — string[]
- *   industry     — string
- *   source       — 'linkedin' | 'indeed' | 'naukri' | 'mock'
- *   posting_date — ISO date string
- *   created_at   — serverTimestamp
+ * Backward-compatible alias export.
+ * Preserved so existing imports do not break.
  */
-function buildJobDoc(fields) {
+const COLLECTIONS = TABLES;
+
+// ───────────────────────────────────────────────────────────────────────────────
+// SQL Row Builders
+// ───────────────────────────────────────────────────────────────────────────────
+
+function buildJobDoc(fields = {}) {
+  const salaryMin = toNullableNumber(fields.salary_min);
+  const salaryMax = toNullableNumber(fields.salary_max);
+
   return {
-    job_title:    fields.job_title    || null,
-    company:      fields.company      || null,
-    location:     fields.location     || null,
-    salary_min:   fields.salary_min   != null ? Number(fields.salary_min)  : null,
-    salary_max:   fields.salary_max   != null ? Number(fields.salary_max)  : null,
-    skills:       Array.isArray(fields.skills) ? fields.skills : [],
-    industry:     fields.industry     || null,
-    source:       fields.source       || 'mock',
-    posting_date: fields.posting_date || new Date().toISOString().slice(0, 10),
-    created_at:   null,
+    job_title: toNullableString(fields.job_title),
+    company: toNullableString(fields.company),
+    location: toNullableString(fields.location),
+    salary_min: salaryMin,
+    salary_max:
+      salaryMax != null
+        ? Math.max(salaryMax, salaryMin ?? salaryMax)
+        : salaryMax,
+    skills: toStringArray(fields.skills),
+    industry: toNullableString(fields.industry),
+    source: toNullableString(fields.source) || 'mock',
+    posting_date: normalizeDate(fields.posting_date)
   };
 }
 
-/**
- * lmi_skill_demand/{skill_name}  (doc ID = normalised skill name)
- *
- *   skill_name     — string
- *   demand_score   — number 0–100
- *   growth_rate    — number (YoY %, e.g. 0.15 = 15%)
- *   industry_usage — string[] — industries where skill is in demand
- *   job_count      — number  — raw posting count driving the score
- *   updated_at     — serverTimestamp
- */
-function buildSkillDemandDoc(fields) {
+function buildSkillDemandDoc(fields = {}) {
   return {
-    skill_name:     fields.skill_name     || null,
-    demand_score:   fields.demand_score   != null ? Number(fields.demand_score)  : 0,
-    growth_rate:    fields.growth_rate    != null ? Number(fields.growth_rate)   : 0,
-    industry_usage: Array.isArray(fields.industry_usage) ? fields.industry_usage : [],
-    job_count:      fields.job_count      != null ? Number(fields.job_count)     : 0,
-    updated_at:     null,
+    skill_name: toNullableString(fields.skill_name),
+    demand_score: clampNumber(toSafeNumber(fields.demand_score, 0), 0, 100),
+    growth_rate: clampNumber(toSafeNumber(fields.growth_rate, 0), 0, 1),
+    industry_usage: toStringArray(fields.industry_usage),
+    job_count: Math.max(0, toSafeInteger(fields.job_count, 0))
   };
 }
 
-/**
- * lmi_career_market_scores/{career_name}  (doc ID = career name)
- *
- *   career_name       — string
- *   demand_score      — number 0–100
- *   salary_growth     — number (YoY %, e.g. 0.12 = 12%)
- *   automation_risk   — number 0–100 (higher = more at risk)
- *   trend_score       — number 0–100  (composite market signal)
- *   avg_entry_salary  — number (INR)
- *   avg_5yr_salary    — number (INR)
- *   avg_10yr_salary   — number (INR)
- *   top_skills        — string[]
- *   updated_at        — serverTimestamp
- */
-function buildCareerScoreDoc(fields) {
+function buildCareerScoreDoc(fields = {}) {
   return {
-    career_name:      fields.career_name      || null,
-    demand_score:     fields.demand_score     != null ? Number(fields.demand_score)    : 0,
-    salary_growth:    fields.salary_growth    != null ? Number(fields.salary_growth)   : 0,
-    automation_risk:  fields.automation_risk  != null ? Number(fields.automation_risk) : 0,
-    trend_score:      fields.trend_score      != null ? Number(fields.trend_score)     : 0,
-    avg_entry_salary: fields.avg_entry_salary != null ? Number(fields.avg_entry_salary) : null,
-    avg_5yr_salary:   fields.avg_5yr_salary   != null ? Number(fields.avg_5yr_salary)   : null,
-    avg_10yr_salary:  fields.avg_10yr_salary  != null ? Number(fields.avg_10yr_salary)  : null,
-    top_skills:       Array.isArray(fields.top_skills) ? fields.top_skills : [],
-    updated_at:       null,
+    career_name: toNullableString(fields.career_name),
+    demand_score: clampNumber(toSafeNumber(fields.demand_score, 0), 0, 100),
+    salary_growth: clampNumber(toSafeNumber(fields.salary_growth, 0), 0, 1),
+    automation_risk: clampNumber(toSafeNumber(fields.automation_risk, 0), 0, 100),
+    trend_score: clampNumber(toSafeNumber(fields.trend_score, 0), 0, 100),
+    avg_entry_salary: toNullablePositiveNumber(fields.avg_entry_salary),
+    avg_5yr_salary: toNullablePositiveNumber(fields.avg_5yr_salary),
+    avg_10yr_salary: toNullablePositiveNumber(fields.avg_10yr_salary),
+    top_skills: toStringArray(fields.top_skills)
   };
 }
 
-module.exports = {
+// ───────────────────────────────────────────────────────────────────────────────
+// Normalization Helpers
+// ───────────────────────────────────────────────────────────────────────────────
+
+function toNullableString(value) {
+  if (typeof value !== 'string') {
+    return value == null ? null : String(value).trim() || null;
+  }
+
+  const trimmed = value.trim();
+  return trimmed || null;
+}
+
+function toNullableNumber(value) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function toNullablePositiveNumber(value) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
+}
+
+function toSafeNumber(value, fallback = 0) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+function toSafeInteger(value, fallback = 0) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? Math.floor(parsed) : fallback;
+}
+
+function toStringArray(value) {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  return [...new Set(
+    value
+      .map((item) => toNullableString(item))
+      .filter(Boolean)
+  )];
+}
+
+function normalizeDate(value) {
+  if (typeof value === 'string') {
+    const trimmed = value.trim();
+    if (/^\d{4}-\d{2}-\d{2}/.test(trimmed)) {
+      return trimmed.slice(0, 10);
+    }
+  }
+
+  return new Date().toISOString().slice(0, 10);
+}
+
+function clampNumber(value, min, max) {
+  return Math.min(max, Math.max(min, value));
+}
+
+module.exports = Object.freeze({
+  TABLES,
   COLLECTIONS,
   buildJobDoc,
   buildSkillDemandDoc,
-  buildCareerScoreDoc,
-};
-
-
-
-
-
-
-
-
-
+  buildCareerScoreDoc
+});

@@ -1,44 +1,73 @@
 'use strict';
 
 /**
- * masterSync.routes.js — Manual Salary Sync Trigger (MASTER_ADMIN only)
+ * src/modules/master/masterSync.routes.js
  *
- * OBSERVABILITY UPGRADE: Writes to admin_logs on sync trigger.
+ * Manual Salary Sync Trigger (MASTER_ADMIN only)
  *
- * Routes:
- *   POST /api/v1/master/sync/trigger  → manually trigger salary API sync
- *   GET  /api/v1/master/sync/status   → last sync timestamp per provider
+ * SUPABASE HARDENING:
+ * - Preserves async background trigger behavior
+ * - Keeps lazy worker loading
+ * - Improves status field compatibility
+ * - Adds stronger background error observability
+ * - Keeps admin audit behavior unchanged
  */
 
-const express            = require('express');
-const { asyncHandler }   = require('../../utils/helpers');
-const externalApiRepo    = require('./externalApi.repository');
+const express = require('express');
+const { asyncHandler } = require('../../utils/helpers');
+const externalApiRepo = require('./externalApi.repository');
 const { logAdminAction } = require('../../utils/adminAuditLogger');
-const logger             = require('../../utils/logger');
+const logger = require('../../utils/logger');
 
 const router = express.Router();
+
+/* ────────────────────────────────────────────────────────────────────────── */
+/* POST /api/v1/master/sync/trigger */
+/* ────────────────────────────────────────────────────────────────────────── */
 
 router.post(
   '/trigger',
   asyncHandler(async (req, res) => {
     const adminId = req.user.uid;
-    logger.info('[MasterSync] Manual sync triggered', { adminId });
+
+    logger.info('[MasterSync] Manual sync triggered', {
+      adminId,
+      ipAddress: req.ip,
+    });
 
     await logAdminAction({
       adminId,
-      action:     'SALARY_SYNC_TRIGGERED',
+      action: 'SALARY_SYNC_TRIGGERED',
       entityType: 'salary_data',
-      metadata:   { triggeredBy: 'manual' },
-      ipAddress:  req.ip,
+      metadata: {
+        triggeredBy: 'manual',
+      },
+      ipAddress: req.ip,
     });
 
-    // Lazy-load worker — avoids cron side effect on server startup
+    /**
+     * Lazy-load worker
+     * Prevents cron/bootstrap side effects on server startup.
+     *
+     * setImmediate ensures API response is returned instantly.
+     */
     setImmediate(async () => {
       try {
-        const { runSalarySync } = require('../../workers/salaryApiSync.worker');
+        const {
+          runSalarySync,
+        } = require('../../workers/salaryApiSync.worker');
+
         await runSalarySync();
-      } catch (err) {
-        logger.error('[MasterSync] Manual sync failed', { error: err.message });
+
+        logger.info('[MasterSync] Manual sync completed', {
+          adminId,
+        });
+      } catch (error) {
+        logger.error('[MasterSync] Manual sync failed', {
+          adminId,
+          error: error.message,
+          stack: error.stack,
+        });
       }
     });
 
@@ -49,30 +78,35 @@ router.post(
   })
 );
 
+/* ────────────────────────────────────────────────────────────────────────── */
+/* GET /api/v1/master/sync/status */
+/* ────────────────────────────────────────────────────────────────────────── */
+
 router.get(
   '/status',
   asyncHandler(async (req, res) => {
     const apis = await externalApiRepo.listAll();
+
+    const data = apis.map((api) => ({
+      id: api.id,
+      providerName: api.providerName,
+      enabled: Boolean(api.enabled),
+
+      /**
+       * Supabase-safe compatibility:
+       * supports both repository-normalized and raw SQL rows
+       */
+      lastSync: api.lastSync ?? api.last_sync ?? null,
+
+      rateLimit: api.rateLimit ?? null,
+    }));
+
     return res.status(200).json({
       success: true,
-      data: apis.map(api => ({
-        id:           api.id,
-        providerName: api.providerName,
-        enabled:      api.enabled,
-        lastSync:     api.lastSync ?? null,
-        rateLimit:    api.rateLimit,
-      })),
-      count: apis.length,
+      data,
+      count: data.length,
     });
   })
 );
 
 module.exports = router;
-
-
-
-
-
-
-
-

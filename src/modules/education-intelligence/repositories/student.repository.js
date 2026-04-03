@@ -1,165 +1,204 @@
 'use strict';
 
 const { supabase } = require('../../../config/supabase');
+const { TABLES } = require('../models/student.model');
 
-// ─── Students ─────────────────────────────────────────
+/**
+ * Normalize Supabase repository errors.
+ *
+ * @param {Error | null} error
+ * @param {string} operation
+ */
+function throwIfError(error, operation) {
+  if (!error) return;
 
-async function upsertStudent(userId, fields) {
-  const now = new Date().toISOString();
+  error.message = `[education-intelligence.student.repository] ${operation}: ${error.message}`;
+  throw error;
+}
 
-  const { data: existing } = await supabase
-    .from('edu_students')
-    .select('*')
-    .eq('id', userId)
-    .maybeSingle();
+/**
+ * Atomic SQL RPC replacement helper.
+ *
+ * Uses PostgreSQL SECURITY DEFINER RPC functions that wrap DELETE + INSERT
+ * in a single transaction.
+ *
+ * @param {string} fn
+ * @param {string} studentId
+ * @param {Array<object>} rows
+ * @param {string} operation
+ */
+async function atomicReplace(fn, studentId, rows, operation) {
+  const { error } = await supabase.rpc(fn, {
+    p_student_id: studentId,
+    p_rows: rows || [],
+  });
 
-  if (!existing) {
-    const { data, error } = await supabase
-      .from('edu_students')
-      .insert([{ id: userId, ...fields, created_at: now, updated_at: now }])
-      .select()
-      .single();
+  throwIfError(error, operation);
+}
 
-    if (error) throw error;
-    return data;
-  }
+// ─────────────────────────────────────────────────────────────────────────────
+// Students
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function upsertStudent(userId, fields = {}) {
+  const payload = {
+    id: userId,
+    ...fields,
+  };
 
   const { data, error } = await supabase
-    .from('edu_students')
-    .update({ ...fields, updated_at: now })
-    .eq('id', userId)
+    .from(TABLES.STUDENTS)
+    .upsert(payload, { onConflict: 'id' })
     .select()
     .single();
 
-  if (error) throw error;
+  throwIfError(error, 'upsertStudent');
   return data;
 }
 
 async function getStudent(userId) {
   const { data, error } = await supabase
-    .from('edu_students')
+    .from(TABLES.STUDENTS)
     .select('*')
     .eq('id', userId)
     .maybeSingle();
 
-  if (error) throw error;
+  throwIfError(error, 'getStudent');
   return data;
 }
 
 async function setOnboardingStep(userId, step) {
   const { error } = await supabase
-    .from('edu_students')
+    .from(TABLES.STUDENTS)
     .update({
       onboarding_step: step,
-      updated_at: new Date().toISOString(),
     })
     .eq('id', userId);
 
-  if (error) throw error;
+  throwIfError(error, 'setOnboardingStep');
 }
 
-// ─── Academic Records ─────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// Academic records
+// ─────────────────────────────────────────────────────────────────────────────
 
-async function replaceAcademicRecords(studentId, records) {
-  await supabase.from('edu_academic').delete().eq('student_id', studentId);
-
-  const rows = records.map(r => ({
-    student_id: studentId,
-    ...r,
-    created_at: new Date().toISOString(),
+async function replaceAcademicRecords(studentId, records = []) {
+  const rows = records.map((record) => ({
+    subject: record.subject,
+    class_level: record.class_level,
+    marks: record.marks,
   }));
 
-  const { error } = await supabase.from('edu_academic').insert(rows);
-  if (error) throw error;
+  await atomicReplace(
+    'replace_student_academic_records',
+    studentId,
+    rows,
+    'replaceAcademicRecords'
+  );
 
   return getAcademicRecords(studentId);
 }
 
 async function getAcademicRecords(studentId) {
   const { data, error } = await supabase
-    .from('edu_academic')
+    .from(TABLES.ACADEMIC_RECORDS)
     .select('*')
-    .eq('student_id', studentId);
+    .eq('student_id', studentId)
+    .order('created_at', { ascending: true });
 
-  if (error) throw error;
-  return data;
+  throwIfError(error, 'getAcademicRecords');
+  return data || [];
 }
 
-// ─── Activities ───────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// Activities
+// ─────────────────────────────────────────────────────────────────────────────
 
-async function replaceActivities(studentId, activities) {
-  await supabase.from('edu_activities').delete().eq('student_id', studentId);
-
-  const rows = activities.map(a => ({
-    student_id: studentId,
-    ...a,
-    created_at: new Date().toISOString(),
+async function replaceActivities(studentId, activities = []) {
+  const rows = activities.map((activity) => ({
+    activity_name: activity.activity_name,
+    activity_level: activity.activity_level,
   }));
 
-  const { error } = await supabase.from('edu_activities').insert(rows);
-  if (error) throw error;
+  await atomicReplace(
+    'replace_student_activities',
+    studentId,
+    rows,
+    'replaceActivities'
+  );
 
   return getActivities(studentId);
 }
 
 async function getActivities(studentId) {
   const { data, error } = await supabase
-    .from('edu_activities')
+    .from(TABLES.EXTRACURRICULAR)
     .select('*')
-    .eq('student_id', studentId);
+    .eq('student_id', studentId)
+    .order('created_at', { ascending: true });
 
-  if (error) throw error;
-  return data;
+  throwIfError(error, 'getActivities');
+  return data || [];
 }
 
-// ─── Cognitive ───────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// Cognitive results
+// ─────────────────────────────────────────────────────────────────────────────
 
-async function upsertCognitive(studentId, fields) {
-  const now = new Date().toISOString();
+async function upsertCognitive(studentId, fields = {}) {
+  const payload = {
+    id: studentId,
+    student_id: studentId,
+    ...fields,
+  };
 
   const { data, error } = await supabase
-    .from('edu_cognitive')
-    .upsert([{ id: studentId, ...fields, updated_at: now }])
+    .from(TABLES.COGNITIVE_RESULTS)
+    .upsert(payload, { onConflict: 'id' })
     .select()
     .single();
 
-  if (error) throw error;
+  throwIfError(error, 'upsertCognitive');
   return data;
 }
 
 async function getCognitive(studentId) {
   const { data, error } = await supabase
-    .from('edu_cognitive')
+    .from(TABLES.COGNITIVE_RESULTS)
     .select('*')
     .eq('id', studentId)
     .maybeSingle();
 
-  if (error) throw error;
+  throwIfError(error, 'getCognitive');
   return data;
 }
 
-// ─── Stream Scores ───────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// Stream scores
+// ─────────────────────────────────────────────────────────────────────────────
 
 async function initStreamScores(studentId) {
-  const { data } = await supabase
-    .from('edu_stream_scores')
-    .select('*')
-    .eq('id', studentId)
-    .maybeSingle();
+  const { error } = await supabase
+    .from(TABLES.STREAM_SCORES)
+    .upsert(
+      {
+        id: studentId,
+        student_id: studentId,
+      },
+      { onConflict: 'id', ignoreDuplicates: true }
+    );
 
-  if (data) return;
-
-  await supabase.from('edu_stream_scores').insert([{ id: studentId }]);
+  throwIfError(error, 'initStreamScores');
 }
 
 async function getStreamScores(studentId) {
   const { data, error } = await supabase
-    .from('edu_stream_scores')
+    .from(TABLES.STREAM_SCORES)
     .select('*')
     .eq('id', studentId)
     .maybeSingle();
 
-  if (error) throw error;
+  throwIfError(error, 'getStreamScores');
   return data;
 }
 
@@ -176,5 +215,3 @@ module.exports = {
   initStreamScores,
   getStreamScores,
 };
-
-

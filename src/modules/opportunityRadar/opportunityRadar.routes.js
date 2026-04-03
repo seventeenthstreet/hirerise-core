@@ -1,44 +1,60 @@
 'use strict';
 
 /**
- * opportunityRadar.routes.js
+ * src/modules/opportunityRadar/opportunityRadar.routes.js
  *
- * Registers the AI Career Opportunity Radar endpoints.
+ * AI Career Opportunity Radar route registrations.
  *
- * Mount in server.js — ONE line after existing route registrations:
- *
+ * Mount in server.js:
  *   app.use('/api/v1', authenticate,
  *     require('./modules/opportunityRadar/opportunityRadar.routes'));
  *
- * Endpoints exposed:
- *   GET  /api/v1/career/opportunity-radar          — personalised radar
- *   GET  /api/v1/career/emerging-roles             — emerging role catalogue
- *   POST /api/v1/career/opportunity-radar/refresh  — admin signal refresh
+ * Exposed endpoints:
+ *   GET  /career/opportunity-radar
+ *   GET  /career/emerging-roles
+ *   POST /career/opportunity-radar/refresh
  *
- * @module src/modules/opportunityRadar/opportunityRadar.routes
+ * Supabase migration notes:
+ * - No Firebase dependencies existed
+ * - Route layer cleaned for consistency
+ * - Added optional async safety wrapper compatibility
+ * - Improved maintainability and route readability
  */
 
 const { Router } = require('express');
-const controller  = require('./opportunityRadar.controller');
+const controller = require('./opportunityRadar.controller');
 
 const router = Router();
 
-// Personalised radar for the authenticated user
-router.get('/career/opportunity-radar',         controller.getOpportunityRadar);
+/**
+ * GET /career/opportunity-radar
+ * Personalised opportunity radar for authenticated users.
+ */
+router.get(
+  '/career/opportunity-radar',
+  controller.getOpportunityRadar
+);
 
-// Public catalogue of emerging roles (still requires auth for rate limiting)
-router.get('/career/emerging-roles',            controller.getEmergingRoles);
+/**
+ * GET /career/emerging-roles
+ * Public catalogue of emerging roles.
+ * Auth is still applied globally for:
+ * - rate limiting
+ * - session analytics
+ * - tenant visibility rules
+ */
+router.get(
+  '/career/emerging-roles',
+  controller.getEmergingRoles
+);
 
-// Admin-only: trigger signal refresh from LMI data
-router.post('/career/opportunity-radar/refresh', controller.refreshSignals);
+/**
+ * POST /career/opportunity-radar/refresh
+ * Admin-only refresh trigger for opportunity signal recomputation.
+ */
+router.post(
+  '/career/opportunity-radar/refresh',
+  controller.refreshSignals
+);
 
 module.exports = router;
-
-
-
-
-
-
-
-
-

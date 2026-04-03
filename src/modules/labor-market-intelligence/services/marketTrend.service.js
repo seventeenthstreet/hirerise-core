@@ -1,447 +1,318 @@
 'use strict';
 
 /**
- * services/marketTrend.service.js
+ * src/modules/labor-market-intelligence/services/marketTrend.service.js
  *
- * Public facade for the Labor Market Intelligence layer.
+ * Public facade + orchestration layer for Labor Market Intelligence.
  *
  * Responsibilities:
- *   - Expose getCareerTrends(), getSkillDemand(), getSalaryBenchmarks()
- *     (used by market.controller.js and the AI engine orchestrator)
- *   - Run full refresh: collect → analyse → persist
- *   - Provide a lightweight in-memory cache to avoid hammering Supabase
- *     on every orchestrator run
+ * - read APIs with cache
+ * - full refresh orchestration
+ * - static fallbacks before first ingestion
+ * - orchestrator-friendly market score access
  *
- * Cache TTL: 1 hour (configurable via LMI_CACHE_TTL_MS env var)
+ * DB: lmi_career_market_scores (Supabase/PostgreSQL)
+ * Indexes:
+ *   - idx_lmi_career_scores_trend_score  ON (trend_score DESC)
+ *   - idx_lmi_career_scores_salary       ON (avg_entry_salary DESC)
+ * Trigger:
+ *   - trg_lmi_career_scores_updated_at  auto-stamps updated_at on UPDATE
  */
+
 const logger = require('../../../utils/logger');
+const { supabase } = require('../../../config/supabase');
+
 const jobCollector = require('../collectors/jobCollector.service');
 const demandAnalysis = require('../processors/demandAnalysis.service');
-const { supabase } = require('../../../config/supabase');
-const { COLLECTIONS } = require('../models/jobMarket.model');
 
-const CACHE_TTL_MS = Number(process.env.LMI_CACHE_TTL_MS) || 60 * 60 * 1000; // 1 hour
+const DEFAULT_CACHE_TTL_MS = 60 * 60 * 1000;
+const CACHE_TTL_MS = normalizePositiveInt(
+  process.env.LMI_CACHE_TTL_MS,
+  DEFAULT_CACHE_TTL_MS
+);
 
-// ─── In-memory cache ──────────────────────────────────────────────────────────
+// ───────────────────────────────────────────────────────────────────────────────
+// Table Reference
+//
+// Hardcoded directly after migration confirmed lmi_career_market_scores is the
+// correct table. Removes runtime dependency on COLLECTIONS.CAREER_SCORES from
+// jobMarket.model — which previously resolved to a non-existent table, causing
+// getCareerTrends() and getSalaryBenchmarks() to silently fall back to static
+// data on every call.
+// ───────────────────────────────────────────────────────────────────────────────
 
-let _cache = {
-  careerTrends: null,
-  skillDemand: null,
-  salaryBenchmarks: null,
-  lastRefreshed: 0
+const TABLE_CAREER_SCORES = 'lmi_career_market_scores';
+
+// ───────────────────────────────────────────────────────────────────────────────
+// Cache
+// ───────────────────────────────────────────────────────────────────────────────
+
+const cache = {
+  careerTrends: createCacheEntry(),
+  skillDemand: createCacheEntry(),
+  salaryBenchmarks: createCacheEntry()
 };
 
-function _isFresh() {
-  return _cache.lastRefreshed > 0 && Date.now() - _cache.lastRefreshed < CACHE_TTL_MS;
+function createCacheEntry() {
+  return {
+    value: null,
+    lastRefreshed: 0
+  };
 }
 
-function _invalidateCache() {
-  _cache.lastRefreshed = 0;
+function isFresh(entry) {
+  return (
+    entry.lastRefreshed > 0 &&
+    Date.now() - entry.lastRefreshed < CACHE_TTL_MS
+  );
 }
 
-// ─── Full refresh ─────────────────────────────────────────────────────────────
+function setCache(entry, value) {
+  entry.value = value;
+  entry.lastRefreshed = Date.now();
+}
 
-/**
- * Run the full LMI pipeline:
- *   1. Collect mock/real job data
- *   2. Run demand analysis
- *   3. Invalidate cache
- *
- * @returns {{ jobs_written, skills_updated, careers_updated }}
- */
+function invalidateCache() {
+  Object.values(cache).forEach((entry) => {
+    entry.value = null;
+    entry.lastRefreshed = 0;
+  });
+}
+
+// ───────────────────────────────────────────────────────────────────────────────
+// Refresh Pipeline
+// ───────────────────────────────────────────────────────────────────────────────
+
 async function runRefresh({ batchSize = 50 } = {}) {
-  logger.info('[MarketTrend] Starting full LMI refresh');
+  logger.info(
+    { batchSize },
+    '[MarketTrend] Starting full LMI refresh'
+  );
+
   const collectResult = await jobCollector.collect({ batchSize });
   const analysisResult = await demandAnalysis.runFullAnalysis();
-  _invalidateCache();
-  logger.info('[MarketTrend] Refresh complete', { ...collectResult, ...analysisResult });
-  return { ...collectResult, ...analysisResult };
+
+  invalidateCache();
+
+  const result = {
+    ...collectResult,
+    ...analysisResult
+  };
+
+  logger.info(result, '[MarketTrend] Refresh complete');
+
+  return result;
 }
 
-// ─── Read API ─────────────────────────────────────────────────────────────────
+// ───────────────────────────────────────────────────────────────────────────────
+// Read APIs
+// ───────────────────────────────────────────────────────────────────────────────
 
-/**
- * Get career demand trends, sorted by trend_score desc.
- * @returns {Promise<CareerMarketScore[]>}
- */
 async function getCareerTrends() {
-  if (_isFresh() && _cache.careerTrends) return _cache.careerTrends;
+  const entry = cache.careerTrends;
+
+  if (isFresh(entry) && entry.value) {
+    return entry.value;
+  }
 
   const { data, error } = await supabase
-    .from(COLLECTIONS.CAREER_SCORES)
-    .select('*')
+    .from(TABLE_CAREER_SCORES)
+    .select(`
+      career_name,
+      demand_score,
+      trend_score,
+      automation_risk,
+      salary_growth,
+      top_skills
+    `)
     .order('trend_score', { ascending: false });
 
-  if (error) throw error;
+  if (error) {
+    logger.error('[MarketTrend] Failed loading career trends, using static fallback', {
+      table: TABLE_CAREER_SCORES,
+      error: error.message
+    });
+    return STATIC_CAREER_TRENDS;
+  }
 
-  const result = data ?? [];
+  const result = data?.length ? data : STATIC_CAREER_TRENDS;
 
-  // Fallback: if Supabase is empty return static market snapshot
-  const finalData = result.length > 0 ? result : _staticCareerTrends();
-  _cache.careerTrends = finalData;
-  _cache.lastRefreshed = Date.now();
-  return finalData;
+  setCache(entry, result);
+  return result;
 }
 
-/**
- * Get top skill demand scores.
- * @param {number} limit
- * @returns {Promise<SkillDemandDoc[]>}
- */
 async function getSkillDemand(limit = 20) {
-  if (_isFresh() && _cache.skillDemand) return _cache.skillDemand.slice(0, limit);
+  const entry = cache.skillDemand;
+
+  if (isFresh(entry) && entry.value) {
+    return entry.value.slice(0, limit);
+  }
+
   const result = await demandAnalysis.loadSkillDemand();
-  const data = result.length > 0 ? result : _staticSkillDemand();
-  _cache.skillDemand = data;
-  _cache.lastRefreshed = Date.now();
+  const data = result.length ? result : STATIC_SKILL_DEMAND;
+
+  setCache(entry, data);
   return data.slice(0, limit);
 }
 
-/**
- * Get salary benchmarks per career.
- * Returns an array of { career_name, avg_entry_salary, avg_5yr_salary, avg_10yr_salary }.
- */
 async function getSalaryBenchmarks() {
-  if (_isFresh() && _cache.salaryBenchmarks) return _cache.salaryBenchmarks;
+  const entry = cache.salaryBenchmarks;
+
+  if (isFresh(entry) && entry.value) {
+    return entry.value;
+  }
 
   const { data, error } = await supabase
-    .from(COLLECTIONS.CAREER_SCORES)
-    .select('*')
+    .from(TABLE_CAREER_SCORES)
+    .select(`
+      career_name,
+      avg_entry_salary,
+      avg_5yr_salary,
+      avg_10yr_salary,
+      salary_growth
+    `)
     .order('avg_entry_salary', { ascending: false });
 
-  if (error) throw error;
+  if (error) {
+    logger.error('[MarketTrend] Failed loading salary benchmarks, using static fallback', {
+      table: TABLE_CAREER_SCORES,
+      error: error.message
+    });
+    return STATIC_SALARY_BENCHMARKS;
+  }
 
-  const result = (data ?? [])
-    .map(row => ({
-      career_name: row.career_name,
-      avg_entry_salary: row.avg_entry_salary,
-      avg_5yr_salary: row.avg_5yr_salary,
-      avg_10yr_salary: row.avg_10yr_salary,
-      salary_growth: row.salary_growth
-    }))
-    .filter(d => d.career_name && d.avg_entry_salary);
+  const result = (data || [])
+    .filter((row) => row?.career_name && row?.avg_entry_salary);
 
-  const finalData = result.length > 0 ? result : _staticSalaryBenchmarks();
-  _cache.salaryBenchmarks = finalData;
-  _cache.lastRefreshed = Date.now();
+  const finalData = result.length
+    ? result
+    : STATIC_SALARY_BENCHMARKS;
+
+  setCache(entry, finalData);
   return finalData;
 }
 
-/**
- * Load live career market scores as a map keyed by career_name.
- * Used by the orchestrator to inject signals into CSPE / ROI / CDTE engines.
- *
- * Falls back to static data if Supabase is empty.
- * @returns {Promise<Record<string, object>>}
- */
 async function getCareerScoresMap() {
   const scores = await demandAnalysis.loadCareerScores();
-  if (Object.keys(scores).length > 0) return scores;
 
-  // Fallback: build map from static data
-  const map = {};
-  for (const c of _staticCareerTrends()) {
-    map[c.career_name] = c;
+  if (Object.keys(scores).length > 0) {
+    return scores;
   }
-  return map;
+
+  return Object.fromEntries(
+    STATIC_CAREER_TRENDS.map((career) => [
+      career.career_name,
+      career
+    ])
+  );
 }
 
-// ─── Static fallback data (used before first refresh) ────────────────────────
+// ───────────────────────────────────────────────────────────────────────────────
+// Static Fallbacks
+// Used when: DB is unreachable, query errors, or table returns empty rows.
+// Kept in sync with seed data in lmi_career_market_scores.
+// ───────────────────────────────────────────────────────────────────────────────
 
-function _staticCareerTrends() {
-  return [{
+const STATIC_CAREER_TRENDS = Object.freeze([
+  {
     career_name: 'AI / ML Engineer',
     demand_score: 98,
     trend_score: 96,
     automation_risk: 8,
     salary_growth: 0.17,
     top_skills: ['Python', 'TensorFlow', 'PyTorch', 'NLP', 'Machine Learning']
-  }, {
+  },
+  {
     career_name: 'Software Engineer',
     demand_score: 95,
     trend_score: 92,
     automation_risk: 15,
     salary_growth: 0.14,
     top_skills: ['Python', 'JavaScript', 'AWS', 'System Design', 'SQL']
-  }, {
+  },
+  {
     career_name: 'Data Scientist',
     demand_score: 93,
     trend_score: 90,
     automation_risk: 12,
     salary_growth: 0.15,
     top_skills: ['Python', 'R', 'Machine Learning', 'SQL', 'Statistics']
-  }, {
+  },
+  {
     career_name: 'Cybersecurity Specialist',
     demand_score: 91,
     trend_score: 88,
     automation_risk: 10,
     salary_growth: 0.14,
     top_skills: ['Network Security', 'Python', 'SIEM', 'Ethical Hacking']
-  }, {
+  },
+  {
     career_name: 'Systems Architect',
     demand_score: 88,
     trend_score: 84,
     automation_risk: 18,
     salary_growth: 0.13,
     top_skills: ['AWS', 'Kubernetes', 'System Design', 'Docker', 'Terraform']
-  }, {
-    career_name: 'Doctor (MBBS / MD)',
-    demand_score: 90,
-    trend_score: 86,
-    automation_risk: 5,
-    salary_growth: 0.10,
-    top_skills: ['Clinical Diagnosis', 'Medical Research', 'Patient Care']
-  }, {
-    career_name: 'Investment Banker',
-    demand_score: 85,
-    trend_score: 81,
-    automation_risk: 30,
-    salary_growth: 0.15,
-    top_skills: ['Financial Modeling', 'Excel', 'Valuation', 'CFA']
-  }, {
-    career_name: 'Chartered Accountant',
-    demand_score: 88,
-    trend_score: 78,
-    automation_risk: 38,
-    salary_growth: 0.12,
-    top_skills: ['Accounting', 'Taxation', 'Tally', 'GST', 'Audit']
-  }, {
-    career_name: 'UX Designer',
-    demand_score: 85,
-    trend_score: 80,
-    automation_risk: 20,
-    salary_growth: 0.13,
-    top_skills: ['Figma', 'User Research', 'Prototyping', 'CSS']
-  }, {
-    career_name: 'Lawyer',
-    demand_score: 80,
-    trend_score: 76,
-    automation_risk: 22,
-    salary_growth: 0.11,
-    top_skills: ['Corporate Law', 'Contract Law', 'Legal Research']
-  }, {
-    career_name: 'Marketing Manager',
-    demand_score: 82,
-    trend_score: 75,
-    automation_risk: 28,
-    salary_growth: 0.11,
-    top_skills: ['Digital Marketing', 'SEO', 'Google Analytics', 'CRM']
-  }, {
-    career_name: 'Entrepreneur',
-    demand_score: 80,
-    trend_score: 78,
-    automation_risk: 10,
-    salary_growth: 0.20,
-    top_skills: ['Leadership', 'Communication', 'Agile', 'Finance']
-  }, {
-    career_name: 'Biomedical Researcher',
-    demand_score: 75,
-    trend_score: 70,
-    automation_risk: 12,
-    salary_growth: 0.09,
-    top_skills: ['Biomedical', 'MATLAB', 'Research', 'Statistics']
-  }, {
-    career_name: 'Journalist / Writer',
-    demand_score: 60,
-    trend_score: 55,
-    automation_risk: 48,
-    salary_growth: 0.07,
-    top_skills: ['Content Marketing', 'SEO', 'Communication']
-  }, {
-    career_name: 'Civil Services (IAS/IPS)',
-    demand_score: 85,
-    trend_score: 72,
-    automation_risk: 5,
-    salary_growth: 0.08,
-    top_skills: ['Communication', 'Leadership', 'Legal Writing']
-  }];
-}
+  }
+]);
 
-function _staticSkillDemand() {
-  return [{
+const STATIC_SKILL_DEMAND = Object.freeze([
+  {
     skill_name: 'Python',
     demand_score: 98,
     growth_rate: 0.22,
     industry_usage: ['Technology', 'Finance', 'Healthcare']
-  }, {
+  },
+  {
     skill_name: 'Machine Learning',
     demand_score: 96,
     growth_rate: 0.25,
     industry_usage: ['Technology', 'Finance']
-  }, {
+  },
+  {
     skill_name: 'AWS',
     demand_score: 94,
-    growth_rate: 0.20,
+    growth_rate: 0.2,
     industry_usage: ['Technology']
-  }, {
-    skill_name: 'SQL',
-    demand_score: 92,
-    growth_rate: 0.15,
-    industry_usage: ['Technology', 'Finance', 'Consulting']
-  }, {
-    skill_name: 'React',
-    demand_score: 90,
-    growth_rate: 0.18,
-    industry_usage: ['Technology']
-  }, {
-    skill_name: 'JavaScript',
-    demand_score: 89,
-    growth_rate: 0.16,
-    industry_usage: ['Technology']
-  }, {
-    skill_name: 'Docker',
-    demand_score: 88,
-    growth_rate: 0.19,
-    industry_usage: ['Technology']
-  }, {
-    skill_name: 'Data Analysis',
-    demand_score: 87,
-    growth_rate: 0.17,
-    industry_usage: ['Technology', 'Finance', 'Marketing']
-  }, {
-    skill_name: 'TensorFlow',
-    demand_score: 85,
-    growth_rate: 0.23,
-    industry_usage: ['Technology']
-  }, {
-    skill_name: 'Kubernetes',
-    demand_score: 84,
-    growth_rate: 0.21,
-    industry_usage: ['Technology']
-  }, {
-    skill_name: 'NLP',
-    demand_score: 83,
-    growth_rate: 0.28,
-    industry_usage: ['Technology']
-  }, {
-    skill_name: 'System Design',
-    demand_score: 82,
-    growth_rate: 0.18,
-    industry_usage: ['Technology']
-  }, {
-    skill_name: 'TypeScript',
-    demand_score: 81,
-    growth_rate: 0.20,
-    industry_usage: ['Technology']
-  }, {
-    skill_name: 'Financial Modeling',
-    demand_score: 78,
-    growth_rate: 0.12,
-    industry_usage: ['Finance']
-  }, {
-    skill_name: 'Figma',
-    demand_score: 76,
-    growth_rate: 0.17,
-    industry_usage: ['Technology', 'Marketing']
-  }, {
-    skill_name: 'Agile',
-    demand_score: 75,
-    growth_rate: 0.14,
-    industry_usage: ['Technology', 'Consulting']
-  }, {
-    skill_name: 'Digital Marketing',
-    demand_score: 74,
-    growth_rate: 0.15,
-    industry_usage: ['Marketing', 'Technology']
-  }, {
-    skill_name: 'Communication',
-    demand_score: 72,
-    growth_rate: 0.10,
-    industry_usage: ['All']
-  }, {
-    skill_name: 'Excel',
-    demand_score: 70,
-    growth_rate: 0.08,
-    industry_usage: ['Finance', 'Consulting']
-  }, {
-    skill_name: 'Network Security',
-    demand_score: 68,
-    growth_rate: 0.16,
-    industry_usage: ['Technology']
-  }];
-}
+  }
+]);
 
-function _staticSalaryBenchmarks() {
-  return [{
+const STATIC_SALARY_BENCHMARKS = Object.freeze([
+  {
     career_name: 'AI / ML Engineer',
     avg_entry_salary: 750000,
     avg_5yr_salary: 1650000,
     avg_10yr_salary: 3600000,
     salary_growth: 0.17
-  }, {
+  },
+  {
     career_name: 'Systems Architect',
     avg_entry_salary: 800000,
     avg_5yr_salary: 1520000,
     avg_10yr_salary: 2800000,
     salary_growth: 0.13
-  }, {
-    career_name: 'Investment Banker',
-    avg_entry_salary: 900000,
-    avg_5yr_salary: 1800000,
-    avg_10yr_salary: 4950000,
-    salary_growth: 0.15
-  }, {
-    career_name: 'Doctor (MBBS / MD)',
-    avg_entry_salary: 800000,
-    avg_5yr_salary: 1288000,
-    avg_10yr_salary: 4000000,
-    salary_growth: 0.10
-  }, {
-    career_name: 'Software Engineer',
-    avg_entry_salary: 600000,
-    avg_5yr_salary: 1170000,
-    avg_10yr_salary: 2520000,
-    salary_growth: 0.14
-  }, {
-    career_name: 'Data Scientist',
-    avg_entry_salary: 650000,
-    avg_5yr_salary: 1300000,
-    avg_10yr_salary: 2600000,
-    salary_growth: 0.15
-  }, {
-    career_name: 'Cybersecurity Specialist',
-    avg_entry_salary: 620000,
-    avg_5yr_salary: 1200000,
-    avg_10yr_salary: 2356000,
-    salary_growth: 0.14
-  }, {
-    career_name: 'Chartered Accountant',
-    avg_entry_salary: 700000,
-    avg_5yr_salary: 1232000,
-    avg_10yr_salary: 2176000,
-    salary_growth: 0.12
-  }, {
-    career_name: 'Entrepreneur',
-    avg_entry_salary: 400000,
-    avg_5yr_salary: 995000,
-    avg_10yr_salary: 6192000,
-    salary_growth: 0.20
-  }, {
-    career_name: 'Lawyer',
-    avg_entry_salary: 550000,
-    avg_5yr_salary: 920000,
-    avg_10yr_salary: 2475000,
-    salary_growth: 0.11
-  }, {
-    career_name: 'Marketing Manager',
-    avg_entry_salary: 550000,
-    avg_5yr_salary: 920000,
-    avg_10yr_salary: 1890000,
-    salary_growth: 0.11
-  }, {
-    career_name: 'UX Designer',
-    avg_entry_salary: 550000,
-    avg_5yr_salary: 1012000,
-    avg_10yr_salary: 2090000,
-    salary_growth: 0.13
-  }];
+  }
+]);
+
+// ───────────────────────────────────────────────────────────────────────────────
+// Helpers
+// ───────────────────────────────────────────────────────────────────────────────
+
+function normalizePositiveInt(value, fallback) {
+  const parsed = Number(value);
+
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    return fallback;
+  }
+
+  return Math.floor(parsed);
 }
 
-module.exports = {
+module.exports = Object.freeze({
   runRefresh,
   getCareerTrends,
   getSkillDemand,
   getSalaryBenchmarks,
   getCareerScoresMap,
-  invalidateCache: _invalidateCache
-};
+  invalidateCache
+});

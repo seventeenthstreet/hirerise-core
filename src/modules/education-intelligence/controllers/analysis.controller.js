@@ -3,85 +3,122 @@
 /**
  * controllers/analysis.controller.js
  *
- * HTTP handlers for the Education Intelligence analysis endpoints.
- * Thin layer: extract → validate → call service → respond.
+ * HTTP handlers for Education Intelligence analysis endpoints.
  *
- * Endpoints handled:
- *   POST  /api/v1/education/analyze/:studentId  → run full AI pipeline
- *   GET   /api/v1/education/analyze/:studentId  → return cached result
+ * Responsibilities:
+ * - auth + ownership guard
+ * - input validation
+ * - service orchestration
+ * - consistent HTTP responses
+ * - structured logging
  */
 
 const analysisService = require('../services/analysis.service');
-const logger          = require('../../../utils/logger');
+const logger = require('../../../utils/logger');
 
-// ─── POST /api/v1/education/analyze/:studentId ────────────────────────────────
+function getAuthenticatedUserId(req) {
+  return req.user?.id || req.user?.uid || null;
+}
+
+function isAdmin(req) {
+  return req.user?.admin === true;
+}
+
+function isValidStudentId(studentId) {
+  return (
+    typeof studentId === 'string' &&
+    studentId.trim().length > 0
+  );
+}
+
+function parseRequireComplete(queryValue) {
+  return queryValue !== 'false';
+}
 
 /**
- * Runs the full AI engine pipeline for the given student.
+ * POST /api/v1/education/analyze/:studentId
  *
- * Auth rules:
- *   - A student may only trigger analysis for their own profile.
- *   - An admin (req.user.admin === true) may trigger analysis for any student.
- *
- * Query params:
- *   ?requireComplete=true  — rejects if student has not finished all onboarding steps.
- *                            Defaults to false so admins can run partial analysis.
+ * Runs the full AI pipeline for a student.
  */
 async function analyzeStudentProfile(req, res, next) {
   try {
-    const requestingUid = req.user.uid;
-    const studentId     = req.params.studentId;
-    const requireComplete = req.query.requireComplete !== 'false';
+    const requestingUserId = getAuthenticatedUserId(req);
+    const studentId = req.params?.studentId;
+    const requireComplete = parseRequireComplete(
+      req.query?.requireComplete
+    );
 
-    // ── Auth guard ───────────────────────────────────────────────────────
-    if (requestingUid !== studentId && !req.user.admin) {
-      return res.status(403).json({
-        success:   false,
-        errorCode: 'FORBIDDEN',
-        message:   'You may only trigger analysis for your own profile.',
-      });
-    }
-
-    // ── Input guard ──────────────────────────────────────────────────────
-    if (!studentId || typeof studentId !== 'string' || studentId.trim().length === 0) {
+    // ── Input validation ─────────────────────────────────────────────
+    if (!isValidStudentId(studentId)) {
       return res.status(400).json({
-        success:   false,
+        success: false,
         errorCode: 'INVALID_STUDENT_ID',
-        message:   'studentId path parameter must be a non-empty string.',
+        message: 'studentId path parameter must be a non-empty string.'
       });
     }
 
-    logger.info({ studentId, requestingUid }, '[AnalysisController] Analysis requested');
+    // ── Auth guard ──────────────────────────────────────────────────
+    if (requestingUserId !== studentId && !isAdmin(req)) {
+      return res.status(403).json({
+        success: false,
+        errorCode: 'FORBIDDEN',
+        message: 'You may only trigger analysis for your own profile.'
+      });
+    }
 
-    const result = await analysisService.runAnalysis(studentId, { requireComplete });
+    logger.info(
+      {
+        studentId,
+        requestingUserId,
+        requireComplete
+      },
+      '[AnalysisController] Analysis requested'
+    );
+
+    const result = await analysisService.runAnalysis(studentId, {
+      requireComplete
+    });
 
     return res.status(200).json({
       success: true,
-      data:    result,
+      data: result
     });
+  } catch (error) {
+    logger.error(
+      {
+        studentId: req.params?.studentId,
+        error: error.message
+      },
+      '[AnalysisController] Analysis failed'
+    );
 
-  } catch (err) {
-    next(err);
+    return next(error);
   }
 }
 
-// ─── GET /api/v1/education/analyze/:studentId ─────────────────────────────────
-
 /**
- * Returns the most recently cached stream analysis result.
- * Does NOT re-run the pipeline.
- * Returns HTTP 404 if no analysis has been run yet.
+ * GET /api/v1/education/analyze/:studentId
+ *
+ * Returns cached analysis result.
  */
 async function getAnalysisResult(req, res, next) {
   try {
-    const requestingUid = req.user.uid;
-    const studentId     = req.params.studentId;
+    const requestingUserId = getAuthenticatedUserId(req);
+    const studentId = req.params?.studentId;
 
-    if (requestingUid !== studentId && !req.user.admin) {
+    if (!isValidStudentId(studentId)) {
+      return res.status(400).json({
+        success: false,
+        errorCode: 'INVALID_STUDENT_ID',
+        message: 'studentId path parameter must be a non-empty string.'
+      });
+    }
+
+    if (requestingUserId !== studentId && !isAdmin(req)) {
       return res.status(403).json({
-        success:   false,
+        success: false,
         errorCode: 'FORBIDDEN',
-        message:   'You may only view your own analysis results.',
+        message: 'You may only view your own analysis results.'
       });
     }
 
@@ -89,31 +126,31 @@ async function getAnalysisResult(req, res, next) {
 
     if (!result) {
       return res.status(404).json({
-        success:   false,
+        success: false,
         errorCode: 'ANALYSIS_NOT_FOUND',
-        message:   'No analysis results found. Submit the onboarding form to generate your stream recommendation.',
+        message:
+          'No analysis results found. Submit the onboarding form to generate your stream recommendation.'
       });
     }
 
     return res.status(200).json({
       success: true,
-      data:    result,
+      data: result
     });
+  } catch (error) {
+    logger.error(
+      {
+        studentId: req.params?.studentId,
+        error: error.message
+      },
+      '[AnalysisController] Fetch cached analysis failed'
+    );
 
-  } catch (err) {
-    next(err);
+    return next(error);
   }
 }
 
 module.exports = {
   analyzeStudentProfile,
-  getAnalysisResult,
+  getAnalysisResult
 };
-
-
-
-
-
-
-
-

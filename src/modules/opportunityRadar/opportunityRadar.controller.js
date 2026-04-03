@@ -1,49 +1,128 @@
 'use strict';
 
 /**
- * opportunityRadar.controller.js
+ * src/modules/opportunityRadar/opportunityRadar.controller.js
  *
  * HTTP handlers for the AI Career Opportunity Radar endpoints.
  *
  * Routes handled (mounted at /api/v1):
- *   GET  /career/opportunity-radar        — personalised radar for auth user
- *   GET  /career/emerging-roles           — public catalogue of emerging roles
+ *   GET  /career/opportunity-radar         — personalised radar for auth user
+ *   GET  /career/emerging-roles            — public catalogue of emerging roles
  *   POST /career/opportunity-radar/refresh — trigger signal refresh (admin)
  *
- * @module src/modules/opportunityRadar/opportunityRadar.controller
+ * Supabase migration notes:
+ * - Removed Firebase-style auth assumptions
+ * - Supports Supabase JWT user payload conventions
+ * - Hardened query parsing and null safety
+ * - Improved structured logging consistency
+ * - Preserves existing API response shape
  */
 
-'use strict';
+const logger = require('../../utils/logger');
+const engine = require('../../engines/opportunityRadar.engine');
 
-const logger  = require('../../utils/logger');
-const engine  = require('../../engines/opportunityRadar.engine');
+// ───────────────────────────────────────────────────────────────────────────────
+// Response helpers
+// ───────────────────────────────────────────────────────────────────────────────
 
-// ─── Response helpers ─────────────────────────────────────────────────────────
+function sendSuccess(res, data, statusCode = 200) {
+  return res.status(statusCode).json({
+    success: true,
+    data,
+  });
+}
 
-const ok  = (res, data)              => res.status(200).json({ success: true,  data });
-const bad = (res, msg, code = 400)   => res.status(code).json({ success: false, error: msg });
-const err = (res, msg, code = 500)   => res.status(code).json({ success: false, error: msg });
+function sendError(res, message, statusCode = 500, meta = undefined) {
+  return res.status(statusCode).json({
+    success: false,
+    error: message,
+    ...(meta ? { meta } : {}),
+  });
+}
 
-// ─── GET /career/opportunity-radar ────────────────────────────────────────────
+// ───────────────────────────────────────────────────────────────────────────────
+// Query helpers
+// ───────────────────────────────────────────────────────────────────────────────
+
+function parseInteger(value, fallback, { min = null, max = null } = {}) {
+  const parsed = Number.parseInt(value, 10);
+
+  if (Number.isNaN(parsed)) return fallback;
+
+  let safeValue = parsed;
+
+  if (min !== null) safeValue = Math.max(min, safeValue);
+  if (max !== null) safeValue = Math.min(max, safeValue);
+
+  return safeValue;
+}
+
+function parseBoolean(value, fallback = false) {
+  if (typeof value === 'boolean') return value;
+  if (typeof value !== 'string') return fallback;
+
+  const normalized = value.trim().toLowerCase();
+
+  if (['true', '1', 'yes'].includes(normalized)) return true;
+  if (['false', '0', 'no'].includes(normalized)) return false;
+
+  return fallback;
+}
+
+function getAuthenticatedUserId(req) {
+  /**
+   * Supabase auth payload compatibility:
+   * - req.user.id       → preferred standard
+   * - req.user.sub      → JWT subject fallback
+   * - req.user.uid      → legacy compatibility kept for drop-in safety
+   */
+  return req.user?.id || req.user?.sub || req.user?.uid || null;
+}
+
+function isAdmin(req) {
+  /**
+   * Supports multiple admin claim conventions:
+   * - req.user.admin === true
+   * - req.user.role === 'admin'
+   * - req.user.app_metadata.role === 'admin'
+   */
+  return Boolean(
+    req.user?.admin === true ||
+    req.user?.role === 'admin' ||
+    req.user?.app_metadata?.role === 'admin'
+  );
+}
+
+// ───────────────────────────────────────────────────────────────────────────────
+// GET /career/opportunity-radar
+// ───────────────────────────────────────────────────────────────────────────────
 
 /**
  * Returns personalised emerging career opportunities for the authenticated user.
  *
  * Query params:
  *   limit               — max results (default 10, max 30)
- *   minOpportunityScore — filter by min opportunity score (default 40)
- *   minMatchScore       — filter by min user match score  (default 0)
- *
- * Example:
- *   GET /api/v1/career/opportunity-radar?limit=5&minOpportunityScore=60
+ *   minOpportunityScore — minimum opportunity score (default 40)
+ *   minMatchScore       — minimum user match score (default 0)
  */
 async function getOpportunityRadar(req, res) {
-  const userId = req.user?.uid || req.user?.id;
-  if (!userId) return bad(res, 'Unauthenticated', 401);
+  const userId = getAuthenticatedUserId(req);
 
-  const topN               = Math.min(parseInt(req.query.limit)               || 10, 30);
-  const minOpportunityScore = parseInt(req.query.minOpportunityScore)         || 40;
-  const minMatchScore       = parseInt(req.query.minMatchScore)               || 0;
+  if (!userId) {
+    return sendError(res, 'Unauthenticated', 401);
+  }
+
+  const topN = parseInteger(req.query.limit, 10, { min: 1, max: 30 });
+  const minOpportunityScore = parseInteger(
+    req.query.minOpportunityScore,
+    40,
+    { min: 0, max: 100 }
+  );
+  const minMatchScore = parseInteger(
+    req.query.minMatchScore,
+    0,
+    { min: 0, max: 100 }
+  );
 
   try {
     const result = await engine.getOpportunityRadar(userId, {
@@ -52,77 +131,98 @@ async function getOpportunityRadar(req, res) {
       minMatchScore,
     });
 
-    ok(res, result);
-  } catch (e) {
-    logger.error('[OpportunityRadar] getOpportunityRadar handler error', {
-      userId, err: e.message,
+    return sendSuccess(res, result);
+  } catch (error) {
+    logger.error('[OpportunityRadarController] getOpportunityRadar failed', {
+      userId,
+      error: error.message,
+      stack: error.stack,
+      query: req.query,
     });
-    err(res, 'Failed to load opportunity radar');
+
+    return sendError(res, 'Failed to load opportunity radar', 500);
   }
 }
 
-// ─── GET /career/emerging-roles ───────────────────────────────────────────────
+// ───────────────────────────────────────────────────────────────────────────────
+// GET /career/emerging-roles
+// ───────────────────────────────────────────────────────────────────────────────
 
 /**
  * Returns the public catalogue of top emerging career roles.
- * Not personalised — no auth required beyond basic session.
  *
  * Query params:
  *   limit        — max results (default 20, max 50)
- *   industry     — filter by industry string (optional)
- *   emergingOnly — 'true' to return only is_emerging=true roles
- *   minScore     — min opportunity_score (default 60)
- *
- * Example:
- *   GET /api/v1/career/emerging-roles?emergingOnly=true&minScore=70
+ *   industry     — optional string filter
+ *   emergingOnly — boolean
+ *   minScore     — minimum opportunity score (default 60)
  */
 async function getEmergingRoles(req, res) {
-  const limit        = Math.min(parseInt(req.query.limit) || 20, 50);
-  const industry     = req.query.industry     ? String(req.query.industry)  : null;
-  const emergingOnly = req.query.emergingOnly === 'true';
-  const minScore     = parseInt(req.query.minScore) || 60;
+  const limit = parseInteger(req.query.limit, 20, { min: 1, max: 50 });
+  const industry = req.query.industry
+    ? String(req.query.industry).trim()
+    : null;
+  const emergingOnly = parseBoolean(req.query.emergingOnly, false);
+  const minScore = parseInteger(req.query.minScore, 60, {
+    min: 0,
+    max: 100,
+  });
 
   try {
-    const result = await engine.getEmergingRoles({ limit, industry, emergingOnly, minScore });
-    ok(res, result);
-  } catch (e) {
-    logger.error('[OpportunityRadar] getEmergingRoles handler error', { err: e.message });
-    err(res, 'Failed to load emerging roles');
+    const result = await engine.getEmergingRoles({
+      limit,
+      industry,
+      emergingOnly,
+      minScore,
+    });
+
+    return sendSuccess(res, result);
+  } catch (error) {
+    logger.error('[OpportunityRadarController] getEmergingRoles failed', {
+      error: error.message,
+      stack: error.stack,
+      query: req.query,
+    });
+
+    return sendError(res, 'Failed to load emerging roles', 500);
   }
 }
 
-// ─── POST /career/opportunity-radar/refresh (admin) ──────────────────────────
+// ───────────────────────────────────────────────────────────────────────────────
+// POST /career/opportunity-radar/refresh
+// ───────────────────────────────────────────────────────────────────────────────
 
 /**
  * Triggers a full refresh of opportunity signals from LMI data.
- * Requires admin role.
+ * Requires admin privileges.
  */
 async function refreshSignals(req, res) {
-  if (!req.user?.admin) {
-    return bad(res, 'Admin access required', 403);
+  if (!isAdmin(req)) {
+    return sendError(res, 'Admin access required', 403);
   }
 
   try {
     const result = await engine.detectOpportunitySignals();
-    ok(res, {
-      message:    'Opportunity signals refreshed successfully',
-      upserted:   result.upserted,
-      total:      result.total,
-      duration_ms: result.duration_ms,
+
+    return sendSuccess(res, {
+      message: 'Opportunity signals refreshed successfully',
+      upserted: result?.upserted ?? 0,
+      total: result?.total ?? 0,
+      duration_ms: result?.duration_ms ?? 0,
     });
-  } catch (e) {
-    logger.error('[OpportunityRadar] refreshSignals handler error', { err: e.message });
-    err(res, 'Signal refresh failed');
+  } catch (error) {
+    logger.error('[OpportunityRadarController] refreshSignals failed', {
+      error: error.message,
+      stack: error.stack,
+      userId: getAuthenticatedUserId(req),
+    });
+
+    return sendError(res, 'Signal refresh failed', 500);
   }
 }
 
-module.exports = { getOpportunityRadar, getEmergingRoles, refreshSignals };
-
-
-
-
-
-
-
-
-
+module.exports = {
+  getOpportunityRadar,
+  getEmergingRoles,
+  refreshSignals,
+};

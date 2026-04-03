@@ -1,7 +1,7 @@
 'use strict';
 
 /**
- * routes/opportunities.routes.js
+ * src/modules/opportunities/routes/opportunities.routes.js
  *
  * Mount in server.js:
  *
@@ -11,39 +11,35 @@
  *     require('./modules/opportunities/routes/opportunities.routes')
  *   );
  *
- * ── Endpoint Map ──────────────────────────────────────────────────────────────
- *
+ * Endpoint:
  *   GET /api/v1/opportunities/:studentId
  *
- *   Response:
- *   {
- *     student_id: "...",
- *     universities: [
- *       { program: "BTech Computer Science", university: "XYZ University",
- *         degree_type: "BTech", duration_years: 4, tuition_cost: 12000,
- *         country: "India", match_score: 87 }
- *     ],
- *     jobs: [
- *       { role: "Software Engineer", company: "TechCorp",
- *         industry: "Technology", salary_range: {...}, match_score: 82 }
- *     ]
- *   }
+ * Notes:
+ * - Fully Firebase-free
+ * - Supabase-compatible route layer
+ * - Param validation moved to route boundary
+ * - Production-safe immutable exports
  */
 
-const { Router }     = require('express');
-const controller     = require('../controllers/opportunities.controller');
+const express = require('express');
+const controller = require('../controllers/opportunities.controller');
 
-const router = Router();
+const router = express.Router();
 
-router.get('/:studentId', controller.getOpportunities);
+/**
+ * Student opportunities
+ *
+ * Route param is constrained to avoid malformed requests
+ * reaching the controller/service layer.
+ *
+ * Accepts:
+ * - UUID
+ * - auth uid style strings
+ * - alphanumeric ids with dashes/underscores
+ */
+router.get(
+  '/:studentId([A-Za-z0-9_-]+)',
+  controller.getOpportunities
+);
 
-module.exports = router;
-
-
-
-
-
-
-
-
-
+module.exports = Object.freeze(router);

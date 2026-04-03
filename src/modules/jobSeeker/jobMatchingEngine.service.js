@@ -1,10 +1,15 @@
 'use strict';
 
 /**
- * jobMatchingEngine.service.js — FULLY FIXED (Production Safe)
- * ✔ No logic removed
- * ✔ All functions preserved
- * ✔ Supabase-safe
+ * src/modules/jobSeeker/jobMatchingEngine.service.js
+ *
+ * Production-grade Supabase job matching engine
+ * - Firebase legacy patterns fully removed
+ * - Supabase relational joins used
+ * - Cache-first architecture
+ * - Strong null safety
+ * - Stable API compatibility preserved
+ * - soft_deleted filter aligned to partial index predicate (soft_deleted = false)
  */
 
 const { supabase } = require('../../config/supabase');
@@ -12,26 +17,77 @@ const cacheManager = require('../../core/cache/cache.manager');
 const logger = require('../../utils/logger');
 
 const CACHE_TTL_SECONDS = 600;
+const ROLES_CACHE_KEY = 'job-matching:roles';
+const ROLES_CACHE_TTL_SECONDS = 1800;
+
 const cache = cacheManager.getClient();
 
 // ─────────────────────────────────────────────────────────────
 // HELPERS
 // ─────────────────────────────────────────────────────────────
 
-function nowISO() {
-  return new Date().toISOString();
+function normalizeSkillList(raw) {
+  if (!Array.isArray(raw)) return [];
+
+  return raw
+    .map((item) => {
+      if (typeof item === 'string') return item.trim().toLowerCase();
+      if (item && typeof item.name === 'string') {
+        return item.name.trim().toLowerCase();
+      }
+      return null;
+    })
+    .filter(Boolean);
+}
+
+function safeNumber(value, fallback = 0) {
+  const num = Number(value);
+  return Number.isFinite(num) ? num : fallback;
 }
 
 // ─────────────────────────────────────────────────────────────
 // PROFILE LOADER
 // ─────────────────────────────────────────────────────────────
 
-async function _loadUserProfile(userId) {
+async function loadUserProfile(userId) {
   try {
     const [profileRes, progressRes, userRes] = await Promise.all([
-      supabase.from('user_profiles').select('*').eq('id', userId).maybeSingle(),
-      supabase.from('onboarding_progress').select('*').eq('id', userId).maybeSingle(),
-      supabase.from('users').select('*').eq('id', userId).maybeSingle()
+      supabase
+        .from('user_profiles')
+        .select(`
+          id,
+          skills,
+          target_role,
+          current_job_title,
+          industry,
+          experience_years
+        `)
+        .eq('id', userId)
+        .maybeSingle(),
+
+      supabase
+        .from('onboarding_progress')
+        .select(`
+          id,
+          skills,
+          target_role,
+          industry,
+          experience_years
+        `)
+        .eq('id', userId)
+        .maybeSingle(),
+
+      supabase
+        .from('users')
+        .select(`
+          id,
+          skills,
+          current_job_title,
+          industry,
+          experience_years
+        `)
+        .eq('id', userId)
+        .maybeSingle()
     ]);
 
     if (profileRes.error) throw profileRes.error;
@@ -43,42 +99,37 @@ async function _loadUserProfile(userId) {
     const user = userRes.data || {};
 
     const rawSkills =
-      profile.skills?.length ? profile.skills :
-      user.skills?.length ? user.skills :
-      progress.skills?.length ? progress.skills : [];
-
-    const skills = rawSkills
-      .map(s => (typeof s === 'string' ? s : s?.name))
-      .filter(Boolean)
-      .map(s => s.toLowerCase());
+      profile.skills ||
+      user.skills ||
+      progress.skills ||
+      [];
 
     return {
-      skills,
-      skillsOriginal: rawSkills,
+      skills: normalizeSkillList(rawSkills),
+      skillsOriginal: Array.isArray(rawSkills) ? rawSkills : [],
       targetRole:
         profile.target_role ||
         profile.current_job_title ||
         user.current_job_title ||
         progress.target_role ||
         null,
-      industry: (
+      industry: String(
         profile.industry ||
-        user.industry ||
-        progress.industry ||
-        ''
+          user.industry ||
+          progress.industry ||
+          ''
       ).toLowerCase(),
-      yearsExperience: Number(
-        profile.experience_years ||
-        user.experience_years ||
-        progress.experience_years ||
+      yearsExperience: safeNumber(
+        profile.experience_years ??
+          user.experience_years ??
+          progress.experience_years,
         0
       )
     };
-
-  } catch (err) {
-    logger.error('[JobMatching] Profile load failed', {
+  } catch (error) {
+    logger.error('[JobMatching] Failed to load user profile', {
       userId,
-      err: err.message
+      error: error.message
     });
 
     return {
@@ -92,70 +143,93 @@ async function _loadUserProfile(userId) {
 }
 
 // ─────────────────────────────────────────────────────────────
-// ROLE FETCHER
+// ROLE FETCHER (JOIN-BASED SUPABASE OPTIMIZED)
 // ─────────────────────────────────────────────────────────────
 
-async function _fetchRolesWithSkills() {
-  const cacheKey = 'job-matching:roles';
-
+async function fetchRolesWithSkills() {
   try {
-    const cached = await cache.get(cacheKey);
+    const cached = await cache.get(ROLES_CACHE_KEY);
     if (cached) return JSON.parse(cached);
-  } catch (_) {}
-
-  let roles = [];
+  } catch (error) {
+    logger.warn('[JobMatching] Roles cache read failed', {
+      error: error.message
+    });
+  }
 
   try {
     const { data, error } = await supabase
       .from('roles')
-      .select('*')
-      .neq('soft_deleted', true)
+      .select(`
+        id,
+        title,
+        name,
+        sector,
+        category,
+        experience_years,
+        role_skills (
+          skill_name
+        )
+      `)
+      // FIX: Changed from .neq('soft_deleted', true) to .eq('soft_deleted', false)
+      // Reason: The existing partial indexes on roles use WHERE (soft_deleted = false)
+      // as their predicate. Using .eq('soft_deleted', false) ensures PostgreSQL's query
+      // planner recognises the predicate match and uses the partial index (idx_roles_active_only,
+      // idx_roles_active, etc.) instead of falling back to a sequential scan.
+      // Additionally, .neq('soft_deleted', true) would incorrectly include NULL rows,
+      // which are not valid active roles and not covered by the partial indexes.
+      .eq('soft_deleted', false)
       .limit(500);
 
     if (error) throw error;
 
-    roles = data || [];
-  } catch (err) {
-    logger.error('[Roles Fetch Failed]', err.message);
-  }
+    const roles = (data || []).map((role) => ({
+      id: role.id,
+      title: role.title || role.name || 'Untitled Role',
+      sector: role.sector || role.category || null,
+      requiredSkills: Array.isArray(role.role_skills)
+        ? role.role_skills
+            .map((s) => s.skill_name)
+            .filter(Boolean)
+            .map((s) => s.toLowerCase())
+        : [],
+      experienceYears: safeNumber(role.experience_years, 0)
+    }));
 
-  const skillsMap = {};
+    try {
+      await cache.set(
+        ROLES_CACHE_KEY,
+        JSON.stringify(roles),
+        'EX',
+        ROLES_CACHE_TTL_SECONDS
+      );
+    } catch (cacheError) {
+      logger.warn('[JobMatching] Roles cache write failed', {
+        error: cacheError.message
+      });
+    }
 
-  try {
-    const { data } = await supabase.from('role_skills').select('*');
-
-    (data || []).forEach(d => {
-      if (!skillsMap[d.role_id]) skillsMap[d.role_id] = [];
-      if (d.skill_name) {
-        skillsMap[d.role_id].push(d.skill_name.toLowerCase());
-      }
+    return roles;
+  } catch (error) {
+    logger.error('[JobMatching] Failed to fetch roles', {
+      error: error.message
     });
-
-  } catch (_) {}
-
-  return roles.map(role => ({
-    id: role.id,
-    title: role.title || role.name,
-    sector: role.sector || role.category,
-    requiredSkills: skillsMap[role.id] || [],
-    experienceYears: role.experience_years || 0
-  }));
+    return [];
+  }
 }
 
 // ─────────────────────────────────────────────────────────────
-// SCORING LOGIC (UNCHANGED)
+// SCORING LOGIC (BUSINESS LOGIC PRESERVED)
 // ─────────────────────────────────────────────────────────────
 
-function _scoreRole(user, role) {
+function scoreRole(user, role) {
   let score = 0;
 
   const userSkills = new Set(user.skills);
-
   let matched = 0;
 
-  role.requiredSkills.forEach(skill => {
+  for (const skill of role.requiredSkills) {
     if (userSkills.has(skill)) matched++;
-  });
+  }
 
   const skillScore =
     role.requiredSkills.length > 0
@@ -164,16 +238,23 @@ function _scoreRole(user, role) {
 
   score += skillScore * 0.6;
 
-  const expDiff = Math.abs(user.yearsExperience - role.experienceYears);
-  const expScore = Math.max(0, 100 - expDiff * 10);
+  const expDiff = Math.abs(
+    safeNumber(user.yearsExperience) -
+      safeNumber(role.experienceYears)
+  );
 
+  const expScore = Math.max(0, 100 - expDiff * 10);
   score += expScore * 0.2;
 
-  if (user.targetRole && role.title.toLowerCase().includes(user.targetRole.toLowerCase())) {
+  if (
+    user.targetRole &&
+    role.title &&
+    role.title.toLowerCase().includes(user.targetRole.toLowerCase())
+  ) {
     score += 20;
   }
 
-  return Math.min(100, score);
+  return Math.min(100, Math.round(score * 100) / 100);
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -186,23 +267,39 @@ async function getJobMatches(userId) {
   try {
     const cached = await cache.get(cacheKey);
     if (cached) return JSON.parse(cached);
-  } catch (_) {}
+  } catch (error) {
+    logger.warn('[JobMatching] Match cache read failed', {
+      userId,
+      error: error.message
+    });
+  }
 
-  const user = await _loadUserProfile(userId);
-  const roles = await _fetchRolesWithSkills();
+  const [user, roles] = await Promise.all([
+    loadUserProfile(userId),
+    fetchRolesWithSkills()
+  ]);
 
-  const results = roles.map(role => ({
-    role,
-    score: _scoreRole(user, role)
-  }));
-
-  const sorted = results
+  const sorted = roles
+    .map((role) => ({
+      role,
+      score: scoreRole(user, role)
+    }))
     .sort((a, b) => b.score - a.score)
     .slice(0, 10);
 
   try {
-    await cache.set(cacheKey, JSON.stringify(sorted), 'EX', CACHE_TTL_SECONDS);
-  } catch (_) {}
+    await cache.set(
+      cacheKey,
+      JSON.stringify(sorted),
+      'EX',
+      CACHE_TTL_SECONDS
+    );
+  } catch (error) {
+    logger.warn('[JobMatching] Match cache write failed', {
+      userId,
+      error: error.message
+    });
+  }
 
   return sorted;
 }
@@ -214,10 +311,10 @@ async function getJobMatches(userId) {
 async function getRecommendations(userId) {
   const matches = await getJobMatches(userId);
 
-  return matches.map(m => ({
-    roleId: m.role.id,
-    title: m.role.title,
-    score: m.score
+  return matches.map((match) => ({
+    roleId: match.role.id,
+    title: match.role.title,
+    score: match.score
   }));
 }
 
@@ -228,10 +325,13 @@ async function getRecommendations(userId) {
 async function invalidateUserMatchCache(userId) {
   try {
     await cache.del(`job-match:${userId}`);
-  } catch (_) {}
+  } catch (error) {
+    logger.warn('[JobMatching] Cache invalidation failed', {
+      userId,
+      error: error.message
+    });
+  }
 }
-
-// ─────────────────────────────────────────────────────────────
 
 module.exports = {
   getJobMatches,

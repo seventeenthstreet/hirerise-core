@@ -1,152 +1,143 @@
 'use strict';
 
 /**
- * services/analysis.service.js
+ * src/modules/education-intelligence/services/analysis.service.js
  *
- * Business logic layer for the Education Intelligence analysis endpoint.
- * Sits between analysis.controller.js and education.orchestrator.js.
+ * Business logic layer for Education Intelligence analysis.
  *
  * Responsibilities:
- *   - Verify student exists and onboarding is complete before running analysis
- *   - Delegate pipeline execution to the orchestrator
- *   - Shape the API response
- *
- * Does NOT contain engine logic — all AI logic lives in engines/.
+ * - validate student readiness
+ * - enforce onboarding completion rules
+ * - run orchestration pipeline
+ * - normalize public API response shape
  */
 
 const orchestrator = require('../orchestrator/education.orchestrator');
-const repository   = require('../repositories/student.repository');
-const logger       = require('../../../utils/logger');
+const repository = require('../repositories/student.repository');
+const logger = require('../../../utils/logger');
 
-// ─── runAnalysis ──────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// Public API
+// ─────────────────────────────────────────────────────────────────────────────
 
-/**
- * Runs the full AI engine pipeline for a student and returns the recommendation.
- *
- * @param {string} studentId — user ID
- * @param {object} options
- * @param {boolean} options.requireComplete — if true, reject if onboarding not done
- * @returns {Promise<AnalysisResponse>}
- */
 async function runAnalysis(studentId, { requireComplete = false } = {}) {
-  // ── Pre-flight: student must exist ───────────────────────────────────────
   const student = await repository.getStudent(studentId);
 
   if (!student) {
-    const err = new Error(`Student profile not found for ${studentId}. Complete onboarding first.`);
-    err.statusCode = 404;
-    err.name = 'NotFoundError';
-    throw err;
+    const error = new Error(
+      `Student profile not found for ${studentId}. Complete onboarding first.`
+    );
+    error.statusCode = 404;
+    error.name = 'NotFoundError';
+    throw error;
   }
 
   if (requireComplete && student.onboarding_step !== 'complete') {
-    const err = new Error(
-      `Onboarding is not complete for ${studentId}. ` +
-      `Current step: ${student.onboarding_step}. All steps must be completed before analysis.`
+    const error = new Error(
+      `Onboarding is not complete for ${studentId}. Current step: ${student.onboarding_step}.`
     );
-    err.statusCode = 422;
-    err.name = 'OnboardingIncompleteError';
-    throw err;
+    error.statusCode = 422;
+    error.name = 'OnboardingIncompleteError';
+    throw error;
   }
 
-  logger.info({ studentId, step: student.onboarding_step }, '[AnalysisService] Starting analysis');
+  logger.info(
+    { studentId, step: student.onboarding_step },
+    '[AnalysisService] Starting analysis'
+  );
 
-  // ── Run pipeline ─────────────────────────────────────────────────────────
   const result = await orchestrator.run(studentId);
 
-  // ── Shape API response ───────────────────────────────────────────────────
-  return _buildResponse(result);
+  return buildResponse(result);
 }
 
-// ─── getAnalysisResult ────────────────────────────────────────────────────────
-
-/**
- * Returns the most recently saved stream scores from Firestore
- * without re-running the pipeline.
- *
- * @param {string} studentId
- * @returns {Promise<AnalysisResponse | null>}
- */
 async function getAnalysisResult(studentId) {
   const scores = await repository.getStreamScores(studentId);
-  if (!scores || scores.recommended_stream === null) return null;
+
+  if (!scores || scores.recommended_stream == null) {
+    return null;
+  }
 
   return {
-    recommended_stream:  scores.recommended_stream,
-    recommended_label:   scores.recommended_label   ?? scores.recommended_stream,
-    confidence:          scores.confidence,
-    alternative_stream:  scores.alternative_stream  ?? null,
-    alternative_label:   scores.alternative_label   ?? null,
+    recommended_stream: scores.recommended_stream,
+    recommended_label:
+      scores.recommended_label ?? scores.recommended_stream,
+    confidence: scores.confidence,
+    alternative_stream: scores.alternative_stream ?? null,
+    alternative_label: scores.alternative_label ?? null,
     stream_scores: {
-      engineering: scores.engineering_score,
-      medical:     scores.medical_score,
-      commerce:    scores.commerce_score,
-      humanities:  scores.humanities_score,
+      engineering: scores.engineering_score ?? 0,
+      medical: scores.medical_score ?? 0,
+      commerce: scores.commerce_score ?? 0,
+      humanities: scores.humanities_score ?? 0,
     },
-    rationale:       scores.rationale       ?? null,
-    engine_version:  scores.engine_version  ?? null,
-    calculated_at:   scores.calculated_at   ?? null,
+    rationale: scores.rationale ?? null,
+    engine_version: scores.engine_version ?? null,
+    calculated_at: scores.calculated_at ?? null,
   };
 }
 
-// ─── Private ─────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// Private helpers
+// ─────────────────────────────────────────────────────────────────────────────
 
-/**
- * Maps raw orchestrator output to the public API response shape.
- */
-function _buildResponse(result) {
-  const stream = result.stream;
+function buildResponse(result = {}) {
+  const stream = result.stream ?? {};
+  const academic = result.academic ?? {};
+  const cognitive = result.cognitive ?? {};
+  const activity = result.activity ?? {};
+  const careers = result.careers ?? {};
+  const roi = result.roi ?? {};
+  const twin = result.twin ?? {};
 
   return {
-    recommended_stream:  stream.recommended_stream,
-    recommended_label:   stream.recommended_label,
-    confidence:          stream.confidence,
-    alternative_stream:  stream.alternative_stream,
-    alternative_label:   stream.alternative_label,
+    recommended_stream: stream.recommended_stream ?? null,
+    recommended_label: stream.recommended_label ?? null,
+    confidence: stream.confidence ?? null,
+    alternative_stream: stream.alternative_stream ?? null,
+    alternative_label: stream.alternative_label ?? null,
+
     stream_scores: {
-      engineering: stream.stream_scores.engineering ?? 0,
-      medical:     stream.stream_scores.medical     ?? 0,
-      commerce:    stream.stream_scores.commerce    ?? 0,
-      humanities:  stream.stream_scores.humanities  ?? 0,
+      engineering: stream.stream_scores?.engineering ?? 0,
+      medical: stream.stream_scores?.medical ?? 0,
+      commerce: stream.stream_scores?.commerce ?? 0,
+      humanities: stream.stream_scores?.humanities ?? 0,
     },
-    rationale:      stream.rationale,
-    engine_version: stream.engine_version,
 
-    // Career Success Probability Engine output
-    top_careers: result.careers?.top_careers ?? [],
+    rationale: stream.rationale ?? null,
+    engine_version: stream.engine_version ?? null,
 
-    // Education ROI Engine output
-    education_options: result.roi?.education_options ?? [],
+    // Career Success Probability Engine
+    top_careers: careers.top_careers ?? [],
 
-    // Career Digital Twin Engine output
-    simulations: result.twin?.simulations ?? [],
+    // Education ROI Engine
+    education_options: roi.education_options ?? [],
 
-    // Debug / insight data (stripped in production if desired)
+    // Career Digital Twin Engine
+    simulations: twin.simulations ?? [],
+
+    // Optional debug payload
     _debug: {
       academic: {
-        overall_learning_velocity: result.academic.overall_learning_velocity,
-        subject_trends:            result.academic.subject_trends,
+        overall_learning_velocity:
+          academic.overall_learning_velocity ?? null,
+        subject_trends: academic.subject_trends ?? [],
       },
       cognitive: {
-        profile_label:   result.cognitive.profile_label,
-        dominant_style:  result.cognitive.dominant_style,
-        strengths:       result.cognitive.strengths,
+        profile_label: cognitive.profile_label ?? null,
+        dominant_style: cognitive.dominant_style ?? null,
+        strengths: cognitive.strengths ?? [],
       },
       activity: {
-        dominant_signal: result.activity.dominant_signal,
-        activity_count:  result.activity.activity_count,
-        matched_signals: result.activity.matched_signals,
+        dominant_signal: activity.dominant_signal ?? null,
+        activity_count: activity.activity_count ?? 0,
+        matched_signals: activity.matched_signals ?? [],
       },
     },
   };
 }
 
-module.exports = { runAnalysis, getAnalysisResult };
-
-
-
-
-
-
-
-
+module.exports = {
+  runAnalysis,
+  getAnalysisResult,
+};

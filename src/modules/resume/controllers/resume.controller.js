@@ -1,229 +1,209 @@
 'use strict';
 
 /**
- * resume.controller.js — HireRise Resume Intelligence Controller
+ * src/modules/resume/controllers/resume.controller.js
  *
- * FIXES:
- *   FIX-A: Added listResumes() controller — GET /api/v1/resumes
- *   FIX-B: Added getResume() controller — GET /api/v1/resumes/:id
- *   FIX-C: Added deleteResume() controller — DELETE /api/v1/resumes/:id
- *   FIX-D: uploadResume() now returns the correct response shape matching
- *           the frontend's ResumeUploadResponse interface:
- *           { jobId, resumeId, fileName, status, pollUrl, message }
- *   FIX-E: listResumes() maps field names to frontend field names:
- *           sizeBytes → fileSize, createdAt → uploadedAt, topSkills → extractedSkills
+ * Production-ready Supabase-first controller.
+ *
+ * Improvements:
+ * - Fully removes lazy per-request Supabase imports
+ * - Eliminates Firestore-style batch update legacy pattern
+ * - Replaces N+1 resume activation loop with 2 SQL updates
+ * - Standardized auth/error responses
+ * - Better null safety + payload validation
+ * - Consistent conversion metadata flow
+ * - Cleaner controller architecture
+ * - Better production maintainability
  */
-const resumeService = require('../resume.service');
-const {
-  conversionNudgeService
-} = require('../../conversion');
 
-function _safeUserId(req) {
+const { supabase } = require('../../../config/supabase');
+const resumeService = require('../resume.service');
+const { conversionNudgeService } = require('../../conversion');
+
+function getUserId(req) {
   return req?.user?.uid ?? req?.user?.id ?? null;
 }
 
-async function _safeGetNudge(userId) {
+function unauthorized(res) {
+  return res.status(401).json({
+    success: false,
+    message: 'Unauthorized'
+  });
+}
+
+function badRequest(res, message) {
+  return res.status(400).json({
+    success: false,
+    message
+  });
+}
+
+async function safeGetNudge(userId) {
   try {
     return await conversionNudgeService.getNudge(userId);
-  } catch {
+  } catch (_) {
     return {
       intentScore: 0,
       engagementScore: 0,
       monetizationScore: 0,
       recommendedAction: 'show_profile_completion_prompt',
-      nudgeMessage: 'Complete your profile to unlock better career opportunities.',
+      nudgeMessage:
+        'Complete your profile to unlock better career opportunities.',
       ruleId: 'fallback_safe'
     };
   }
 }
 
-// ─── Map resume doc → frontend Resume shape ───────────────────────────────────
+function attachConversion(req, event, userId, metadata = {}) {
+  req.conversionEvent = event;
+  req.conversionMetadata = metadata;
 
-function _mapResumeDoc(id, data) {
-  return {
-    id,
-    fileName: data.fileName,
-    fileSize: data.sizeBytes ?? data.fileSize ?? 0,
-    // sizeBytes is the stored field name
-    mimeType: data.mimetype ?? data.mimeType ?? '',
-    status: data.analysisStatus ?? data.status ?? 'processing',
-    extractedSkills: data.topSkills ?? data.extractedSkills ?? [],
-    uploadedAt: data.createdAt ?? new Date().toISOString(),
-    analysedAt: data.scoredAt ?? data.analysedAt ?? null
-  };
+  const uniquePart =
+    metadata.resumeId ??
+    metadata.jobId ??
+    metadata.targetRole ??
+    'unknown';
+
+  req.conversionIdempotencyKey = `${userId}:${event}:${uniquePart}`;
 }
-
-// ─── POST / — Upload CV ───────────────────────────────────────────────────────
 
 /**
  * POST /api/v1/resumes
- *
- * FIX-D: Returns jobId for async polling and correct frontend shape.
- * The upload stores the file, extracts text, validates it's a CV,
- * and returns a jobId that the frontend uses to poll AI processing status.
  */
 async function uploadResume(req, res, next) {
   try {
-    const userId = _safeUserId(req);
-    if (!userId) {
-      return res.status(401).json({
-        success: false,
-        message: 'Unauthorized'
-      });
-    }
-    const file = req.file;
+    const userId = getUserId(req);
+    if (!userId) return unauthorized(res);
 
-    // multer validation: req.file is undefined if no file was sent or mimetype rejected
+    const file = req.file;
     if (!file) {
       return res.status(400).json({
         success: false,
         error: {
           code: 'NO_FILE',
-          message: 'No file received. Please attach a PDF or DOCX resume file.'
+          message:
+            'No file received. Please attach a PDF or DOCX resume file.'
         }
       });
     }
-    const uploadResult = await resumeService.uploadResume(userId, file);
-    req.conversionEvent = 'resume_uploaded';
-    req.conversionMetadata = {
-      resumeId: uploadResult.resumeId
-    };
-    req.conversionIdempotencyKey = `${userId}:resume_uploaded:${uploadResult.resumeId}`;
-    const nudge = await _safeGetNudge(userId);
 
-    // FIX-D: Return shape that matches frontend ResumeUploadResponse
+    const uploadResult = await resumeService.uploadResume(userId, file);
+
+    attachConversion(req, 'resume_uploaded', userId, {
+      resumeId: uploadResult.resumeId
+    });
+
+    const nudge = await safeGetNudge(userId);
+    const jobId = uploadResult.jobId ?? uploadResult.resumeId;
+
     return res.status(201).json({
       success: true,
       data: {
         resume: {
-          jobId: uploadResult.jobId ?? uploadResult.resumeId,
+          jobId,
           resumeId: uploadResult.resumeId,
           fileName: uploadResult.fileName,
           status: uploadResult.status ?? 'pending',
-          pollUrl: `/api/v1/ai-jobs/${uploadResult.jobId ?? uploadResult.resumeId}`,
-          message: 'Resume uploaded successfully. Processing has started.'
+          pollUrl: `/api/v1/ai-jobs/${jobId}`,
+          message:
+            'Resume uploaded successfully. Processing has started.'
         }
       },
       meta: {
-        conversion: {
-          intentScore: nudge.intentScore,
-          engagementScore: nudge.engagementScore,
-          monetizationScore: nudge.monetizationScore,
-          recommendedAction: nudge.recommendedAction,
-          nudgeMessage: nudge.nudgeMessage,
-          ruleId: nudge.ruleId
-        }
+        conversion: nudge
       }
     });
-  } catch (err) {
-    return next(err);
+  } catch (error) {
+    return next(error);
   }
 }
-
-// ─── GET / — List resumes ─────────────────────────────────────────────────────
 
 /**
  * GET /api/v1/resumes
- *
- * FIX-A: This endpoint was completely missing — causing a 404 whenever the
- * frontend called listResumes(). Now returns paginated list mapped to the
- * frontend's Resume interface.
  */
 async function listResumes(req, res, next) {
   try {
-    const userId = _safeUserId(req);
-    if (!userId) {
-      return res.status(401).json({
-        success: false,
-        message: 'Unauthorized'
-      });
-    }
+    const userId = getUserId(req);
+    if (!userId) return unauthorized(res);
+
     const result = await resumeService.listResumes(userId);
+
     return res.status(200).json({
       success: true,
       data: result
     });
-  } catch (err) {
-    return next(err);
+  } catch (error) {
+    return next(error);
   }
 }
-
-// ─── GET /:id — Get single resume ─────────────────────────────────────────────
 
 /**
  * GET /api/v1/resumes/:id
- *
- * FIX-B: This endpoint was missing. Returns single resume mapped to frontend shape.
  */
 async function getResume(req, res, next) {
   try {
-    const userId = _safeUserId(req);
-    const resumeId = req.params.id;
-    if (!userId) {
-      return res.status(401).json({
-        success: false,
-        message: 'Unauthorized'
-      });
-    }
+    const userId = getUserId(req);
+    if (!userId) return unauthorized(res);
+
+    const resumeId = req.params?.id;
+    if (!resumeId) return badRequest(res, 'resumeId is required');
+
     const result = await resumeService.getResume(userId, resumeId);
+
     return res.status(200).json({
       success: true,
       data: result
     });
-  } catch (err) {
-    return next(err);
+  } catch (error) {
+    return next(error);
   }
 }
 
-// ─── DELETE /:id — Delete resume ──────────────────────────────────────────────
-
 /**
  * DELETE /api/v1/resumes/:id
- *
- * FIX-C: This endpoint was missing. Soft-deletes the resume.
  */
 async function deleteResume(req, res, next) {
   try {
-    const userId = _safeUserId(req);
-    const resumeId = req.params.id;
-    if (!userId) {
-      return res.status(401).json({
-        success: false,
-        message: 'Unauthorized'
-      });
-    }
+    const userId = getUserId(req);
+    if (!userId) return unauthorized(res);
+
+    const resumeId = req.params?.id;
+    if (!resumeId) return badRequest(res, 'resumeId is required');
+
     await resumeService.deleteResume(userId, resumeId);
+
     return res.status(200).json({
       success: true,
       data: null
     });
-  } catch (err) {
-    return next(err);
+  } catch (error) {
+    return next(error);
   }
 }
 
-// ─── POST /score — AI resume scoring ─────────────────────────────────────────
-
+/**
+ * POST /api/v1/resumes/score
+ */
 async function scoreResume(req, res, next) {
   try {
-    const userId = _safeUserId(req);
-    if (!userId) {
-      return res.status(401).json({
-        success: false,
-        message: 'Unauthorized'
-      });
-    }
-    const {
+    const userId = getUserId(req);
+    if (!userId) return unauthorized(res);
+
+    const { resumeId } = req.body || {};
+    if (!resumeId) return badRequest(res, 'resumeId is required');
+
+    const scoreResult = await resumeService.scoreResume(
+      userId,
       resumeId
-    } = req.body;
-    const scoreResult = await resumeService.scoreResume(userId, resumeId);
-    req.conversionEvent = 'resume_scored';
-    req.conversionMetadata = {
+    );
+
+    attachConversion(req, 'resume_scored', userId, {
       resumeId,
-      score: scoreResult.score
-    };
-    req.conversionIdempotencyKey = `${userId}:resume_scored:${resumeId}`;
-    const nudge = await _safeGetNudge(userId);
+      score: scoreResult?.score
+    });
+
+    const nudge = await safeGetNudge(userId);
+
     return res.status(200).json({
       success: true,
       data: {
@@ -233,37 +213,34 @@ async function scoreResume(req, res, next) {
         conversion: nudge
       }
     });
-  } catch (err) {
-    return next(err);
+  } catch (error) {
+    return next(error);
   }
 }
 
-// ─── POST /growth — AI growth analysis ───────────────────────────────────────
-
+/**
+ * POST /api/v1/resumes/growth
+ */
 async function analyzeResumeGrowth(req, res, next) {
   try {
-    const userId = _safeUserId(req);
-    if (!userId) {
-      return res.status(401).json({
-        success: false,
-        message: 'Unauthorized'
-      });
-    }
-    const {
-      resumeId,
-      targetRole
-    } = req.body;
+    const userId = getUserId(req);
+    if (!userId) return unauthorized(res);
+
+    const { resumeId, targetRole } = req.body || {};
+    if (!resumeId) return badRequest(res, 'resumeId is required');
+
     const result = await resumeService.analyzeResumeGrowth(userId, {
       resumeId,
       targetRole
     });
-    req.conversionEvent = 'resume_growth_analysed';
-    req.conversionMetadata = {
+
+    attachConversion(req, 'resume_growth_analysed', userId, {
       resumeId,
       targetRole
-    };
-    req.conversionIdempotencyKey = `${userId}:resume_growth:${resumeId}`;
-    const nudge = await _safeGetNudge(userId);
+    });
+
+    const nudge = await safeGetNudge(userId);
+
     return res.status(200).json({
       success: true,
       data: {
@@ -273,100 +250,101 @@ async function analyzeResumeGrowth(req, res, next) {
         conversion: nudge
       }
     });
-  } catch (err) {
-    return next(err);
+  } catch (error) {
+    return next(error);
   }
 }
 
-// ─── POST /:resumeId/refresh-url ─────────────────────────────────────────────
-
+/**
+ * POST /api/v1/resumes/:resumeId/refresh-url
+ */
 async function refreshSignedUrl(req, res, next) {
   try {
-    const userId = _safeUserId(req);
-    const resumeId = req.params.resumeId;
-    if (!userId) return res.status(401).json({
-      success: false,
-      message: 'Unauthorized'
-    });
-    if (!resumeId) return res.status(400).json({
-      success: false,
-      message: 'resumeId is required'
-    });
-    const result = await resumeService.refreshSignedUrl(userId, resumeId);
+    const userId = getUserId(req);
+    if (!userId) return unauthorized(res);
+
+    const resumeId = req.params?.resumeId;
+    if (!resumeId) return badRequest(res, 'resumeId is required');
+
+    const result = await resumeService.refreshSignedUrl(
+      userId,
+      resumeId
+    );
+
     return res.status(200).json({
       success: true,
       data: result
     });
-  } catch (err) {
-    return next(err);
+  } catch (error) {
+    return next(error);
   }
 }
 
-// ─── POST /set-active ─────────────────────────────────────────────────────────
-
+/**
+ * POST /api/v1/resumes/set-active
+ *
+ * Supabase-optimized:
+ * - No per-row Promise.all loop
+ * - Uses 2 SQL updates only
+ * - Much faster at scale
+ */
 async function setActiveResume(req, res, next) {
   try {
-    const userId = _safeUserId(req);
-    const {
-      resumeId
-    } = req.body || {};
-    if (!userId) return res.status(401).json({
-      success: false,
-      message: 'Unauthorized'
-    });
-    if (!resumeId) return res.status(400).json({
-      success: false,
-      message: 'resumeId is required'
-    });
+    const userId = getUserId(req);
+    if (!userId) return unauthorized(res);
 
-    const { supabase } = require('../../../config/supabase');
+    const { resumeId } = req.body || {};
+    if (!resumeId) return badRequest(res, 'resumeId is required');
 
-    // Verify the resume belongs to this user
-    const { data: resumeData, error: resumeError } = await supabase
+    const { data: resumeRow, error: resumeError } = await supabase
       .from('resumes')
-      .select('userId')
+      .select('id')
       .eq('id', resumeId)
+      .eq('userId', userId)
+      .eq('softDeleted', false)
       .maybeSingle();
 
     if (resumeError) throw resumeError;
 
-    if (!resumeData || resumeData.userId !== userId) {
+    if (!resumeRow) {
       return res.status(404).json({
         success: false,
         message: 'Resume not found'
       });
     }
 
-    // Fetch all non-deleted resumes for this user to update isActive flags
-    const { data: allResumes, error: allError } = await supabase
+    // deactivate all
+    const { error: deactivateError } = await supabase
       .from('resumes')
-      .select('id')
+      .update({
+        isActive: false,
+        updatedAt: new Date().toISOString()
+      })
       .eq('userId', userId)
       .eq('softDeleted', false);
 
-    if (allError) throw allError;
+    if (deactivateError) throw deactivateError;
 
-    // Update isActive on all resumes for this user — active only for the target resumeId
-    await Promise.all(
-      (allResumes || []).map(doc =>
-        supabase
-          .from('resumes')
-          .update({
-            isActive: doc.id === resumeId,
-            updatedAt: new Date().toISOString()
-          })
-          .eq('id', doc.id)
-      )
-    );
+    // activate selected
+    const { error: activateError } = await supabase
+      .from('resumes')
+      .update({
+        isActive: true,
+        updatedAt: new Date().toISOString()
+      })
+      .eq('id', resumeId)
+      .eq('userId', userId);
 
-    // Update users table with new active resume
+    if (activateError) throw activateError;
+
+    // update profile pointer
     const { error: userError } = await supabase
       .from('users')
-      .upsert({
-        id: userId,
+      .update({
         latestResumeId: resumeId,
         updatedAt: new Date().toISOString()
-      });
+      })
+      .eq('id', userId);
 
     if (userError) throw userError;
 
@@ -377,43 +355,35 @@ async function setActiveResume(req, res, next) {
         message: 'Active resume updated successfully.'
       }
     });
-  } catch (err) {
-    return next(err);
+  } catch (error) {
+    return next(error);
   }
 }
 
-// ─── POST /:resumeId/rescore — Retrigger scoring for a stuck resume ────────────
-
 /**
  * POST /api/v1/resumes/:resumeId/rescore
- *
- * Triggers AI scoring for a pending/stuck resume.
- * No plan gate — any authenticated user can rescore their own resume.
- * Needed for onboarding-path CVs that were never scored.
  */
 async function rescoreResume(req, res, next) {
   try {
-    const userId = _safeUserId(req);
-    if (!userId) return res.status(401).json({
-      success: false,
-      message: 'Unauthorized'
-    });
-    const resumeId = req.params.resumeId;
-    if (!resumeId) {
-      return res.status(400).json({
-        success: false,
-        message: 'resumeId is required'
-      });
-    }
-    const scoreResult = await resumeService.scoreResume(userId, resumeId);
+    const userId = getUserId(req);
+    if (!userId) return unauthorized(res);
+
+    const resumeId = req.params?.resumeId;
+    if (!resumeId) return badRequest(res, 'resumeId is required');
+
+    const scoreResult = await resumeService.scoreResume(
+      userId,
+      resumeId
+    );
+
     return res.status(200).json({
       success: true,
       data: {
         resume: scoreResult
       }
     });
-  } catch (err) {
-    return next(err);
+  } catch (error) {
+    return next(error);
   }
 }
 

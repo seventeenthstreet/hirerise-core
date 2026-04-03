@@ -1,177 +1,392 @@
 'use strict';
 
+/**
+ * src/modules/platform-intelligence/services/platformIntelligence.service.js
+ *
+ * Supabase-native service layer for Platform Intelligence.
+ * Fully removes remaining Firestore-era assumptions.
+ */
+
 const { supabase } = require('../../../config/supabase');
-const logger   = require('../../../utils/logger');
+const logger = require('../../../utils/logger');
 
 const {
-  COLLECTIONS,
-  buildAISettingsDoc,
-  buildMarketSourceDoc,
-  buildCareerDatasetDoc,
-  buildCHIWeightsDoc,
-  buildSkillTaxonomyDoc,
-  buildCareerPathDoc,
-  buildTrainingSourceDoc,
-  buildSubscriptionPlanDoc,
-  buildAIUsageLogDoc,
-  buildFeatureFlagDoc,
-  buildAIPromptDoc,
+  TABLES,
+  buildAISettingsRow,
+  buildMarketSourceRow,
+  buildCareerDatasetRow,
+  buildCHIWeightsRow,
+  buildSkillTaxonomyRow,
+  buildCareerPathRow,
+  buildTrainingSourceRow,
+  buildSubscriptionPlanRow,
+  buildAIUsageLogRow,
+  buildFeatureFlagRow,
+  buildAIPromptRow,
 } = require('../models/platformIntelligence.model');
 
-// ─── Helpers ──────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────
+// Shared DB helpers
+// ─────────────────────────────────────────────────────────────
 
-async function _get(table, id) {
+function normalizeDbError(error, context) {
+  logger.error(
+    {
+      context,
+      error: error?.message,
+      details: error?.details,
+      hint: error?.hint,
+      code: error?.code,
+    },
+    '[PlatformIntelligenceService] database operation failed'
+  );
+
+  const err = new Error(error?.message || 'Database operation failed');
+  err.statusCode = 500;
+  throw err;
+}
+
+async function getById(table, id) {
   const { data, error } = await supabase
     .from(table)
     .select('*')
     .eq('id', id)
     .maybeSingle();
 
-  if (error) throw new Error(error.message);
+  if (error) normalizeDbError(error, `getById:${table}`);
   return data;
 }
 
-async function _list(table, orderField = 'created_at') {
+async function listRows(table, orderField = 'created_at') {
   const { data, error } = await supabase
     .from(table)
     .select('*')
     .order(orderField, { ascending: false });
 
-  if (error) throw new Error(error.message);
+  if (error) normalizeDbError(error, `listRows:${table}`);
   return data || [];
 }
 
-async function _create(table, doc) {
+async function insertRow(table, row) {
   const { data, error } = await supabase
     .from(table)
-    .insert({ ...doc, created_at: new Date().toISOString() })
+    .insert(row)
     .select()
     .single();
 
-  if (error) throw new Error(error.message);
+  if (error) normalizeDbError(error, `insertRow:${table}`);
   return data;
 }
 
-async function _update(table, id, partial) {
+async function updateRow(table, id, row) {
   const { data, error } = await supabase
     .from(table)
-    .update({ ...partial, updated_at: new Date().toISOString() })
+    .update(row)
     .eq('id', id)
     .select()
     .single();
 
-  if (error) throw new Error(error.message);
+  if (error) normalizeDbError(error, `updateRow:${table}`);
   return data;
 }
 
-async function _delete(table, id) {
+async function upsertById(table, id, row) {
+  const payload = { ...row, id };
+
+  const { data, error } = await supabase
+    .from(table)
+    .upsert(payload, {
+      onConflict: 'id',
+    })
+    .select()
+    .single();
+
+  if (error) normalizeDbError(error, `upsertById:${table}`);
+  return data;
+}
+
+async function deleteRow(table, id) {
   const { error } = await supabase
     .from(table)
     .delete()
     .eq('id', id);
 
-  if (error) throw new Error(error.message);
+  if (error) normalizeDbError(error, `deleteRow:${table}`);
 }
 
-// ─── AI Settings ──────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────
+// 1. AI Settings
+// ─────────────────────────────────────────────────────────────
 
 async function getAISettings() {
-  const doc = await _get(COLLECTIONS.AI_SETTINGS, 'config');
-  return doc ?? buildAISettingsDoc({});
+  const row = await getById(TABLES.AI_SETTINGS, 'config');
+  return row ?? buildAISettingsRow({});
 }
 
 async function upsertAISettings(fields) {
-  return _update(COLLECTIONS.AI_SETTINGS, 'config', buildAISettingsDoc(fields));
+  return upsertById(
+    TABLES.AI_SETTINGS,
+    'config',
+    buildAISettingsRow(fields)
+  );
 }
 
-// ─── Market Sources ───────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────
+// 2. Market Sources
+// ─────────────────────────────────────────────────────────────
 
-const listMarketSources  = () => _list(COLLECTIONS.MARKET_SOURCES);
-const getMarketSource    = id  => _get(COLLECTIONS.MARKET_SOURCES, id);
-const createMarketSource = f   => _create(COLLECTIONS.MARKET_SOURCES, buildMarketSourceDoc(f));
-const updateMarketSource = (id, f) => _update(COLLECTIONS.MARKET_SOURCES, id, f);
-const deleteMarketSource = id  => _delete(COLLECTIONS.MARKET_SOURCES, id);
+const listMarketSources = () => listRows(TABLES.MARKET_SOURCES);
+const getMarketSource = (id) => getById(TABLES.MARKET_SOURCES, id);
+const createMarketSource = (fields) =>
+  insertRow(TABLES.MARKET_SOURCES, buildMarketSourceRow(fields));
+const updateMarketSource = (id, fields) =>
+  updateRow(TABLES.MARKET_SOURCES, id, buildMarketSourceRow(fields));
+const deleteMarketSource = (id) => deleteRow(TABLES.MARKET_SOURCES, id);
 
-// ─── Career Datasets ─────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────
+// 3. Career Datasets
+// ─────────────────────────────────────────────────────────────
 
-const listCareerDatasets  = () => _list(COLLECTIONS.CAREER_DATASETS, 'uploaded_at');
-const getCareerDataset    = id  => _get(COLLECTIONS.CAREER_DATASETS, id);
-const createCareerDataset = f   => _create(COLLECTIONS.CAREER_DATASETS, {
-  ...buildCareerDatasetDoc(f),
-  uploaded_at: new Date().toISOString()
-});
-const updateCareerDataset = (id, f) => _update(COLLECTIONS.CAREER_DATASETS, id, f);
-const deleteCareerDataset = id  => _delete(COLLECTIONS.CAREER_DATASETS, id);
+const listCareerDatasets = () =>
+  listRows(TABLES.CAREER_DATASETS, 'uploaded_at');
 
-// ─── CHI Weights ─────────────────────────────────────────────────────────────
+const getCareerDataset = (id) =>
+  getById(TABLES.CAREER_DATASETS, id);
+
+const createCareerDataset = (fields) =>
+  insertRow(TABLES.CAREER_DATASETS, buildCareerDatasetRow(fields));
+
+const updateCareerDataset = (id, fields) =>
+  updateRow(TABLES.CAREER_DATASETS, id, buildCareerDatasetRow(fields));
+
+const deleteCareerDataset = (id) =>
+  deleteRow(TABLES.CAREER_DATASETS, id);
+
+// ─────────────────────────────────────────────────────────────
+// 4. CHI Weights
+// ─────────────────────────────────────────────────────────────
 
 async function getCHIWeights() {
-  const doc = await _get(COLLECTIONS.CHI_WEIGHTS, 'config');
-  return doc ?? buildCHIWeightsDoc({});
+  const row = await getById(TABLES.CHI_WEIGHTS, 'config');
+  return row ?? buildCHIWeightsRow({});
 }
 
 async function upsertCHIWeights(fields) {
-  const total = ['skill_weight','experience_weight','market_weight','salary_weight','education_weight']
-    .reduce((sum, k) => sum + (Number(fields[k]) || 0), 0);
+  const row = buildCHIWeightsRow(fields);
+
+  const total =
+    row.skill_weight +
+    row.experience_weight +
+    row.market_weight +
+    row.salary_weight +
+    row.education_weight;
 
   if (Math.round(total) !== 100) {
-    throw new Error('CHI weights must sum to 100');
+    const error = new Error('CHI weights must sum to 100');
+    error.statusCode = 400;
+    throw error;
   }
 
-  return _update(COLLECTIONS.CHI_WEIGHTS, 'config', buildCHIWeightsDoc(fields));
+  return upsertById(TABLES.CHI_WEIGHTS, 'config', row);
 }
 
-// ─── Skill Taxonomy ──────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────
+// 5. Skill Taxonomy
+// ─────────────────────────────────────────────────────────────
 
-const listSkillTaxonomy  = () => _list(COLLECTIONS.SKILL_TAXONOMY);
-const getSkillTaxonomy   = id  => _get(COLLECTIONS.SKILL_TAXONOMY, id);
-const createSkillTaxonomy = f  => _create(COLLECTIONS.SKILL_TAXONOMY, buildSkillTaxonomyDoc(f));
-const updateSkillTaxonomy = (id, f) => _update(COLLECTIONS.SKILL_TAXONOMY, id, f);
-const deleteSkillTaxonomy = id => _delete(COLLECTIONS.SKILL_TAXONOMY, id);
+const listSkillTaxonomy = () => listRows(TABLES.SKILL_TAXONOMY);
+const getSkillTaxonomy = (id) => getById(TABLES.SKILL_TAXONOMY, id);
+const createSkillTaxonomy = (fields) =>
+  insertRow(TABLES.SKILL_TAXONOMY, buildSkillTaxonomyRow(fields));
+const updateSkillTaxonomy = (id, fields) =>
+  updateRow(TABLES.SKILL_TAXONOMY, id, buildSkillTaxonomyRow(fields));
+const deleteSkillTaxonomy = (id) =>
+  deleteRow(TABLES.SKILL_TAXONOMY, id);
 
-// ─── Career Paths ────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────
+// 6. Career Paths
+// ─────────────────────────────────────────────────────────────
 
-const listCareerPaths  = () => _list(COLLECTIONS.CAREER_PATHS);
-const getCareerPath    = id  => _get(COLLECTIONS.CAREER_PATHS, id);
-const createCareerPath = f   => _create(COLLECTIONS.CAREER_PATHS, buildCareerPathDoc(f));
-const updateCareerPath = (id, f) => _update(COLLECTIONS.CAREER_PATHS, id, f);
-const deleteCareerPath = id  => _delete(COLLECTIONS.CAREER_PATHS, id);
+const listCareerPaths = () => listRows(TABLES.CAREER_PATHS);
+const getCareerPath = (id) => getById(TABLES.CAREER_PATHS, id);
+const createCareerPath = (fields) =>
+  insertRow(TABLES.CAREER_PATHS, buildCareerPathRow(fields));
+const updateCareerPath = (id, fields) =>
+  updateRow(TABLES.CAREER_PATHS, id, buildCareerPathRow(fields));
+const deleteCareerPath = (id) =>
+  deleteRow(TABLES.CAREER_PATHS, id);
 
-// ─── Training Sources ────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────
+// 7. Training Sources
+// ─────────────────────────────────────────────────────────────
 
-const listTrainingSources  = () => _list(COLLECTIONS.TRAINING_SOURCES);
-const getTrainingSource    = id  => _get(COLLECTIONS.TRAINING_SOURCES, id);
-const createTrainingSource = f   => _create(COLLECTIONS.TRAINING_SOURCES, buildTrainingSourceDoc(f));
-const updateTrainingSource = (id, f) => _update(COLLECTIONS.TRAINING_SOURCES, id, f);
-const deleteTrainingSource = id  => _delete(COLLECTIONS.TRAINING_SOURCES, id);
+const listTrainingSources = () => listRows(TABLES.TRAINING_SOURCES);
+const getTrainingSource = (id) =>
+  getById(TABLES.TRAINING_SOURCES, id);
+const createTrainingSource = (fields) =>
+  insertRow(TABLES.TRAINING_SOURCES, buildTrainingSourceRow(fields));
+const updateTrainingSource = (id, fields) =>
+  updateRow(TABLES.TRAINING_SOURCES, id, buildTrainingSourceRow(fields));
+const deleteTrainingSource = (id) =>
+  deleteRow(TABLES.TRAINING_SOURCES, id);
 
-// ─── Feature Flags ───────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────
+// 8. Subscription Plans
+// ─────────────────────────────────────────────────────────────
 
-const listFeatureFlags  = () => _list(COLLECTIONS.FEATURE_FLAGS);
-const upsertFeatureFlag = (name, enabled) =>
-  _update(COLLECTIONS.FEATURE_FLAGS, name, buildFeatureFlagDoc({ feature_name: name, enabled }));
+const listSubscriptionPlans = () =>
+  listRows(TABLES.SUBSCRIPTION_PLANS, 'updated_at');
 
-// ─── AI Usage ────────────────────────────────────────────────────────────────
+const upsertSubscriptionPlan = (plan, fields) =>
+  upsertById(
+    TABLES.SUBSCRIPTION_PLANS,
+    plan,
+    buildSubscriptionPlanRow({
+      ...fields,
+      plan_name: plan,
+    })
+  );
+
+// ─────────────────────────────────────────────────────────────
+// 9. AI Usage Analytics
+// ─────────────────────────────────────────────────────────────
+
+async function getAIUsageAnalytics(days = 30) {
+  const since = new Date();
+  since.setDate(since.getDate() - days);
+
+  const { data, error } = await supabase
+    .from(TABLES.AI_USAGE_LOGS)
+    .select('tokens_used,cost,model_used,created_at')
+    .gte('created_at', since.toISOString())
+    .order('created_at', { ascending: false });
+
+  if (error) normalizeDbError(error, 'getAIUsageAnalytics');
+
+  return {
+    total_requests: data.length,
+    total_tokens: data.reduce((sum, row) => sum + (row.tokens_used || 0), 0),
+    total_cost: data.reduce((sum, row) => sum + Number(row.cost || 0), 0),
+    by_model: data.reduce((acc, row) => {
+      const key = row.model_used || 'unknown';
+      acc[key] = (acc[key] || 0) + 1;
+      return acc;
+    }, {}),
+    recent: data.slice(0, 100),
+  };
+}
 
 async function logAIUsage(fields) {
-  return _create(COLLECTIONS.AI_USAGE_LOGS, buildAIUsageLogDoc(fields));
+  return insertRow(TABLES.AI_USAGE_LOGS, buildAIUsageLogRow(fields));
 }
 
-// ─── Exports ─────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────
+// 10. Feature Flags
+// ─────────────────────────────────────────────────────────────
+
+const listFeatureFlags = () => listRows(TABLES.FEATURE_FLAGS, 'updated_at');
+
+const upsertFeatureFlag = (featureName, enabled) =>
+  upsertById(
+    TABLES.FEATURE_FLAGS,
+    featureName,
+    buildFeatureFlagRow({
+      feature_name: featureName,
+      enabled,
+    })
+  );
+
+async function bulkSetFeatureFlags(flags = []) {
+  if (!Array.isArray(flags) || flags.length === 0) return [];
+
+  const rows = flags.map((flag) =>
+    buildFeatureFlagRow({
+      feature_name: flag.feature_name,
+      enabled: flag.enabled,
+      id: flag.feature_name,
+    })
+  );
+
+  const payload = rows.map((row) => ({
+    ...row,
+    id: row.feature_name,
+  }));
+
+  const { data, error } = await supabase
+    .from(TABLES.FEATURE_FLAGS)
+    .upsert(payload, { onConflict: 'id' })
+    .select();
+
+  if (error) normalizeDbError(error, 'bulkSetFeatureFlags');
+  return data || [];
+}
+
+// ─────────────────────────────────────────────────────────────
+// 11. AI Prompts
+// ─────────────────────────────────────────────────────────────
+
+const listAIPrompts = () => listRows(TABLES.AI_PROMPTS, 'updated_at');
+const getAIPrompt = (id) => getById(TABLES.AI_PROMPTS, id);
+const createAIPrompt = (fields) =>
+  insertRow(TABLES.AI_PROMPTS, buildAIPromptRow(fields));
+const updateAIPrompt = (id, fields) =>
+  updateRow(TABLES.AI_PROMPTS, id, buildAIPromptRow(fields));
+const deleteAIPrompt = (id) => deleteRow(TABLES.AI_PROMPTS, id);
+
+// ─────────────────────────────────────────────────────────────
+// Exports
+// ─────────────────────────────────────────────────────────────
 
 module.exports = {
-  getAISettings, upsertAISettings,
-  listMarketSources, getMarketSource, createMarketSource, updateMarketSource, deleteMarketSource,
-  listCareerDatasets, getCareerDataset, createCareerDataset, updateCareerDataset, deleteCareerDataset,
-  getCHIWeights, upsertCHIWeights,
-  listSkillTaxonomy, getSkillTaxonomy, createSkillTaxonomy, updateSkillTaxonomy, deleteSkillTaxonomy,
-  listCareerPaths, getCareerPath, createCareerPath, updateCareerPath, deleteCareerPath,
-  listTrainingSources, getTrainingSource, createTrainingSource, updateTrainingSource, deleteTrainingSource,
-  listFeatureFlags, upsertFeatureFlag,
+  getAISettings,
+  upsertAISettings,
+
+  listMarketSources,
+  getMarketSource,
+  createMarketSource,
+  updateMarketSource,
+  deleteMarketSource,
+
+  listCareerDatasets,
+  getCareerDataset,
+  createCareerDataset,
+  updateCareerDataset,
+  deleteCareerDataset,
+
+  getCHIWeights,
+  upsertCHIWeights,
+
+  listSkillTaxonomy,
+  getSkillTaxonomy,
+  createSkillTaxonomy,
+  updateSkillTaxonomy,
+  deleteSkillTaxonomy,
+
+  listCareerPaths,
+  getCareerPath,
+  createCareerPath,
+  updateCareerPath,
+  deleteCareerPath,
+
+  listTrainingSources,
+  getTrainingSource,
+  createTrainingSource,
+  updateTrainingSource,
+  deleteTrainingSource,
+
+  listSubscriptionPlans,
+  upsertSubscriptionPlan,
+
+  getAIUsageAnalytics,
   logAIUsage,
+
+  listFeatureFlags,
+  upsertFeatureFlag,
+  bulkSetFeatureFlags,
+
+  listAIPrompts,
+  getAIPrompt,
+  createAIPrompt,
+  updateAIPrompt,
+  deleteAIPrompt,
 };
-
-
-
-
-

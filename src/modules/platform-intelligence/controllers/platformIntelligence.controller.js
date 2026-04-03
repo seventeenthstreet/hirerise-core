@@ -1,174 +1,302 @@
 'use strict';
 
 /**
- * controllers/platformIntelligence.controller.js
+ * src/modules/platform-intelligence/controllers/platformIntelligence.controller.js
  *
- * HTTP controller for all 11 Platform Intelligence sub-modules.
- * All routes require authenticate + requireAdmin (applied in routes file).
+ * HTTP controller for all Platform Intelligence sub-modules.
+ * Fully optimized for Supabase-backed service layer usage.
+ *
+ * Routes should already enforce:
+ *   authenticate + requireAdmin
  */
 
-const svc    = require('../services/platformIntelligence.service');
+const service = require('../services/platformIntelligence.service');
 const logger = require('../../../utils/logger');
 
-const ok  = (res, data, status = 200) => res.status(status).json({ success: true, data });
-const fail = (res, next, err, label)  => {
-  logger.error({ err: err.message }, `[PI] ${label}`);
-  if (err.statusCode) return res.status(err.statusCode).json({ success: false, error: err.message });
-  return next(err);
+/**
+ * Standard success response helper
+ */
+const sendSuccess = (res, data, statusCode = 200) =>
+  res.status(statusCode).json({
+    success: true,
+    data,
+  });
+
+/**
+ * Standard error response helper
+ */
+const handleError = (res, next, error, action, meta = {}) => {
+  logger.error(
+    {
+      action,
+      error: error?.message,
+      stack: error?.stack,
+      ...meta,
+    },
+    `[PlatformIntelligence] ${action} failed`
+  );
+
+  if (error?.statusCode) {
+    return res.status(error.statusCode).json({
+      success: false,
+      error: error.message,
+    });
+  }
+
+  return next(error);
 };
 
-// ─── 1. AI Settings ──────────────────────────────────────────────────────────
+/**
+ * Higher-order async controller wrapper
+ */
+const controller =
+  (action, serviceFn, options = {}) =>
+  async (req, res, next) => {
+    try {
+      const result = await serviceFn(req, res);
+      return sendSuccess(res, result, options.statusCode || 200);
+    } catch (error) {
+      return handleError(res, next, error, action, {
+        params: req.params,
+        query: req.query,
+      });
+    }
+  };
 
-exports.getAISettings    = async (req, res, next) => {
-  try { ok(res, await svc.getAISettings()); } catch (e) { fail(res, next, e, 'getAISettings'); }
-};
-exports.upsertAISettings = async (req, res, next) => {
-  try { ok(res, await svc.upsertAISettings(req.body)); } catch (e) { fail(res, next, e, 'upsertAISettings'); }
-};
+/**
+ * Safe positive integer parser with max cap
+ */
+const parsePositiveInt = (value, fallback, max) => {
+  const parsed = Number.parseInt(value, 10);
 
-// ─── 2. Market Data Sources ───────────────────────────────────────────────────
-
-exports.listMarketSources   = async (req, res, next) => {
-  try { ok(res, await svc.listMarketSources()); } catch (e) { fail(res, next, e, 'listMarketSources'); }
-};
-exports.createMarketSource  = async (req, res, next) => {
-  try { ok(res, await svc.createMarketSource(req.body), 201); } catch (e) { fail(res, next, e, 'createMarketSource'); }
-};
-exports.updateMarketSource  = async (req, res, next) => {
-  try { ok(res, await svc.updateMarketSource(req.params.id, req.body)); } catch (e) { fail(res, next, e, 'updateMarketSource'); }
-};
-exports.deleteMarketSource  = async (req, res, next) => {
-  try { await svc.deleteMarketSource(req.params.id); ok(res, { deleted: true }); } catch (e) { fail(res, next, e, 'deleteMarketSource'); }
-};
-
-// ─── 3. Career Datasets ───────────────────────────────────────────────────────
-
-exports.listCareerDatasets   = async (req, res, next) => {
-  try { ok(res, await svc.listCareerDatasets()); } catch (e) { fail(res, next, e, 'listCareerDatasets'); }
-};
-exports.createCareerDataset  = async (req, res, next) => {
-  try { ok(res, await svc.createCareerDataset(req.body), 201); } catch (e) { fail(res, next, e, 'createCareerDataset'); }
-};
-exports.updateCareerDataset  = async (req, res, next) => {
-  try { ok(res, await svc.updateCareerDataset(req.params.id, req.body)); } catch (e) { fail(res, next, e, 'updateCareerDataset'); }
-};
-exports.deleteCareerDataset  = async (req, res, next) => {
-  try { await svc.deleteCareerDataset(req.params.id); ok(res, { deleted: true }); } catch (e) { fail(res, next, e, 'deleteCareerDataset'); }
+  if (!Number.isFinite(parsed) || parsed <= 0) return fallback;
+  return Math.min(parsed, max);
 };
 
-// ─── 4. CHI Weights ───────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────
+// 1. AI Settings
+// ─────────────────────────────────────────────────────────────
 
-exports.getCHIWeights    = async (req, res, next) => {
-  try { ok(res, await svc.getCHIWeights()); } catch (e) { fail(res, next, e, 'getCHIWeights'); }
-};
-exports.upsertCHIWeights = async (req, res, next) => {
-  try { ok(res, await svc.upsertCHIWeights(req.body)); } catch (e) { fail(res, next, e, 'upsertCHIWeights'); }
-};
+exports.getAISettings = controller('getAISettings', () =>
+  service.getAISettings()
+);
 
-// ─── 5. Skill Taxonomy ────────────────────────────────────────────────────────
+exports.upsertAISettings = controller('upsertAISettings', (req) =>
+  service.upsertAISettings(req.body)
+);
 
-exports.listSkillTaxonomy   = async (req, res, next) => {
-  try { ok(res, await svc.listSkillTaxonomy()); } catch (e) { fail(res, next, e, 'listSkillTaxonomy'); }
-};
-exports.createSkillTaxonomy = async (req, res, next) => {
-  try { ok(res, await svc.createSkillTaxonomy(req.body), 201); } catch (e) { fail(res, next, e, 'createSkillTaxonomy'); }
-};
-exports.updateSkillTaxonomy = async (req, res, next) => {
-  try { ok(res, await svc.updateSkillTaxonomy(req.params.id, req.body)); } catch (e) { fail(res, next, e, 'updateSkillTaxonomy'); }
-};
-exports.deleteSkillTaxonomy = async (req, res, next) => {
-  try { await svc.deleteSkillTaxonomy(req.params.id); ok(res, { deleted: true }); } catch (e) { fail(res, next, e, 'deleteSkillTaxonomy'); }
-};
+// ─────────────────────────────────────────────────────────────
+// 2. Market Data Sources
+// ─────────────────────────────────────────────────────────────
 
-// ─── 6. Career Paths ─────────────────────────────────────────────────────────
+exports.listMarketSources = controller('listMarketSources', () =>
+  service.listMarketSources()
+);
 
-exports.listCareerPaths   = async (req, res, next) => {
-  try { ok(res, await svc.listCareerPaths()); } catch (e) { fail(res, next, e, 'listCareerPaths'); }
-};
-exports.createCareerPath  = async (req, res, next) => {
-  try { ok(res, await svc.createCareerPath(req.body), 201); } catch (e) { fail(res, next, e, 'createCareerPath'); }
-};
-exports.updateCareerPath  = async (req, res, next) => {
-  try { ok(res, await svc.updateCareerPath(req.params.id, req.body)); } catch (e) { fail(res, next, e, 'updateCareerPath'); }
-};
-exports.deleteCareerPath  = async (req, res, next) => {
-  try { await svc.deleteCareerPath(req.params.id); ok(res, { deleted: true }); } catch (e) { fail(res, next, e, 'deleteCareerPath'); }
-};
+exports.createMarketSource = controller(
+  'createMarketSource',
+  (req) => service.createMarketSource(req.body),
+  { statusCode: 201 }
+);
 
-// ─── 7. Training Sources ──────────────────────────────────────────────────────
+exports.updateMarketSource = controller('updateMarketSource', (req) =>
+  service.updateMarketSource(req.params.id, req.body)
+);
 
-exports.listTrainingSources   = async (req, res, next) => {
-  try { ok(res, await svc.listTrainingSources()); } catch (e) { fail(res, next, e, 'listTrainingSources'); }
-};
-exports.createTrainingSource  = async (req, res, next) => {
-  try { ok(res, await svc.createTrainingSource(req.body), 201); } catch (e) { fail(res, next, e, 'createTrainingSource'); }
-};
-exports.updateTrainingSource  = async (req, res, next) => {
-  try { ok(res, await svc.updateTrainingSource(req.params.id, req.body)); } catch (e) { fail(res, next, e, 'updateTrainingSource'); }
-};
-exports.deleteTrainingSource  = async (req, res, next) => {
-  try { await svc.deleteTrainingSource(req.params.id); ok(res, { deleted: true }); } catch (e) { fail(res, next, e, 'deleteTrainingSource'); }
-};
+exports.deleteMarketSource = controller('deleteMarketSource', async (req) => {
+  await service.deleteMarketSource(req.params.id);
+  return { deleted: true };
+});
 
-// ─── 8. Subscription Plans ────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────
+// 3. Career Datasets
+// ─────────────────────────────────────────────────────────────
 
-exports.listSubscriptionPlans  = async (req, res, next) => {
-  try { ok(res, await svc.listSubscriptionPlans()); } catch (e) { fail(res, next, e, 'listSubscriptionPlans'); }
-};
-exports.upsertSubscriptionPlan = async (req, res, next) => {
-  try { ok(res, await svc.upsertSubscriptionPlan(req.params.plan, req.body)); } catch (e) { fail(res, next, e, 'upsertSubscriptionPlan'); }
-};
+exports.listCareerDatasets = controller('listCareerDatasets', () =>
+  service.listCareerDatasets()
+);
 
-// ─── 9. AI Usage Analytics ───────────────────────────────────────────────────
+exports.createCareerDataset = controller(
+  'createCareerDataset',
+  (req) => service.createCareerDataset(req.body),
+  { statusCode: 201 }
+);
 
-exports.getAIUsageAnalytics = async (req, res, next) => {
-  const days = Math.min(90, parseInt(req.query.days ?? '30', 10));
-  try { ok(res, await svc.getAIUsageAnalytics(days)); } catch (e) { fail(res, next, e, 'getAIUsageAnalytics'); }
-};
-exports.logAIUsage = async (req, res, next) => {
-  try { ok(res, await svc.logAIUsage(req.body), 201); } catch (e) { fail(res, next, e, 'logAIUsage'); }
-};
+exports.updateCareerDataset = controller('updateCareerDataset', (req) =>
+  service.updateCareerDataset(req.params.id, req.body)
+);
 
-// ─── 10. Feature Flags ────────────────────────────────────────────────────────
+exports.deleteCareerDataset = controller('deleteCareerDataset', async (req) => {
+  await service.deleteCareerDataset(req.params.id);
+  return { deleted: true };
+});
 
-exports.listFeatureFlags  = async (req, res, next) => {
-  try { ok(res, await svc.listFeatureFlags()); } catch (e) { fail(res, next, e, 'listFeatureFlags'); }
-};
-exports.upsertFeatureFlag = async (req, res, next) => {
-  const { enabled } = req.body;
-  try { ok(res, await svc.upsertFeatureFlag(req.params.feature, Boolean(enabled))); } catch (e) { fail(res, next, e, 'upsertFeatureFlag'); }
-};
-exports.bulkSetFeatureFlags = async (req, res, next) => {
-  try { ok(res, await svc.bulkSetFeatureFlags(req.body.flags)); } catch (e) { fail(res, next, e, 'bulkSetFeatureFlags'); }
-};
+// ─────────────────────────────────────────────────────────────
+// 4. CHI Weights
+// ─────────────────────────────────────────────────────────────
 
-// ─── 11. AI Prompts ───────────────────────────────────────────────────────────
+exports.getCHIWeights = controller('getCHIWeights', () =>
+  service.getCHIWeights()
+);
 
-exports.listAIPrompts   = async (req, res, next) => {
-  try { ok(res, await svc.listAIPrompts()); } catch (e) { fail(res, next, e, 'listAIPrompts'); }
-};
-exports.getAIPrompt     = async (req, res, next) => {
+exports.upsertCHIWeights = controller('upsertCHIWeights', (req) =>
+  service.upsertCHIWeights(req.body)
+);
+
+// ─────────────────────────────────────────────────────────────
+// 5. Skill Taxonomy
+// ─────────────────────────────────────────────────────────────
+
+exports.listSkillTaxonomy = controller('listSkillTaxonomy', () =>
+  service.listSkillTaxonomy()
+);
+
+exports.createSkillTaxonomy = controller(
+  'createSkillTaxonomy',
+  (req) => service.createSkillTaxonomy(req.body),
+  { statusCode: 201 }
+);
+
+exports.updateSkillTaxonomy = controller('updateSkillTaxonomy', (req) =>
+  service.updateSkillTaxonomy(req.params.id, req.body)
+);
+
+exports.deleteSkillTaxonomy = controller('deleteSkillTaxonomy', async (req) => {
+  await service.deleteSkillTaxonomy(req.params.id);
+  return { deleted: true };
+});
+
+// ─────────────────────────────────────────────────────────────
+// 6. Career Paths
+// ─────────────────────────────────────────────────────────────
+
+exports.listCareerPaths = controller('listCareerPaths', () =>
+  service.listCareerPaths()
+);
+
+exports.createCareerPath = controller(
+  'createCareerPath',
+  (req) => service.createCareerPath(req.body),
+  { statusCode: 201 }
+);
+
+exports.updateCareerPath = controller('updateCareerPath', (req) =>
+  service.updateCareerPath(req.params.id, req.body)
+);
+
+exports.deleteCareerPath = controller('deleteCareerPath', async (req) => {
+  await service.deleteCareerPath(req.params.id);
+  return { deleted: true };
+});
+
+// ─────────────────────────────────────────────────────────────
+// 7. Training Sources
+// ─────────────────────────────────────────────────────────────
+
+exports.listTrainingSources = controller('listTrainingSources', () =>
+  service.listTrainingSources()
+);
+
+exports.createTrainingSource = controller(
+  'createTrainingSource',
+  (req) => service.createTrainingSource(req.body),
+  { statusCode: 201 }
+);
+
+exports.updateTrainingSource = controller('updateTrainingSource', (req) =>
+  service.updateTrainingSource(req.params.id, req.body)
+);
+
+exports.deleteTrainingSource = controller('deleteTrainingSource', async (req) => {
+  await service.deleteTrainingSource(req.params.id);
+  return { deleted: true };
+});
+
+// ─────────────────────────────────────────────────────────────
+// 8. Subscription Plans
+// ─────────────────────────────────────────────────────────────
+
+exports.listSubscriptionPlans = controller('listSubscriptionPlans', () =>
+  service.listSubscriptionPlans()
+);
+
+exports.upsertSubscriptionPlan = controller(
+  'upsertSubscriptionPlan',
+  (req) => service.upsertSubscriptionPlan(req.params.plan, req.body)
+);
+
+// ─────────────────────────────────────────────────────────────
+// 9. AI Usage Analytics
+// ─────────────────────────────────────────────────────────────
+
+exports.getAIUsageAnalytics = controller('getAIUsageAnalytics', (req) => {
+  const days = parsePositiveInt(req.query.days, 30, 90);
+  return service.getAIUsageAnalytics(days);
+});
+
+exports.logAIUsage = controller(
+  'logAIUsage',
+  (req) => service.logAIUsage(req.body),
+  { statusCode: 201 }
+);
+
+// ─────────────────────────────────────────────────────────────
+// 10. Feature Flags
+// ─────────────────────────────────────────────────────────────
+
+exports.listFeatureFlags = controller('listFeatureFlags', () =>
+  service.listFeatureFlags()
+);
+
+exports.upsertFeatureFlag = controller('upsertFeatureFlag', (req) =>
+  service.upsertFeatureFlag(
+    req.params.feature,
+    Boolean(req.body?.enabled)
+  )
+);
+
+exports.bulkSetFeatureFlags = controller('bulkSetFeatureFlags', (req) =>
+  service.bulkSetFeatureFlags(req.body?.flags || [])
+);
+
+// ─────────────────────────────────────────────────────────────
+// 11. AI Prompts
+// ─────────────────────────────────────────────────────────────
+
+exports.listAIPrompts = controller('listAIPrompts', () =>
+  service.listAIPrompts()
+);
+
+exports.getAIPrompt = async (req, res, next) => {
   try {
-    const p = await svc.getAIPrompt(req.params.id);
-    if (!p) return res.status(404).json({ success: false, error: 'Prompt not found' });
-    ok(res, p);
-  } catch (e) { fail(res, next, e, 'getAIPrompt'); }
+    const prompt = await service.getAIPrompt(req.params.id);
+
+    if (!prompt) {
+      return res.status(404).json({
+        success: false,
+        error: 'Prompt not found',
+      });
+    }
+
+    return sendSuccess(res, prompt);
+  } catch (error) {
+    return handleError(res, next, error, 'getAIPrompt', {
+      promptId: req.params.id,
+    });
+  }
 };
-exports.createAIPrompt  = async (req, res, next) => {
-  try { ok(res, await svc.createAIPrompt(req.body), 201); } catch (e) { fail(res, next, e, 'createAIPrompt'); }
-};
-exports.updateAIPrompt  = async (req, res, next) => {
-  try { ok(res, await svc.updateAIPrompt(req.params.id, req.body)); } catch (e) { fail(res, next, e, 'updateAIPrompt'); }
-};
-exports.deleteAIPrompt  = async (req, res, next) => {
-  try { await svc.deleteAIPrompt(req.params.id); ok(res, { deleted: true }); } catch (e) { fail(res, next, e, 'deleteAIPrompt'); }
-};
 
+exports.createAIPrompt = controller(
+  'createAIPrompt',
+  (req) => service.createAIPrompt(req.body),
+  { statusCode: 201 }
+);
 
+exports.updateAIPrompt = controller('updateAIPrompt', (req) =>
+  service.updateAIPrompt(req.params.id, req.body)
+);
 
-
-
-
-
-
-
+exports.deleteAIPrompt = controller('deleteAIPrompt', async (req) => {
+  await service.deleteAIPrompt(req.params.id);
+  return { deleted: true };
+});

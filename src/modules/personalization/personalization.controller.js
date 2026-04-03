@@ -1,185 +1,263 @@
 'use strict';
 
 /**
- * personalization.controller.js
+ * src/modules/personalization/personalization.controller.js
  *
  * HTTP handlers for the AI Personalization Engine endpoints.
  *
  * Routes:
  *   GET  /api/v1/career/personalized-recommendations
  *   POST /api/v1/user/behavior-event
- *   GET  /api/v1/user/personalization-profile    (debug / dashboard)
- *   POST /api/v1/user/update-behavior-profile    (admin / manual trigger)
+ *   GET  /api/v1/user/personalization-profile
+ *   POST /api/v1/user/update-behavior-profile
  *
- * @module src/modules/personalization/personalization.controller
+ * Supabase migration notes:
+ * - Removed Firebase UID-first assumptions
+ * - Added Supabase JWT compatibility
+ * - Hardened body/query parsing
+ * - Improved error logging consistency
+ * - Preserved API response contracts
  */
 
-'use strict';
+const logger = require('../../utils/logger');
+const engine = require('../../engines/aiPersonalization.engine');
 
-const logger  = require('../../utils/logger');
-const engine  = require('../../engines/aiPersonalization.engine');
+// ───────────────────────────────────────────────────────────────────────────────
+// Response helpers
+// ───────────────────────────────────────────────────────────────────────────────
 
-// ─── Response helpers ─────────────────────────────────────────────────────────
-
-const ok  = (res, data)            => res.status(200).json({ success: true,  data });
-const bad = (res, msg, code = 400) => res.status(code).json({ success: false, error: msg });
-
-function _userId(req) {
-  return req.user?.uid || req.user?.id || null;
+function sendSuccess(res, data, statusCode = 200) {
+  return res.status(statusCode).json({
+    success: true,
+    data,
+  });
 }
 
-// ─── GET /career/personalized-recommendations ─────────────────────────────────
+function sendError(res, message, statusCode = 500, meta = undefined) {
+  return res.status(statusCode).json({
+    success: false,
+    error: message,
+    ...(meta ? { meta } : {}),
+  });
+}
 
-/**
- * Returns personalized career recommendations for the authenticated user.
- *
- * Query params:
- *   topN          — max results (default 10, max 30)
- *   forceRefresh  — 'true' to bypass cache and recompute
- *
- * Response includes:
- *   personalized_roles[]   — scored career list
- *   signal_strength        — none | low | medium | high | very_high
- *   has_personalization    — true if enough behavioral data exists
- *   personalization_score  — top role's composite score
- */
+// ───────────────────────────────────────────────────────────────────────────────
+// Request helpers
+// ───────────────────────────────────────────────────────────────────────────────
+
+function getAuthenticatedUserId(req) {
+  /**
+   * Supabase-compatible auth resolution
+   * preferred: id → sub
+   * legacy fallback: uid
+   */
+  return req.user?.id || req.user?.sub || req.user?.uid || null;
+}
+
+function parseInteger(value, fallback, { min = null, max = null } = {}) {
+  const parsed = Number.parseInt(value, 10);
+
+  if (Number.isNaN(parsed)) return fallback;
+
+  let safeValue = parsed;
+
+  if (min !== null) safeValue = Math.max(min, safeValue);
+  if (max !== null) safeValue = Math.min(max, safeValue);
+
+  return safeValue;
+}
+
+function parseBoolean(value, fallback = false) {
+  if (typeof value === 'boolean') return value;
+  if (typeof value !== 'string') return fallback;
+
+  const normalized = value.trim().toLowerCase();
+
+  if (['true', '1', 'yes'].includes(normalized)) return true;
+  if (['false', '0', 'no'].includes(normalized)) return false;
+
+  return fallback;
+}
+
+function sanitizeObject(value) {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? value
+    : {};
+}
+
+// ───────────────────────────────────────────────────────────────────────────────
+// GET /career/personalized-recommendations
+// ───────────────────────────────────────────────────────────────────────────────
+
 async function getPersonalizedRecommendations(req, res) {
-  const userId = _userId(req);
-  if (!userId) return bad(res, 'Unauthenticated', 401);
+  const userId = getAuthenticatedUserId(req);
 
-  const topN         = Math.min(parseInt(req.query.topN) || 10, 30);
-  const forceRefresh = req.query.forceRefresh === 'true';
+  if (!userId) {
+    return sendError(res, 'Unauthenticated', 401);
+  }
+
+  const topN = parseInteger(req.query.topN, 10, {
+    min: 1,
+    max: 30,
+  });
+
+  const forceRefresh = parseBoolean(req.query.forceRefresh, false);
 
   try {
     const result = await engine.recommendPersonalizedCareers(userId, {
-      topN, forceRefresh,
+      topN,
+      forceRefresh,
     });
-    ok(res, result);
-  } catch (e) {
-    logger.error('[PersonalizationController] getPersonalizedRecommendations error', {
-      userId, err: e.message,
-    });
-    bad(res, 'Failed to load personalized recommendations', 500);
+
+    return sendSuccess(res, result);
+  } catch (error) {
+    logger.error(
+      '[PersonalizationController] getPersonalizedRecommendations failed',
+      {
+        userId,
+        query: req.query,
+        error: error.message,
+        stack: error.stack,
+      }
+    );
+
+    return sendError(
+      res,
+      'Failed to load personalized recommendations',
+      500
+    );
   }
 }
 
-// ─── POST /user/behavior-event ────────────────────────────────────────────────
+// ───────────────────────────────────────────────────────────────────────────────
+// POST /user/behavior-event
+// ───────────────────────────────────────────────────────────────────────────────
 
-/**
- * Track a user behavior event.
- *
- * Body:
- *   event_type    {string}  required — one of EVENT_TYPES
- *   entity_type   {string}  optional — 'role' | 'skill' | 'course' | 'module'
- *   entity_id     {string}  optional — identifier of the entity interacted with
- *   entity_label  {string}  optional — human-readable label for entity
- *   metadata      {object}  optional — additional context
- *   session_id    {string}  optional — client session ID
- *
- * Example body:
- *   { "event_type": "job_click", "entity_type": "role", "entity_id": "data_analyst",
- *     "entity_label": "Data Analyst", "metadata": { "source": "job_matches_page" } }
- */
 async function trackBehaviorEvent(req, res) {
-  const userId = _userId(req);
-  if (!userId) return bad(res, 'Unauthenticated', 401);
+  const userId = getAuthenticatedUserId(req);
+
+  if (!userId) {
+    return sendError(res, 'Unauthenticated', 401);
+  }
 
   const {
     event_type,
-    entity_type,
-    entity_id,
-    entity_label,
-    metadata,
-    session_id,
-  } = req.body;
+    entity_type = null,
+    entity_id = null,
+    entity_label = null,
+    metadata = {},
+    session_id = null,
+  } = req.body || {};
 
-  if (!event_type) return bad(res, '"event_type" is required');
+  if (!event_type || typeof event_type !== 'string') {
+    return sendError(res, '"event_type" is required', 400);
+  }
 
   try {
     const result = await engine.trackBehaviorEvent(userId, {
-      event_type,
+      event_type: event_type.trim(),
       entity_type,
       entity_id,
       entity_label,
-      metadata,
+      metadata: sanitizeObject(metadata),
       session_id,
     });
 
-    ok(res, {
-      recorded:              true,
-      event_id:              result.id,
-      queued_profile_update: result.queued_profile_update,
+    return sendSuccess(res, {
+      recorded: true,
+      event_id: result?.id ?? null,
+      queued_profile_update: result?.queued_profile_update ?? false,
     });
-  } catch (e) {
-    logger.error('[PersonalizationController] trackBehaviorEvent error', {
-      userId, event_type, err: e.message,
+  } catch (error) {
+    logger.error('[PersonalizationController] trackBehaviorEvent failed', {
+      userId,
+      event_type,
+      error: error.message,
+      stack: error.stack,
     });
-    bad(res, 'Failed to record behavior event', 500);
+
+    return sendError(res, 'Failed to record behavior event', 500);
   }
 }
 
-// ─── GET /user/personalization-profile ───────────────────────────────────────
+// ───────────────────────────────────────────────────────────────────────────────
+// GET /user/personalization-profile
+// ───────────────────────────────────────────────────────────────────────────────
 
-/**
- * Returns the user's current personalization profile.
- * Useful for dashboard display and debugging.
- */
 async function getPersonalizationProfile(req, res) {
-  const userId = _userId(req);
-  if (!userId) return bad(res, 'Unauthenticated', 401);
+  const userId = getAuthenticatedUserId(req);
+
+  if (!userId) {
+    return sendError(res, 'Unauthenticated', 401);
+  }
 
   try {
     const profile = await engine.getPersonalizationProfile(userId);
 
     if (!profile) {
-      return ok(res, {
-        user_id:              userId,
-        has_profile:          false,
-        preferred_roles:      [],
-        preferred_skills:     [],
-        career_interests:     [],
-        active_modules:       [],
-        engagement_score:     0,
-        total_events:         0,
+      return sendSuccess(res, {
+        user_id: userId,
+        has_profile: false,
+        preferred_roles: [],
+        preferred_skills: [],
+        career_interests: [],
+        active_modules: [],
+        engagement_score: 0,
+        total_events: 0,
         profile_completeness: 0,
-        message:              'No personalization data yet. Interact with the platform to build your profile.',
+        message:
+          'No personalization data yet. Interact with the platform to build your profile.',
       });
     }
 
-    ok(res, { ...profile, has_profile: true });
-  } catch (e) {
-    logger.error('[PersonalizationController] getPersonalizationProfile error', {
-      userId, err: e.message,
+    return sendSuccess(res, {
+      ...profile,
+      has_profile: true,
     });
-    bad(res, 'Failed to load personalization profile', 500);
+  } catch (error) {
+    logger.error(
+      '[PersonalizationController] getPersonalizationProfile failed',
+      {
+        userId,
+        error: error.message,
+        stack: error.stack,
+      }
+    );
+
+    return sendError(res, 'Failed to load personalization profile', 500);
   }
 }
 
-// ─── POST /user/update-behavior-profile ──────────────────────────────────────
+// ───────────────────────────────────────────────────────────────────────────────
+// POST /user/update-behavior-profile
+// ───────────────────────────────────────────────────────────────────────────────
 
-/**
- * Manually trigger a behavior profile update.
- * Useful after a batch of events, or after initial onboarding.
- */
 async function updateBehaviorProfile(req, res) {
-  const userId = _userId(req);
-  if (!userId) return bad(res, 'Unauthenticated', 401);
+  const userId = getAuthenticatedUserId(req);
+
+  if (!userId) {
+    return sendError(res, 'Unauthenticated', 401);
+  }
 
   try {
     const profile = await engine.updateBehaviorProfile(userId);
-    ok(res, {
-      updated:              true,
-      total_events:         profile.total_events,
-      roles_detected:       (profile.preferred_roles || []).length,
-      skills_detected:      (profile.preferred_skills || []).length,
-      engagement_score:     profile.engagement_score,
-      profile_completeness: profile.profile_completeness,
+
+    return sendSuccess(res, {
+      updated: true,
+      total_events: profile?.total_events ?? 0,
+      roles_detected: profile?.preferred_roles?.length ?? 0,
+      skills_detected: profile?.preferred_skills?.length ?? 0,
+      engagement_score: profile?.engagement_score ?? 0,
+      profile_completeness: profile?.profile_completeness ?? 0,
     });
-  } catch (e) {
-    logger.error('[PersonalizationController] updateBehaviorProfile error', {
-      userId, err: e.message,
+  } catch (error) {
+    logger.error('[PersonalizationController] updateBehaviorProfile failed', {
+      userId,
+      error: error.message,
+      stack: error.stack,
     });
-    bad(res, 'Failed to update behavior profile', 500);
+
+    return sendError(res, 'Failed to update behavior profile', 500);
   }
 }
 
@@ -189,12 +267,3 @@ module.exports = {
   getPersonalizationProfile,
   updateBehaviorProfile,
 };
-
-
-
-
-
-
-
-
-

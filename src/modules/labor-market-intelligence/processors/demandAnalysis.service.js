@@ -1,19 +1,20 @@
 'use strict';
 
 /**
- * processors/demandAnalysis.service.js
+ * src/modules/labor-market-intelligence/processors/demandAnalysis.service.js
  *
- * Analyses job market data to compute:
- *   - Skill demand scores (0–100)
- *   - Career demand scores (0–100)
- *   - Salary benchmarks per career
+ * Computes:
+ * - skill demand scores
+ * - career market scores
+ * - salary benchmark projections
  *
- * Reads from:  lmi_job_market_data (Supabase)
- * Writes to:   lmi_skill_demand, lmi_career_market_scores (Supabase)
- *
- * Called by:   marketTrend.service.js → full refresh cycle
- *              market.controller.js   → POST /api/v1/market/refresh
+ * Fully Supabase-optimized:
+ * - row-based SQL reads
+ * - bulk upserts
+ * - reduced memory churn
+ * - O(n) aggregation passes
  */
+
 const { supabase } = require('../../../config/supabase');
 const logger = require('../../../utils/logger');
 const {
@@ -25,10 +26,10 @@ const {
   aggregateSkillCounts
 } = require('./skillExtraction.service');
 
-// ─── Career title normalisation ───────────────────────────────────────────────
-// Maps raw job titles from postings → canonical career names used by CSPE/CDTE
+const UPSERT_CHUNK_SIZE = 500;
+const MAX_SKILL_RESULTS = 50;
 
-const TITLE_MAP = {
+const TITLE_MAP = Object.freeze({
   'software engineer': 'Software Engineer',
   'senior software engineer': 'Software Engineer',
   'software developer': 'Software Engineer',
@@ -52,10 +53,9 @@ const TITLE_MAP = {
   'corporate lawyer': 'Lawyer',
   'ux designer': 'UX Designer',
   'content strategist': 'Journalist / Writer'
-};
+});
 
-// Automation risk estimates per career (0–100, higher = more at risk)
-const AUTOMATION_RISK = {
+const AUTOMATION_RISK = Object.freeze({
   'Software Engineer': 15,
   'AI / ML Engineer': 8,
   'Data Scientist': 12,
@@ -63,230 +63,307 @@ const AUTOMATION_RISK = {
   'Systems Architect': 18,
   'Doctor (MBBS / MD)': 5,
   'Biomedical Researcher': 12,
-  'Pharmacist': 45,
+  Pharmacist: 45,
   'Chartered Accountant': 38,
   'Investment Banker': 30,
-  'Entrepreneur': 10,
+  Entrepreneur: 10,
   'Marketing Manager': 28,
-  'Lawyer': 22,
+  Lawyer: 22,
   'Journalist / Writer': 48,
   'UX Designer': 20,
   'Civil Services (IAS/IPS)': 5
-};
+});
 
-// ─── Helpers ──────────────────────────────────────────────────────────────────
+// ───────────────────────────────────────────────────────────────────────────────
+// Public API
+// ───────────────────────────────────────────────────────────────────────────────
 
-function _normalise(value, max, min = 0) {
-  if (max === min) return 50;
-  return Math.round((value - min) / (max - min) * 100);
-}
-
-function _clamp(n, lo, hi) {
-  return Math.min(hi, Math.max(lo, n));
-}
-
-// ─── Core analysis ────────────────────────────────────────────────────────────
-
-/**
- * Full demand analysis cycle:
- *   1. Load all job market docs from Supabase
- *   2. Compute skill demand scores
- *   3. Compute career demand + salary benchmarks
- *   4. Persist results
- *
- * @returns {{ skills_updated: number, careers_updated: number }}
- */
 async function runFullAnalysis() {
   logger.info('[DemandAnalysis] Starting full analysis cycle');
 
-  // ── Load job data ─────────────────────────────────────────────────────
-  const { data: jobs, error } = await supabase
-    .from(COLLECTIONS.JOB_MARKET)
-    .select('*');
+  const jobs = await loadJobs();
 
-  if (error) throw error;
-
-  if (!jobs || jobs.length === 0) {
+  if (jobs.length === 0) {
     logger.warn('[DemandAnalysis] No job data found — run collector first');
     return { skills_updated: 0, careers_updated: 0 };
   }
 
-  logger.info({ count: jobs.length }, '[DemandAnalysis] Loaded job docs');
+  logger.info(
+    { count: jobs.length },
+    '[DemandAnalysis] Loaded job rows'
+  );
 
-  // ── Skill demand ──────────────────────────────────────────────────────
-  const skillsUpdated = await _analyseSkillDemand(jobs);
+  const [skillsUpdated, careersUpdated] = await Promise.all([
+    analyseSkillDemand(jobs),
+    analyseCareerDemand(jobs)
+  ]);
 
-  // ── Career demand + salaries ──────────────────────────────────────────
-  const careersUpdated = await _analyseCareerDemand(jobs);
+  logger.info(
+    { skillsUpdated, careersUpdated },
+    '[DemandAnalysis] Analysis complete'
+  );
 
-  logger.info({ skillsUpdated, careersUpdated }, '[DemandAnalysis] Analysis complete');
-  return { skills_updated: skillsUpdated, careers_updated: careersUpdated };
+  return {
+    skills_updated: skillsUpdated,
+    careers_updated: careersUpdated
+  };
 }
 
-// ─── Skill demand ─────────────────────────────────────────────────────────────
-
-async function _analyseSkillDemand(jobs) {
-  const skillCounts = aggregateSkillCounts(jobs);
-  if (skillCounts.size === 0) return 0;
-
-  const maxCount = Math.max(...skillCounts.values());
-  const minCount = Math.min(...skillCounts.values());
-
-  // Estimate growth_rate from posting recency (recent = high growth proxy)
-  // For mock data we use count share as a growth proxy
-  const totalJobs = jobs.length;
-  const rows = [];
-
-  for (const [skill, count] of skillCounts.entries()) {
-    const demand_score = _normalise(count, maxCount, minCount);
-    const growth_rate = _clamp(count / totalJobs, 0, 1);
-
-    // Derive industries from jobs that list this skill
-    const industries = [
-      ...new Set(
-        jobs
-          .filter(j => (j.skills ?? []).some(s => s.toLowerCase() === skill.toLowerCase()))
-          .map(j => j.industry)
-          .filter(Boolean)
-      )
-    ].slice(0, 5);
-
-    const docId = skill.toLowerCase().replace(/[^a-z0-9]/g, '_');
-    rows.push({
-      id: docId,
-      ...buildSkillDemandDoc({
-        skill_name: skill,
-        demand_score,
-        growth_rate,
-        industry_usage: industries,
-        job_count: count
-      }),
-      updated_at: new Date().toISOString()
-    });
-  }
-
-  const { error } = await supabase
-    .from(COLLECTIONS.SKILL_DEMAND)
-    .upsert(rows);
-
-  if (error) throw error;
-  return rows.length;
-}
-
-// ─── Career demand ────────────────────────────────────────────────────────────
-
-async function _analyseCareerDemand(jobs) {
-  // Group jobs by normalised career
-  const careerGroups = new Map();
-  for (const job of jobs) {
-    const rawTitle = (job.job_title ?? '').toLowerCase().trim();
-    const canonical = TITLE_MAP[rawTitle] ?? null;
-    if (!canonical) continue;
-    if (!careerGroups.has(canonical)) careerGroups.set(canonical, []);
-    careerGroups.get(canonical).push(job);
-  }
-
-  if (careerGroups.size === 0) return 0;
-
-  const maxCount = Math.max(...[...careerGroups.values()].map(g => g.length));
-  const minCount = Math.min(...[...careerGroups.values()].map(g => g.length));
-  const rows = [];
-
-  for (const [career, careerJobs] of careerGroups.entries()) {
-    const count = careerJobs.length;
-
-    // ── Salary benchmarks ─────────────────────────────────────────────
-    const salaries = careerJobs
-      .map(j => (j.salary_min ?? 0 + j.salary_max ?? 0) / 2)
-      .filter(s => s > 0);
-    const avgSalary = salaries.length
-      ? Math.round(salaries.reduce((a, b) => a + b, 0) / salaries.length)
-      : 0;
-
-    // Simple projection (mirrors Digital Twin engine logic)
-    const growthRate = 0.12 + count / (maxCount * 5); // 12–32% range
-    const avg5yrSalary = Math.round(avgSalary * Math.pow(1 + growthRate, 4));
-    const avg10yrSalary = Math.round(avgSalary * Math.pow(1 + growthRate, 9));
-
-    // ── Scores ────────────────────────────────────────────────────────
-    const demand_score = _normalise(count, maxCount, minCount);
-    const salary_growth = _clamp(growthRate, 0, 1);
-    const automation_risk = AUTOMATION_RISK[career] ?? 30;
-
-    // Trend score: weighted combination
-    const trend_score = Math.round(
-      demand_score * 0.5 +
-      (1 - automation_risk / 100) * 100 * 0.3 +
-      _clamp(salary_growth / 0.3 * 100, 0, 100) * 0.2
-    );
-
-    // Top skills for this career
-    const skillMap = aggregateSkillCounts(careerJobs);
-    const topSkills = [...skillMap.entries()]
-      .sort((a, b) => b[1] - a[1])
-      .slice(0, 6)
-      .map(([s]) => s);
-
-    const docId = career.toLowerCase().replace(/[^a-z0-9]/g, '_');
-    rows.push({
-      id: docId,
-      ...buildCareerScoreDoc({
-        career_name: career,
-        demand_score,
-        salary_growth,
-        automation_risk,
-        trend_score,
-        avg_entry_salary: avgSalary,
-        avg_5yr_salary: avg5yrSalary,
-        avg_10yr_salary: avg10yrSalary,
-        top_skills: topSkills
-      }),
-      updated_at: new Date().toISOString()
-    });
-  }
-
-  const { error } = await supabase
-    .from(COLLECTIONS.CAREER_SCORES)
-    .upsert(rows);
-
-  if (error) throw error;
-  return rows.length;
-}
-
-/**
- * Load all career market scores as a plain object keyed by career name.
- * Used by the orchestrator to inject live market signals into engines.
- *
- * @returns {Promise<Record<string, CareerMarketScore>>}
- */
 async function loadCareerScores() {
   const { data, error } = await supabase
     .from(COLLECTIONS.CAREER_SCORES)
     .select('*');
 
-  if (error) throw error;
-
-  const result = {};
-  for (const row of (data ?? [])) {
-    if (row.career_name) result[row.career_name] = row;
+  if (error) {
+    throw new Error(`[DemandAnalysis] Failed loading career scores: ${error.message}`);
   }
-  return result;
+
+  return Object.fromEntries(
+    (data || [])
+      .filter((row) => row?.career_name)
+      .map((row) => [row.career_name, row])
+  );
 }
 
-/**
- * Load all skill demand scores as an array, sorted by demand_score desc.
- *
- * @returns {Promise<SkillDemandDoc[]>}
- */
 async function loadSkillDemand() {
   const { data, error } = await supabase
     .from(COLLECTIONS.SKILL_DEMAND)
     .select('*')
     .order('demand_score', { ascending: false })
-    .limit(50);
+    .limit(MAX_SKILL_RESULTS);
 
-  if (error) throw error;
-  return data ?? [];
+  if (error) {
+    throw new Error(`[DemandAnalysis] Failed loading skill demand: ${error.message}`);
+  }
+
+  return data || [];
+}
+
+// ───────────────────────────────────────────────────────────────────────────────
+// Core Analysis
+// ───────────────────────────────────────────────────────────────────────────────
+
+async function analyseSkillDemand(jobs) {
+  const skillCounts = aggregateSkillCounts(jobs);
+
+  if (skillCounts.size === 0) {
+    return 0;
+  }
+
+  const counts = [...skillCounts.values()];
+  const maxCount = Math.max(...counts);
+  const minCount = Math.min(...counts);
+  const totalJobs = jobs.length;
+  const updatedAt = new Date().toISOString();
+
+  const skillIndustryMap = buildSkillIndustryMap(jobs);
+  const rows = [];
+
+  for (const [skill, count] of skillCounts.entries()) {
+    rows.push({
+      id: toDocId(skill),
+      ...buildSkillDemandDoc({
+        skill_name: skill,
+        demand_score: normalise(count, maxCount, minCount),
+        growth_rate: clamp(count / totalJobs, 0, 1),
+        industry_usage: skillIndustryMap.get(skill) || [],
+        job_count: count
+      }),
+      updated_at: updatedAt
+    });
+  }
+
+  await bulkUpsert(COLLECTIONS.SKILL_DEMAND, rows);
+  return rows.length;
+}
+
+async function analyseCareerDemand(jobs) {
+  const careerGroups = groupJobsByCareer(jobs);
+
+  if (careerGroups.size === 0) {
+    return 0;
+  }
+
+  const counts = [...careerGroups.values()].map((rows) => rows.length);
+  const maxCount = Math.max(...counts);
+  const minCount = Math.min(...counts);
+  const updatedAt = new Date().toISOString();
+
+  const rows = [];
+
+  for (const [career, careerJobs] of careerGroups.entries()) {
+    const count = careerJobs.length;
+    const avgSalary = calculateAverageSalary(careerJobs);
+
+    const growthRate = 0.12 + count / (maxCount * 5);
+    const salaryGrowth = clamp(growthRate, 0, 1);
+    const avg5yrSalary = Math.round(avgSalary * Math.pow(1 + salaryGrowth, 4));
+    const avg10yrSalary = Math.round(avgSalary * Math.pow(1 + salaryGrowth, 9));
+
+    const demandScore = normalise(count, maxCount, minCount);
+    const automationRisk = AUTOMATION_RISK[career] ?? 30;
+
+    const trendScore = Math.round(
+      demandScore * 0.5 +
+      (1 - automationRisk / 100) * 100 * 0.3 +
+      clamp((salaryGrowth / 0.3) * 100, 0, 100) * 0.2
+    );
+
+    const topSkills = getTopSkills(careerJobs);
+
+    rows.push({
+      id: toDocId(career),
+      ...buildCareerScoreDoc({
+        career_name: career,
+        demand_score: demandScore,
+        salary_growth: salaryGrowth,
+        automation_risk: automationRisk,
+        trend_score: trendScore,
+        avg_entry_salary: avgSalary,
+        avg_5yr_salary: avg5yrSalary,
+        avg_10yr_salary: avg10yrSalary,
+        top_skills: topSkills
+      }),
+      updated_at: updatedAt
+    });
+  }
+
+  await bulkUpsert(COLLECTIONS.CAREER_SCORES, rows);
+  return rows.length;
+}
+
+// ───────────────────────────────────────────────────────────────────────────────
+// DB Helpers
+// ───────────────────────────────────────────────────────────────────────────────
+
+async function loadJobs() {
+  const { data, error } = await supabase
+    .from(COLLECTIONS.JOB_MARKET)
+    .select(`
+      job_title,
+      salary_min,
+      salary_max,
+      skills,
+      industry
+    `);
+
+  if (error) {
+    throw new Error(`[DemandAnalysis] Failed loading jobs: ${error.message}`);
+  }
+
+  return data || [];
+}
+
+async function bulkUpsert(table, rows) {
+  for (let i = 0; i < rows.length; i += UPSERT_CHUNK_SIZE) {
+    const chunk = rows.slice(i, i + UPSERT_CHUNK_SIZE);
+
+    const { error } = await supabase
+      .from(table)
+      .upsert(chunk);
+
+    if (error) {
+      throw new Error(`[DemandAnalysis] Upsert failed for ${table}: ${error.message}`);
+    }
+  }
+}
+
+// ───────────────────────────────────────────────────────────────────────────────
+// Pure Helpers
+// ───────────────────────────────────────────────────────────────────────────────
+
+function groupJobsByCareer(jobs) {
+  const groups = new Map();
+
+  for (const job of jobs) {
+    const rawTitle = String(job?.job_title || '')
+      .trim()
+      .toLowerCase();
+
+    const canonical = TITLE_MAP[rawTitle];
+    if (!canonical) continue;
+
+    if (!groups.has(canonical)) {
+      groups.set(canonical, []);
+    }
+
+    groups.get(canonical).push(job);
+  }
+
+  return groups;
+}
+
+function buildSkillIndustryMap(jobs) {
+  const map = new Map();
+
+  for (const job of jobs) {
+    const skills = Array.isArray(job?.skills) ? job.skills : [];
+    const industry = job?.industry;
+
+    for (const rawSkill of skills) {
+      const skill = String(rawSkill || '').trim();
+      if (!skill) continue;
+
+      if (!map.has(skill)) {
+        map.set(skill, new Set());
+      }
+
+      if (industry) {
+        map.get(skill).add(industry);
+      }
+    }
+  }
+
+  const normalized = new Map();
+
+  for (const [skill, industries] of map.entries()) {
+    normalized.set(skill, [...industries].slice(0, 5));
+  }
+
+  return normalized;
+}
+
+function calculateAverageSalary(jobs) {
+  const salaries = jobs
+    .map((job) => {
+      const min = Number(job?.salary_min) || 0;
+      const max = Number(job?.salary_max) || 0;
+      const avg = (min + max) / 2;
+      return avg > 0 ? avg : null;
+    })
+    .filter(Boolean);
+
+  if (salaries.length === 0) {
+    return 0;
+  }
+
+  return Math.round(
+    salaries.reduce((sum, value) => sum + value, 0) / salaries.length
+  );
+}
+
+function getTopSkills(jobs) {
+  const skillMap = aggregateSkillCounts(jobs);
+
+  return [...skillMap.entries()]
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 6)
+    .map(([skill]) => skill);
+}
+
+function normalise(value, max, min = 0) {
+  if (max === min) return 50;
+  return Math.round(((value - min) / (max - min)) * 100);
+}
+
+function clamp(value, min, max) {
+  return Math.min(max, Math.max(min, value));
+}
+
+function toDocId(value) {
+  return String(value || '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]/g, '_');
 }
 
 module.exports = {

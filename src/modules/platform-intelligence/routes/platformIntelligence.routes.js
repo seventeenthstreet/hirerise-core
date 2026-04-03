@@ -1,94 +1,165 @@
 'use strict';
 
 /**
- * routes/platformIntelligence.routes.js
+ * src/modules/platform-intelligence/routes/platformIntelligence.routes.js
  *
- * Mounted at: /api/v1/admin/platform-intelligence
- * Auth stack: authenticate + requireAdmin (applied in server.js)
+ * Mounted at:
+ *   /api/v1/admin/platform-intelligence
  *
- * Sub-routes:
- *   /ai-settings            — AI engine config (singleton)
- *   /market-sources         — LMI data source CRUD
- *   /career-datasets        — Dataset metadata CRUD
- *   /chi-weights            — CHI scoring weights (singleton)
- *   /skill-taxonomy         — Hierarchical skill nodes CRUD
- *   /career-paths           — Career transition rules CRUD
- *   /training-sources       — Course providers CRUD
- *   /subscription-plans     — Plan limits
- *   /ai-usage               — Usage analytics + log ingestion
- *   /feature-flags          — Per-feature on/off toggles
- *   /ai-prompts             — Engine prompt CRUD
+ * Auth middleware stack:
+ *   authenticate + requireAdmin
+ *
+ * Notes:
+ * - Controller/service/model layers are fully Supabase-native
+ * - Route order preserves static paths before dynamic params
+ * - Uses grouped route chaining for maintainability
  */
 
 const express = require('express');
-const router  = express.Router();
-const c       = require('../controllers/platformIntelligence.controller');
+const router = express.Router();
+const controller = require('../controllers/platformIntelligence.controller');
 
-// 1. AI Settings
-router.get ('/ai-settings',         c.getAISettings);
-router.post('/ai-settings',         c.upsertAISettings);
+// ─────────────────────────────────────────────────────────────
+// 1. AI Settings (singleton)
+// ─────────────────────────────────────────────────────────────
 
+router
+  .route('/ai-settings')
+  .get(controller.getAISettings)
+  .post(controller.upsertAISettings);
+
+// ─────────────────────────────────────────────────────────────
 // 2. Market Data Sources
-router.get   ('/market-sources',        c.listMarketSources);
-router.post  ('/market-sources',        c.createMarketSource);
-router.put   ('/market-sources/:id',    c.updateMarketSource);
-router.delete('/market-sources/:id',    c.deleteMarketSource);
+// ─────────────────────────────────────────────────────────────
 
+router
+  .route('/market-sources')
+  .get(controller.listMarketSources)
+  .post(controller.createMarketSource);
+
+router
+  .route('/market-sources/:id')
+  .put(controller.updateMarketSource)
+  .delete(controller.deleteMarketSource);
+
+// ─────────────────────────────────────────────────────────────
 // 3. Career Datasets
-router.get   ('/career-datasets',       c.listCareerDatasets);
-router.post  ('/career-datasets',       c.createCareerDataset);
-router.put   ('/career-datasets/:id',   c.updateCareerDataset);
-router.delete('/career-datasets/:id',   c.deleteCareerDataset);
+// ─────────────────────────────────────────────────────────────
 
-// 4. CHI Weights
-router.get ('/chi-weights',        c.getCHIWeights);
-router.post('/chi-weights',        c.upsertCHIWeights);
+router
+  .route('/career-datasets')
+  .get(controller.listCareerDatasets)
+  .post(controller.createCareerDataset);
 
+router
+  .route('/career-datasets/:id')
+  .put(controller.updateCareerDataset)
+  .delete(controller.deleteCareerDataset);
+
+// ─────────────────────────────────────────────────────────────
+// 4. CHI Weights (singleton)
+// ─────────────────────────────────────────────────────────────
+
+router
+  .route('/chi-weights')
+  .get(controller.getCHIWeights)
+  .post(controller.upsertCHIWeights);
+
+// ─────────────────────────────────────────────────────────────
 // 5. Skill Taxonomy
-router.get   ('/skill-taxonomy',        c.listSkillTaxonomy);
-router.post  ('/skill-taxonomy',        c.createSkillTaxonomy);
-router.put   ('/skill-taxonomy/:id',    c.updateSkillTaxonomy);
-router.delete('/skill-taxonomy/:id',    c.deleteSkillTaxonomy);
+// ─────────────────────────────────────────────────────────────
 
+router
+  .route('/skill-taxonomy')
+  .get(controller.listSkillTaxonomy)
+  .post(controller.createSkillTaxonomy);
+
+router
+  .route('/skill-taxonomy/:id')
+  .put(controller.updateSkillTaxonomy)
+  .delete(controller.deleteSkillTaxonomy);
+
+// ─────────────────────────────────────────────────────────────
 // 6. Career Paths
-router.get   ('/career-paths',          c.listCareerPaths);
-router.post  ('/career-paths',          c.createCareerPath);
-router.put   ('/career-paths/:id',      c.updateCareerPath);
-router.delete('/career-paths/:id',      c.deleteCareerPath);
+// ─────────────────────────────────────────────────────────────
 
+router
+  .route('/career-paths')
+  .get(controller.listCareerPaths)
+  .post(controller.createCareerPath);
+
+router
+  .route('/career-paths/:id')
+  .put(controller.updateCareerPath)
+  .delete(controller.deleteCareerPath);
+
+// ─────────────────────────────────────────────────────────────
 // 7. Training Sources
-router.get   ('/training-sources',      c.listTrainingSources);
-router.post  ('/training-sources',      c.createTrainingSource);
-router.put   ('/training-sources/:id',  c.updateTrainingSource);
-router.delete('/training-sources/:id',  c.deleteTrainingSource);
+// ─────────────────────────────────────────────────────────────
 
+router
+  .route('/training-sources')
+  .get(controller.listTrainingSources)
+  .post(controller.createTrainingSource);
+
+router
+  .route('/training-sources/:id')
+  .put(controller.updateTrainingSource)
+  .delete(controller.deleteTrainingSource);
+
+// ─────────────────────────────────────────────────────────────
 // 8. Subscription Plans
-router.get('/subscription-plans',            c.listSubscriptionPlans);
-router.put('/subscription-plans/:plan',      c.upsertSubscriptionPlan);
+// ─────────────────────────────────────────────────────────────
 
+router
+  .route('/subscription-plans')
+  .get(controller.listSubscriptionPlans);
+
+router
+  .route('/subscription-plans/:plan')
+  .put(controller.upsertSubscriptionPlan);
+
+// ─────────────────────────────────────────────────────────────
 // 9. AI Usage Analytics
-router.get ('/ai-usage',           c.getAIUsageAnalytics);
-router.post('/ai-usage/log',       c.logAIUsage);
+// ─────────────────────────────────────────────────────────────
 
+router
+  .route('/ai-usage')
+  .get(controller.getAIUsageAnalytics);
+
+router
+  .route('/ai-usage/log')
+  .post(controller.logAIUsage);
+
+// ─────────────────────────────────────────────────────────────
 // 10. Feature Flags
-router.get  ('/feature-flags',             c.listFeatureFlags);
-router.put  ('/feature-flags/:feature',    c.upsertFeatureFlag);
-router.post ('/feature-flags/bulk',        c.bulkSetFeatureFlags);
+// ─────────────────────────────────────────────────────────────
 
+router
+  .route('/feature-flags')
+  .get(controller.listFeatureFlags);
+
+router
+  .route('/feature-flags/bulk')
+  .post(controller.bulkSetFeatureFlags);
+
+router
+  .route('/feature-flags/:feature')
+  .put(controller.upsertFeatureFlag);
+
+// ─────────────────────────────────────────────────────────────
 // 11. AI Prompts
-router.get   ('/ai-prompts',               c.listAIPrompts);
-router.get   ('/ai-prompts/:id',           c.getAIPrompt);
-router.post  ('/ai-prompts',               c.createAIPrompt);
-router.put   ('/ai-prompts/:id',           c.updateAIPrompt);
-router.delete('/ai-prompts/:id',           c.deleteAIPrompt);
+// ─────────────────────────────────────────────────────────────
+
+router
+  .route('/ai-prompts')
+  .get(controller.listAIPrompts)
+  .post(controller.createAIPrompt);
+
+router
+  .route('/ai-prompts/:id')
+  .get(controller.getAIPrompt)
+  .put(controller.updateAIPrompt)
+  .delete(controller.deleteAIPrompt);
 
 module.exports = router;
-
-
-
-
-
-
-
-
-

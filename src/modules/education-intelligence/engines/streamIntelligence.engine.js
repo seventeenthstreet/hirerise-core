@@ -3,209 +3,230 @@
 /**
  * engines/streamIntelligence.engine.js
  *
- * Combines outputs from all three upstream engines into a final stream
- * recommendation with a confidence score and human-readable rationale.
- *
- * Scoring formula per stream:
- *
- *   raw_score =
- *       (academic_subject_score  × WEIGHT.academic)
- *     + (cognitive_affinity      × WEIGHT.cognitive)
- *     + (activity_influence_norm × WEIGHT.activity)
- *     + (learning_velocity_bonus × WEIGHT.velocity)
- *
- *   confidence = (top_score − second_score) / top_score × 100
- *                clamped to 0–99
- *
- * Weights are tuned so that academic performance is the primary signal
- * (50%), cognitive ability is secondary (30%), and activities + velocity
- * are supporting signals (10% each).
- *
- * Input:
- *   context        — { studentId, student, academics, activities, cognitive }
- *   academicResult — output of AcademicTrendEngine.analyze()
- *   cognitiveResult— output of CognitiveProfileEngine.analyze()
- *   activityResult — output of ActivityAnalyzerEngine.analyze()
- *
- * Output:
- * {
- *   recommended_stream:  'engineering',
- *   recommended_label:   'Computer Science',
- *   confidence:          84,
- *   alternative_stream:  'commerce',
- *   alternative_label:   'Commerce',
- *   stream_scores: {
- *     engineering: 84,
- *     medical:     34,
- *     commerce:    72,
- *     humanities:  55,
- *   },
- *   rationale: 'Strong Mathematics (88%) and analytical thinking (84) align well with Computer Science.',
- *   engine_version: '1.0.0',
- * }
+ * Final stream recommendation intelligence engine.
+ * Deterministic, production-hardened.
  */
 
 const { STREAMS } = require('../models/academic.model');
 
-const ENGINE_VERSION = '1.0.0';
+const ENGINE_VERSION = '1.1.0';
 
-// ─── Score weights ────────────────────────────────────────────────────────────
+const WEIGHT = Object.freeze({
+  academic: 0.5,
+  cognitive: 0.3,
+  activity: 0.1,
+  velocity: 0.1
+});
 
-const WEIGHT = {
-  academic:  0.50,  // academic subject score (0–100)
-  cognitive: 0.30,  // cognitive stream affinity (0–100)
-  activity:  0.10,  // activity influence normalised (0–100)
-  velocity:  0.10,  // learning velocity bonus (0–100, clamped)
-};
-
-// Activity influence max (matches activityAnalyzer cap) — used for normalisation
 const ACTIVITY_MAX = 30;
+const VELOCITY_MIN = -10;
+const VELOCITY_MAX = 10;
 
-// Velocity range for bonus normalisation
-const VELOCITY_MIN = -10;   // full decline
-const VELOCITY_MAX =  10;   // strong improvement
+const STREAM_ORDER = Object.freeze([
+  STREAMS.ENGINEERING,
+  STREAMS.MEDICAL,
+  STREAMS.COMMERCE,
+  STREAMS.HUMANITIES
+]);
 
-// Stream display labels
-const STREAM_LABEL = {
+const STREAM_LABEL = Object.freeze({
   [STREAMS.ENGINEERING]: 'Computer Science',
-  [STREAMS.MEDICAL]:     'Bio-Maths',
-  [STREAMS.COMMERCE]:    'Commerce',
-  [STREAMS.HUMANITIES]:  'Humanities',
-};
+  [STREAMS.MEDICAL]: 'Bio-Maths',
+  [STREAMS.COMMERCE]: 'Commerce',
+  [STREAMS.HUMANITIES]: 'Humanities'
+});
 
-// ─── Main ─────────────────────────────────────────────────────────────────────
+async function recommend(
+  context,
+  academicResult,
+  cognitiveResult,
+  activityResult
+) {
+  const rawScores = {};
 
-/**
- * @param {object} context
- * @param {object} academicResult   — from AcademicTrendEngine.analyze()
- * @param {object} cognitiveResult  — from CognitiveProfileEngine.analyze()
- * @param {object} activityResult   — from ActivityAnalyzerEngine.analyze()
- * @returns {Promise<StreamRecommendation>}
- */
-async function recommend(context, academicResult, cognitiveResult, activityResult) {
-  const streams = Object.values(STREAMS);
+  for (const stream of STREAM_ORDER) {
+    const academicScore =
+      Number(
+        academicResult?.stream_subject_scores?.[
+          stream
+        ]
+      ) || 0;
 
-  // ── 1. Compute raw score for each stream ─────────────────────────────────
-  const raw_scores = {};
+    const cognitiveScore =
+      Number(
+        cognitiveResult?.stream_affinity?.[
+          stream
+        ]
+      ) || 0;
 
-  for (const stream of streams) {
-    const academic_score  = academicResult?.stream_subject_scores?.[stream]   ?? 0;
-    const cognitive_score = cognitiveResult?.stream_affinity?.[stream]         ?? 0;
-    const activity_raw    = activityResult?.stream_influence?.[stream]         ?? 0;
-    const velocity        = academicResult?.overall_learning_velocity           ?? 0;
+    const activityRaw =
+      Number(
+        activityResult?.stream_influence?.[
+          stream
+        ]
+      ) || 0;
 
-    // Normalise activity influence to 0–100
-    const activity_score = _clamp(_round((activity_raw / ACTIVITY_MAX) * 100, 1), 0, 100);
+    const velocity =
+      Number(
+        academicResult?.overall_learning_velocity
+      ) || 0;
 
-    // Normalise velocity to 0–100 (mid-point = 50 = neutral)
-    const velocity_norm  = _clamp(
-      _round(((velocity - VELOCITY_MIN) / (VELOCITY_MAX - VELOCITY_MIN)) * 100, 1),
-      0, 100
+    const activityScore = clamp(
+      round((activityRaw / ACTIVITY_MAX) * 100, 1),
+      0,
+      100
     );
 
-    raw_scores[stream] = _round(
-      academic_score  * WEIGHT.academic  +
-      cognitive_score * WEIGHT.cognitive +
-      activity_score  * WEIGHT.activity  +
-      velocity_norm   * WEIGHT.velocity,
+    const velocityNorm = clamp(
+      round(
+        ((velocity - VELOCITY_MIN) /
+          (VELOCITY_MAX - VELOCITY_MIN)) *
+          100,
+        1
+      ),
+      0,
+      100
+    );
+
+    rawScores[stream] = round(
+      academicScore * WEIGHT.academic +
+        cognitiveScore * WEIGHT.cognitive +
+        activityScore * WEIGHT.activity +
+        velocityNorm * WEIGHT.velocity,
       1
     );
   }
 
-  // ── 2. Clamp final scores to 0–100 ───────────────────────────────────────
   const stream_scores = {};
-  for (const [stream, score] of Object.entries(raw_scores)) {
-    stream_scores[stream] = _clamp(_round(score, 0), 0, 100);
+
+  for (const stream of STREAM_ORDER) {
+    stream_scores[stream] = clamp(
+      round(rawScores[stream], 0),
+      0,
+      100
+    );
   }
 
-  // ── 3. Sort streams by score descending ──────────────────────────────────
-  const ranked = Object.entries(stream_scores)
-    .sort(([, a], [, b]) => b - a);
+  const ranked = [...STREAM_ORDER]
+    .map((stream) => [
+      stream,
+      stream_scores[stream]
+    ])
+    .sort((a, b) => {
+      if (b[1] !== a[1]) return b[1] - a[1];
 
-  const [topStream, topScore]    = ranked[0];
-  const [altStream, altScore]    = ranked[1] ?? [null, 0];
+      // deterministic tie-break by stream priority
+      return (
+        STREAM_ORDER.indexOf(a[0]) -
+        STREAM_ORDER.indexOf(b[0])
+      );
+    });
 
-  // ── 4. Confidence score ───────────────────────────────────────────────────
-  // How decisively does the top stream lead?
-  // Gap-based: wider gap = higher confidence, capped at 99
-  const gap        = topScore - (altScore ?? 0);
-  const confidence = _clamp(_round((gap / Math.max(topScore, 1)) * 100 + 40, 0), 30, 99);
-  // +40 baseline so a clear winner still shows a meaningful confidence
+  const [topStream, topScore] = ranked[0];
+  const [altStream, altScore] = ranked[1] || [
+    null,
+    0
+  ];
 
-  // ── 5. Build rationale ───────────────────────────────────────────────────
-  const rationale = _buildRationale(
-    topStream, topScore, altStream,
-    academicResult, cognitiveResult, activityResult
+  const topSafe = Math.max(topScore, 1);
+  const gapRatio = (topScore - altScore) / topSafe;
+
+  const confidence = clamp(
+    round(gapRatio * 100, 0),
+    15,
+    99
+  );
+
+  const rationale = buildRationale(
+    topStream,
+    altStream,
+    academicResult,
+    cognitiveResult,
+    activityResult
   );
 
   return {
-    recommended_stream:  topStream,
-    recommended_label:   STREAM_LABEL[topStream] ?? topStream,
+    recommended_stream: topStream,
+    recommended_label:
+      STREAM_LABEL[topStream] || topStream,
     confidence,
-    alternative_stream:  altStream,
-    alternative_label:   STREAM_LABEL[altStream] ?? altStream,
+    alternative_stream: altStream,
+    alternative_label: altStream
+      ? STREAM_LABEL[altStream] || altStream
+      : null,
     stream_scores,
     rationale,
-    engine_version: ENGINE_VERSION,
+    engine_version: ENGINE_VERSION
   };
 }
 
-// ─── Rationale builder ────────────────────────────────────────────────────────
-
-function _buildRationale(topStream, topScore, altStream, academic, cognitive, activity) {
+function buildRationale(
+  topStream,
+  altStream,
+  academic,
+  cognitive,
+  activity
+) {
   const parts = [];
 
-  // Academic signal
-  const strengths = Object.entries(academic?.subject_strengths ?? {})
-    .filter(([, s]) => s >= 70)
-    .sort(([, a], [, b]) => b - a)
+  const strengths = Object.entries(
+    academic?.subject_strengths || {}
+  )
+    .filter(([, score]) => score >= 70)
+    .sort((a, b) => b[1] - a[1])
     .slice(0, 2)
-    .map(([subj, s]) => `${subj} (${s}%)`);
+    .map(([subject, score]) => `${subject} (${score}%)`);
 
   if (strengths.length) {
-    parts.push(`Strong academic performance in ${strengths.join(' and ')}`);
+    parts.push(
+      `strong academic performance in ${strengths.join(
+        ' and '
+      )}`
+    );
   }
 
-  // Cognitive signal
-  const profile = cognitive?.profile_label;
-  if (profile) {
-    parts.push(`cognitive profile (${profile})`);
+  if (cognitive?.profile_label) {
+    parts.push(
+      `cognitive profile (${cognitive.profile_label})`
+    );
   }
 
-  // Activity signal
-  const domSignal = activity?.dominant_signal;
-  if (domSignal === topStream && activity.activity_count > 0) {
-    parts.push(`extracurricular activities aligned with ${STREAM_LABEL[topStream]}`);
+  if (
+    activity?.dominant_signal === topStream &&
+    activity?.activity_count > 0
+  ) {
+    parts.push(
+      `extracurricular alignment with ${
+        STREAM_LABEL[topStream]
+      }`
+    );
   }
 
-  const label = STREAM_LABEL[topStream] ?? topStream;
-  const base  = parts.length
-    ? `${parts.join(', ')} support a strong fit for ${label}.`
+  const label =
+    STREAM_LABEL[topStream] || topStream;
+
+  const base = parts.length
+    ? `${parts.join(
+        ', '
+      )} suggest a strong fit for ${label}.`
     : `Overall profile best matches ${label}.`;
 
-  const altLabel = STREAM_LABEL[altStream] ?? altStream;
-  return altLabel
-    ? `${base} ${altLabel} is a strong alternative if your interests shift.`
-    : base;
+  if (!altStream) return base;
+
+  return `${base} ${
+    STREAM_LABEL[altStream]
+  } remains a strong alternative.`;
 }
 
-// ─── Helpers ──────────────────────────────────────────────────────────────────
-
-function _round(n, decimals) {
-  const factor = Math.pow(10, decimals);
-  return Math.round(n * factor) / factor;
+function round(value, decimals = 0) {
+  const factor = 10 ** decimals;
+  return Math.round(value * factor) / factor;
 }
 
-function _clamp(n, min, max) {
-  return Math.min(max, Math.max(min, n));
+function clamp(value, min, max) {
+  return Math.min(max, Math.max(min, value));
 }
 
-module.exports = { recommend };
-
-
-
-
-
-
-
-
+module.exports = {
+  recommend
+};

@@ -5,9 +5,6 @@ const { AppError, ErrorCodes } = require('../../middleware/errorHandler');
 const logger = require('../../utils/logger');
 const { logAIInteraction } = require('../../infrastructure/aiLogger');
 
-let careerGraph = null;
-try { careerGraph = require('../careerGraph/CareerGraph'); } catch (_) {}
-
 const {
   MODEL,
   callAnthropicWithRetry,
@@ -22,14 +19,13 @@ const {
   persistCompletionIfReady,
 } = require('./onboarding.helpers');
 
+const TABLE_ONBOARDING_PROGRESS = 'onboarding_progress';
+const TABLE_USER_PROFILES = 'user_profiles';
+
 const getAnthropicClient = () => {
   if (process.env.NODE_ENV === 'test') return null;
   return require('../../config/anthropic.client');
 };
-
-// ─────────────────────────────────────────────────────────────────────────────
-// PROMPT BUILDER
-// ─────────────────────────────────────────────────────────────────────────────
 
 function buildCareerReportPrompt(region) {
   return `You are a senior career counsellor with 20 years of experience in ${region}'s job market.
@@ -47,48 +43,67 @@ Return ONLY valid JSON.
 }`;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// MAIN SERVICE
-// ─────────────────────────────────────────────────────────────────────────────
-
-async function generateCareerReport(userId, creditCost, idempotencyKey = null, userTier = 'free') {
+async function generateCareerReport(
+  userId,
+  creditCost,
+  idempotencyKey = null,
+  userTier = 'free'
+) {
   if (!userId) {
-    throw new AppError('userId is required', 400, {}, ErrorCodes.VALIDATION_ERROR);
+    throw new AppError(
+      'userId is required',
+      400,
+      {},
+      ErrorCodes.VALIDATION_ERROR
+    );
   }
 
-  const cached = await checkIdempotencyKey(userId, 'careerReport', idempotencyKey);
+  const cached = await checkIdempotencyKey(
+    userId,
+    'careerReport',
+    idempotencyKey
+  );
   if (cached) return cached;
 
   const [progressRes, profileRes] = await Promise.all([
-    supabase.from('onboardingProgress').select('*').eq('id', userId).maybeSingle(),
-    supabase.from('userProfiles').select('*').eq('id', userId).maybeSingle(),
+    supabase
+      .from(TABLE_ONBOARDING_PROGRESS)
+      .select('education, experience, step, updated_at')
+      .eq('id', userId)
+      .maybeSingle(),
+
+    supabase
+      .from(TABLE_USER_PROFILES)
+      .select('expected_role_ids, current_city, skills')
+      .eq('id', userId)
+      .maybeSingle(),
   ]);
 
   if (progressRes.error) throw progressRes.error;
   if (profileRes.error) throw profileRes.error;
 
-  if (!progressRes.data) {
+  const progress = progressRes.data;
+  const profile = profileRes.data || {};
+
+  if (!progress) {
     throw new AppError('No onboarding data found', 404);
   }
 
-  const data = progressRes.data;
-  const profile = profileRes.data || {};
-
-  if (!data.education?.length && !data.experience?.length) {
+  if (!progress.education?.length && !progress.experience?.length) {
     throw new AppError('Add education or experience first', 422);
   }
 
-  const expectedRoleIds = profile.expectedRoleIds || [];
+  const expectedRoleIds = profile.expected_role_ids || [];
   if (!expectedRoleIds.length) {
     throw new AppError('Target role required', 422);
   }
 
-  const aiContext = buildAIContext(data, profile);
+  const aiContext = buildAIContext(progress, profile);
 
   const userPrompt = JSON.stringify({
-    education: data.education || [],
-    experience: data.experience || [],
-    context: aiContext
+    education: progress.education || [],
+    experience: progress.experience || [],
+    context: aiContext,
   });
 
   let report;
@@ -97,24 +112,36 @@ async function generateCareerReport(userId, creditCost, idempotencyKey = null, u
 
   try {
     const anthropic = getAnthropicClient();
-    if (!anthropic) throw new Error('Anthropic client not available');
+    if (!anthropic) {
+      throw new Error('Anthropic client unavailable');
+    }
 
     const response = await callAnthropicWithRetry(
-      () => anthropic.messages.create({
-        model: MODEL,
-        max_tokens: 2048,
-        system: buildCareerReportPrompt(aiContext.userRegion || 'India'),
-        messages: [{ role: 'user', content: userPrompt }],
-      }),
+      () =>
+        anthropic.messages.create({
+          model: MODEL,
+          max_tokens: 2048,
+          system: buildCareerReportPrompt(
+            aiContext.userRegion || 'India'
+          ),
+          messages: [{ role: 'user', content: userPrompt }],
+        }),
       { module: 'careerReport', userId }
     );
 
     const raw = response.content?.[0]?.text || '{}';
     report = JSON.parse(stripJson(raw));
 
-    if (creditCost) {
+    if (creditCost > 0) {
       await deductCredits(userId, creditCost, idempotencyKey);
     }
+
+    logAIInteraction({
+      module: 'careerReport',
+      latencyMs: Date.now() - startMs,
+      status: 'success',
+      userId,
+    });
 
   } catch (err) {
     logAIInteraction({
@@ -125,26 +152,43 @@ async function generateCareerReport(userId, creditCost, idempotencyKey = null, u
       userId,
     });
 
+    logger.error('[CareerReport] generation failed', {
+      userId,
+      err: err.message,
+    });
+
     throw new AppError('AI generation failed', 502);
   }
 
-  const stepHistory = await mergeStepHistory(userId, 'career_report_generated');
+  const stepHistory = await mergeStepHistory(
+    userId,
+    'career_report_generated'
+  );
 
   const { error: upsertError } = await supabase
-    .from('onboardingProgress')
+    .from(TABLE_ONBOARDING_PROGRESS)
     .upsert({
       id: userId,
       step: 'career_report_generated',
-      careerReport: report,
-      stepHistory,
-      updatedAt: now,
+      career_report: report,
+      step_history: stepHistory,
+      updated_at: now,
     });
 
   if (upsertError) throw upsertError;
 
   const [updatedProgress, updatedProfile] = await Promise.all([
-    supabase.from('onboardingProgress').select('*').eq('id', userId).maybeSingle(),
-    supabase.from('userProfiles').select('*').eq('id', userId).maybeSingle(),
+    supabase
+      .from(TABLE_ONBOARDING_PROGRESS)
+      .select('*')
+      .eq('id', userId)
+      .maybeSingle(),
+
+    supabase
+      .from(TABLE_USER_PROFILES)
+      .select('*')
+      .eq('id', userId)
+      .maybeSingle(),
   ]);
 
   await persistCompletionIfReady(
@@ -153,10 +197,16 @@ async function generateCareerReport(userId, creditCost, idempotencyKey = null, u
     updatedProfile.data || {}
   );
 
-  triggerProvisionalChi(userId, data, profile, report, userTier);
+  triggerProvisionalChi(
+    userId,
+    progress,
+    profile,
+    report,
+    userTier
+  );
 
   emitOnboardingEvent(userId, 'onboarding_step_completed', {
-    step: 'career_report_generated'
+    step: 'career_report_generated',
   });
 
   const result = {
@@ -165,39 +215,45 @@ async function generateCareerReport(userId, creditCost, idempotencyKey = null, u
     careerReport: report,
   };
 
-  await saveIdempotencyKey(userId, 'careerReport', idempotencyKey, result);
+  await saveIdempotencyKey(
+    userId,
+    'careerReport',
+    idempotencyKey,
+    result
+  );
 
   return result;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// STATUS
-// ─────────────────────────────────────────────────────────────────────────────
-
 async function getCareerReportStatus(userId) {
-  if (!userId) throw new AppError('userId is required', 400);
+  if (!userId) {
+    throw new AppError(
+      'userId is required',
+      400,
+      {},
+      ErrorCodes.VALIDATION_ERROR
+    );
+  }
 
   const { data, error } = await supabase
-    .from('onboardingProgress')
-    .select('careerReport, aiFailures')
+    .from(TABLE_ONBOARDING_PROGRESS)
+    .select('career_report, ai_failures')
     .eq('id', userId)
     .maybeSingle();
 
   if (error) throw error;
-
   if (!data) return { status: 'pending' };
 
-  if (data.careerReport) {
+  if (data.career_report) {
     return { status: 'complete' };
   }
 
-  const failure = data.aiFailures?.slice(-1)[0];
-
+  const failure = data.ai_failures?.slice(-1)?.[0];
   if (failure) {
     return {
       status: 'failed',
       retryable: true,
-      retryAfterSeconds: 30
+      retryAfterSeconds: 30,
     };
   }
 

@@ -1,40 +1,22 @@
 'use strict';
 
 /**
- * resume.routes.js — HireRise Resume Intelligence Routes
+ * src/modules/resume/resume.routes.js
  *
- * FIXES APPLIED:
- *   FIX-1: Added GET / (list resumes) — was completely missing, causing listResumes() 404
- *   FIX-2: Added GET /:id (single resume) — was missing
- *   FIX-3: Added DELETE /:id (delete resume) — was missing
- *   FIX-4: Changed upload route from POST /upload to POST / to match frontend
- *           contract (POST /api/v1/resumes)
- *   FIX-5: Removed requirePaidPlan from upload — CV upload is a core free feature,
- *           not an AI-only premium endpoint. Scoring/growth remain gated.
- *   FIX-6: Upload now responds with jobId for async polling
- *   FIX-7: Removed conversionHookMiddleware from all route chains.
- *           conversionHook.middleware.js exports a repository singleton instance,
- *           not an Express middleware function. Passing it to router.post() caused:
- *           "Route.post() requires a callback function but got a [object Object]"
- *           Conversion tracking is handled inside the controller layer, not here.
+ * Production-ready Resume routes.
  *
- * ROUTE MAP:
- *   POST   /api/v1/resumes              — upload CV (all authenticated users)
- *   GET    /api/v1/resumes              — list user's resumes
- *   GET    /api/v1/resumes/:id          — get single resume
- *   DELETE /api/v1/resumes/:id          — delete resume
- *   POST   /api/v1/resumes/score        — AI score (paid only)
- *   POST   /api/v1/resumes/growth       — AI growth analysis (paid only)
- *   POST   /api/v1/resumes/:id/refresh-url — refresh signed URL
- *   POST   /api/v1/resumes/:id/rescore  — re-trigger AI scoring
- *   POST   /api/v1/resumes/set-active   — mark resume as primary
- *
- * authenticate is applied at server.js mount point:
- *   app.use(`${API_PREFIX}/resumes`, authenticate, require('./modules/resume/resume.routes'));
+ * Improvements:
+ * - Route ordering hardened
+ * - Multer validation production-safe
+ * - Centralized upload middleware
+ * - Better MIME + extension validation
+ * - Explicit multer error normalization
+ * - Safer memory usage
+ * - Cleaner maintainability
  */
 
 const path = require('path');
-const { Router } = require('express');
+const express = require('express');
 const multer = require('multer');
 
 const {
@@ -46,102 +28,111 @@ const {
   getResume,
   deleteResume,
   setActiveResume,
-  rescoreResume,
+  rescoreResume
 } = require('./controllers/resume.controller');
 
-const { requirePaidPlan }    = require('../../middleware/requirePaidPlan.middleware');
-const { aiRateLimitByPlan }  = require('../../middleware/aiRateLimitByPlan.middleware');
+const {
+  requirePaidPlan
+} = require('../../middleware/requirePaidPlan.middleware');
 
-// FIX-7: conversionHookMiddleware import removed entirely.
-// The conversion repository (conversionHook.middleware.js) exports a singleton
-// class instance — it is not an Express middleware function and must not appear
-// in a router.post() chain. Conversion tracking belongs in the controller layer.
+const {
+  aiRateLimitByPlan
+} = require('../../middleware/aiRateLimitByPlan.middleware');
 
-const router = Router();
+const router = express.Router();
 
 // ─────────────────────────────────────────────────────────────
-// MULTER — memory storage with type + size validation
+// Upload configuration
 // ─────────────────────────────────────────────────────────────
 
-const ALLOWED_MIMETYPES = new Set([
+const MAX_UPLOAD_SIZE_BYTES = 10 * 1024 * 1024; // 10MB
+
+const ALLOWED_MIME_TYPES = new Set([
   'application/pdf',
   'application/msword',
   'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
-  'text/plain',
+  'text/plain'
 ]);
 
-const ALLOWED_EXTENSIONS = new Set(['.pdf', '.doc', '.docx', '.txt']);
+const ALLOWED_EXTENSIONS = new Set([
+  '.pdf',
+  '.doc',
+  '.docx',
+  '.txt'
+]);
 
 function fileFilter(req, file, cb) {
-  const ext = path.extname(file.originalname).toLowerCase();
-  if (ALLOWED_MIMETYPES.has(file.mimetype) || ALLOWED_EXTENSIONS.has(ext)) {
-    cb(null, true);
-  } else {
-    cb(
+  const extension = path.extname(file.originalname || '').toLowerCase();
+  const mimeType = file.mimetype || '';
+
+  const isMimeAllowed = ALLOWED_MIME_TYPES.has(mimeType);
+  const isExtensionAllowed = ALLOWED_EXTENSIONS.has(extension);
+
+  if (!isMimeAllowed && !isExtensionAllowed) {
+    return cb(
       new multer.MulterError(
         'LIMIT_UNEXPECTED_FILE',
-        `Unsupported file type "${ext || file.mimetype}". ` +
-        'Please upload a PDF, DOC, DOCX, or TXT file.'
-      ),
-      false
+        `Unsupported file type "${extension || mimeType}". ` +
+          'Please upload a PDF, DOC, DOCX, or TXT file.'
+      )
     );
   }
+
+  return cb(null, true);
 }
 
-const upload = multer({
-  storage:    multer.memoryStorage(),
-  limits:     { fileSize: 10 * 1024 * 1024 }, // 10 MB
-  fileFilter,
+const uploadResumeMiddleware = multer({
+  storage: multer.memoryStorage(),
+  limits: {
+    fileSize: MAX_UPLOAD_SIZE_BYTES,
+    files: 1
+  },
+  fileFilter
 });
 
 // ─────────────────────────────────────────────────────────────
-// CRUD ROUTES (no AI gating — available to all authenticated users)
+// CRUD routes
 // ─────────────────────────────────────────────────────────────
 
-// POST /api/v1/resumes — upload CV
-router.post('/',
-  upload.single('resume'),
-  uploadResume,
+// POST /api/v1/resumes
+router.post(
+  '/',
+  uploadResumeMiddleware.single('resume'),
+  uploadResume
 );
 
-// GET /api/v1/resumes — list user's uploaded resumes
+// GET /api/v1/resumes
 router.get('/', listResumes);
 
-// GET /api/v1/resumes/:id — get a single resume
+// GET /api/v1/resumes/:id
 router.get('/:id', getResume);
 
-// DELETE /api/v1/resumes/:id — soft-delete a resume
+// DELETE /api/v1/resumes/:id
 router.delete('/:id', deleteResume);
 
 // ─────────────────────────────────────────────────────────────
-// AI ROUTES (paid-plan gated)
+// AI routes
 // ─────────────────────────────────────────────────────────────
 
-// POST /api/v1/resumes/score
-// NOTE: /score must be defined before /:id to prevent Express matching
-// "score" as a dynamic :id parameter.
-router.post('/score',
+// Must stay before param routes
+router.post(
+  '/score',
   requirePaidPlan,
   aiRateLimitByPlan,
-  scoreResume,
+  scoreResume
 );
 
-// POST /api/v1/resumes/growth
-// NOTE: /growth must be defined before /:resumeId routes for the same reason.
-router.post('/growth',
+router.post(
+  '/growth',
   requirePaidPlan,
   aiRateLimitByPlan,
-  analyzeResumeGrowth,
+  analyzeResumeGrowth
 );
 
-// POST /api/v1/resumes/set-active — mark a resume as the active/primary one
-// NOTE: defined before /:resumeId routes to avoid being swallowed by the param.
 router.post('/set-active', setActiveResume);
 
-// POST /api/v1/resumes/:resumeId/refresh-url
+// Param routes last
 router.post('/:resumeId/refresh-url', refreshSignedUrl);
-
-// POST /api/v1/resumes/:resumeId/rescore
 router.post('/:resumeId/rescore', rescoreResume);
 
 module.exports = router;

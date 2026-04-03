@@ -1,11 +1,24 @@
 'use strict';
 
 /**
- * routes/careerSimulation.routes.js
+ * src/modules/education-intelligence/routes/careerSimulation.routes.js
  *
- * Mount in server.js:
- *   app.use(`${API_PREFIX}/education`, authenticate,
- *     require('./modules/education-intelligence/routes/careerSimulation.routes'));
+ * Education Intelligence career simulation routes.
+ *
+ * Mounted in server.js:
+ * app.use(
+ *   `${API_PREFIX}/education`,
+ *   authenticate,
+ *   require('./modules/education-intelligence/routes/careerSimulation.routes')
+ * );
+ *
+ * ENDPOINTS
+ * POST /career-simulation/:studentId
+ *   Runs the Career Digital Twin simulation engine
+ *   and persists the latest simulation results.
+ *
+ * GET /career-simulation/:studentId
+ *   Returns the latest stored career simulations.
  */
 
 const { Router } = require('express');
@@ -13,16 +26,22 @@ const controller = require('../controllers/careerSimulation.controller');
 
 const router = Router();
 
-router.post('/career-simulation/:studentId', controller.simulateCareers);
-router.get('/career-simulation/:studentId',  controller.getSimulations);
+// ─────────────────────────────────────────────────────────────────────────────
+// Career simulation execution
+// ─────────────────────────────────────────────────────────────────────────────
+
+router.post(
+  '/career-simulation/:studentId',
+  controller.simulateCareers
+);
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Cached career simulations
+// ─────────────────────────────────────────────────────────────────────────────
+
+router.get(
+  '/career-simulation/:studentId',
+  controller.getSimulations
+);
 
 module.exports = router;
-
-
-
-
-
-
-
-
-

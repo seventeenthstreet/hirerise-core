@@ -1,21 +1,34 @@
 'use strict';
 
 /**
- * routes/student.routes.js
+ * src/modules/education-intelligence/routes/student.routes.js
  *
- * Education Intelligence API routes.
+ * Education Intelligence student onboarding and profile routes.
  *
- * Mount in server.js:
- *   app.use(`${API_PREFIX}/education`, authenticate, require('./modules/education-intelligence/routes/student.routes'));
+ * Mounted in server.js:
+ * app.use(
+ *   `${API_PREFIX}/education`,
+ *   authenticate,
+ *   require('./modules/education-intelligence/routes/student.routes')
+ * );
  *
- * All routes inherit `authenticate` from the mount — req.user.uid is always available.
+ * All routes inherit authentication from mount middleware.
  *
- * Endpoints:
- *   POST  /api/v1/education/student      → create/update student profile
- *   POST  /api/v1/education/academics    → save subject marks
- *   POST  /api/v1/education/activities   → save extracurricular activities
- *   POST  /api/v1/education/cognitive    → save cognitive test scores
- *   GET   /api/v1/education/student/:id  → fetch full student profile
+ * ENDPOINTS
+ * POST /student
+ *   Create or update the authenticated student's profile.
+ *
+ * POST /academics
+ *   Atomically replace all academic subject records.
+ *
+ * POST /activities
+ *   Atomically replace all extracurricular activities.
+ *
+ * POST /cognitive
+ *   Save or update cognitive assessment scores.
+ *
+ * GET /student/:id
+ *   Fetch the aggregated student onboarding profile.
  */
 
 const { Router } = require('express');
@@ -23,49 +36,49 @@ const controller = require('../controllers/student.controller');
 
 const router = Router();
 
-/**
- * POST /api/v1/education/student
- * Create or update the authenticated user's student profile.
- * First step of the education onboarding flow.
- */
-router.post('/student', controller.createStudent);
+// ─────────────────────────────────────────────────────────────────────────────
+// Student profile
+// ─────────────────────────────────────────────────────────────────────────────
 
-/**
- * POST /api/v1/education/academics
- * Save academic subject marks. Full replace on each submit.
- * Body: { records: [{ subject, class_level, marks }] }
- */
-router.post('/academics', controller.saveAcademics);
+router.post(
+  '/student',
+  controller.createStudent
+);
 
-/**
- * POST /api/v1/education/activities
- * Save extracurricular activities. Full replace on each submit.
- * Body: { activities: [{ activity_name, activity_level }] }
- */
-router.post('/activities', controller.saveActivities);
+// ─────────────────────────────────────────────────────────────────────────────
+// Academic records
+// ─────────────────────────────────────────────────────────────────────────────
 
-/**
- * POST /api/v1/education/cognitive
- * Save cognitive self-assessment scores. Marks onboarding complete.
- * Body: { analytical_score, logical_score, memory_score,
- *         communication_score, creativity_score, raw_answers? }
- */
-router.post('/cognitive', controller.saveCognitive);
+router.post(
+  '/academics',
+  controller.saveAcademics
+);
 
-/**
- * GET /api/v1/education/student/:id
- * Fetch the full student profile aggregated across all collections.
- * Students may only access their own profile unless admin.
- */
-router.get('/student/:id', controller.getStudentProfile);
+// ─────────────────────────────────────────────────────────────────────────────
+// Extracurricular activities
+// ─────────────────────────────────────────────────────────────────────────────
+
+router.post(
+  '/activities',
+  controller.saveActivities
+);
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Cognitive assessment
+// ─────────────────────────────────────────────────────────────────────────────
+
+router.post(
+  '/cognitive',
+  controller.saveCognitive
+);
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Aggregated student profile
+// ─────────────────────────────────────────────────────────────────────────────
+
+router.get(
+  '/student/:id',
+  controller.getStudentProfile
+);
 
 module.exports = router;
-
-
-
-
-
-
-
-
-

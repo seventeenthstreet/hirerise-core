@@ -3,69 +3,107 @@
 /**
  * src/modules/qualification/qualification.service.js
  *
- * Supabase version — Firestore fully removed.
+ * Qualification service
+ * ---------------------
+ * Fully migrated for Supabase production use.
+ * Firestore legacy patterns removed.
  */
 
 const { supabase } = require('../../config/supabase');
-
 const {
   AppError,
   ErrorCodes
 } = require('../../middleware/errorHandler');
 
-// Level sort order
-const LEVEL_ORDER = {
+/**
+ * Qualification level sort precedence
+ */
+const LEVEL_ORDER = Object.freeze({
   certificate: 0,
   diploma: 1,
   undergraduate: 2,
   postgraduate: 3,
   doctorate: 4
-};
+});
 
-// ─────────────────────────────────────────────────────────
-// listActiveQualifications
-// ─────────────────────────────────────────────────────────
+/**
+ * Shared row mapper
+ */
+function mapQualificationRow(row) {
+  if (!row) return null;
 
-async function listActiveQualifications() {
-
-  const { data, error } = await supabase
-    .from('qualifications')
-    .select('*')
-    .eq('isActive', true); // ⚠️ change to is_active if DB uses snake_case
-
-  if (error) throw error;
-
-  const results = (data || []).map(row => ({
+  return {
     id: row.id,
     name: row.name,
-    shortName: row.shortName ?? null,
+    shortName: row.short_name ?? null,
     level: row.level,
     domain:
-      typeof row.domain === 'string' && row.domain
-        ? row.domain
+      typeof row.domain === 'string' && row.domain.trim()
+        ? row.domain.trim()
         : 'general',
-    category: row.category,
-    country: row.country
-  }));
+    category: row.category ?? null,
+    country: row.country ?? null,
+    isActive: Boolean(row.is_active)
+  };
+}
 
-  return results.sort((a, b) => {
+/**
+ * Stable application-side sort fallback
+ */
+function sortQualifications(rows) {
+  return rows.sort((a, b) => {
     const levelDiff =
       (LEVEL_ORDER[a.level] ?? 99) -
       (LEVEL_ORDER[b.level] ?? 99);
 
     if (levelDiff !== 0) return levelDiff;
 
-    return a.name.localeCompare(b.name, 'en');
+    return (a.name || '').localeCompare(b.name || '', 'en');
   });
 }
 
-// ─────────────────────────────────────────────────────────
-// getQualificationById
-// ─────────────────────────────────────────────────────────
+/**
+ * Fetch all active qualifications
+ */
+async function listActiveQualifications() {
+  const { data, error } = await supabase
+    .from('qualifications')
+    .select(`
+      id,
+      name,
+      short_name,
+      level,
+      domain,
+      category,
+      country,
+      is_active
+    `)
+    .eq('is_active', true);
 
+  if (error) {
+    throw new AppError(
+      'Failed to fetch qualifications.',
+      500,
+      { supabaseError: error.message },
+      ErrorCodes.DB_ERROR
+    );
+  }
+
+  const results = (data || []).map(mapQualificationRow);
+
+  return sortQualifications(results);
+}
+
+/**
+ * Fetch qualification by id
+ */
 async function getQualificationById(qualificationId) {
+  const normalizedId =
+    typeof qualificationId === 'string'
+      ? qualificationId.trim()
+      : '';
 
-  if (!qualificationId || typeof qualificationId !== 'string') {
+  if (!normalizedId) {
     throw new AppError(
       'qualificationId must be a non-empty string.',
       400,
@@ -76,43 +114,49 @@ async function getQualificationById(qualificationId) {
 
   const { data, error } = await supabase
     .from('qualifications')
-    .select('*')
-    .eq('id', qualificationId.trim())
+    .select(`
+      id,
+      name,
+      short_name,
+      level,
+      domain,
+      category,
+      country,
+      is_active
+    `)
+    .eq('id', normalizedId)
     .maybeSingle();
 
-  if (error) throw error;
+  if (error) {
+    throw new AppError(
+      'Failed to fetch qualification.',
+      500,
+      { qualificationId: normalizedId, supabaseError: error.message },
+      ErrorCodes.DB_ERROR
+    );
+  }
 
   if (!data) {
     throw new AppError(
       'Invalid qualification selected.',
       400,
-      { qualificationId },
+      { qualificationId: normalizedId },
       ErrorCodes.VALIDATION_ERROR
     );
   }
 
-  if (!data.isActive) { // ⚠️ snake_case: is_active
+  const qualification = mapQualificationRow(data);
+
+  if (!qualification.isActive) {
     throw new AppError(
       'The selected qualification is no longer available.',
       400,
-      { qualificationId },
+      { qualificationId: normalizedId },
       ErrorCodes.VALIDATION_ERROR
     );
   }
 
-  return {
-    id: data.id,
-    name: data.name,
-    shortName: data.shortName ?? null,
-    level: data.level,
-    domain:
-      typeof data.domain === 'string' && data.domain
-        ? data.domain
-        : 'general',
-    category: data.category,
-    country: data.country,
-    isActive: data.isActive
-  };
+  return qualification;
 }
 
 module.exports = {

@@ -1,192 +1,181 @@
 'use strict';
 
 /**
- * models/platformIntelligence.model.js
+ * src/modules/platform-intelligence/models/platformIntelligence.model.js
  *
- * Firestore collection names and document builders for all 11
- * Platform Intelligence & Control Center sub-modules.
+ * Supabase-first table names and row builders for all Platform Intelligence
+ * sub-modules.
  *
- * Collections (prefixed pi_ to stay isolated from existing modules):
- *
- *   pi_ai_model_settings      — AI engine model + parameter config
- *   pi_market_data_sources     — external LMI API registrations
- *   pi_career_datasets         — uploaded dataset metadata
- *   pi_chi_weights             — CHI scoring weight config
- *   pi_skill_taxonomy          — hierarchical skill tree nodes
- *   pi_career_paths            — career transition rules
- *   pi_training_sources        — course provider + course mappings
- *   pi_subscription_plans      — plan limits (Free / Pro / Enterprise)
- *   pi_ai_usage_logs           — per-request AI usage records
- *   pi_feature_flags           — per-feature on/off toggles
- *   pi_ai_prompts              — editable engine prompts
+ * IMPORTANT:
+ * - Replaces Firestore "collection/document" terminology
+ * - Optimized for PostgreSQL row inserts + upserts
+ * - Timestamp columns should be DB-managed via DEFAULT now() + update triggers
+ * - Builders intentionally exclude created_at / updated_at unless explicitly set
  */
 
-const COLLECTIONS = {
-  AI_SETTINGS:        'pi_ai_model_settings',
-  MARKET_SOURCES:     'pi_market_data_sources',
-  CAREER_DATASETS:    'pi_career_datasets',
-  CHI_WEIGHTS:        'pi_chi_weights',
-  SKILL_TAXONOMY:     'pi_skill_taxonomy',
-  CAREER_PATHS:       'pi_career_paths',
-  TRAINING_SOURCES:   'pi_training_sources',
+const TABLES = Object.freeze({
+  AI_SETTINGS: 'pi_ai_model_settings',
+  MARKET_SOURCES: 'pi_market_data_sources',
+  CAREER_DATASETS: 'pi_career_datasets',
+  CHI_WEIGHTS: 'pi_chi_weights',
+  SKILL_TAXONOMY: 'pi_skill_taxonomy',
+  CAREER_PATHS: 'pi_career_paths',
+  TRAINING_SOURCES: 'pi_training_sources',
   SUBSCRIPTION_PLANS: 'pi_subscription_plans',
-  AI_USAGE_LOGS:      'pi_ai_usage_logs',
-  FEATURE_FLAGS:      'pi_feature_flags',
-  AI_PROMPTS:         'pi_ai_prompts',
-};
+  AI_USAGE_LOGS: 'pi_ai_usage_logs',
+  FEATURE_FLAGS: 'pi_feature_flags',
+  AI_PROMPTS: 'pi_ai_prompts',
+});
 
-// ─── Document builders ────────────────────────────────────────────────────────
+/**
+ * Safe number coercion helper
+ */
+function toNumber(value, fallback = 0) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : fallback;
+}
 
-/** pi_ai_model_settings — singleton doc id: 'config' */
-function buildAISettingsDoc(f) {
+/**
+ * Safe string helper
+ */
+function toNullableString(value, fallback = null) {
+  if (value === undefined || value === null || value === '') {
+    return fallback;
+  }
+
+  return String(value).trim();
+}
+
+/**
+ * Safe array helper
+ */
+function toArray(value) {
+  return Array.isArray(value) ? value : [];
+}
+
+// ─────────────────────────────────────────────────────────────
+// Row builders
+// ─────────────────────────────────────────────────────────────
+
+function buildAISettingsRow(input = {}) {
   return {
-    primary_model:   f.primary_model   || 'claude-sonnet-4-5',
-    fallback_model:  f.fallback_model  || 'gpt-4o-mini',
-    temperature:     f.temperature     != null ? Number(f.temperature)  : 0.3,
-    max_tokens:      f.max_tokens      != null ? Number(f.max_tokens)   : 1200,
-    analysis_mode:   f.analysis_mode   || 'balanced',
-    updated_at:      null, // serverTimestamp
+    primary_model: toNullableString(input.primary_model, 'claude-sonnet-4-5'),
+    fallback_model: toNullableString(input.fallback_model, 'gpt-4o-mini'),
+    temperature: toNumber(input.temperature, 0.3),
+    max_tokens: toNumber(input.max_tokens, 1200),
+    analysis_mode: toNullableString(input.analysis_mode, 'balanced'),
   };
 }
 
-/** pi_market_data_sources/{id} */
-function buildMarketSourceDoc(f) {
+function buildMarketSourceRow(input = {}) {
   return {
-    name:             f.name             || null,
-    api_key:          f.api_key          || null,
-    endpoint:         f.endpoint         || null,
-    region:           f.region           || 'global',
-    update_frequency: f.update_frequency || 'daily',
-    status:           f.status           || 'active',
-    created_at:       null,
+    name: toNullableString(input.name),
+    api_key: toNullableString(input.api_key),
+    endpoint: toNullableString(input.endpoint),
+    region: toNullableString(input.region, 'global'),
+    update_frequency: toNullableString(input.update_frequency, 'daily'),
+    status: toNullableString(input.status, 'active'),
   };
 }
 
-/** pi_career_datasets/{id} */
-function buildCareerDatasetDoc(f) {
+function buildCareerDatasetRow(input = {}) {
   return {
-    dataset_name: f.dataset_name || null,
-    dataset_type: f.dataset_type || null, // 'job_roles'|'salary_benchmarks'|'skill_taxonomy'|'industry_demand'
-    file_url:     f.file_url     || null,
-    version:      f.version      || '1.0.0',
-    uploaded_at:  null,
+    dataset_name: toNullableString(input.dataset_name),
+    dataset_type: toNullableString(input.dataset_type),
+    file_url: toNullableString(input.file_url),
+    version: toNullableString(input.version, '1.0.0'),
   };
 }
 
-/** pi_chi_weights — singleton doc id: 'config' */
-function buildCHIWeightsDoc(f) {
+function buildCHIWeightsRow(input = {}) {
   return {
-    skill_weight:      f.skill_weight      != null ? Number(f.skill_weight)      : 25,
-    experience_weight: f.experience_weight != null ? Number(f.experience_weight) : 20,
-    market_weight:     f.market_weight     != null ? Number(f.market_weight)     : 20,
-    salary_weight:     f.salary_weight     != null ? Number(f.salary_weight)     : 20,
-    education_weight:  f.education_weight  != null ? Number(f.education_weight)  : 15,
-    updated_at:        null,
+    skill_weight: toNumber(input.skill_weight, 25),
+    experience_weight: toNumber(input.experience_weight, 20),
+    market_weight: toNumber(input.market_weight, 20),
+    salary_weight: toNumber(input.salary_weight, 20),
+    education_weight: toNumber(input.education_weight, 15),
   };
 }
 
-/** pi_skill_taxonomy/{id} */
-function buildSkillTaxonomyDoc(f) {
+function buildSkillTaxonomyRow(input = {}) {
   return {
-    skill_name:     f.skill_name     || null,
-    parent_skill_id:f.parent_skill_id|| null,
-    category:       f.category       || null,
-    created_at:     null,
+    skill_name: toNullableString(input.skill_name),
+    parent_skill_id: toNullableString(input.parent_skill_id),
+    category: toNullableString(input.category),
   };
 }
 
-/** pi_career_paths/{id} */
-function buildCareerPathDoc(f) {
+function buildCareerPathRow(input = {}) {
   return {
-    from_role:        f.from_role        || null,
-    to_role:          f.to_role          || null,
-    required_skills:  Array.isArray(f.required_skills) ? f.required_skills : [],
-    min_experience:   f.min_experience   != null ? Number(f.min_experience) : 0,
-    salary_range:     f.salary_range     || null,
-    probability_score:f.probability_score!= null ? Number(f.probability_score): 0,
-    created_at:       null,
+    from_role: toNullableString(input.from_role),
+    to_role: toNullableString(input.to_role),
+    required_skills: toArray(input.required_skills),
+    min_experience: toNumber(input.min_experience, 0),
+    salary_range: input.salary_range ?? null,
+    probability_score: toNumber(input.probability_score, 0),
   };
 }
 
-/** pi_training_sources/{id} */
-function buildTrainingSourceDoc(f) {
+function buildTrainingSourceRow(input = {}) {
   return {
-    provider_name: f.provider_name || null,
-    course_name:   f.course_name   || null,
-    mapped_skill:  f.mapped_skill  || null,
-    difficulty:    f.difficulty    || 'beginner',
-    duration:      f.duration      || null,
-    cost:          f.cost          != null ? Number(f.cost) : 0,
-    link:          f.link          || null,
-    created_at:    null,
+    provider_name: toNullableString(input.provider_name),
+    course_name: toNullableString(input.course_name),
+    mapped_skill: toNullableString(input.mapped_skill),
+    difficulty: toNullableString(input.difficulty, 'beginner'),
+    duration: toNullableString(input.duration),
+    cost: toNumber(input.cost, 0),
+    link: toNullableString(input.link),
   };
 }
 
-/** pi_subscription_plans/{plan_name} — doc id = plan name */
-function buildSubscriptionPlanDoc(f) {
+function buildSubscriptionPlanRow(input = {}) {
   return {
-    plan_name:             f.plan_name             || null,
-    monthly_price:         f.monthly_price         != null ? Number(f.monthly_price)          : 0,
-    career_analyses_limit: f.career_analyses_limit != null ? Number(f.career_analyses_limit)  : 0,
-    resume_scans_limit:    f.resume_scans_limit    != null ? Number(f.resume_scans_limit)     : 0,
-    market_reports_limit:  f.market_reports_limit  != null ? Number(f.market_reports_limit)   : 0,
-    api_calls_limit:       f.api_calls_limit       != null ? Number(f.api_calls_limit)        : 0,
-    updated_at:            null,
+    plan_name: toNullableString(input.plan_name),
+    monthly_price: toNumber(input.monthly_price, 0),
+    career_analyses_limit: toNumber(input.career_analyses_limit, 0),
+    resume_scans_limit: toNumber(input.resume_scans_limit, 0),
+    market_reports_limit: toNumber(input.market_reports_limit, 0),
+    api_calls_limit: toNumber(input.api_calls_limit, 0),
   };
 }
 
-/** pi_ai_usage_logs/{autoId} */
-function buildAIUsageLogDoc(f) {
+function buildAIUsageLogRow(input = {}) {
   return {
-    user_id:    f.user_id    || null,
-    action:     f.action     || null,
-    tokens_used:f.tokens_used!= null ? Number(f.tokens_used) : 0,
-    model_used: f.model_used || null,
-    cost:       f.cost       != null ? Number(f.cost) : 0,
-    created_at: null,
+    user_id: toNullableString(input.user_id),
+    action: toNullableString(input.action),
+    tokens_used: toNumber(input.tokens_used, 0),
+    model_used: toNullableString(input.model_used),
+    cost: toNumber(input.cost, 0),
   };
 }
 
-/** pi_feature_flags/{feature_name} — doc id = feature_name */
-function buildFeatureFlagDoc(f) {
+function buildFeatureFlagRow(input = {}) {
   return {
-    feature_name: f.feature_name || null,
-    enabled:      typeof f.enabled === 'boolean' ? f.enabled : false,
-    updated_at:   null,
+    feature_name: toNullableString(input.feature_name),
+    enabled: Boolean(input.enabled),
   };
 }
 
-/** pi_ai_prompts/{id} */
-function buildAIPromptDoc(f) {
+function buildAIPromptRow(input = {}) {
   return {
-    prompt_name: f.prompt_name || null,
-    prompt_text: f.prompt_text || null,
-    engine:      f.engine      || null,
-    version:     f.version     || '1.0.0',
-    updated_at:  null,
+    prompt_name: toNullableString(input.prompt_name),
+    prompt_text: toNullableString(input.prompt_text),
+    engine: toNullableString(input.engine),
+    version: toNullableString(input.version, '1.0.0'),
   };
 }
 
 module.exports = {
-  COLLECTIONS,
-  buildAISettingsDoc,
-  buildMarketSourceDoc,
-  buildCareerDatasetDoc,
-  buildCHIWeightsDoc,
-  buildSkillTaxonomyDoc,
-  buildCareerPathDoc,
-  buildTrainingSourceDoc,
-  buildSubscriptionPlanDoc,
-  buildAIUsageLogDoc,
-  buildFeatureFlagDoc,
-  buildAIPromptDoc,
+  TABLES,
+  buildAISettingsRow,
+  buildMarketSourceRow,
+  buildCareerDatasetRow,
+  buildCHIWeightsRow,
+  buildSkillTaxonomyRow,
+  buildCareerPathRow,
+  buildTrainingSourceRow,
+  buildSubscriptionPlanRow,
+  buildAIUsageLogRow,
+  buildFeatureFlagRow,
+  buildAIPromptRow,
 };
-
-
-
-
-
-
-
-
-

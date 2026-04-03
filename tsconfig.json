@@ -11,13 +11,12 @@
     "esModuleInterop": true,
     "allowSyntheticDefaultImports": true,
 
-    "module": "esnext",
-    "moduleResolution": "node",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
     "resolveJsonModule": true,
 
     "jsx": "react-jsx",
 
-    "baseUrl": ".",
     "paths": {
       "@/*": ["./src/*"]
     }
