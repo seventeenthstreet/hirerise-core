@@ -3,7 +3,7 @@
 const ResumeGrowthService = require('../resumeGrowth/resumeGrowth.service');
 const ResumeGrowthRepository = require('../resumeGrowth/resumeGrowth.repository');
 const RoleRepository = require('../../repositories/RoleRepository');
-const SkillRepository = require('../../repositories/skillRepository');
+const skillRepository = require('../../repositories/skillRepository');
 const logger = require('../../utils/logger');
 
 const {
@@ -19,7 +19,7 @@ const {
  */
 const dependencies = Object.freeze({
   roleRepository: new RoleRepository(),
-  skillRepository: new SkillRepository(),
+  skillRepository: new skillRepository(),
   resumeGrowthRepository: new ResumeGrowthRepository()
 });
 

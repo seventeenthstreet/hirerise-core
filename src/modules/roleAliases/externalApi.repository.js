@@ -1,87 +1,165 @@
 'use strict';
 
 /**
- * externalApi.repository.js — Data Access for external_salary_apis collection
+ * src/modules/roleAliases/externalApi.repository.js
  *
- * Collection: external_salary_apis
+ * Supabase-native repository for external_salary_apis
  *
- * Schema:
- *   {
- *     id,
- *     providerName: string,
- *     baseUrl:      string,
- *     apiKey:       string   (encrypted at rest — store encrypted, decrypt on use)
- *     enabled:      boolean,
- *     rateLimit:    number   (requests per day),
- *     lastSync:     Timestamp | null,
- *     createdAt, updatedAt, softDeleted
- *   }
+ * Table: external_salary_apis
  *
- * Security note:
- *   apiKey is stored as-is here. In production, encrypt before storing
- *   using Cloud KMS or Secret Manager. Decrypt on retrieval for sync worker.
+ * Preserved business behavior:
+ * - list all providers
+ * - list enabled providers
+ * - update last sync timestamp
+ * - enable / disable provider
  *
- * @module modules/master/externalApi.repository
+ * Firebase / Firestore legacy patterns fully removed.
  */
 
-const BaseRepository = require('../../repositories/BaseRepository');
+const { supabase } = require('../../config/supabase');
+const {
+  AppError,
+  ErrorCodes
+} = require('../../middleware/errorHandler');
 
-const COLLECTION = 'external_salary_apis';
+const TABLE = 'external_salary_apis';
 
-class ExternalApiRepository extends BaseRepository {
-  constructor() {
-    super(COLLECTION);
+class ExternalApiRepository {
+  static get SELECT_COLUMNS() {
+    return `
+      id,
+      providerName,
+      baseUrl,
+      apiKey,
+      enabled,
+      rateLimit,
+      lastSync,
+      createdAt,
+      updatedAt,
+      softDeleted
+    `;
   }
 
-  /**
-   * List all registered external APIs.
-   * @returns {Promise<object[]>}
-   */
+  normalize(row) {
+    if (!row) return null;
+
+    return {
+      id: row.id,
+      providerName: row.providerName ?? null,
+      baseUrl: row.baseUrl ?? null,
+      apiKey: row.apiKey ?? null,
+      enabled: Boolean(row.enabled),
+      rateLimit: Number(row.rateLimit ?? 0),
+      lastSync: row.lastSync ?? null,
+      createdAt: row.createdAt ?? null,
+      updatedAt: row.updatedAt ?? null,
+      softDeleted: Boolean(row.softDeleted)
+    };
+  }
+
   async listAll() {
-    const { docs } = await super.find([], { orderBy: { field: 'createdAt', direction: 'desc' } });
-    return docs;
+    const { data, error } = await supabase
+      .from(TABLE)
+      .select(ExternalApiRepository.SELECT_COLUMNS)
+      .eq('softDeleted', false)
+      .order('createdAt', { ascending: false });
+
+    if (error) {
+      throw new AppError(
+        'Failed to fetch external API providers',
+        500,
+        ErrorCodes.DB_ERROR,
+        error
+      );
+    }
+
+    return (data || []).map((row) => this.normalize(row));
   }
 
-  /**
-   * List only enabled APIs (for the sync worker).
-   * @returns {Promise<object[]>}
-   */
   async listEnabled() {
-    const { docs } = await super.find([
-      { field: 'enabled',      op: '==', value: true },
-      { field: 'softDeleted',  op: '==', value: false },
-    ]);
-    return docs;
+    const { data, error } = await supabase
+      .from(TABLE)
+      .select(ExternalApiRepository.SELECT_COLUMNS)
+      .eq('enabled', true)
+      .eq('softDeleted', false)
+      .order('createdAt', { ascending: true });
+
+    if (error) {
+      throw new AppError(
+        'Failed to fetch enabled external API providers',
+        500,
+        ErrorCodes.DB_ERROR,
+        error
+      );
+    }
+
+    return (data || []).map((row) => this.normalize(row));
   }
 
-  /**
-   * Update lastSync timestamp after worker run.
-   * @param {string} id
-   * @returns {Promise<void>}
-   */
   async updateLastSync(id) {
-    const col = this._getCollection();
-    await col.doc(id).update({ lastSync: new Date(), updatedAt: new Date() });
+    if (!id) {
+      throw new AppError(
+        'Provider ID is required',
+        400,
+        ErrorCodes.VALIDATION_ERROR
+      );
+    }
+
+    const timestamp = new Date().toISOString();
+
+    const { error } = await supabase
+      .from(TABLE)
+      .update({
+        lastSync: timestamp,
+        updatedAt: timestamp
+      })
+      .eq('id', id)
+      .eq('softDeleted', false);
+
+    if (error) {
+      throw new AppError(
+        `Failed to update last sync for provider: ${id}`,
+        500,
+        ErrorCodes.DB_ERROR,
+        error
+      );
+    }
   }
 
-  /**
-   * Enable or disable an external API.
-   * @param {string} id
-   * @param {boolean} enabled
-   * @param {string} adminId
-   * @returns {Promise<object>}
-   */
   async setEnabled(id, enabled, adminId) {
-    return await super.update(id, { enabled }, adminId);
+    if (!id) {
+      throw new AppError(
+        'Provider ID is required',
+        400,
+        ErrorCodes.VALIDATION_ERROR
+      );
+    }
+
+    const timestamp = new Date().toISOString();
+
+    const { data, error } = await supabase
+      .from(TABLE)
+      .update({
+        enabled: Boolean(enabled),
+        updatedAt: timestamp,
+        updatedBy: adminId || null
+      })
+      .eq('id', id)
+      .eq('softDeleted', false)
+      .select(ExternalApiRepository.SELECT_COLUMNS)
+      .single();
+
+    if (error) {
+      throw new AppError(
+        `Failed to update provider enabled status: ${id}`,
+        500,
+        ErrorCodes.DB_ERROR,
+        error
+      );
+    }
+
+    return this.normalize(data);
   }
 }
 
 module.exports = new ExternalApiRepository();
-
-
-
-
-
-
-
-

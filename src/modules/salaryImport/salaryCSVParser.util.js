@@ -1,105 +1,206 @@
 'use strict';
 
 /**
- * salaryCSVParser.util.js — Streaming CSV Parser for Salary Data
+ * src/modules/salaryImport/salaryCSVParser.util.js
  *
- * Uses csv-parser for streaming (no full file load into memory).
- * Accepts a Buffer from multer, wraps it in a Readable stream,
- * and resolves with an array of normalized row objects.
+ * Production-grade streaming CSV parser for salary imports.
  *
- * Expected CSV columns (case-insensitive, trimmed):
- *   role, location, experienceLevel, minSalary, medianSalary, maxSalary
+ * Supabase migration note:
+ * This utility is storage/database agnostic and contains no Firebase-specific
+ * logic. No Supabase query-layer migration is required here.
+ *
+ * Improvements:
+ * - strict header normalization
+ * - deterministic numeric parsing
+ * - safer null handling
+ * - consistent AppError wrapping
+ * - reduced duplicate property lookups
+ * - clearer modular helpers for maintainability
+ * - drop-in API compatibility preserved
+ *
+ * Expected required columns:
+ *   role, minSalary, medianSalary, maxSalary
  *
  * Optional columns:
- *   industry, sourceName, confidenceScore
- *
- * Example CSV:
- *   role,location,experienceLevel,minSalary,medianSalary,maxSalary
- *   Software Engineer,India,Mid,100000,200000,300000
+ *   location, experienceLevel, industry, sourceName, confidenceScore
  *
  * @module modules/salaryImport/salaryCSVParser.util
  */
 
 const { Readable } = require('stream');
-const csv          = require('csv-parser');
-const { AppError, ErrorCodes } = require('../../middleware/errorHandler');
+const csv = require('csv-parser');
+const {
+  AppError,
+  ErrorCodes,
+} = require('../../middleware/errorHandler');
 
-const REQUIRED_COLUMNS = ['role', 'minSalary', 'medianSalary', 'maxSalary'];
+const REQUIRED_COLUMNS = Object.freeze([
+  'role',
+  'minsalary',
+  'mediansalary',
+  'maxsalary',
+]);
+
+const DEFAULT_SOURCE_NAME = 'csv-import';
+const DEFAULT_CONFIDENCE_SCORE = 0.8;
 
 /**
- * Parse a CSV buffer into an array of salary row objects.
- * Streams the buffer — does not load the full file into memory.
+ * Normalize CSV header keys for stable access.
+ * @param {string} header
+ * @returns {string}
+ */
+function normalizeHeader(header) {
+  return String(header || '')
+    .trim()
+    .toLowerCase();
+}
+
+/**
+ * Parse numeric CSV values safely.
+ * Empty / invalid values become null.
+ * @param {unknown} value
+ * @returns {number|null}
+ */
+function toNullableNumber(value) {
+  if (value === undefined || value === null || value === '') return null;
+
+  const parsed = Number.parseFloat(String(value).trim());
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+/**
+ * Normalize a parsed CSV row into the salary import schema.
+ * Preserves existing API behavior.
  *
- * @param {Buffer} buffer   — Raw file buffer from multer
- * @returns {Promise<object[]>} Array of normalized row objects
+ * @param {Record<string, any>} rawRow
+ * @param {number} rowIndex
+ * @returns {object|null}
+ */
+function normalizeSalaryRow(rawRow, rowIndex) {
+  const role = String(rawRow.role || '').trim();
+
+  const minSalary = toNullableNumber(rawRow.minsalary);
+  const medianSalary = toNullableNumber(rawRow.mediansalary);
+  const maxSalary = toNullableNumber(rawRow.maxsalary);
+
+  // Preserve legacy behavior: skip fully blank rows
+  if (!role && minSalary === null) {
+    return null;
+  }
+
+  const confidenceScore =
+    toNullableNumber(rawRow.confidencescore) ?? DEFAULT_CONFIDENCE_SCORE;
+
+  return {
+    _rowIndex: rowIndex,
+    role,
+    location: String(rawRow.location || '').trim(),
+    experienceLevel: String(rawRow.experiencelevel || '').trim(),
+    industry: String(rawRow.industry || '').trim(),
+    sourceName: String(rawRow.sourcename || DEFAULT_SOURCE_NAME).trim(),
+    confidenceScore,
+    minSalary,
+    medianSalary,
+    maxSalary,
+  };
+}
+
+/**
+ * Parse a CSV buffer into normalized salary rows.
+ *
+ * Streaming-based implementation keeps memory usage efficient for large uploads.
+ * The returned array behavior is intentionally preserved for existing service flow.
+ *
+ * @param {Buffer} buffer
+ * @returns {Promise<object[]>}
  */
 function parseSalaryCSVBuffer(buffer) {
   return new Promise((resolve, reject) => {
-    const rows   = [];
+    if (!Buffer.isBuffer(buffer) || buffer.length === 0) {
+      return reject(
+        new AppError(
+          'CSV file buffer is empty or invalid',
+          400,
+          null,
+          ErrorCodes.VALIDATION_ERROR
+        )
+      );
+    }
+
+    const rows = [];
     let rowIndex = 0;
     let headersValidated = false;
 
-    const stream = Readable.from(buffer);
+    const sourceStream = Readable.from(buffer);
 
-    stream
-      .pipe(csv({
-        mapHeaders: ({ header }) => header.trim().toLowerCase(),
-        skipLines:  0,
-      }))
+    const parser = csv({
+      mapHeaders: ({ header }) => normalizeHeader(header),
+      skipLines: 0,
+      strict: false,
+    });
+
+    sourceStream
+      .pipe(parser)
       .on('headers', (headers) => {
-        // Validate required columns exist
-        const missing = REQUIRED_COLUMNS.filter(col => !headers.includes(col.toLowerCase()));
-        if (missing.length > 0) {
-          stream.destroy(new AppError(
-            `CSV missing required columns: ${missing.join(', ')}`,
-            400,
-            { missingColumns: missing, requiredColumns: REQUIRED_COLUMNS },
-            ErrorCodes.VALIDATION_ERROR
-          ));
+        const normalizedHeaders = headers.map(normalizeHeader);
+
+        const missingColumns = REQUIRED_COLUMNS.filter(
+          (column) => !normalizedHeaders.includes(column)
+        );
+
+        if (missingColumns.length > 0) {
+          return sourceStream.destroy(
+            new AppError(
+              `CSV missing required columns: ${missingColumns.join(', ')}`,
+              400,
+              {
+                missingColumns,
+                requiredColumns: REQUIRED_COLUMNS,
+              },
+              ErrorCodes.VALIDATION_ERROR
+            )
+          );
         }
+
         headersValidated = true;
       })
       .on('data', (rawRow) => {
-        rowIndex++;
+        rowIndex += 1;
 
-        // Normalize numeric fields
-        const minSalary    = parseFloat(rawRow.minsalary    || rawRow.minSalary    || '');
-        const medianSalary = parseFloat(rawRow.mediansalary || rawRow.medianSalary || '');
-        const maxSalary    = parseFloat(rawRow.maxsalary    || rawRow.maxSalary    || '');
-
-        // Skip entirely blank rows
-        if (!rawRow.role && isNaN(minSalary)) return;
-
-        rows.push({
-          _rowIndex:       rowIndex,
-          role:            (rawRow.role            || '').trim(),
-          location:        (rawRow.location         || '').trim(),
-          experienceLevel: (rawRow.experiencelevel  || rawRow.experienceLevel || '').trim(),
-          industry:        (rawRow.industry         || '').trim(),
-          sourceName:      (rawRow.sourcename       || rawRow.sourceName || 'csv-import').trim(),
-          confidenceScore: parseFloat(rawRow.confidencescore || rawRow.confidenceScore) || 0.8,
-          minSalary:       isNaN(minSalary)    ? null : minSalary,
-          medianSalary:    isNaN(medianSalary) ? null : medianSalary,
-          maxSalary:       isNaN(maxSalary)    ? null : maxSalary,
-        });
+        const normalizedRow = normalizeSalaryRow(rawRow, rowIndex);
+        if (normalizedRow) rows.push(normalizedRow);
       })
-      .on('end',   () => resolve(rows))
-      .on('error', (err) => {
-        if (err.isOperational) return reject(err);
-        reject(new AppError(
-          `CSV parse error: ${err.message}`,
-          400, null, ErrorCodes.VALIDATION_ERROR
-        ));
+      .on('end', () => {
+        if (!headersValidated) {
+          return reject(
+            new AppError(
+              'CSV headers could not be validated',
+              400,
+              null,
+              ErrorCodes.VALIDATION_ERROR
+            )
+          );
+        }
+
+        return resolve(rows);
+      })
+      .on('error', (error) => {
+        if (error?.isOperational) {
+          return reject(error);
+        }
+
+        return reject(
+          new AppError(
+            `CSV parse error: ${error.message}`,
+            400,
+            { rowIndex },
+            ErrorCodes.VALIDATION_ERROR
+          )
+        );
       });
   });
 }
 
-module.exports = { parseSalaryCSVBuffer };
-
-
-
-
-
-
-
-
+module.exports = {
+  parseSalaryCSVBuffer,
+};

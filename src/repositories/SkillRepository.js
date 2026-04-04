@@ -1,93 +1,117 @@
 'use strict';
 
-const fs = require('fs');
-const path = require('path');
+const fs = require('node:fs/promises');
+const path = require('node:path');
+const logger = require('../utils/logger');
 
 class SkillRepository {
   constructor() {
-    this._skillsPath = path.join(
+    this._skillsPath = path.resolve(
       __dirname,
       '../data/career-graph/skills.json'
     );
 
     this._cache = null;
+    this._lookup = null;
+    this._loadPromise = null;
   }
 
-  /**
-   * Safely loads and caches skills
-   */
-  _loadSkills() {
+  async _loadSkills() {
     if (this._cache) return this._cache;
+    if (this._loadPromise) return this._loadPromise;
 
-    if (!fs.existsSync(this._skillsPath)) {
-      throw new Error(`Skill file not found at ${this._skillsPath}`);
+    this._loadPromise = this.#loadAndIndex();
+    return this._loadPromise;
+  }
+
+  async getAllWithAliases() {
+    return this._loadSkills();
+  }
+
+  async getByName(name) {
+    if (!name || typeof name !== 'string') {
+      return null;
     }
 
-    const raw = fs.readFileSync(this._skillsPath, 'utf8');
+    await this._loadSkills();
+
+    return (
+      this._lookup.get(name.trim().toLowerCase()) ??
+      null
+    );
+  }
+
+  refreshCache() {
+    this._cache = null;
+    this._lookup = null;
+    this._loadPromise = null;
+  }
+
+  async #loadAndIndex() {
+    let raw;
+
+    try {
+      raw = await fs.readFile(this._skillsPath, 'utf8');
+    } catch (error) {
+      logger.error('[SkillRepository] Failed reading skills file', {
+        path: this._skillsPath,
+        message: error.message,
+      });
+      throw error;
+    }
 
     let parsed;
     try {
       parsed = JSON.parse(raw);
-    } catch (err) {
-      throw new Error(`Invalid JSON in skills.json: ${err.message}`);
+    } catch (error) {
+      throw new Error(
+        `Invalid JSON in skills.json: ${error.message}`
+      );
     }
 
     if (!Array.isArray(parsed)) {
       throw new Error('skills.json must be an array');
     }
 
-    this._cache = parsed
-      .filter(skill => skill && typeof skill.name === 'string')
-      .map(skill => ({
+    const cache = [];
+    const lookup = new Map();
+
+    for (const skill of parsed) {
+      if (!skill || typeof skill.name !== 'string') {
+        continue;
+      }
+
+      const normalized = Object.freeze({
         name: skill.name.trim(),
-        aliases: Array.isArray(skill.aliases)
-          ? skill.aliases.map(a => String(a).trim())
-          : []
-      }));
+        aliases: Object.freeze(
+          Array.isArray(skill.aliases)
+            ? skill.aliases.map(a => String(a).trim())
+            : []
+        ),
+      });
+
+      cache.push(normalized);
+
+      lookup.set(
+        normalized.name.toLowerCase(),
+        normalized
+      );
+
+      for (const alias of normalized.aliases) {
+        lookup.set(alias.toLowerCase(), normalized);
+      }
+    }
+
+    this._cache = Object.freeze(cache);
+    this._lookup = lookup;
+
+    logger.info('[SkillRepository] Skills loaded', {
+      totalSkills: cache.length,
+      totalLookupKeys: lookup.size,
+    });
 
     return this._cache;
-  }
-
-  /**
-   * Returns all skills with aliases
-   */
-  async getAllWithAliases() {
-    return this._loadSkills();
-  }
-
-  /**
-   * Returns single skill by name or alias
-   */
-  async getByName(name) {
-    if (!name || typeof name !== 'string') return null;
-
-    const skills = this._loadSkills();
-    const lower = name.trim().toLowerCase();
-
-    return (
-      skills.find(
-        s =>
-          s.name.toLowerCase() === lower ||
-          s.aliases.some(a => a.toLowerCase() === lower)
-      ) || null
-    );
-  }
-
-  /**
-   * Clears cache (for admin refresh)
-   */
-  refreshCache() {
-    this._cache = null;
   }
 }
 
 module.exports = SkillRepository;
-
-
-
-
-
-
-
-
-

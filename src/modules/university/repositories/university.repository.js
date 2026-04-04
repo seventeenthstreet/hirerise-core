@@ -1,188 +1,225 @@
 'use strict';
 
 const { supabase } = require('../../../config/supabase');
+const logger = require('../../../utils/logger');
 
 const {
-  COLLECTIONS,
-  buildUniversityDoc,
-  buildUniversityUserDoc,
-  buildProgramDoc,
+  TABLES,
+  buildUniversityRow,
+  buildUniversityUserRow,
+  buildProgramRow,
+  sanitizeProgramPatch,
 } = require('../models/university.model');
 
-// ─── Universities ─────────────────────────────────────
+// ─────────────────────────────────────────────────────────────
+// Internal Helper
+// ─────────────────────────────────────────────────────────────
+
+function throwIfError(error, context) {
+  if (!error) return;
+
+  logger.error(
+    {
+      context,
+      message: error.message,
+      details: error.details,
+      hint: error.hint,
+      code: error.code,
+    },
+    `[UniversityRepository] ${context}`
+  );
+
+  throw error;
+}
+
+// ─────────────────────────────────────────────────────────────
+// Universities
+// ─────────────────────────────────────────────────────────────
 
 async function createUniversity(createdBy, fields) {
-  const doc = buildUniversityDoc(createdBy, fields);
+  const row = buildUniversityRow(createdBy, fields);
 
   const { data, error } = await supabase
-    .from(COLLECTIONS.UNIVERSITIES)
-    .insert([
-      {
-        ...doc,
-        created_at: new Date(),
-        updated_at: new Date(),
-      },
-    ])
+    .from(TABLES.UNIVERSITIES)
+    .insert(row)
     .select()
     .single();
 
-  if (error) throw error;
+  throwIfError(error, 'createUniversity');
   return data;
 }
 
 async function getUniversity(universityId) {
   const { data, error } = await supabase
-    .from(COLLECTIONS.UNIVERSITIES)
+    .from(TABLES.UNIVERSITIES)
     .select('*')
     .eq('id', universityId)
-    .single();
+    .maybeSingle();
 
-  if (error) return null;
-  return data;
+  throwIfError(error, 'getUniversity');
+  return data || null;
 }
 
-async function listUniversities() {
+async function listUniversities(limit = 200) {
+  const safeLimit = Math.min(Number(limit) || 200, 500);
+
   const { data, error } = await supabase
-    .from(COLLECTIONS.UNIVERSITIES)
+    .from(TABLES.UNIVERSITIES)
     .select('*')
     .order('created_at', { ascending: false })
-    .limit(200);
+    .limit(safeLimit);
 
-  if (error) throw error;
+  throwIfError(error, 'listUniversities');
   return data || [];
 }
 
-// ─── University Users ─────────────────────────────────
+/**
+ * Critical rollback helper
+ * Used by service compensating transaction logic
+ */
+async function deleteUniversity(universityId) {
+  const { error } = await supabase
+    .from(TABLES.UNIVERSITIES)
+    .delete()
+    .eq('id', universityId);
+
+  throwIfError(error, 'deleteUniversity');
+  return true;
+}
+
+// ─────────────────────────────────────────────────────────────
+// University Users
+// ─────────────────────────────────────────────────────────────
 
 async function addUniversityUser(universityId, userId, role) {
-  const doc = buildUniversityUserDoc(universityId, userId, role);
+  const row = buildUniversityUserRow(universityId, userId, role);
 
   const { data, error } = await supabase
-    .from(COLLECTIONS.UNIVERSITY_USERS)
-    .insert([
-      {
-        ...doc,
-        created_at: new Date(),
-      },
-    ])
+    .from(TABLES.UNIVERSITY_USERS)
+    .insert(row)
     .select()
     .single();
 
-  if (error) throw error;
+  throwIfError(error, 'addUniversityUser');
   return data;
 }
 
 async function getUniversityUser(universityId, userId) {
-  const { data } = await supabase
-    .from(COLLECTIONS.UNIVERSITY_USERS)
+  const { data, error } = await supabase
+    .from(TABLES.UNIVERSITY_USERS)
     .select('*')
     .eq('university_id', universityId)
     .eq('user_id', userId)
-    .single();
+    .maybeSingle();
 
+  throwIfError(error, 'getUniversityUser');
   return data || null;
 }
 
 async function getMyUniversities(userId) {
-  const { data: memberships } = await supabase
-    .from(COLLECTIONS.UNIVERSITY_USERS)
-    .select('*')
+  const { data: memberships, error: membershipError } = await supabase
+    .from(TABLES.UNIVERSITY_USERS)
+    .select('university_id')
     .eq('user_id', userId);
 
-  if (!memberships || !memberships.length) return [];
+  throwIfError(membershipError, 'getMyUniversities.memberships');
 
-  const ids = [...new Set(memberships.map(m => m.university_id))];
+  if (!memberships?.length) return [];
 
-  const { data: universities } = await supabase
-    .from(COLLECTIONS.UNIVERSITIES)
+  const ids = [...new Set(memberships.map((m) => m.university_id))];
+
+  const { data: universities, error: universityError } = await supabase
+    .from(TABLES.UNIVERSITIES)
     .select('*')
-    .in('id', ids);
+    .in('id', ids)
+    .order('created_at', { ascending: false });
+
+  throwIfError(universityError, 'getMyUniversities.universities');
 
   return universities || [];
 }
 
-// ─── Programs ─────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────
+// Programs
+// ─────────────────────────────────────────────────────────────
 
 async function createProgram(universityId, fields) {
-  const doc = buildProgramDoc(universityId, fields);
+  const row = buildProgramRow(universityId, fields);
 
   const { data, error } = await supabase
-    .from(COLLECTIONS.PROGRAMS)
-    .insert([
-      {
-        ...doc,
-        created_at: new Date(),
-        updated_at: new Date(),
-      },
-    ])
+    .from(TABLES.PROGRAMS)
+    .insert(row)
     .select()
     .single();
 
-  if (error) throw error;
+  throwIfError(error, 'createProgram');
   return data;
 }
 
 async function getProgram(programId) {
   const { data, error } = await supabase
-    .from(COLLECTIONS.PROGRAMS)
+    .from(TABLES.PROGRAMS)
     .select('*')
     .eq('id', programId)
-    .single();
+    .maybeSingle();
 
-  if (error) return null;
-  return data;
+  throwIfError(error, 'getProgram');
+  return data || null;
 }
 
 async function listPrograms(universityId) {
   const { data, error } = await supabase
-    .from(COLLECTIONS.PROGRAMS)
+    .from(TABLES.PROGRAMS)
     .select('*')
     .eq('university_id', universityId)
     .order('created_at', { ascending: false });
 
-  if (error) throw error;
+  throwIfError(error, 'listPrograms');
   return data || [];
 }
 
-async function listAllPrograms() {
+async function listAllPrograms(limit = 500) {
+  const safeLimit = Math.min(Number(limit) || 500, 1000);
+
   const { data, error } = await supabase
-    .from(COLLECTIONS.PROGRAMS)
+    .from(TABLES.PROGRAMS)
     .select('*')
     .order('created_at', { ascending: false })
-    .limit(500);
+    .limit(safeLimit);
 
-  if (error) throw error;
+  throwIfError(error, 'listAllPrograms');
   return data || [];
 }
 
 async function updateProgram(programId, fields) {
+  const patch = sanitizeProgramPatch(fields);
+
   const { data, error } = await supabase
-    .from(COLLECTIONS.PROGRAMS)
-    .update({
-      ...fields,
-      updated_at: new Date(),
-    })
+    .from(TABLES.PROGRAMS)
+    .update(patch)
     .eq('id', programId)
     .select()
     .single();
 
-  if (error) throw error;
+  throwIfError(error, 'updateProgram');
   return data;
 }
 
 async function deleteProgram(programId) {
   const { error } = await supabase
-    .from(COLLECTIONS.PROGRAMS)
+    .from(TABLES.PROGRAMS)
     .delete()
     .eq('id', programId);
 
-  if (error) throw error;
+  throwIfError(error, 'deleteProgram');
+  return true;
 }
 
 module.exports = {
   createUniversity,
   getUniversity,
   listUniversities,
+  deleteUniversity,
   addUniversityUser,
   getUniversityUser,
   getMyUniversities,

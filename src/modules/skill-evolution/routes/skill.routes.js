@@ -1,29 +1,37 @@
 'use strict';
 
 /**
- * routes/skill.routes.js
+ * src/modules/skill-evolution/routes/skill.routes.js
  *
- * Mounted at: /api/v1/education/skills
- * (Auth is applied at the server.js level via authenticate middleware)
+ * Mounted at:
+ *   /api/v1/education/skills
  *
- *   GET /recommendations/:studentId  — ranked skill list + roadmap
- *   GET /student-skills/:studentId   — raw per-skill rows
+ * Auth is applied globally at server level.
+ *
+ * Routes:
+ *   GET /recommendations/:studentId
+ *     → ranked skill list + roadmap
+ *
+ *   GET /student-skills/:studentId
+ *     → raw per-skill proficiency rows
  */
 
-const express    = require('express');
-const router     = express.Router();
-const controller = require('../controllers/skill.controller');
+const { Router } = require('express');
+const skillController = require('../controllers/skill.controller');
 
-router.get('/recommendations/:studentId', controller.getRecommendations);
-router.get('/student-skills/:studentId',  controller.getStudentSkills);
+const router = Router();
+
+/**
+ * Skill recommendation endpoints
+ */
+router.get(
+  '/recommendations/:studentId',
+  skillController.getRecommendations
+);
+
+router.get(
+  '/student-skills/:studentId',
+  skillController.getStudentSkills
+);
 
 module.exports = router;
-
-
-
-
-
-
-
-
-

@@ -1,16 +1,103 @@
 'use strict';
 
+/**
+ * src/modules/salary/salary.repository.js
+ *
+ * Production-grade Supabase salary repository
+ * - Firestore legacy patterns removed
+ * - snake_case Postgres columns normalized
+ * - conflict-safe bulk upsert
+ * - SQL-driven dedupe strategy
+ * - efficient cache invalidation
+ * - no N+1 duplicate queries
+ * - clean row ↔ domain mapping
+ */
+
 const { supabase } = require('../../config/supabase');
 const BaseRepository = require('../../repositories/BaseRepository');
 const logger = require('../../utils/logger');
 const { invalidateSalaryCache } = require('../../utils/salaryCache');
-const crypto = require('crypto');
 
-const COLLECTION = 'salary_data';
+const TABLE = 'salary_data';
+
+const READ_COLUMNS = `
+  id,
+  role_id,
+  location,
+  experience_level,
+  industry,
+  source_name,
+  source_type,
+  min_salary,
+  max_salary,
+  confidence_score,
+  created_at,
+  updated_at,
+  created_by,
+  updated_by,
+  soft_deleted,
+  status,
+  version
+`;
 
 class SalaryRepository extends BaseRepository {
   constructor() {
-    super(COLLECTION);
+    super(TABLE);
+  }
+
+  mapRow(row) {
+    if (!row) return null;
+
+    return {
+      id: row.id,
+      roleId: row.role_id,
+      location: row.location,
+      experienceLevel: row.experience_level,
+      industry: row.industry,
+      sourceName: row.source_name,
+      sourceType: row.source_type,
+      minSalary: row.min_salary,
+      maxSalary: row.max_salary,
+      confidenceScore: row.confidence_score,
+      createdAt: row.created_at,
+      updatedAt: row.updated_at,
+      createdBy: row.created_by,
+      updatedBy: row.updated_by,
+      softDeleted: row.soft_deleted,
+      status: row.status,
+      version: row.version,
+    };
+  }
+
+  createDedupeKey(record) {
+    return require('crypto')
+      .createHash('md5')
+      .update([
+        record.roleId,
+        record.location || '',
+        record.experienceLevel || '',
+        record.sourceName || '',
+        record.minSalary,
+        record.maxSalary,
+      ].join('|'))
+      .digest('hex');
+  }
+
+  normalizeRecord(record, adminId, sourceTypeFallback = 'ADMIN') {
+    return {
+      role_id: record.roleId,
+      location: record.location || null,
+      experience_level: record.experienceLevel || null,
+      industry: record.industry || null,
+      source_name: record.sourceName || null,
+      source_type: record.sourceType || sourceTypeFallback,
+      min_salary: record.minSalary,
+      max_salary: record.maxSalary,
+      confidence_score: record.confidenceScore ?? 1.0,
+      created_by: adminId,
+      updated_by: adminId,
+      dedupe_key: this.createDedupeKey(record),
+    };
   }
 
   // ─────────────────────────────────────────────────────────
@@ -20,33 +107,32 @@ class SalaryRepository extends BaseRepository {
     if (!roleId) return [];
 
     const { data, error } = await supabase
-      .from(COLLECTION)
-      .select('*')
-      .eq('roleId', roleId)          // ⚠️ snake_case → role_id
-      .eq('softDeleted', false);     // ⚠️ → soft_deleted
+      .from(TABLE)
+      .select(READ_COLUMNS)
+      .eq('role_id', roleId)
+      .eq('soft_deleted', false);
 
     if (error) throw error;
 
-    return (data || []).map(row => ({ id: row.id, ...row }));
+    return (data || []).map((row) => this.mapRow(row));
   }
 
   // ─────────────────────────────────────────────────────────
   // Find with filters
   // ─────────────────────────────────────────────────────────
   async findByRoleIdWithFilters(roleId, filters = {}) {
-
     let query = supabase
-      .from(COLLECTION)
-      .select('*')
-      .eq('roleId', roleId)
-      .eq('softDeleted', false);
+      .from(TABLE)
+      .select(READ_COLUMNS)
+      .eq('role_id', roleId)
+      .eq('soft_deleted', false);
 
     if (filters.location) {
       query = query.eq('location', filters.location);
     }
 
     if (filters.experienceLevel) {
-      query = query.eq('experienceLevel', filters.experienceLevel);
+      query = query.eq('experience_level', filters.experienceLevel);
     }
 
     if (filters.industry) {
@@ -57,104 +143,67 @@ class SalaryRepository extends BaseRepository {
 
     if (error) throw error;
 
-    return (data || []).map(row => ({ id: row.id, ...row }));
-  }
-
-  // ─────────────────────────────────────────────────────────
-  // Duplicate check
-  // ─────────────────────────────────────────────────────────
-  async isDuplicate(record) {
-
-    const { data, error } = await supabase
-      .from(COLLECTION)
-      .select('id')
-      .eq('roleId', record.roleId)
-      .eq('location', record.location || '')
-      .eq('experienceLevel', record.experienceLevel || '')
-      .eq('sourceName', record.sourceName || '')
-      .eq('minSalary', record.minSalary)
-      .eq('maxSalary', record.maxSalary)
-      .limit(1);
-
-    if (error) throw error;
-
-    return (data && data.length > 0);
+    return (data || []).map((row) => this.mapRow(row));
   }
 
   // ─────────────────────────────────────────────────────────
   // Insert single
   // ─────────────────────────────────────────────────────────
   async insertSalaryRecord(record, adminId = 'system') {
+    const payload = this.normalizeRecord(record, adminId);
 
-    const created = await super.create({
-      ...record,
-      sourceType: record.sourceType || 'ADMIN',
-      confidenceScore: record.confidenceScore ?? 1.0,
-    }, adminId);
+    const { data, error } = await supabase
+      .from(TABLE)
+      .upsert(payload, {
+        onConflict: 'dedupe_key',
+        ignoreDuplicates: true,
+      })
+      .select(READ_COLUMNS)
+      .single();
+
+    if (error) throw error;
 
     invalidateSalaryCache(record.roleId);
 
-    return created;
+    return this.mapRow(data);
   }
 
   // ─────────────────────────────────────────────────────────
-  // Batch insert (FIXED)
+  // Batch insert (Production Optimized)
   // ─────────────────────────────────────────────────────────
   async batchInsert(records, adminId = 'system') {
-
-    if (!records || records.length === 0) {
+    if (!Array.isArray(records) || records.length === 0) {
       return { inserted: 0, duplicates: 0 };
     }
 
-    const BATCH_SIZE = 500;
+    const BATCH_SIZE = 1000;
     let inserted = 0;
-    let duplicates = 0;
-    const nowISO = new Date().toISOString();
     const affectedRoles = new Set();
 
     for (let i = 0; i < records.length; i += BATCH_SIZE) {
-
       const chunk = records.slice(i, i + BATCH_SIZE);
-      const insertPayload = [];
 
-      for (const record of chunk) {
-
-        const isDup = await this.isDuplicate(record);
-
-        if (isDup) {
-          duplicates++;
-          continue;
-        }
-
-        insertPayload.push({
-          id: crypto.randomUUID(),
-          ...record,
-          createdAt: nowISO,
-          updatedAt: nowISO,
-          createdBy: adminId,
-          updatedBy: adminId,
-          softDeleted: false,
-          status: 'active',
-          version: 1,
-          sourceType: record.sourceType || 'CSV',
-          confidenceScore: record.confidenceScore ?? 0.8,
-        });
-
-        inserted++;
+      const payload = chunk.map((record) => {
         affectedRoles.add(record.roleId);
-      }
+        return this.normalizeRecord(record, adminId, 'CSV');
+      });
 
-      if (insertPayload.length > 0) {
-        const { error } = await supabase
-          .from(COLLECTION)
-          .insert(insertPayload);
+      const { data, error } = await supabase
+        .from(TABLE)
+        .upsert(payload, {
+          onConflict: 'dedupe_key',
+          ignoreDuplicates: true,
+        })
+        .select('role_id');
 
-        if (error) throw error;
-      }
+      if (error) throw error;
 
-      logger.info('[SalaryRepository] Batch inserted', {
-        chunk: i / BATCH_SIZE + 1,
-        inserted
+      inserted += data?.length || 0;
+
+      logger.info('[SalaryRepository] Batch upsert completed', {
+        chunk: Math.floor(i / BATCH_SIZE) + 1,
+        chunkSize: chunk.length,
+        insertedSoFar: inserted,
       });
     }
 
@@ -162,23 +211,25 @@ class SalaryRepository extends BaseRepository {
       invalidateSalaryCache(roleId);
     }
 
-    return { inserted, duplicates };
+    return {
+      inserted,
+      duplicates: records.length - inserted,
+    };
   }
 
   // ─────────────────────────────────────────────────────────
-  // Find by sourceType
+  // Find by source type
   // ─────────────────────────────────────────────────────────
   async findBySourceType(sourceType) {
-
     const { data, error } = await supabase
-      .from(COLLECTION)
-      .select('*')
-      .eq('sourceType', sourceType)
-      .eq('softDeleted', false);
+      .from(TABLE)
+      .select(READ_COLUMNS)
+      .eq('source_type', sourceType)
+      .eq('soft_deleted', false);
 
     if (error) throw error;
 
-    return (data || []).map(row => ({ id: row.id, ...row }));
+    return (data || []).map((row) => this.mapRow(row));
   }
 }
 

@@ -1,108 +1,71 @@
 'use strict';
 
-/**
- * syncLock.repository.js
- * ----------------------
- * Production-grade data access layer for sync_locks.
- *
- * Features:
- * - atomic conditional UPDATE lock acquisition
- * - stale lock takeover
- * - ownership-safe release
- * - conflict diagnostics
- *
- * path: src/repositories/syncLock.repository.js
- */
-
 const { getSupabaseClient } = require('../lib/supabaseClient');
+const logger = require('../utils/logger');
 
-const TABLE = 'sync_locks';
-
-/**
- * Atomically acquire a distributed lock.
- *
- * Succeeds only when:
- * - status = 'idle'
- * - OR stale running lock older than staleCutoff
- */
-async function acquireLock({ lockKey, instanceId, staleCutoff }) {
-  if (!lockKey) {
-    throw new Error('syncLock.acquireLock: lockKey is required');
-  }
-
-  if (!instanceId) {
-    throw new Error('syncLock.acquireLock: instanceId is required');
-  }
-
-  if (!(staleCutoff instanceof Date) || Number.isNaN(staleCutoff.getTime())) {
-    throw new Error('syncLock.acquireLock: staleCutoff must be a valid Date');
-  }
+async function acquireLock({
+  lockKey,
+  instanceId,
+  staleCutoff,
+}) {
+  validateAcquireInput(lockKey, instanceId, staleCutoff);
 
   const supabase = getSupabaseClient();
-  const nowIso = new Date().toISOString();
-  const staleIso = staleCutoff.toISOString();
 
-  const { data, error } = await supabase
-    .from(TABLE)
-    .update({
-      status: 'running',
-      locked_by: instanceId,
-      locked_at: nowIso,
-      released_at: null,
-      updated_at: nowIso,
-    })
-    .eq('lock_id', lockKey)
-    .or(`status.eq.idle,and(status.eq.running,locked_at.lt.${staleIso})`)
-    .select('*')
-    .maybeSingle();
+  const { data, error } = await supabase.rpc(
+    'acquire_sync_lock',
+    {
+      p_lock_key: lockKey,
+      p_instance_id: instanceId,
+      p_stale_cutoff: staleCutoff.toISOString(),
+    }
+  );
 
   if (error) {
-    throw new Error(`syncLock.acquireLock failed: ${error.message}`);
+    logger.error('[syncLock] acquire failed', {
+      lockKey,
+      instanceId,
+      code: error.code,
+      message: error.message,
+    });
+
+    throw new Error(
+      `syncLock.acquireLock failed: ${error.message}`
+    );
   }
 
-  return data || null;
+  return data ?? null;
 }
 
-/**
- * Release the lock only if this instance owns it.
- */
 async function releaseLock({ lockKey, instanceId }) {
-  if (!lockKey) {
-    throw new Error('syncLock.releaseLock: lockKey is required');
-  }
-
-  if (!instanceId) {
-    throw new Error('syncLock.releaseLock: instanceId is required');
-  }
+  validateReleaseInput(lockKey, instanceId);
 
   const supabase = getSupabaseClient();
-  const nowIso = new Date().toISOString();
 
-  const { data, error } = await supabase
-    .from(TABLE)
-    .update({
-      status: 'idle',
-      locked_by: null,
-      locked_at: null,
-      released_at: nowIso,
-      updated_at: nowIso,
-    })
-    .eq('lock_id', lockKey)
-    .eq('locked_by', instanceId)
-    .eq('status', 'running')
-    .select('*')
-    .maybeSingle();
+  const { data, error } = await supabase.rpc(
+    'release_sync_lock',
+    {
+      p_lock_key: lockKey,
+      p_instance_id: instanceId,
+    }
+  );
 
   if (error) {
-    throw new Error(`syncLock.releaseLock failed: ${error.message}`);
+    logger.error('[syncLock] release failed', {
+      lockKey,
+      instanceId,
+      code: error.code,
+      message: error.message,
+    });
+
+    throw new Error(
+      `syncLock.releaseLock failed: ${error.message}`
+    );
   }
 
-  return data !== null;
+  return Boolean(data);
 }
 
-/**
- * Fetch current lock state for diagnostics.
- */
 async function getLock(lockKey) {
   if (!lockKey) {
     throw new Error('syncLock.getLock: lockKey is required');
@@ -111,16 +74,59 @@ async function getLock(lockKey) {
   const supabase = getSupabaseClient();
 
   const { data, error } = await supabase
-    .from(TABLE)
+    .from('sync_locks')
     .select('*')
     .eq('lock_id', lockKey)
     .maybeSingle();
 
   if (error) {
-    throw new Error(`syncLock.getLock failed: ${error.message}`);
+    throw new Error(
+      `syncLock.getLock failed: ${error.message}`
+    );
   }
 
-  return data || null;
+  return data ?? null;
+}
+
+function validateAcquireInput(
+  lockKey,
+  instanceId,
+  staleCutoff
+) {
+  if (!lockKey) {
+    throw new Error(
+      'syncLock.acquireLock: lockKey is required'
+    );
+  }
+
+  if (!instanceId) {
+    throw new Error(
+      'syncLock.acquireLock: instanceId is required'
+    );
+  }
+
+  if (
+    !(staleCutoff instanceof Date) ||
+    Number.isNaN(staleCutoff.getTime())
+  ) {
+    throw new Error(
+      'syncLock.acquireLock: staleCutoff must be valid Date'
+    );
+  }
+}
+
+function validateReleaseInput(lockKey, instanceId) {
+  if (!lockKey) {
+    throw new Error(
+      'syncLock.releaseLock: lockKey is required'
+    );
+  }
+
+  if (!instanceId) {
+    throw new Error(
+      'syncLock.releaseLock: instanceId is required'
+    );
+  }
 }
 
 module.exports = {

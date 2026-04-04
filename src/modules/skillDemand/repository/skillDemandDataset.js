@@ -3,45 +3,40 @@
 /**
  * skillDemandDataset.js — Skill Demand Data Layer
  *
- * MIGRATED: Previously read from CSV files on disk (src/data/role-skills.csv,
- * src/data/skills-demand-india.csv). Now reads from Supabase tables:
- *   - skill_demand   (was skills-demand-india.csv)
- *   - role_skills    (was role-skills.csv)
+ * Supabase-native dataset loader with:
+ * - TTL cache
+ * - concurrency-safe single-flight refresh
+ * - keyset pagination
+ * - partial-match role index
+ * - graceful fallback semantics
  *
- * WHY SUPABASE INSTEAD OF CSV:
- *   1. No redeploy needed to update skill/role data
- *   2. Works on all cloud platforms (no filesystem dependency)
- *   3. Supports admin UI updates without code changes
- *   4. Properly indexed for fast lookups at scale
- *   5. CSV had wrong skill names causing 0% match scores (e.g. "Tally" vs "Tally ERP")
- *
- * In-memory cache (1 hour TTL) preserved — same interface as before so
- * skillDemand.service.js needs no changes.
- *
- * @module modules/skillDemand/repository/skillDemandDataset
+ * Column mapping (role_skills):
+ *   role     → role_id
+ *   skill    → skill_id
+ *   priority → importance_weight
  */
 
 const logger = require('../../../utils/logger');
+const { supabase } = require('../../../config/supabase');
 
-// Lazy-load supabase to avoid issues in test mode
-function getSupabase() {
-  const { supabase } = require('../../../config/supabase'); return supabase;
-}
+const SKILL_DEMAND_TABLE = 'skill_demand';
+const ROLE_SKILLS_TABLE = 'role_skills';
+const PAGE_SIZE = 1000;
+const CACHE_TTL_MS = Number.parseInt(
+  process.env.SKILL_DEMAND_CACHE_TTL_MS || '3600000',
+  10
+);
 
-// ─── Cache ────────────────────────────────────────────────────────────────────
-
-const CACHE_TTL_MS = parseInt(process.env.SKILL_DEMAND_CACHE_TTL_MS || '3600000', 10); // 1 hour
-
-const _cache = {
-  skillDemand: null,   // Map<normalizedSkillName, SkillDemandRecord>
-  roleSkills:  null,   // Map<normalizedRoleName, string[]>
-  loadedAt:    null,
+const cache = {
+  skillDemand: null,
+  roleSkills: null,
+  roleKeys: null,
+  loadedAt: 0,
+  refreshPromise: null,
 };
 
-// ─── Normalisation ────────────────────────────────────────────────────────────
-
-function normalise(name) {
-  return (name || '')
+function normalise(value) {
+  return String(value || '')
     .toLowerCase()
     .replace(/\./g, '')
     .replace(/[_\-/]/g, ' ')
@@ -49,116 +44,175 @@ function normalise(name) {
     .trim();
 }
 
-// ─── Supabase Loaders ─────────────────────────────────────────────────────────
-
-async function _loadSkillDemandFromSupabase() {
-  const supabase = getSupabase();
+async function loadSkillDemandFromSupabase() {
   const map = new Map();
+  let lastSkill = null;
 
-  // Fetch in pages to handle large datasets
-  let from = 0;
-  const PAGE = 1000;
   while (true) {
-    const { data, error } = await supabase
-      .from('skill_demand')
-      .select('skill, demand_score, growth_rate, salary_boost, industry')
-      .range(from, from + PAGE - 1);
+    let query = supabase
+      .from(SKILL_DEMAND_TABLE)
+      .select('skill,demand_score,growth_rate,salary_boost,industry')
+      .order('skill', { ascending: true })
+      .limit(PAGE_SIZE);
+
+    if (lastSkill) {
+      query = query.gt('skill', lastSkill);
+    }
+
+    const { data, error } = await query;
 
     if (error) {
-      logger.debug('[SkillDemandDataset] skill_demand table not found — using static fallback', { error: error.message });
-      return map; // return empty map so static benchmarks take over
-      break;
+      logger.warn('[SkillDemandDataset] skill_demand unavailable', {
+        error: error.message,
+        code: error.code,
+      });
+      return map;
     }
-    if (!data || data.length === 0) break;
+
+    if (!data?.length) break;
 
     for (const row of data) {
-      if (!row.skill) continue;
+      if (!row?.skill) continue;
+
       map.set(normalise(row.skill), {
-        skill:        row.skill,
-        demand_score: parseFloat(row.demand_score) || 0,
-        growth_rate:  parseFloat(row.growth_rate)  || 0,
-        salary_boost: parseFloat(row.salary_boost) || 0,
-        industry:     row.industry || 'General',
+        skill: row.skill,
+        demand_score: Number(row.demand_score) || 0,
+        growth_rate: Number(row.growth_rate) || 0,
+        salary_boost: Number(row.salary_boost) || 0,
+        industry: row.industry || 'General',
       });
     }
 
-    if (data.length < PAGE) break;
-    from += PAGE;
+    if (data.length < PAGE_SIZE) break;
+    lastSkill = data[data.length - 1].skill;
   }
 
   return map;
 }
 
-async function _loadRoleSkillsFromSupabase() {
-  const supabase = getSupabase();
-  const map = new Map(); // normalised role → string[] of skill names
+async function loadRoleSkillsFromSupabase() {
+  const map = new Map();
+  let lastRoleId = null;
+  let lastWeight = null;
 
-  let from = 0;
-  const PAGE = 1000;
   while (true) {
-    const { data, error } = await supabase
-      .from('role_skills')
-      .select('role, skill, is_required, priority')
-      .order('role')
-      .order('priority')
-      .range(from, from + PAGE - 1);
+    let query = supabase
+      .from(ROLE_SKILLS_TABLE)
+      .select('role_id,skill_id,importance_weight')
+      .order('role_id', { ascending: true })
+      .order('importance_weight', { ascending: true })
+      .limit(PAGE_SIZE);
+
+    if (lastRoleId !== null) {
+      query = query.or(
+        `role_id.gt.${lastRoleId},and(role_id.eq.${lastRoleId},importance_weight.gt.${lastWeight ?? 0})`
+      );
+    }
+
+    const { data, error } = await query;
 
     if (error) {
-      logger.debug('[SkillDemandDataset] role_skills table not found — using static fallback', { error: error.message });
-      return map; // return empty map so static benchmarks take over
-      break;
+      logger.warn('[SkillDemandDataset] role_skills unavailable', {
+        error: error.message,
+        code: error.code,
+      });
+      return map;
     }
-    if (!data || data.length === 0) break;
+
+    if (!data?.length) break;
 
     for (const row of data) {
-      if (!row.role || !row.skill) continue;
-      const key = normalise(row.role);
-      if (!map.has(key)) map.set(key, []);
-      map.get(key).push(row.skill);
+      if (!row?.role_id || !row?.skill_id) continue;
+
+      const key = normalise(row.role_id);
+
+      if (!map.has(key)) {
+        map.set(key, []);
+      }
+
+      map.get(key).push(row.skill_id);
     }
 
-    if (data.length < PAGE) break;
-    from += PAGE;
+    if (data.length < PAGE_SIZE) break;
+
+    const last = data[data.length - 1];
+    lastRoleId = last.role_id;
+    lastWeight = last.importance_weight ?? 0;
   }
 
   return map;
 }
 
-// ─── Public Loader ────────────────────────────────────────────────────────────
+function buildRoleKeyIndex(roleSkillsMap) {
+  return Array.from(roleSkillsMap.keys());
+}
+
+async function refreshDatasets() {
+  const [skillDemand, roleSkills] = await Promise.all([
+    loadSkillDemandFromSupabase(),
+    loadRoleSkillsFromSupabase(),
+  ]);
+
+  cache.skillDemand = skillDemand;
+  cache.roleSkills = roleSkills;
+  cache.roleKeys = buildRoleKeyIndex(roleSkills);
+  cache.loadedAt = Date.now();
+
+  logger.info('[SkillDemandDataset] Datasets loaded', {
+    skillDemandCount: skillDemand.size,
+    roleSkillsCount: roleSkills.size,
+  });
+
+  return { skillDemand, roleSkills };
+}
 
 async function loadDatasets() {
   const now = Date.now();
+  const cacheFresh =
+    cache.skillDemand &&
+    cache.roleSkills &&
+    now - cache.loadedAt < CACHE_TTL_MS;
 
-  // Return from cache if still fresh
-  if (_cache.skillDemand && _cache.roleSkills && _cache.loadedAt) {
-    if (now - _cache.loadedAt < CACHE_TTL_MS) {
-      return { skillDemand: _cache.skillDemand, roleSkills: _cache.roleSkills };
-    }
+  if (cacheFresh) {
+    return {
+      skillDemand: cache.skillDemand,
+      roleSkills: cache.roleSkills,
+    };
   }
 
-  logger.debug('[SkillDemandDataset] Loading datasets from Supabase...');
+  if (!cache.refreshPromise) {
+    logger.debug('[SkillDemandDataset] Refreshing Supabase datasets');
 
-  const [skillDemand, roleSkills] = await Promise.all([
-    _loadSkillDemandFromSupabase(),
-    _loadRoleSkillsFromSupabase(),
-  ]);
+    cache.refreshPromise = refreshDatasets()
+      .catch((error) => {
+        logger.error('[SkillDemandDataset] Refresh failed', {
+          error: error.message,
+        });
 
-  _cache.skillDemand = skillDemand;
-  _cache.roleSkills  = roleSkills;
-  _cache.loadedAt    = now;
+        if (cache.skillDemand && cache.roleSkills) {
+          return {
+            skillDemand: cache.skillDemand,
+            roleSkills: cache.roleSkills,
+          };
+        }
 
-  logger.info('[SkillDemandDataset] Datasets loaded', {
-    skillDemandCount: _cache.skillDemand.size,
-    roleSkillsCount:  _cache.roleSkills.size,
-  });
+        throw error;
+      })
+      .finally(() => {
+        cache.refreshPromise = null;
+      });
+  }
 
-  return { skillDemand: _cache.skillDemand, roleSkills: _cache.roleSkills };
+  return cache.refreshPromise;
 }
 
 function invalidateCache() {
-  _cache.skillDemand = null;
-  _cache.roleSkills  = null;
-  _cache.loadedAt    = null;
+  cache.skillDemand = null;
+  cache.roleSkills = null;
+  cache.roleKeys = null;
+  cache.loadedAt = 0;
+  cache.refreshPromise = null;
+
   logger.info('[SkillDemandDataset] Cache invalidated');
 }
 
@@ -169,15 +223,14 @@ function lookupSkillDemand(skillDemandMap, skillName) {
 function lookupRoleSkills(roleSkillsMap, roleName) {
   const normRole = normalise(roleName);
 
-  // 1. Exact match
-  if (roleSkillsMap.has(normRole)) {
-    return roleSkillsMap.get(normRole);
-  }
+  const exact = roleSkillsMap.get(normRole);
+  if (exact) return exact;
 
-  // 2. Partial match
-  for (const [key, skills] of roleSkillsMap.entries()) {
+  const keys = cache.roleKeys || Array.from(roleSkillsMap.keys());
+
+  for (const key of keys) {
     if (key.includes(normRole) || normRole.includes(key)) {
-      return skills;
+      return roleSkillsMap.get(key) || [];
     }
   }
 

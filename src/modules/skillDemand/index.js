@@ -1,65 +1,65 @@
 'use strict';
 
 /**
- * skillDemand/index.js — Barrel export for the Skill Demand Intelligence Engine
+ * skillDemand/index.js — Barrel export for Skill Demand Intelligence
  *
- * Provides the Express router and internal service for CHI integration.
- *
- * Mount in server.js:
- *   const { skillDemandRouter } = require('./modules/skillDemand');
- *   app.use(`${API_PREFIX}/skills`, authenticate, skillDemandRouter);
- *
- * Use in CHI engine:
- *   const { computeChiSkillScore } = require('./modules/skillDemand');
- *   const skillScore = await computeChiSkillScore(role, userSkills);
- *
- * @module modules/skillDemand
+ * Exposes:
+ * - Express router
+ * - service + repository classes
+ * - CHI integration helpers
+ * - full analysis helper
  */
 
-const router  = require('./routes/skillDemand.routes');
-const { SkillDemandService }    = require('./service/skillDemand.service');
+const skillDemandRouter = require('./routes/skillDemand.routes');
+const { SkillDemandService } = require('./service/skillDemand.service');
 const { SkillDemandRepository } = require('./repository/skillDemand.repository');
 
-const _serviceInstance = new SkillDemandService();
+/**
+ * Lazy singleton service instance.
+ * Prevents eager side effects during module load.
+ *
+ * @type {SkillDemandService|null}
+ */
+let serviceInstance = null;
 
 /**
- * computeChiSkillScore(role, skills) — CHI integration helper
+ * Get shared service instance.
  *
- * Lightweight adapter used by the CHI engine to get a skill score
- * without going through the full HTTP layer.
- *
- * @param {string}   role
- * @param {string[]} skills
- * @returns {Promise<number>} 0–100
+ * @returns {SkillDemandService}
  */
-async function computeChiSkillScore(role, skills) {
-  return _serviceInstance.computeChiSkillScore(role, skills);
+function getService() {
+  if (!serviceInstance) {
+    serviceInstance = new SkillDemandService();
+  }
+
+  return serviceInstance;
 }
 
 /**
- * analyzeSkillDemand({ role, skills }) — Full analysis helper
+ * Lightweight CHI adapter.
  *
- * Internal use. Returns complete SkillDemandResult without HTTP overhead.
+ * @param {string} role
+ * @param {Array<string|{name:string}>} skills
+ * @returns {Promise<number>}
+ */
+async function computeChiSkillScore(role, skills) {
+  return getService().computeChiSkillScore(role, skills);
+}
+
+/**
+ * Internal full analysis helper.
  *
  * @param {Object} params
- * @returns {Promise<SkillDemandResult>}
+ * @returns {Promise<Object>}
  */
 async function analyzeSkillDemand(params) {
-  return _serviceInstance.analyzeSkillDemand(params);
+  return getService().analyzeSkillDemand(params);
 }
 
 module.exports = {
-  skillDemandRouter: router,
+  skillDemandRouter,
   computeChiSkillScore,
   analyzeSkillDemand,
   SkillDemandService,
   SkillDemandRepository,
 };
-
-
-
-
-
-
-
-

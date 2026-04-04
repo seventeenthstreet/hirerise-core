@@ -1,187 +1,231 @@
 'use strict';
 
 /**
- * roles.controller.js — HTTP handlers for the Roles module.
+ * src/modules/roles/controllers/roles.controller.js
+ *
+ * Supabase-ready HTTP handlers for the Roles module.
  *
  * Responsibilities:
- *   - Extract userId from req.user.uid (set by auth.middleware)
- *   - Extract plan from req.user.plan (set by auth.middleware)
- *   - Delegate to roles.service for all business logic
- *   - Return consistent { success, data } envelope
+ *   - Extract authenticated user identity from req.user
+ *   - Normalize request inputs
+ *   - Delegate business logic to roles.service
+ *   - Return consistent { success, data } response envelopes
  *
- * No business logic lives here. If you find yourself writing an if-statement
- * about role IDs or tier limits in this file, move it to roles.service.js.
+ * Notes:
+ *   - No business logic should live here
+ *   - Compatible with Supabase auth middleware payloads
+ *   - Legacy Firebase uid payloads still supported for backward compatibility
  */
 
 const rolesService = require('../roles.service');
-const { AppError: _AppError, ErrorCodes: _ErrorCodes } = require('../../../middleware/errorHandler');
-const { AppError, ErrorCodes } = require('../../../middleware/errorHandler');
-// ─── GET /api/v1/roles ────────────────────────────────────────────────────────
+const {
+  AppError,
+  ErrorCodes,
+} = require('../../../middleware/errorHandler');
 
+/**
+ * Extract authenticated user ID from auth middleware payload.
+ *
+ * Supports:
+ *   - Supabase: req.user.id
+ *   - Legacy compatibility: req.user.uid
+ *
+ * @param {import('express').Request} req
+ * @returns {string|null}
+ */
+function getAuthenticatedUserId(req) {
+  return req.user?.id || req.user?.uid || null;
+}
+
+/**
+ * Normalize numeric query limit safely.
+ *
+ * @param {unknown} value
+ * @param {number} fallback
+ * @param {number} max
+ * @returns {number}
+ */
+function parseSafeLimit(value, fallback, max) {
+  const parsed = Number.parseInt(String(value ?? ''), 10);
+  if (Number.isNaN(parsed) || parsed <= 0) return fallback;
+  return Math.min(parsed, max);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /api/v1/roles
+// ─────────────────────────────────────────────────────────────────────────────
 async function listRoles(req, res, next) {
   try {
-    const { search, category, limit } = req.query; // already validated + coerced by Zod
-    const result = await rolesService.listRoles({ search, category, limit });
+    const { search, category, limit } = req.query;
+
+    const result = await rolesService.listRoles({
+      search,
+      category,
+      limit,
+    });
 
     return res.status(200).json({
       success: true,
-      data:    result,
+      data: result,
     });
-  } catch (err) {
-    return next(err);
+  } catch (error) {
+    return next(error);
   }
 }
 
-// ─── GET /api/v1/roles/:roleId ────────────────────────────────────────────────
-
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /api/v1/roles/:roleId
+// ─────────────────────────────────────────────────────────────────────────────
 async function getRoleById(req, res, next) {
   try {
-    const { roleId } = req.params;
+    const roleId = String(req.params?.roleId || '').trim();
 
-    if (!roleId || typeof roleId !== 'string' || !roleId.trim()) {
-      return next(new AppError(
-        'roleId param is required.',
-        400,
-        { roleId },
-        ErrorCodes.VALIDATION_ERROR
-      ));
+    if (!roleId) {
+      return next(
+        new AppError(
+          'roleId param is required.',
+          400,
+          { roleId: req.params?.roleId },
+          ErrorCodes.VALIDATION_ERROR
+        )
+      );
     }
 
-    const role = await rolesService.getRoleById(roleId.trim());
+    const role = await rolesService.getRoleById(roleId);
 
     return res.status(200).json({
       success: true,
-      data:    { role },
+      data: { role },
     });
-  } catch (err) {
-    return next(err);
+  } catch (error) {
+    return next(error);
   }
 }
 
-// ─── POST /api/v1/onboarding/roles ───────────────────────────────────────────
-
+// ─────────────────────────────────────────────────────────────────────────────
+// POST /api/v1/onboarding/roles
+// ─────────────────────────────────────────────────────────────────────────────
 async function saveOnboardingRoles(req, res, next) {
   try {
-    const userId = req.user?.uid;
-    const plan   = req.user?.plan ?? 'free';
+    const userId = getAuthenticatedUserId(req);
+    const plan = req.user?.plan ?? 'free';
 
     if (!userId) {
-      return next(new AppError('Authentication required.', 401, {}, ErrorCodes.UNAUTHORIZED));
+      return next(
+        new AppError(
+          'Authentication required.',
+          401,
+          {},
+          ErrorCodes.UNAUTHORIZED
+        )
+      );
     }
 
-    // req.body is already validated + stripped by the Zod middleware in the route
-    const result = await rolesService.saveOnboardingRoles(userId, plan, req.body);
+    const result = await rolesService.saveOnboardingRoles(
+      userId,
+      plan,
+      req.body
+    );
 
     return res.status(200).json({
       success: true,
-      data:    result,
+      data: result,
     });
-  } catch (err) {
-    return next(err);
+  } catch (error) {
+    return next(error);
   }
 }
 
-// ─── GET /api/v1/onboarding/roles ────────────────────────────────────────────
-// Returns the user's saved role profile. Useful for the frontend to pre-fill
-// the onboarding form on revisit.
-
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /api/v1/onboarding/roles
+// ─────────────────────────────────────────────────────────────────────────────
 async function getOnboardingRoles(req, res, next) {
   try {
-    const userId = req.user?.uid;
+    const userId = getAuthenticatedUserId(req);
 
     if (!userId) {
-      return next(new AppError('Authentication required.', 401, {}, ErrorCodes.UNAUTHORIZED));
+      return next(
+        new AppError(
+          'Authentication required.',
+          401,
+          {},
+          ErrorCodes.UNAUTHORIZED
+        )
+      );
     }
 
     const profile = await rolesService.getUserProfile(userId);
 
     return res.status(200).json({
       success: true,
-      data:    { profile },
+      data: { profile },
     });
-  } catch (err) {
-    return next(err);
+  } catch (error) {
+    return next(error);
   }
 }
 
-// ─── GET /api/v1/roles/search (FIX G-06) ─────────────────────────────────────
-
-/**
- * FIX G-06: Onboarding-specific role search.
- *
- * Query params:
- *   q           — text search across title + aliases
- *   jobFamilyId — filter by job family (for grouped hierarchy)
- *   limit       — max results (default 30)
- *
- * Response includes both a flat `roles[]` array and a `grouped[]` structure
- * keyed by jobFamilyId — frontend can choose which to render.
- */
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /api/v1/roles/search
+// ─────────────────────────────────────────────────────────────────────────────
 async function searchRolesForOnboarding(req, res, next) {
   try {
     const { q, jobFamilyId, limit } = req.query;
-    const parsedLimit = limit ? Math.min(parseInt(limit, 10) || 30, 100) : 30;
 
     const result = await rolesService.searchRolesForOnboarding({
-      q:           q           ? String(q).trim()           : undefined,
-      jobFamilyId: jobFamilyId ? String(jobFamilyId).trim() : undefined,
-      limit:       parsedLimit,
+      q: q ? String(q).trim() : undefined,
+      jobFamilyId: jobFamilyId
+        ? String(jobFamilyId).trim()
+        : undefined,
+      limit: parseSafeLimit(limit, 30, 100),
     });
 
-    return res.status(200).json({ success: true, data: result });
-  } catch (err) {
-    return next(err);
+    return res.status(200).json({
+      success: true,
+      data: result,
+    });
+  } catch (error) {
+    return next(error);
   }
 }
 
-// ─── GET /api/v1/onboarding/suggest-roles (P1-05) ────────────────────────────
-
-/**
- * P1-05: Role suggestions for Quick Start pre-fill.
- *
- * Query params:
- *   q     — job title string typed by the user (required)
- *   limit — max results (default 5, max 10)
- *
- * Response:
- *   { suggestions: [{roleId, title, confidence, category}], total }
- *
- * Confidence 0-100: frontend shows high-confidence suggestions as primary,
- * lower-confidence as "Did you mean...?" secondary suggestions.
- */
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /api/v1/onboarding/suggest-roles
+// ─────────────────────────────────────────────────────────────────────────────
 async function suggestRolesForOnboarding(req, res, next) {
   try {
     const { q, limit } = req.query;
-    const parsedLimit  = limit ? Math.min(parseInt(limit, 10) || 5, 10) : 5;
+    const jobTitle = String(q || '').trim();
 
-    if (!q || !String(q).trim()) {
-      return res.status(200).json({ success: true, data: { suggestions: [], total: 0 } });
+    if (!jobTitle) {
+      return res.status(200).json({
+        success: true,
+        data: {
+          suggestions: [],
+          total: 0,
+        },
+      });
     }
 
     const result = await rolesService.suggestRolesForOnboarding({
-      jobTitle: String(q).trim(),
-      limit:    parsedLimit,
+      jobTitle,
+      limit: parseSafeLimit(limit, 5, 10),
     });
 
-    return res.status(200).json({ success: true, data: result });
-  } catch (err) {
-    return next(err);
+    return res.status(200).json({
+      success: true,
+      data: result,
+    });
+  } catch (error) {
+    return next(error);
   }
 }
 
 module.exports = {
   listRoles,
   getRoleById,
-  searchRolesForOnboarding, // G-06
-  suggestRolesForOnboarding, // P1-05
+  searchRolesForOnboarding,
+  suggestRolesForOnboarding,
   saveOnboardingRoles,
   getOnboardingRoles,
 };
-
-
-
-
-
-
-
-

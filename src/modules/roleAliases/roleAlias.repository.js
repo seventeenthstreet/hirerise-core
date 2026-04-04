@@ -1,73 +1,174 @@
 'use strict';
 
 /**
- * roleAlias.repository.js — Supabase version
+ * src/modules/roleAliases/roleAlias.repository.js
+ *
+ * Supabase-native repository for role_aliases
+ *
+ * Fully removes BaseRepository / Firebase legacy inheritance.
  */
 
 const { supabase } = require('../../config/supabase');
-const BaseRepository = require('../../repositories/BaseRepository');
+const {
+  AppError,
+  ErrorCodes
+} = require('../../middleware/errorHandler');
 
-const COLLECTION = 'role_aliases';
+const TABLE = 'role_aliases';
 
-class RoleAliasRepository extends BaseRepository {
-  constructor() {
-    super(COLLECTION);
+class RoleAliasRepository {
+  static get SELECT_COLUMNS() {
+    return `
+      id,
+      alias,
+      normalizedAlias,
+      canonicalName,
+      roleId,
+      softDeleted,
+      createdAt,
+      updatedAt
+    `;
   }
 
   /**
-   * Find canonical role by alias (case-insensitive).
+   * Normalize DB row into safe domain object.
+   * @param {object} row
+   * @returns {object|null}
    */
-  async findCanonicalRole(alias) {
-    if (!alias) return null;
-
-    const normalized = alias.toLowerCase().trim();
-
-    const { data, error } = await supabase
-      .from(COLLECTION)
-      .select('roleId, canonicalName')
-      .eq('normalizedAlias', normalized)   // ⚠️ snake_case → normalized_alias
-      .eq('softDeleted', false)            // ⚠️ → soft_deleted
-      .limit(1)
-      .maybeSingle();
-
-    if (error) throw error;
-
-    if (!data) return null;
+  normalize(row) {
+    if (!row) return null;
 
     return {
-      roleId: data.roleId,
-      canonicalName: data.canonicalName,
+      id: row.id,
+      alias: row.alias ?? null,
+      normalizedAlias: row.normalizedAlias ?? null,
+      canonicalName: row.canonicalName ?? null,
+      roleId: row.roleId ?? null,
+      softDeleted: Boolean(row.softDeleted),
+      createdAt: row.createdAt ?? null,
+      updatedAt: row.updatedAt ?? null
     };
   }
 
   /**
-   * Create alias (keeps BaseRepository logic)
+   * Find canonical role by alias (case-insensitive)
+   * Preserves existing business behavior.
+   *
+   * @param {string} alias
+   * @returns {Promise<object|null>}
+   */
+  async findCanonicalRole(alias) {
+    if (!alias || typeof alias !== 'string') return null;
+
+    const normalized = alias.trim().toLowerCase();
+    if (!normalized) return null;
+
+    const { data, error } = await supabase
+      .from(TABLE)
+      .select('roleId, canonicalName')
+      .eq('normalizedAlias', normalized)
+      .eq('softDeleted', false)
+      .limit(1)
+      .maybeSingle();
+
+    if (error) {
+      throw new AppError(
+        'Failed to resolve canonical role alias',
+        500,
+        ErrorCodes.DB_ERROR,
+        error
+      );
+    }
+
+    if (!data) return null;
+
+    return {
+      roleId: data.roleId ?? null,
+      canonicalName: data.canonicalName ?? null
+    };
+  }
+
+  /**
+   * Create new alias.
+   * Replaces BaseRepository.create()
+   *
+   * @param {object} payload
+   * @param {string} adminId
+   * @returns {Promise<object>}
    */
   async createAlias(payload, adminId) {
-    return await super.create({
+    if (!payload?.alias || !payload?.canonicalName || !payload?.roleId) {
+      throw new AppError(
+        'alias, canonicalName and roleId are required',
+        400,
+        ErrorCodes.VALIDATION_ERROR
+      );
+    }
+
+    const timestamp = new Date().toISOString();
+
+    const insertPayload = {
       alias: payload.alias.trim(),
-      normalizedAlias: payload.alias.toLowerCase().trim(),
+      normalizedAlias: payload.alias.trim().toLowerCase(),
       canonicalName: payload.canonicalName,
       roleId: payload.roleId,
-    }, adminId);
+      softDeleted: false,
+      createdAt: timestamp,
+      updatedAt: timestamp,
+      createdBy: adminId || null,
+      updatedBy: adminId || null
+    };
+
+    const { data, error } = await supabase
+      .from(TABLE)
+      .insert(insertPayload)
+      .select(RoleAliasRepository.SELECT_COLUMNS)
+      .single();
+
+    if (error) {
+      throw new AppError(
+        'Failed to create role alias',
+        500,
+        ErrorCodes.DB_ERROR,
+        error
+      );
+    }
+
+    return this.normalize(data);
   }
 
   /**
    * List aliases by roleId
+   *
+   * @param {string} roleId
+   * @returns {Promise<object[]>}
    */
   async findByRoleId(roleId) {
+    if (!roleId) {
+      throw new AppError(
+        'roleId is required',
+        400,
+        ErrorCodes.VALIDATION_ERROR
+      );
+    }
+
     const { data, error } = await supabase
-      .from(COLLECTION)
-      .select('*')
-      .eq('roleId', roleId)        // ⚠️ → role_id
-      .eq('softDeleted', false);   // ⚠️ → soft_deleted
+      .from(TABLE)
+      .select(RoleAliasRepository.SELECT_COLUMNS)
+      .eq('roleId', roleId)
+      .eq('softDeleted', false)
+      .order('createdAt', { ascending: true });
 
-    if (error) throw error;
+    if (error) {
+      throw new AppError(
+        'Failed to fetch aliases by roleId',
+        500,
+        ErrorCodes.DB_ERROR,
+        error
+      );
+    }
 
-    return (data || []).map(row => ({
-      id: row.id,
-      ...row
-    }));
+    return (data || []).map((row) => this.normalize(row));
   }
 }
 

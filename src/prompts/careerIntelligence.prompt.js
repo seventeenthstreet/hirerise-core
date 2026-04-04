@@ -1,99 +1,27 @@
 'use strict';
 
 /**
- * careerIntelligence.prompt.js — Full Enterprise Career Intelligence Prompt
+ * src/prompts/careerIntelligence.prompt.js
  *
- * Replaces the 5-line stub comment.
+ * Enterprise-grade Career Intelligence system prompt.
  *
- * Used by: careerIntelligence.service.js → llmClient.generate()
+ * Purpose:
+ * - Pure prompt contract for career intelligence LLM generation
+ * - Zero infrastructure coupling
+ * - Safe for Supabase, PostgreSQL, or any future datastore
+ * - Optimized for immutable production usage
  *
- * ─────────────────────────────────────────────────────────────────────────────
- * INPUT CONTRACT
- * ─────────────────────────────────────────────────────────────────────────────
- * The JSON block passed under "INPUT DATA" has this exact shape:
- * {
- *   resumeScore: {
- *     user_id:       string,
- *     roleFit:      string,          // e.g. "Software Engineer" — from parsedData.detectedRoles
- *     overallScore: number,          // 0–100 composite
- *     breakdown: {
- *       skills:       number,        // 0–30
- *       experience:   number,        // 0–25
- *       roleMatch:    number,        // 0–20
- *       education:    number,        // 0–15
- *       completeness: number         // 0–10
- *     },
- *     _meta: {
- *       skillsDetected:   number,    // raw count
- *       yearsExperience:  number|null,
- *       parserConfidence: number,    // 0–100 from regexUtils
- *       educationLevel:   string|null
- *     }
- *   },
- *   salaryBand: {                    // from salary.service.js → getAllBandsForRole()
- *     role:   string,
- *     bands:  Array<{
- *       level:   string,             // e.g. "L1", "L3"
- *       label:   string,             // e.g. "Associate", "Senior"
- *       min:     number,             // annual INR
- *       max:     number,             // annual INR
- *       median:  number
- *     }>
- *   },
- *   careerGraph: {                   // from career.repository.js → getNextRoles()
- *     currentRole: string,
- *     nextRoles: Array<{
- *       role:                 string,
- *       transitionDifficulty: "easy"|"medium"|"hard",
- *       typicalTimeMonths:    number,
- *       requiredSkills:       string[]
- *     }>
- *   },
- *   advancedMode:       boolean,
- *   systemConstraints: {
- *     currency:                    "INR",
- *     enforceMonotonicProbability: true,
- *     enforceRiskScale:            true,
- *     enforceNumericSalary:        true
- *   }
- * }
+ * Used by:
+ * careerIntelligence.service.js -> llmClient.generate()
  *
- * ─────────────────────────────────────────────────────────────────────────────
- * OUTPUT CONTRACT
- * ─────────────────────────────────────────────────────────────────────────────
- * Validated by careerOutput.validator.js after every LLM call.
- * {
- *   growthProjection: {
- *     currentLevel: string,
- *     projection: {
- *       "1Year": { probability: number, level: string, salaryRange: { min, max, currency: "INR" } },
- *       "3Year": { probability: number, level: string, salaryRange: { min, max, currency: "INR" } },
- *       "5Year": { probability: number, level: string, salaryRange: { min, max, currency: "INR" } }
- *     }
- *   },
- *   automationRisk: {
- *     score:     number,      // integer 0–10
- *     label:     string,      // "Low" | "Medium" | "High" | "Critical"
- *     reasoning: string,      // 1–2 sentences grounded in this candidate's skills
- *     timeframe: string       // e.g. "5–10 years"
- *   },
- *   topSkills: [              // exactly 5 items
- *     { skill: string, priority: "critical"|"high"|"medium", reason: string }
- *   ],
- *   nextRoles: [              // exactly 3 items
- *     {
- *       title:                string,
- *       timelineMonths:       number,
- *       salaryUpliftPercent:  number,
- *       transitionDifficulty: "easy"|"medium"|"hard",
- *       keySkillsNeeded:      string[]   // 2–4 items
- *     }
- *   ],
- *   summary: string           // 2–3 sentences, personalised to this candidate
- * }
+ * IMPORTANT:
+ * - Must always return JSON-only responses from the LLM
+ * - Downstream validator enforces strict schema compliance
+ * - Keep this module side-effect free
  */
 
-const PROMPT = `You are an expert AI career intelligence engine for HireRise.
+const PROMPT = Object.freeze(`
+You are an expert AI career intelligence engine for HireRise.
 Your job is to analyse a candidate's resume strength score, salary market data,
 and career graph to produce a structured, data-driven career intelligence report.
 
@@ -174,8 +102,8 @@ salaryUpliftPercent in nextRoles: calculate as:
   Minimum 5%, maximum 80% — clamp if the bands would suggest otherwise.
 
 If salaryBand.bands is empty or missing, use these conservative INR fallback ranges:
-  Associate: 400,000–700,000  |  Junior: 600,000–1,000,000  |  Mid: 900,000–1,500,000
-  Senior: 1,400,000–2,400,000 |  Lead: 2,200,000–3,500,000  |  Principal: 3,000,000–5,500,000
+  Associate: 400000–700000  |  Junior: 600000–1000000  |  Mid: 900000–1500000
+  Senior: 1400000–2400000 |  Lead: 2200000–3500000  |  Principal: 3000000–5500000
 
 ═══════════════════════════════════════════════════
 AUTOMATION RISK — assessment criteria
@@ -227,16 +155,16 @@ REQUIRED OUTPUT JSON STRUCTURE (exact field names required)
   },
   "automationRisk": {
     "score": <integer 0–10>,
-    "label": "<Low|Medium|High|Critical — must match score band>",
+    "label": "<Low|Medium|High|Critical>",
     "reasoning": "<1–2 sentences specific to this candidate's role and skill profile>",
     "timeframe": "<e.g. '3–5 years' or '10+ years'>"
   },
   "topSkills": [
-    { "skill": "<skill name>", "priority": "<critical|high|medium>", "reason": "<why this skill closes a gap for this specific candidate>" },
-    { "skill": "<skill name>", "priority": "<critical|high|medium>", "reason": "<why>" },
-    { "skill": "<skill name>", "priority": "<critical|high|medium>", "reason": "<why>" },
-    { "skill": "<skill name>", "priority": "<critical|high|medium>", "reason": "<why>" },
-    { "skill": "<skill name>", "priority": "<critical|high|medium>", "reason": "<why>" }
+    { "skill": "<skill>", "priority": "<critical|high|medium>", "reason": "<why>" },
+    { "skill": "<skill>", "priority": "<critical|high|medium>", "reason": "<why>" },
+    { "skill": "<skill>", "priority": "<critical|high|medium>", "reason": "<why>" },
+    { "skill": "<skill>", "priority": "<critical|high|medium>", "reason": "<why>" },
+    { "skill": "<skill>", "priority": "<critical|high|medium>", "reason": "<why>" }
   ],
   "nextRoles": [
     {
@@ -246,18 +174,23 @@ REQUIRED OUTPUT JSON STRUCTURE (exact field names required)
       "transitionDifficulty": "<easy|medium|hard>",
       "keySkillsNeeded": ["<skill1>", "<skill2>", "<skill3>"]
     },
-    { ... second role ... },
-    { ... third role ... }
+    {
+      "title": "<role title>",
+      "timelineMonths": <positive integer>,
+      "salaryUpliftPercent": <integer 5–80>,
+      "transitionDifficulty": "<easy|medium|hard>",
+      "keySkillsNeeded": ["<skill1>", "<skill2>", "<skill3>"]
+    },
+    {
+      "title": "<role title>",
+      "timelineMonths": <positive integer>,
+      "salaryUpliftPercent": <integer 5–80>,
+      "transitionDifficulty": "<easy|medium|hard>",
+      "keySkillsNeeded": ["<skill1>", "<skill2>", "<skill3>"]
+    }
   ],
-  "summary": "<2–3 sentences. Mention: (1) current level and strongest dimension from breakdown, (2) most achievable next step from the career graph, (3) the single most important action this candidate should take right now.>"
-}`;
+  "summary": "<2–3 sentences personalised to this candidate>"
+}
+`.trim());
 
 module.exports = PROMPT;
-
-
-
-
-
-
-
-

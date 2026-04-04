@@ -1,9 +1,11 @@
 'use strict';
 
 /**
- * routes/university.routes.js
+ * src/modules/university/routes/university.routes.js
  *
- * Clean, production-ready routing layer
+ * Production-ready routing layer
+ * Fully Firebase-free
+ * Optimized for maintainability and route safety
  */
 
 const { Router } = require('express');
@@ -15,24 +17,23 @@ const {
 
 const router = Router();
 
-// ─── Public (Authenticated Users) ─────────────────────
+// ─────────────────────────────────────────────────────────────
+// Authenticated User Routes
+// ─────────────────────────────────────────────────────────────
 
 router.post('/', controller.createUniversity);
 router.get('/my', controller.getMyUniversities);
 
-// ─── University Member Routes ─────────────────────────
+// ─────────────────────────────────────────────────────────────
+// University Member Routes
+// ─────────────────────────────────────────────────────────────
 
-router.get(
-  '/:universityId',
-  requireUniversityMember,
-  controller.getUniversity
-);
+router.get('/:universityId', requireUniversityMember, controller.getUniversity);
 
-router.get(
-  '/:universityId/programs',
-  requireUniversityMember,
-  controller.listPrograms
-);
+router
+  .route('/:universityId/programs')
+  .get(requireUniversityMember, controller.listPrograms)
+  .post(requireUniversityAdmin, controller.createProgram);
 
 router.get(
   '/:universityId/analytics',
@@ -46,24 +47,13 @@ router.get(
   controller.getProgramMatches
 );
 
-// ─── Admin Routes ─────────────────────────────────────
+// ─────────────────────────────────────────────────────────────
+// University Admin Routes
+// ─────────────────────────────────────────────────────────────
 
-router.post(
-  '/:universityId/programs',
-  requireUniversityAdmin,
-  controller.createProgram
-);
-
-router.patch(
-  '/:universityId/programs/:programId',
-  requireUniversityAdmin,
-  controller.updateProgram
-);
-
-router.delete(
-  '/:universityId/programs/:programId',
-  requireUniversityAdmin,
-  controller.deleteProgram
-);
+router
+  .route('/:universityId/programs/:programId')
+  .patch(requireUniversityAdmin, controller.updateProgram)
+  .delete(requireUniversityAdmin, controller.deleteProgram);
 
 module.exports = router;

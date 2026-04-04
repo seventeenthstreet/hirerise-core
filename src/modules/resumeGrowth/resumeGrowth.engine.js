@@ -1,86 +1,148 @@
 'use strict';
 
 /**
- * resumeGrowth.engine.js
- * Pure logic — no DB, no I/O, fully testable in isolation.
+ * src/modules/resumeGrowth/resumeGrowth.engine.js
+ *
+ * Pure deterministic scoring engine.
+ * No DB, no I/O, no framework coupling.
+ *
+ * Production upgrades:
+ * - stronger null safety
+ * - faster Set reuse
+ * - invalid input guards
+ * - date parsing hardening
+ * - divide-by-zero protection
+ * - immutable constants
+ * - safer numeric coercion
+ * - deterministic scoring
  */
 
-// ─── Level thresholds ─────────────────────────────────────────
+// ──────────────────────────────────────────────────────────────
+// Immutable scoring configuration
+// ──────────────────────────────────────────────────────────────
 
-const LEVEL_THRESHOLDS = [
-  { level: 'L1', minYears: 0,  minSkillCoverage: 0  },
-  { level: 'L2', minYears: 2,  minSkillCoverage: 40 },
-  { level: 'L3', minYears: 5,  minSkillCoverage: 65 },
-  { level: 'L4', minYears: 8,  minSkillCoverage: 80 },
-  { level: 'L5', minYears: 12, minSkillCoverage: 90 },
-];
+const LEVEL_THRESHOLDS = Object.freeze([
+  Object.freeze({ level: 'L1', minYears: 0, minSkillCoverage: 0 }),
+  Object.freeze({ level: 'L2', minYears: 2, minSkillCoverage: 40 }),
+  Object.freeze({ level: 'L3', minYears: 5, minSkillCoverage: 65 }),
+  Object.freeze({ level: 'L4', minYears: 8, minSkillCoverage: 80 }),
+  Object.freeze({ level: 'L5', minYears: 12, minSkillCoverage: 90 }),
+]);
 
-const PROMOTION_READINESS_BANDS = [
-  { min: 80, label: 'High' },
-  { min: 55, label: 'Moderate' },
-  { min: 0,  label: 'Early' },
-];
+const PROMOTION_READINESS_BANDS = Object.freeze([
+  Object.freeze({ min: 80, label: 'High' }),
+  Object.freeze({ min: 55, label: 'Moderate' }),
+  Object.freeze({ min: 0, label: 'Early' }),
+]);
 
-const DEGREE_WEIGHTS = {
-  phd:         100,
-  doctorate:   100,
-  masters:     85,
-  mba:         85,
-  bachelor:    65,
-  associate:   45,
-  diploma:     35,
+const DEGREE_WEIGHTS = Object.freeze({
+  phd: 100,
+  doctorate: 100,
+  masters: 85,
+  mba: 85,
+  bachelor: 65,
+  associate: 45,
+  diploma: 35,
   certificate: 30,
-};
+});
 
-// ─── Skill Coverage ───────────────────────────────────────────
+// ──────────────────────────────────────────────────────────────
+// Shared helpers
+// ──────────────────────────────────────────────────────────────
+
+function toSafeArray(value) {
+  return Array.isArray(value) ? value : [];
+}
+
+function toSafeLowerSet(values) {
+  return new Set(
+    toSafeArray(values)
+      .filter(v => typeof v === 'string')
+      .map(v => v.trim().toLowerCase())
+      .filter(Boolean)
+  );
+}
+
+function toSafeNumber(value, fallback = 0) {
+  return Number.isFinite(value) ? value : fallback;
+}
+
+// ──────────────────────────────────────────────────────────────
+// Skill Coverage
+// ──────────────────────────────────────────────────────────────
 
 function calculateSkillCoverage(candidateSkills, requiredSkills, preferredSkills = []) {
-  if (!requiredSkills.length) return 50;
+  const required = toSafeArray(requiredSkills);
+  const preferred = toSafeArray(preferredSkills);
+  const candidateSet = toSafeLowerSet(candidateSkills);
 
-  const candidateSet = new Set(candidateSkills.map(s => s.toLowerCase()));
+  if (!required.length) return 50;
 
-  const requiredHits  = requiredSkills.filter(s => candidateSet.has(s.toLowerCase())).length;
-  const requiredScore = (requiredHits / requiredSkills.length) * 80;
+  const requiredHits = required.filter(skill =>
+    candidateSet.has(String(skill).toLowerCase())
+  ).length;
 
-  const preferredHits  = preferredSkills.filter(s => candidateSet.has(s.toLowerCase())).length;
-  const preferredScore = preferredSkills.length
-    ? (preferredHits / preferredSkills.length) * 20
+  const preferredHits = preferred.filter(skill =>
+    candidateSet.has(String(skill).toLowerCase())
+  ).length;
+
+  const requiredScore = (requiredHits / required.length) * 80;
+  const preferredScore = preferred.length
+    ? (preferredHits / preferred.length) * 20
     : 0;
 
   return Math.round(Math.min(100, requiredScore + preferredScore));
 }
 
 function findSkillGaps(candidateSkills, requiredSkills) {
-  const candidateSet = new Set(candidateSkills.map(s => s.toLowerCase()));
-  return requiredSkills.filter(s => !candidateSet.has(s.toLowerCase()));
+  const candidateSet = toSafeLowerSet(candidateSkills);
+
+  return toSafeArray(requiredSkills).filter(skill =>
+    !candidateSet.has(String(skill).toLowerCase())
+  );
 }
 
-// ─── Experience Depth ─────────────────────────────────────────
+// ──────────────────────────────────────────────────────────────
+// Experience Depth
+// ──────────────────────────────────────────────────────────────
 
-function calculateExperienceDepth(experience, totalYears, roleContext) {
-  const minYears   = roleContext.min_experience_years   || 0;
-  const idealYears = roleContext.ideal_experience_years || minYears + 3;
+function calculateExperienceDepth(experience, totalYears, roleContext = {}) {
+  const safeExperience = toSafeArray(experience);
+  const years = toSafeNumber(totalYears, 0);
 
-  let yearsScore;
+  const minYears = toSafeNumber(roleContext.min_experience_years, 0);
+  const idealYears = toSafeNumber(
+    roleContext.ideal_experience_years,
+    minYears + 3
+  );
 
-  if (totalYears >= idealYears) {
+  let yearsScore = 0;
+
+  if (years >= idealYears) {
     yearsScore = 50;
-  } else if (totalYears >= minYears) {
-    yearsScore = ((totalYears - minYears) / (idealYears - minYears || 1)) * 50;
+  } else if (years >= minYears) {
+    const denominator = Math.max(1, idealYears - minYears);
+    yearsScore = ((years - minYears) / denominator) * 50;
   } else {
-    yearsScore = (totalYears / (minYears || 1)) * 30;
+    yearsScore = (years / Math.max(1, minYears)) * 30;
   }
 
-  const enriched = experience.filter(
-    e => e.responsibilities?.length >= 2 || e.achievements?.length >= 1
-  ).length;
+  const enriched = safeExperience.filter(exp => {
+    const responsibilities = toSafeArray(exp?.responsibilities);
+    const achievements = toSafeArray(exp?.achievements);
 
-  const richnessScore = experience.length
-    ? (enriched / experience.length) * 30
+    return responsibilities.length >= 2 || achievements.length >= 1;
+  }).length;
+
+  const richnessScore = safeExperience.length
+    ? (enriched / safeExperience.length) * 30
     : 0;
 
-  const avgMonths = experience.length
-    ? experience.reduce((s, e) => s + (e.duration_months || 0), 0) / experience.length
+  const avgMonths = safeExperience.length
+    ? safeExperience.reduce(
+        (sum, exp) => sum + toSafeNumber(exp?.duration_months, 0),
+        0
+      ) / safeExperience.length
     : 0;
 
   const tenureScore = Math.min(20, (avgMonths / 24) * 20);
@@ -89,59 +151,86 @@ function calculateExperienceDepth(experience, totalYears, roleContext) {
 }
 
 function attachDurations(experience) {
-  return experience.map(exp => {
-    const start = parseDate(exp.start_date);
-    const end   = exp.end_date ? parseDate(exp.end_date) : new Date();
+  return toSafeArray(experience).map(exp => {
+    const start = parseDate(exp?.start_date);
+    const end = exp?.end_date ? parseDate(exp.end_date) : new Date();
+
     const months = start ? Math.max(0, monthDiff(start, end)) : 0;
-    return { ...exp, duration_months: months };
+
+    return {
+      ...exp,
+      duration_months: months,
+    };
   });
 }
 
-function parseDate(str) {
-  if (!str) return null;
-  if (str.toLowerCase() === 'present') return new Date();
-  const d = new Date(str);
-  return isNaN(d.getTime()) ? null : d;
+function parseDate(value) {
+  if (!value || typeof value !== 'string') return null;
+
+  const normalized = value.trim().toLowerCase();
+
+  if (normalized === 'present' || normalized === 'current') {
+    return new Date();
+  }
+
+  const parsed = new Date(value);
+  return Number.isNaN(parsed.getTime()) ? null : parsed;
 }
 
 function monthDiff(start, end) {
-  return (end.getFullYear() - start.getFullYear()) * 12 +
-         (end.getMonth() - start.getMonth());
+  if (!(start instanceof Date) || !(end instanceof Date)) return 0;
+
+  return (
+    (end.getFullYear() - start.getFullYear()) * 12 +
+    (end.getMonth() - start.getMonth())
+  );
 }
 
-// ─── Education Alignment ──────────────────────────────────────
+// ──────────────────────────────────────────────────────────────
+// Education Alignment
+// ──────────────────────────────────────────────────────────────
 
 function calculateEducationAlignment(education, certifications) {
+  const safeEducation = toSafeArray(education);
+  const safeCertifications = toSafeArray(certifications);
+
   let best = 0;
 
-  for (const edu of education) {
-    const degree = (edu.degree || '').toLowerCase();
+  for (const edu of safeEducation) {
+    const degree = String(edu?.degree || '').toLowerCase();
 
-    for (const [key, pts] of Object.entries(DEGREE_WEIGHTS)) {
-      if (degree.includes(key)) {
-        best = Math.max(best, pts);
+    for (const [keyword, points] of Object.entries(DEGREE_WEIGHTS)) {
+      if (degree.includes(keyword)) {
+        best = Math.max(best, points);
         break;
       }
     }
   }
 
-  if (best === 0 && education.length) best = 25;
+  if (best === 0 && safeEducation.length) best = 25;
   if (best === 0) best = 10;
 
-  const certBonus = Math.min(20, certifications.length * 5);
+  const certBonus = Math.min(20, safeCertifications.length * 5);
 
   return Math.round(Math.min(100, best + certBonus));
 }
 
-// ─── Level Estimation ─────────────────────────────────────────
+// ──────────────────────────────────────────────────────────────
+// Level Estimation
+// ──────────────────────────────────────────────────────────────
 
 function estimateLevel(totalYears, skillCoverage) {
+  const years = toSafeNumber(totalYears, 0);
+  const coverage = toSafeNumber(skillCoverage, 0);
+
   let level = LEVEL_THRESHOLDS[0].level;
 
-  for (const band of LEVEL_THRESHOLDS) {
-    if (totalYears >= band.minYears &&
-        skillCoverage >= band.minSkillCoverage) {
-      level = band.level;
+  for (const threshold of LEVEL_THRESHOLDS) {
+    if (
+      years >= threshold.minYears &&
+      coverage >= threshold.minSkillCoverage
+    ) {
+      level = threshold.level;
     }
   }
 
@@ -149,27 +238,41 @@ function estimateLevel(totalYears, skillCoverage) {
 }
 
 function estimateLevelIfImproved(totalYears, currentCoverage) {
-  const projectedCoverage = Math.min(100, currentCoverage + 25);
+  const projectedCoverage = Math.min(
+    100,
+    toSafeNumber(currentCoverage, 0) + 25
+  );
+
   return estimateLevel(totalYears, projectedCoverage);
 }
 
-// ─── Promotion Readiness ──────────────────────────────────────
+// ──────────────────────────────────────────────────────────────
+// Promotion Readiness
+// ──────────────────────────────────────────────────────────────
 
-function assessPromotionReadiness(skillCoverage, experienceDepth, educationAlignment) {
+function assessPromotionReadiness(
+  skillCoverage,
+  experienceDepth,
+  educationAlignment
+) {
   const composite = Math.round(
-    skillCoverage      * 0.45 +
-    experienceDepth    * 0.35 +
-    educationAlignment * 0.20
+    toSafeNumber(skillCoverage) * 0.45 +
+      toSafeNumber(experienceDepth) * 0.35 +
+      toSafeNumber(educationAlignment) * 0.2
   );
 
-  const band = PROMOTION_READINESS_BANDS.find(b => composite >= b.min);
+  const band = PROMOTION_READINESS_BANDS.find(
+    item => composite >= item.min
+  );
 
-  return band ? band.label : 'Early';
+  return band?.label || 'Early';
 }
 
-// ─── Export (CommonJS) ────────────────────────────────────────
+// ──────────────────────────────────────────────────────────────
+// Exports
+// ──────────────────────────────────────────────────────────────
 
-module.exports = {
+module.exports = Object.freeze({
   attachDurations,
   calculateSkillCoverage,
   findSkillGaps,
@@ -178,13 +281,4 @@ module.exports = {
   estimateLevel,
   estimateLevelIfImproved,
   assessPromotionReadiness,
-};
-
-
-
-
-
-
-
-
-
+});

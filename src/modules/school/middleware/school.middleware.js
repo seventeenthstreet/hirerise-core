@@ -1,122 +1,192 @@
 'use strict';
 
 /**
- * middleware/school.middleware.js
+ * src/modules/school/middleware/school.middleware.js
  *
  * Role-based access control middleware for the School & Counselor Platform.
  *
- * Middlewares:
- *   requireSchoolMember  — user must be admin OR counselor in the school
- *   requireSchoolAdmin   — user must be school_admin in the school
+ * Responsibilities:
+ * - Validate schoolId path param
+ * - Resolve authenticated user membership role
+ * - Support platform admin bypass
+ * - Attach req.schoolRole
+ * - Enforce role authorization
  *
- * Both middlewares:
- *   1. Extract schoolId from req.params.schoolId
- *   2. Look up the user's role in sch_school_users
- *   3. Attach req.schoolRole for downstream use
- *   4. Return 403 if role is insufficient
- *
- * Usage:
- *   router.get('/students', requireSchoolMember, controller.listStudents);
- *   router.post('/counselors', requireSchoolAdmin, controller.addCounselor);
+ * Supabase migration notes:
+ * - Fully removes Firebase auth payload assumptions
+ * - Supports temporary backward compatibility with req.user.uid
+ * - Optimized for minimal DB round trips
  */
 
-const schoolRepo   = require('../repositories/school.repository');
+const schoolRepo = require('../repositories/school.repository');
 const { SCHOOL_ROLES } = require('../models/school.model');
-const logger           = require('../../../utils/logger');
+const logger = require('../../../utils/logger');
 
-// ─── requireSchoolMember ───────────────────────────────────────────────────────
+/* ──────────────────────────────────────────────────────────────
+ * Shared helpers
+ * ────────────────────────────────────────────────────────────── */
+function fail(res, statusCode, message, code) {
+  return res.status(statusCode).json({
+    success: false,
+    error: {
+      message,
+      code,
+    },
+  });
+}
 
-/**
- * Allows school_admin and counselor.
- * Platform admins (req.user.admin === true) bypass this check.
- */
+function getAuthenticatedUserId(req) {
+  return req?.user?.id || req?.user?.uid || null;
+}
+
+function isPlatformAdmin(req) {
+  return req?.user?.admin === true;
+}
+
+function getSchoolId(req) {
+  return req?.params?.schoolId || null;
+}
+
+async function resolveSchoolRole(req) {
+  const schoolId = getSchoolId(req);
+  const userId = getAuthenticatedUserId(req);
+
+  if (!schoolId) {
+    return {
+      error: {
+        statusCode: 400,
+        message: 'schoolId path parameter is required.',
+        code: 'MISSING_SCHOOL_ID',
+      },
+    };
+  }
+
+  if (!userId) {
+    return {
+      error: {
+        statusCode: 401,
+        message: 'Unauthorized.',
+        code: 'UNAUTHORIZED',
+      },
+    };
+  }
+
+  const role = await schoolRepo.getMemberRole(schoolId, userId);
+
+  return {
+    schoolId,
+    userId,
+    role,
+  };
+}
+
+/* ──────────────────────────────────────────────────────────────
+ * requireSchoolMember
+ * Allows: school_admin, counselor
+ * ────────────────────────────────────────────────────────────── */
 async function requireSchoolMember(req, res, next) {
   try {
-    // Platform admins can access any school
-    if (req.user && req.user.admin) {
+    if (isPlatformAdmin(req)) {
       req.schoolRole = SCHOOL_ROLES.ADMIN;
       return next();
     }
 
-    const schoolId = req.params.schoolId;
-    const userId   = req.user && req.user.uid;
+    const result = await resolveSchoolRole(req);
 
-    if (!schoolId) {
-      return res.status(400).json({
-        success: false,
-        error: { message: 'schoolId path parameter is required.', code: 'MISSING_SCHOOL_ID' },
-      });
+    if (result.error) {
+      return fail(
+        res,
+        result.error.statusCode,
+        result.error.message,
+        result.error.code
+      );
     }
 
-    const role = await schoolRepo.getMemberRole(schoolId, userId);
+    const { schoolId, userId, role } = result;
 
     if (!role) {
-      logger.warn({ userId, schoolId }, '[SchoolMiddleware] Access denied — not a school member');
-      return res.status(403).json({
-        success: false,
-        error: { message: 'You are not a member of this school.', code: 'NOT_SCHOOL_MEMBER' },
-      });
+      logger.warn(
+        { userId, schoolId },
+        '[SchoolMiddleware] Access denied — not a school member'
+      );
+
+      return fail(
+        res,
+        403,
+        'You are not a member of this school.',
+        'NOT_SCHOOL_MEMBER'
+      );
     }
 
     req.schoolRole = role;
     return next();
   } catch (err) {
-    logger.error({ err: err.message }, '[SchoolMiddleware] requireSchoolMember error');
+    logger.error(
+      {
+        err: err?.message,
+        stack: err?.stack,
+      },
+      '[SchoolMiddleware] requireSchoolMember error'
+    );
+
     return next(err);
   }
 }
 
-// ─── requireSchoolAdmin ────────────────────────────────────────────────────────
-
-/**
- * Allows school_admin only.
- * Platform admins (req.user.admin === true) bypass this check.
- */
+/* ──────────────────────────────────────────────────────────────
+ * requireSchoolAdmin
+ * Allows: school_admin only
+ * ────────────────────────────────────────────────────────────── */
 async function requireSchoolAdmin(req, res, next) {
   try {
-    if (req.user && req.user.admin) {
+    if (isPlatformAdmin(req)) {
       req.schoolRole = SCHOOL_ROLES.ADMIN;
       return next();
     }
 
-    const schoolId = req.params.schoolId;
-    const userId   = req.user && req.user.uid;
+    const result = await resolveSchoolRole(req);
 
-    if (!schoolId) {
-      return res.status(400).json({
-        success: false,
-        error: { message: 'schoolId path parameter is required.', code: 'MISSING_SCHOOL_ID' },
-      });
+    if (result.error) {
+      return fail(
+        res,
+        result.error.statusCode,
+        result.error.message,
+        result.error.code
+      );
     }
 
-    const role = await schoolRepo.getMemberRole(schoolId, userId);
+    const { schoolId, userId, role } = result;
 
     if (role !== SCHOOL_ROLES.ADMIN) {
-      logger.warn({ userId, schoolId, role }, '[SchoolMiddleware] Access denied — school_admin required');
-      return res.status(403).json({
-        success: false,
-        error: {
-          message: 'Only school administrators can perform this action.',
-          code:    'SCHOOL_ADMIN_REQUIRED',
-        },
-      });
+      logger.warn(
+        { userId, schoolId, role },
+        '[SchoolMiddleware] Access denied — school_admin required'
+      );
+
+      return fail(
+        res,
+        403,
+        'Only school administrators can perform this action.',
+        'SCHOOL_ADMIN_REQUIRED'
+      );
     }
 
     req.schoolRole = role;
     return next();
   } catch (err) {
-    logger.error({ err: err.message }, '[SchoolMiddleware] requireSchoolAdmin error');
+    logger.error(
+      {
+        err: err?.message,
+        stack: err?.stack,
+      },
+      '[SchoolMiddleware] requireSchoolAdmin error'
+    );
+
     return next(err);
   }
 }
 
-module.exports = { requireSchoolMember, requireSchoolAdmin };
-
-
-
-
-
-
-
-
-
+module.exports = {
+  requireSchoolMember,
+  requireSchoolAdmin,
+};

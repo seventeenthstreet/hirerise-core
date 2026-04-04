@@ -1,27 +1,17 @@
 'use strict';
 
-/**
- * syncLog.repository.js
- * ---------------------
- * Production-grade data access layer for sync_logs.
- *
- * Features:
- * - structured sync result writes
- * - dashboard-safe recent log queries
- * - failure trend analysis
- *
- * path: src/repositories/syncLog.repository.js
- */
-
 const { getSupabaseClient } = require('../lib/supabaseClient');
+const logger = require('../utils/logger');
 
 const TABLE = 'sync_logs';
 const DEFAULT_RECENT_LIMIT = 50;
 const DEFAULT_FAILURE_LIMIT = 100;
 const MAX_QUERY_LIMIT = 500;
+const DEFAULT_FAILURE_HOURS = 168;
 
 function normalizeLimit(limit, fallback) {
   const parsed = Number(limit);
+
   if (!Number.isFinite(parsed) || parsed <= 0) {
     return fallback;
   }
@@ -30,15 +20,15 @@ function normalizeLimit(limit, fallback) {
 }
 
 function safeNumber(value) {
-  return Number.isFinite(value) ? value : null;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : null;
 }
 
-/**
- * Insert a structured sync log row.
- */
 async function createLog(row = {}) {
   if (!row.source_type) {
-    throw new Error('syncLog.createLog: source_type is required');
+    throw new Error(
+      'syncLog.createLog: source_type is required'
+    );
   }
 
   const supabase = getSupabaseClient();
@@ -62,21 +52,30 @@ async function createLog(row = {}) {
     .single();
 
   if (error) {
-    throw new Error(`syncLog.createLog failed: ${error.message}`);
+    logger.error('[syncLog] createLog failed', {
+      sourceType: payload.source_type,
+      requestId: payload.request_id,
+      code: error.code,
+      message: error.message,
+    });
+
+    throw new Error(
+      `syncLog.createLog failed: ${error.message}`
+    );
   }
 
   return data;
 }
 
-/**
- * Fetch recent logs for dashboard / debugging.
- */
 async function getRecentLogs({
   sourceType,
   limit = DEFAULT_RECENT_LIMIT,
 } = {}) {
   const supabase = getSupabaseClient();
-  const safeLimit = normalizeLimit(limit, DEFAULT_RECENT_LIMIT);
+  const safeLimit = normalizeLimit(
+    limit,
+    DEFAULT_RECENT_LIMIT
+  );
 
   let query = supabase
     .from(TABLE)
@@ -91,26 +90,37 @@ async function getRecentLogs({
   const { data, error } = await query;
 
   if (error) {
-    throw new Error(`syncLog.getRecentLogs failed: ${error.message}`);
+    logger.error('[syncLog] getRecentLogs failed', {
+      sourceType,
+      limit: safeLimit,
+      code: error.code,
+      message: error.message,
+    });
+
+    throw new Error(
+      `syncLog.getRecentLogs failed: ${error.message}`
+    );
   }
 
-  return data || [];
+  return data ?? [];
 }
 
-/**
- * Fetch failure logs for trend analysis.
- */
 async function getFailureLogs({
-  sinceHours = 168,
+  sinceHours = DEFAULT_FAILURE_HOURS,
   limit = DEFAULT_FAILURE_LIMIT,
 } = {}) {
   const supabase = getSupabaseClient();
 
-  const safeLimit = normalizeLimit(limit, DEFAULT_FAILURE_LIMIT);
+  const safeLimit = normalizeLimit(
+    limit,
+    DEFAULT_FAILURE_LIMIT
+  );
+
   const safeHours =
-    Number.isFinite(sinceHours) && sinceHours > 0
-      ? sinceHours
-      : 168;
+    Number.isFinite(Number(sinceHours)) &&
+    Number(sinceHours) > 0
+      ? Number(sinceHours)
+      : DEFAULT_FAILURE_HOURS;
 
   const since = new Date(
     Date.now() - safeHours * 60 * 60 * 1000
@@ -119,16 +129,25 @@ async function getFailureLogs({
   const { data, error } = await supabase
     .from(TABLE)
     .select('*')
-    .gt('fail_count', 0)
     .gte('created_at', since)
+    .or('fail_count.gt.0,status.eq.failed')
     .order('created_at', { ascending: false })
     .limit(safeLimit);
 
   if (error) {
-    throw new Error(`syncLog.getFailureLogs failed: ${error.message}`);
+    logger.error('[syncLog] getFailureLogs failed', {
+      sinceHours: safeHours,
+      limit: safeLimit,
+      code: error.code,
+      message: error.message,
+    });
+
+    throw new Error(
+      `syncLog.getFailureLogs failed: ${error.message}`
+    );
   }
 
-  return data || [];
+  return data ?? [];
 }
 
 module.exports = {

@@ -2,17 +2,27 @@
 
 /**
  * skillRecommendations.service.js
- * Located: src/modules/skillDemand/
+ * Location: src/modules/skillDemand/
  *
- * Paths from here:
- *   ../../utils/logger         = src/utils/logger
- *   ../../config/supabase      = src/config/supabase
- *   ./repository/...           = src/modules/skillDemand/repository/...
- *   ../../core/supabase  = src/core/supabase
+ * Personalized skill recommendation engine:
+ * - live benchmark skills from dataset
+ * - role fallback benchmarks
+ * - user profile enrichment
+ * - demand-ranked missing skills
  */
-const logger = require('../../utils/logger');
 
-// ─── Role → benchmark skills (static fallback) ────────────────────────────────
+const logger = require('../../utils/logger');
+const { supabase } = require('../../config/supabase');
+
+const {
+  loadDatasets,
+  lookupRoleSkills,
+  lookupSkillDemand,
+} = require('./repository/skillDemandDataset');
+
+const DEFAULT_DEMAND_SCORE = 60;
+const MAX_RECOMMENDATIONS = 6;
+const MIN_LIVE_BENCHMARK_COUNT = 3;
 
 const ROLE_BENCHMARKS = {
   accountant: ['Advanced Excel', 'Tally ERP', 'GST Compliance', 'Financial Reporting', 'Tax Planning', 'Accounts Payable', 'Bank Reconciliation', 'Financial Modelling', 'Cost Accounting', 'MIS Reporting'],
@@ -32,142 +42,173 @@ const ROLE_BENCHMARKS = {
   'operations manager': ['Process Improvement', 'Project Management', 'Team Leadership', 'Supply Chain', 'KPI Management', 'ERP Systems', 'Budget Management', 'Vendor Management', 'Cross-functional Coordination', 'Lean/Six Sigma'],
   'business analyst': ['Requirement Gathering', 'Process Mapping', 'SQL', 'Excel', 'Stakeholder Management', 'Agile', 'BPMN', 'Power BI', 'User Stories', 'Gap Analysis'],
   'sales manager': ['B2B Sales', 'CRM', 'Pipeline Management', 'Team Leadership', 'Negotiation', 'Salesforce', 'Account Management', 'Revenue Forecasting', 'Cold Outreach', 'Customer Success'],
-  default: ['Communication', 'Microsoft Office', 'Project Management', 'Problem Solving', 'Data Analysis', 'Leadership', 'Time Management', 'Teamwork', 'Critical Thinking', 'Presentation Skills']
+  default: ['Communication', 'Microsoft Office', 'Project Management', 'Problem Solving', 'Data Analysis', 'Leadership', 'Time Management', 'Teamwork', 'Critical Thinking', 'Presentation Skills'],
 };
+
+function normalizeSkill(value) {
+  return String(value || '')
+    .toLowerCase()
+    .replace(/\./g, '')
+    .replace(/[_\-/]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
 
 function classifyRole(role) {
   if (!role) return 'default';
-  const r = role.toLowerCase().trim();
+
+  const normalized = role.toLowerCase().trim();
+
   for (const key of Object.keys(ROLE_BENCHMARKS)) {
-    if (r === key || r.includes(key) || key.includes(r)) return key;
+    if (
+      normalized === key ||
+      normalized.includes(key) ||
+      key.includes(normalized)
+    ) {
+      return key;
+    }
   }
-  if (/account|ca\b|chartered|cpa/.test(r)) return 'accountant';
-  if (/financial analyst/.test(r)) return 'financial analyst';
-  if (/finance manag|cfo/.test(r)) return 'finance manager';
-  if (/hr manag|people.*manag/.test(r)) return 'hr manager';
-  if (/hr exec|hr officer/.test(r)) return 'hr executive';
-  if (/recruit|talent acqui/.test(r)) return 'recruiter';
-  if (/software eng|sde|developer|programmer/.test(r)) return 'software engineer';
-  if (/full.?stack/.test(r)) return 'full stack developer';
-  if (/data analys/.test(r)) return 'data analyst';
-  if (/data scien|ml engineer/.test(r)) return 'data scientist';
-  if (/product manag|pm\b/.test(r)) return 'product manager';
-  if (/devops|sre|platform eng/.test(r)) return 'devops engineer';
-  if (/market.*manag/.test(r)) return 'marketing manager';
-  if (/digital market/.test(r)) return 'digital marketer';
-  if (/ops manag|operations manag/.test(r)) return 'operations manager';
-  if (/business analys|ba\b/.test(r)) return 'business analyst';
-  if (/sales manag/.test(r)) return 'sales manager';
+
+  if (/account|ca\b|chartered|cpa/.test(normalized)) return 'accountant';
+  if (/financial analyst/.test(normalized)) return 'financial analyst';
+  if (/finance manag|cfo/.test(normalized)) return 'finance manager';
+  if (/hr manag|people.*manag/.test(normalized)) return 'hr manager';
+  if (/hr exec|hr officer/.test(normalized)) return 'hr executive';
+  if (/recruit|talent acqui/.test(normalized)) return 'recruiter';
+  if (/software eng|sde|developer|programmer/.test(normalized)) return 'software engineer';
+  if (/full.?stack/.test(normalized)) return 'full stack developer';
+  if (/data analys/.test(normalized)) return 'data analyst';
+  if (/data scien|ml engineer/.test(normalized)) return 'data scientist';
+  if (/product manag|pm\b/.test(normalized)) return 'product manager';
+  if (/devops|sre|platform eng/.test(normalized)) return 'devops engineer';
+  if (/market.*manag/.test(normalized)) return 'marketing manager';
+  if (/digital market/.test(normalized)) return 'digital marketer';
+  if (/ops manag|operations manag/.test(normalized)) return 'operations manager';
+  if (/business analys|ba\b/.test(normalized)) return 'business analyst';
+  if (/sales manag/.test(normalized)) return 'sales manager';
+
   return 'default';
 }
 
-function normalizeSkill(s) {
-  return (s || '').toLowerCase().replace(/\./g, '').replace(/[_\-/]/g, ' ').replace(/\s+/g, ' ').trim();
+function normalizeSkillArray(skills) {
+  return (skills ?? [])
+    .map((item) =>
+      typeof item === 'string'
+        ? item
+        : typeof item?.name === 'string'
+          ? item.name
+          : ''
+    )
+    .filter(Boolean);
 }
-
-// ─── Load user profile ─────────────────────────────────────────────────────────
 
 async function loadUserProfile(userId) {
   try {
-    const { supabase } = require('../../config/supabase');
+    const { data: chiData } = await supabase
+      .from('career_health_index')
+      .select('top_skills,detected_profession,current_job_title')
+      .eq('user_id', userId)
+      .order('generated_at', { ascending: false })
+      .limit(1);
 
-    // CHI snapshot first (most accurate)
-    try {
-      const { data: chiData, error: chiError } = await supabase
-        .from('careerHealthIndex')
-        .select('*')
-        .eq('userId', userId)
-        .order('generatedAt', { ascending: false })
-        .limit(1);
+    if (chiData?.length) {
+      const chi = chiData[0];
+      const skills = normalizeSkillArray(chi.top_skills);
+      const role =
+        chi.detected_profession ?? chi.current_job_title ?? null;
 
-      if (!chiError && chiData && chiData.length > 0) {
-        const chi = chiData[0];
-        const skills = chi.topSkills ?? chi.skills ?? [];
-        const role = chi.detectedProfession ?? chi.currentJobTitle ?? null;
-        if (skills.length > 0 || role) {
-          return {
-            userSkills: skills.map(s => typeof s === 'string' ? s : s?.name ?? '').filter(Boolean),
-            targetRole: role
-          };
-        }
+      if (skills.length || role) {
+        return { userSkills: skills, targetRole: role };
       }
-    } catch (chiErr) {
-      logger.warn('[SkillRecs] CHI query failed, trying userProfiles', { error: chiErr.message });
     }
 
-    // Fallback: userProfiles
-    try {
-      const { data: profileData } = await supabase
-        .from('userProfiles')
-        .select('*')
-        .eq('id', userId)
-        .maybeSingle();
+    const { data: profileData } = await supabase
+      .from('user_profiles')
+      .select('skills,target_role,current_job_title')
+      .eq('user_id', userId)
+      .maybeSingle();
 
-      if (profileData) {
-        const skills = (profileData.skills ?? []).map(s => typeof s === 'string' ? s : s?.name ?? '').filter(Boolean);
-        const role = profileData.targetRole ?? profileData.currentJobTitle ?? null;
-        if (skills.length > 0 || role) return { userSkills: skills, targetRole: role };
+    if (profileData) {
+      const skills = normalizeSkillArray(profileData.skills);
+      const role =
+        profileData.target_role ??
+        profileData.current_job_title ??
+        null;
+
+      if (skills.length || role) {
+        return { userSkills: skills, targetRole: role };
       }
-    } catch {}
+    }
 
-    // Fallback: users doc
     const { data: userData } = await supabase
       .from('users')
-      .select('*')
+      .select('skills,target_role,current_job_title')
       .eq('id', userId)
       .maybeSingle();
 
     if (userData) {
       return {
-        userSkills: (userData.skills ?? []).map(s => typeof s === 'string' ? s : s?.name ?? '').filter(Boolean),
-        targetRole: userData.targetRole ?? userData.jobTitle ?? null
+        userSkills: normalizeSkillArray(userData.skills),
+        targetRole: userData.target_role ?? userData.current_job_title ?? null,
       };
     }
 
     return { userSkills: [], targetRole: null };
-  } catch (err) {
-    logger.warn('[SkillRecs] loadUserProfile failed', { userId, error: err.message });
+  } catch (error) {
+    logger.warn('[SkillRecs] loadUserProfile failed', {
+      userId,
+      error: error.message,
+    });
+
     return { userSkills: [], targetRole: null };
   }
 }
 
-// ─── Load benchmark skills ────────────────────────────────────────────────────
-
 async function loadBenchmarkSkills(role) {
   try {
-    const { loadDatasets, lookupRoleSkills } = require('./repository/skillDemandDataset');
     const { roleSkills } = await loadDatasets();
     const live = lookupRoleSkills(roleSkills, role);
-    if (live && live.length >= 3) return live;
-  } catch (err) {
-    logger.warn('[SkillRecs] Supabase dataset failed, using static fallback', { error: err.message });
-  }
-  const key = classifyRole(role);
-  return ROLE_BENCHMARKS[key] ?? ROLE_BENCHMARKS.default;
-}
 
-// ─── Load demand scores ───────────────────────────────────────────────────────
+    if (live?.length >= MIN_LIVE_BENCHMARK_COUNT) {
+      return live;
+    }
+  } catch (error) {
+    logger.warn('[SkillRecs] dataset fallback', {
+      role,
+      error: error.message,
+    });
+  }
+
+  return ROLE_BENCHMARKS[classifyRole(role)] ?? ROLE_BENCHMARKS.default;
+}
 
 async function loadDemandScores(skillNames) {
   const scores = new Map();
+
   try {
-    const { loadDatasets, lookupSkillDemand } = require('./repository/skillDemandDataset');
     const { skillDemand } = await loadDatasets();
+
     for (const skill of skillNames) {
-      const d = lookupSkillDemand(skillDemand, skill);
-      scores.set(skill, d?.demand_score ?? 60);
+      const demand = lookupSkillDemand(skillDemand, skill);
+      scores.set(skill, demand?.demand_score ?? DEFAULT_DEMAND_SCORE);
     }
   } catch {
-    for (const skill of skillNames) scores.set(skill, 60);
+    for (const skill of skillNames) {
+      scores.set(skill, DEFAULT_DEMAND_SCORE);
+    }
   }
+
   return scores;
 }
 
-// ─── Main API ─────────────────────────────────────────────────────────────────
-
 async function getSkillRecommendations(userId) {
   const { userSkills, targetRole } = await loadUserProfile(userId);
-  logger.info('[SkillRecs] profile', { userId, skillCount: userSkills.length, targetRole });
+
+  logger.info('[SkillRecs] profile loaded', {
+    userId,
+    skillCount: userSkills.length,
+    targetRole,
+  });
 
   if (!targetRole) {
     return {
@@ -177,48 +218,56 @@ async function getSkillRecommendations(userId) {
       matchScoreImpact: 0,
       targetRole: null,
       hasTargetRole: false,
-      explanation: 'Set your target role in your profile to get personalised skill recommendations.',
+      explanation:
+        'Set your target role in your profile to get personalised skill recommendations.',
       userSkillCount: userSkills.length,
-      benchmarkSkills: []
+      benchmarkSkills: [],
     };
   }
 
   const benchmarkSkills = await loadBenchmarkSkills(targetRole);
-  const normUser = new Set(userSkills.map(normalizeSkill));
-  const allMissing = benchmarkSkills.filter(s => !normUser.has(normalizeSkill(s)));
-  const demandScores = await loadDemandScores(allMissing);
-  const perSkillImpact = benchmarkSkills.length > 0 ? Math.round(100 / benchmarkSkills.length) : 5;
+  const normalizedUserSkills = new Set(userSkills.map(normalizeSkill));
 
-  // Cap at 6 — never overwhelm the user with a huge list
-  const MAX_RECS = 6;
-  const recommendedSkills = allMissing
-    .map(name => ({
+  const missingSkills = benchmarkSkills.filter(
+    (skill) => !normalizedUserSkills.has(normalizeSkill(skill))
+  );
+
+  const demandScores = await loadDemandScores(missingSkills);
+
+  const perSkillImpact = benchmarkSkills.length
+    ? Math.round(100 / benchmarkSkills.length)
+    : 5;
+
+  const recommendedSkills = missingSkills
+    .map((name) => ({
       name,
-      demandScore: demandScores.get(name) ?? 60,
-      matchScoreImpact: perSkillImpact
+      demandScore: demandScores.get(name) ?? DEFAULT_DEMAND_SCORE,
+      matchScoreImpact: perSkillImpact,
     }))
     .sort((a, b) => b.demandScore - a.demandScore)
-    .slice(0, MAX_RECS);
+    .slice(0, MAX_RECOMMENDATIONS);
 
-  const matched = benchmarkSkills.filter(s => normUser.has(normalizeSkill(s)));
-  const matchScore = benchmarkSkills.length > 0 ? Math.round(matched.length / benchmarkSkills.length * 100) : 0;
-  const topCount = recommendedSkills.length;
-  const gain = Math.min(topCount * perSkillImpact, 100 - matchScore);
+  const matchedCount = benchmarkSkills.length - missingSkills.length;
+  const matchScore = benchmarkSkills.length
+    ? Math.round((matchedCount / benchmarkSkills.length) * 100)
+    : 0;
 
-  // Human-friendly copy — only when we have a real target role
-  let explanation = null;
-  if (targetRole) {
-    if (topCount === 0) {
-      explanation = `Great — your profile already covers all key skills for ${targetRole}!`;
-    } else if (topCount === 1) {
-      explanation = `Adding "${recommendedSkills[0].name}" is the single highest-impact move for a ${targetRole} role.`;
-    } else {
-      explanation = `Start with these ${topCount} skills — they appear in most ${targetRole} job listings and will have the biggest impact on your score.`;
-    }
+  const gain = Math.min(
+    recommendedSkills.length * perSkillImpact,
+    100 - matchScore
+  );
+
+  let explanation;
+  if (!recommendedSkills.length) {
+    explanation = `Great — your profile already covers all key skills for ${targetRole}!`;
+  } else if (recommendedSkills.length === 1) {
+    explanation = `Adding "${recommendedSkills[0].name}" is the single highest-impact move for a ${targetRole} role.`;
+  } else {
+    explanation = `Start with these ${recommendedSkills.length} skills — they appear in most ${targetRole} job listings and will have the biggest impact on your score.`;
   }
 
   return {
-    missingSkills: recommendedSkills.map(s => s.name),
+    missingSkills: recommendedSkills.map((item) => item.name),
     recommendedSkills,
     matchScore,
     matchScoreImpact: gain,
@@ -226,73 +275,49 @@ async function getSkillRecommendations(userId) {
     hasTargetRole: true,
     explanation,
     userSkillCount: userSkills.length,
-    benchmarkSkills
+    benchmarkSkills,
   };
 }
 
 async function addSkillsToProfile(userId, skillNames) {
-  const { supabase } = require('../../config/supabase');
-  const normalizedNew = skillNames.map(s => String(s).trim()).filter(Boolean);
-  if (!normalizedNew.length) return { added: 0, skills: [] };
+  const cleanedSkills = skillNames
+    .map((value) => String(value).trim())
+    .filter(Boolean);
+
+  if (!cleanedSkills.length) {
+    return { added: 0, skills: [] };
+  }
 
   try {
-    const { data: userData } = await supabase
-      .from('users')
-      .select('*')
-      .eq('id', userId)
-      .maybeSingle();
+    // Single transactional RPC — atomically merges into both
+    // users.skills and user_profiles.skills with dedup
+    const { data, error } = await supabase.rpc('add_skills_to_profile', {
+      p_user_id: userId,
+      p_skills:  cleanedSkills,
+    });
 
-    const existing = new Set(
-      (userData?.skills ?? [])
-        .map(s => (typeof s === 'string' ? s : s?.name ?? '').toLowerCase())
-    );
+    if (error) throw error;
 
-    const toAdd = normalizedNew.filter(s => !existing.has(s.toLowerCase()));
-    if (!toAdd.length) return { added: 0, skills: [] };
+    logger.info('[SkillRecs] skills added', {
+      userId,
+      added: data.added,
+    });
 
-    const now = new Date().toISOString();
-    const mergedSkills = [...existing, ...toAdd.map(s => s.toLowerCase())];
-    const profileSkills = toAdd.map(name => ({
-      name,
-      proficiency: 'beginner',
-      addedAt: now
-    }));
+    return {
+      added:  data.added,
+      skills: data.skills,
+    };
+  } catch (error) {
+    logger.error('[SkillRecs] addSkillsToProfile failed', {
+      userId,
+      error: error.message,
+    });
 
-    // Get existing profile skills to merge
-    const { data: profileData } = await supabase
-      .from('userProfiles')
-      .select('skills')
-      .eq('id', userId)
-      .maybeSingle();
-
-    const existingProfileSkills = profileData?.skills ?? [];
-
-    await Promise.all([
-      supabase
-        .from('users')
-        .upsert([{
-          id: userId,
-          skills: mergedSkills,
-          updatedAt: now
-        }]),
-      supabase
-        .from('userProfiles')
-        .upsert([{
-          id: userId,
-          skills: [...existingProfileSkills, ...profileSkills],
-          updatedAt: now
-        }])
-    ]);
-
-    logger.info('[SkillRecs] added skills', { userId, count: toAdd.length });
-    return { added: toAdd.length, skills: toAdd };
-  } catch (err) {
-    logger.error('[SkillRecs] addSkillsToProfile failed', { userId, error: err.message });
-    throw err;
+    throw error;
   }
 }
 
 module.exports = {
   getSkillRecommendations,
-  addSkillsToProfile
+  addSkillsToProfile,
 };

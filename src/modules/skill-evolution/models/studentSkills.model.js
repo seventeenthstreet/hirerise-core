@@ -1,82 +1,96 @@
 'use strict';
 
 /**
- * models/studentSkills.model.js
+ * src/modules/skill-evolution/models/studentSkills.model.js
  *
- * Firestore collection for the Skill Evolution Engine.
+ * Supabase row model contracts for Skill Evolution Engine.
  *
- * Collection: edu_student_skills
- *   One document per (student_id, skill_name) pair.
- *   Written by the orchestrator after the SEE pipeline step.
- *   Read by the skill controller when serving /api/skills/recommendations/:studentId
+ * PostgreSQL tables:
+ *   - edu_student_skills
+ *   - edu_skill_recommendations
+ *
+ * This file replaces Firestore document builders with
+ * SQL row-safe normalization helpers.
  */
 
-const COLLECTIONS = {
-  STUDENT_SKILLS:      'edu_student_skills',
-  SKILL_RECOMMENDATIONS: 'edu_skill_recommendations', // cached ranked list per student
-};
+const TABLES = Object.freeze({
+  STUDENT_SKILLS: 'edu_student_skills',
+  SKILL_RECOMMENDATIONS: 'edu_skill_recommendations',
+});
 
-const PROFICIENCY_LEVELS = ['beginner', 'intermediate', 'advanced', 'expert'];
+const PROFICIENCY_LEVELS = Object.freeze([
+  'beginner',
+  'intermediate',
+  'advanced',
+  'expert',
+]);
+
+function normalizeProficiency(level) {
+  return PROFICIENCY_LEVELS.includes(level)
+    ? level
+    : 'beginner';
+}
 
 /**
- * edu_student_skills/{autoId}
+ * Build normalized PostgreSQL row for edu_student_skills
  *
- *   id               — auto-generated Firestore ID
- *   student_id       — user ID
- *   skill_name       — string
- *   proficiency_level — PROFICIENCY_LEVELS value
- *   impact_score     — number 0–100 (calculated by SEE)
- *   career_relevance — number 0–1 (how relevant to top career)
- *   demand_score     — number 0–100 (from LMI)
- *   created_at       — serverTimestamp
+ * @param {string} studentId
+ * @param {object} fields
+ * @returns {object}
  */
-function buildStudentSkillDoc(studentId, fields) {
+function buildStudentSkillRow(studentId, fields = {}) {
   return {
-    student_id:        studentId,
-    skill_name:        fields.skill_name        || null,
-    proficiency_level: fields.proficiency_level || 'beginner',
-    impact_score:      fields.impact_score      != null ? Number(fields.impact_score)      : null,
-    career_relevance:  fields.career_relevance  != null ? Number(fields.career_relevance)  : null,
-    demand_score:      fields.demand_score      != null ? Number(fields.demand_score)       : null,
-    created_at:        null, // set by repository
+    student_id: studentId,
+    skill_name: fields.skill_name
+      ? String(fields.skill_name).trim()
+      : null,
+    proficiency_level: normalizeProficiency(
+      fields.proficiency_level
+    ),
+    impact_score:
+      fields.impact_score != null
+        ? Number(fields.impact_score)
+        : null,
+    career_relevance:
+      fields.career_relevance != null
+        ? Number(fields.career_relevance)
+        : null,
+    demand_score:
+      fields.demand_score != null
+        ? Number(fields.demand_score)
+        : null,
   };
 }
 
 /**
- * edu_skill_recommendations/{studentId}  (keyed by studentId — one per student)
+ * Build normalized PostgreSQL row for edu_skill_recommendations
  *
- *   student_id       — user ID
- *   top_career       — string (the student's #1 predicted career)
- *   recommended_stream — string
- *   skills           — SkillRecommendation[]
- *   roadmap          — RoadmapStep[]
- *   engine_version   — string
- *   calculated_at    — serverTimestamp
+ * @param {string} studentId
+ * @param {object} fields
+ * @returns {object}
  */
-function buildSkillRecommendationDoc(studentId, fields) {
+function buildSkillRecommendationRow(studentId, fields = {}) {
   return {
-    student_id:         studentId,
-    top_career:         fields.top_career         || null,
-    recommended_stream: fields.recommended_stream || null,
-    skills:             fields.skills             || [],
-    roadmap:            fields.roadmap            || [],
-    engine_version:     fields.engine_version     || '1.0.0',
-    calculated_at:      null, // set by repository
+    student_id: studentId,
+    top_career: fields.top_career
+      ? String(fields.top_career)
+      : null,
+    recommended_stream: fields.recommended_stream
+      ? String(fields.recommended_stream)
+      : null,
+    skills: Array.isArray(fields.skills)
+      ? fields.skills
+      : [],
+    roadmap: Array.isArray(fields.roadmap)
+      ? fields.roadmap
+      : [],
+    engine_version: fields.engine_version || '2.0.0',
   };
 }
 
 module.exports = {
-  COLLECTIONS,
+  TABLES,
   PROFICIENCY_LEVELS,
-  buildStudentSkillDoc,
-  buildSkillRecommendationDoc,
+  buildStudentSkillRow,
+  buildSkillRecommendationRow,
 };
-
-
-
-
-
-
-
-
-

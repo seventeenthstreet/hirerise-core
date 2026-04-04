@@ -1,161 +1,195 @@
 'use strict';
 
 /**
- * services/skillEvolution.service.js
+ * src/modules/skill-evolution/services/skillEvolution.service.js
  *
- * Service layer for the Skill Evolution Engine.
+ * Skill Evolution Engine service layer
  *
- * Responsibilities:
- *   - Accept orchestrator outputs (career, stream, cognitive, market)
- *   - Call the SkillRecommendationEngine
- *   - Persist results to Supabase (edu_skill_recommendations + edu_student_skills)
- *   - Provide a read path for the API controller
+ * Fully Supabase-native:
+ * - atomic upsert-safe persistence
+ * - DB-owned timestamps
+ * - no Firestore delete+rewrite patterns
+ * - conflict-safe row writes
+ * - optimized read paths
  */
+
 const logger = require('../../../utils/logger');
 const { supabase } = require('../../../config/supabase');
+
 const skillEngine = require('../engines/skillRecommendation.engine');
 const {
-  COLLECTIONS,
-  buildStudentSkillDoc,
-  buildSkillRecommendationDoc
+  TABLES,
+  buildStudentSkillRow,
+  buildSkillRecommendationRow,
 } = require('../models/studentSkills.model');
+
 const marketTrendService = require('../../labor-market-intelligence/services/marketTrend.service');
 
-// ─── Run the SEE pipeline and persist results ─────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// Generate + persist recommendations
+// ─────────────────────────────────────────────────────────────────────────────
 
-/**
- * Generate skill recommendations for a student from engine outputs.
- * Called by the education orchestrator after CareerDigitalTwinEngine.
- *
- * @param {string} studentId
- * @param {object} careerResult     — CareerSuccessEngine output
- * @param {object} streamResult     — StreamIntelligenceEngine output
- * @param {object} cognitiveResult  — CognitiveProfileEngine output
- * @returns {SkillEvolutionResult}
- */
-async function generateRecommendations(studentId, {
-  careerResult,
-  streamResult,
-  cognitiveResult
-}) {
-  logger.info({ studentId }, '[SEE] Generating skill recommendations');
+async function generateRecommendations(
+  studentId,
+  {
+    careerResult = {},
+    streamResult = {},
+    cognitiveResult = {},
+  } = {}
+) {
+  logger.info(
+    { studentId },
+    '[SEE] Generating skill recommendations'
+  );
 
-  // ── Load live LMI skill demand (non-blocking fallback) ──────────────────
   let marketDemand = [];
+
   try {
     marketDemand = await marketTrendService.getSkillDemand(30);
   } catch (err) {
-    logger.warn({ err: err.message }, '[SEE] LMI unavailable — using engine static data');
+    logger.warn(
+      { studentId, error: err.message },
+      '[SEE] LMI unavailable — using static fallback'
+    );
   }
 
-  // ── Run the engine ───────────────────────────────────────────────────────
   const result = skillEngine.recommend({
     careerResult,
     streamResult,
     cognitiveResult,
-    marketDemand
+    marketDemand,
   });
 
-  // ── Persist top-level recommendation document ────────────────────────────
-  const recommendationDoc = buildSkillRecommendationDoc(studentId, {
-    top_career: result.top_career,
-    recommended_stream: result.recommended_stream,
-    skills: result.skills,
-    roadmap: result.roadmap,
-    engine_version: result.engine_version
-  });
+  // ── Upsert cached recommendation row ─────────────────────────────────────
+  const recommendationRow = buildSkillRecommendationRow(
+    studentId,
+    result
+  );
 
-  const { error: upsertRecError } = await supabase
-    .from(COLLECTIONS.SKILL_RECOMMENDATIONS)
-    .upsert([{
-      id: studentId,
-      ...recommendationDoc,
-      calculated_at: new Date().toISOString()
-    }]);
+  const { error: recommendationError } = await supabase
+    .from(TABLES.SKILL_RECOMMENDATIONS)
+    .upsert(recommendationRow, {
+      onConflict: 'student_id',
+    });
 
-  if (upsertRecError) {
-    logger.error({ studentId, error: upsertRecError.message }, '[SEE] Failed to upsert skill recommendations');
-    throw new Error(upsertRecError.message);
+  if (recommendationError) {
+    logger.error(
+      {
+        studentId,
+        error: recommendationError.message,
+      },
+      '[SEE] Failed to upsert recommendation cache'
+    );
+
+    throw recommendationError;
   }
 
-  // ── Persist per-skill rows (replace previous run) ───────────────────────
-  // Delete existing skill rows for this student, then insert fresh ones
-  const { error: deleteError } = await supabase
-    .from(COLLECTIONS.STUDENT_SKILLS)
-    .delete()
-    .eq('student_id', studentId);
+  // ── Bulk upsert skill rows ───────────────────────────────────────────────
+  const skillRows = Array.isArray(result.skills)
+    ? result.skills.map((skill) =>
+        buildStudentSkillRow(studentId, {
+          skill_name: skill.skill,
+          proficiency_level: 'beginner',
+          impact_score: skill.impact,
+          career_relevance: skill.career_relevance,
+          demand_score: skill.demand_score,
+        })
+      )
+    : [];
 
-  if (deleteError) {
-    logger.warn({ studentId, error: deleteError.message }, '[SEE] Failed to delete existing student skills');
-  }
+  if (skillRows.length > 0) {
+    const { error: skillsError } = await supabase
+      .from(TABLES.STUDENT_SKILLS)
+      .upsert(skillRows, {
+        onConflict: 'student_id,skill_name',
+      });
 
-  if (result.skills && result.skills.length > 0) {
-    const skillRows = result.skills.map(skill => ({
-      ...buildStudentSkillDoc(studentId, {
-        skill_name: skill.skill,
-        proficiency_level: 'beginner',
-        impact_score: skill.impact,
-        career_relevance: skill.career_relevance,
-        demand_score: skill.demand_score
-      }),
-      created_at: new Date().toISOString()
-    }));
+    if (skillsError) {
+      logger.error(
+        {
+          studentId,
+          error: skillsError.message,
+        },
+        '[SEE] Failed to bulk upsert student skills'
+      );
 
-    const { error: insertSkillsError } = await supabase
-      .from(COLLECTIONS.STUDENT_SKILLS)
-      .insert(skillRows);
-
-    if (insertSkillsError) {
-      logger.error({ studentId, error: insertSkillsError.message }, '[SEE] Failed to insert student skills');
-      throw new Error(insertSkillsError.message);
+      throw skillsError;
     }
   }
 
-  logger.info({ studentId, skillCount: result.skills.length }, '[SEE] Skill recommendations persisted');
+  logger.info(
+    {
+      studentId,
+      skillCount: skillRows.length,
+      topCareer: result.top_career,
+    },
+    '[SEE] Skill recommendations persisted successfully'
+  );
+
   return result;
 }
 
-// ─── Read path ────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// Read cached recommendation
+// ─────────────────────────────────────────────────────────────────────────────
 
-/**
- * Retrieve cached skill recommendations for a student.
- * Returns null if not yet generated.
- *
- * @param {string} studentId
- * @returns {object|null}
- */
 async function getRecommendations(studentId) {
   const { data, error } = await supabase
-    .from(COLLECTIONS.SKILL_RECOMMENDATIONS)
-    .select('*')
-    .eq('id', studentId)
+    .from(TABLES.SKILL_RECOMMENDATIONS)
+    .select(
+      `
+      student_id,
+      top_career,
+      recommended_stream,
+      skills,
+      roadmap,
+      engine_version,
+      calculated_at,
+      updated_at
+      `
+    )
+    .eq('student_id', studentId)
     .maybeSingle();
 
   if (error) {
-    logger.error({ studentId, error: error.message }, '[SEE] Failed to fetch recommendations');
-    throw new Error(error.message);
+    logger.error(
+      { studentId, error: error.message },
+      '[SEE] Failed to fetch recommendations'
+    );
+    throw error;
   }
 
-  if (!data) return null;
-  return data;
+  return data || null;
 }
 
-/**
- * Retrieve raw per-skill rows for a student (useful for detailed views).
- *
- * @param {string} studentId
- * @returns {Array}
- */
+// ─────────────────────────────────────────────────────────────────────────────
+// Read student skills
+// ─────────────────────────────────────────────────────────────────────────────
+
 async function getStudentSkills(studentId) {
   const { data, error } = await supabase
-    .from(COLLECTIONS.STUDENT_SKILLS)
-    .select('*')
+    .from(TABLES.STUDENT_SKILLS)
+    .select(
+      `
+      student_id,
+      skill_name,
+      proficiency_level,
+      impact_score,
+      career_relevance,
+      demand_score,
+      created_at,
+      updated_at
+      `
+    )
     .eq('student_id', studentId)
     .order('impact_score', { ascending: false });
 
   if (error) {
-    logger.error({ studentId, error: error.message }, '[SEE] Failed to fetch student skills');
-    throw new Error(error.message);
+    logger.error(
+      { studentId, error: error.message },
+      '[SEE] Failed to fetch student skills'
+    );
+    throw error;
   }
 
   return data || [];
@@ -164,5 +198,5 @@ async function getStudentSkills(studentId) {
 module.exports = {
   generateRecommendations,
   getRecommendations,
-  getStudentSkills
+  getStudentSkills,
 };

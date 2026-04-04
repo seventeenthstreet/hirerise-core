@@ -1,277 +1,262 @@
 'use strict';
 
-/**
- * BaseRepository.js — Supabase data-access base class
- *
- * MIGRATION: Removed require('../config/supabase') and all db.collection() calls.
- * All persistence now uses direct supabase.from() queries.
- *
- * Key behaviour changes vs the Firestore version:
- *   - Column names are snake_case in Postgres; _normalize() converts them to
- *     camelCase for the application layer on every read.
- *   - _toSnakeCase() converts camelCase payloads before writes.
- *   - Timestamps are stored as ISO 8601 strings (timestamptz in Postgres).
- *     No Firestore Timestamp objects will ever appear — convertTimestamps()
- *     in firestoreTimestamp.js is now a no-op for these, but kept for callers
- *     that still import it.
- *   - softDeleted → soft_deleted column (snake_case in DB).
- *   - The old runTransaction() method (which used db.runTransaction()) has been
- *     replaced with a Supabase RPC-based helper. Use it for multi-table atomic ops.
- */
-
-const supabase                    = require('../config/supabase');
-const { AppError, ErrorCodes }    = require('../middleware/errorHandler');
+const crypto = require('node:crypto');
+const { supabase } = require('../config/supabase');
+const { AppError, ErrorCodes } = require('../middleware/errorHandler');
+const logger = require('../utils/logger');
 
 class BaseRepository {
-  /**
-   * @param {string} tableName — Postgres table name (snake_case, e.g. 'cms_roles')
-   */
   constructor(tableName) {
+    if (!tableName) {
+      throw new Error('BaseRepository requires a table name');
+    }
+
     this.table = tableName;
+    this.db = supabase;
   }
 
-  // ─── Read ──────────────────────────────────────────────────────────────────
+  // ───────────────────────────────────────────────────────────────────────────
+  // READ
+  // ───────────────────────────────────────────────────────────────────────────
 
-  /**
-   * Find a single document by its primary key.
-   * Returns null if not found or soft-deleted.
-   *
-   * @param {string} id
-   * @returns {Promise<object|null>}
-   */
-  async findById(id) {
+  async findById(id, { includeDeleted = false } = {}) {
     if (!id) return null;
 
-    const { data, error } = await supabase
+    let query = this.db
       .from(this.table)
       .select('*')
       .eq('id', id)
+      .limit(1)
       .maybeSingle();
-
-    if (error) {
-      throw new AppError(
-        `DB error in findById [${this.table}/${id}]`,
-        500,
-        { error: error.message },
-        ErrorCodes.INTERNAL_ERROR
-      );
-    }
-
-    if (!data || data.soft_deleted === true) return null;
-
-    return this._normalize(data);
-  }
-
-  /**
-   * Find multiple records matching a set of filters.
-   *
-   * @param {Array<{ field: string, op: string, value: * }>} filters
-   *   op values: '==' | '!=' | '>' | '>=' | '<' | '<=' | 'in' | 'array-contains'
-   * @param {{ orderBy?, limit?, includeDeleted? }} options
-   * @returns {Promise<{ docs: object[], count: number }>}
-   */
-  async find(filters = [], options = {}) {
-    const includeDeleted = options.includeDeleted === true;
-
-    let query = supabase.from(this.table).select('*');
 
     if (!includeDeleted) {
       query = query.eq('soft_deleted', false);
     }
 
-    for (const { field, op, value } of filters) {
-      query = this._applyFilter(query, field, op, value);
-    }
-
-    if (options.orderBy) {
-      const ascending = (options.orderBy.direction || 'asc') !== 'desc';
-      query = query.order(options.orderBy.field, { ascending });
-    }
-
-    if (options.limit) {
-      query = query.limit(options.limit);
-    }
-
     const { data, error } = await query;
 
-    if (error) {
-      throw new AppError(
-        `DB error in find [${this.table}]`,
-        500,
-        { error: error.message },
-        ErrorCodes.INTERNAL_ERROR
+    this._throwDbError(error, 'findById', { id });
+    return data ? this._normalize(data) : null;
+  }
+
+  async find(filters = [], options = {}) {
+    const {
+      includeDeleted = false,
+      orderBy,
+      limit,
+    } = options;
+
+    let query = this.db
+      .from(this.table)
+      .select('*', { count: 'exact' });
+
+    if (!includeDeleted) {
+      query = query.eq('soft_deleted', false);
+    }
+
+    for (const filter of filters) {
+      query = this._applyFilter(
+        query,
+        filter.field,
+        filter.op,
+        filter.value
       );
     }
 
-    const docs = (data ?? []).map(row => this._normalize(row));
-    return { docs, count: docs.length };
+    if (orderBy?.field) {
+      query = query.order(
+        this._toSnakeKey(orderBy.field),
+        { ascending: orderBy.direction !== 'desc' }
+      );
+    }
+
+    if (Number.isInteger(limit) && limit > 0) {
+      query = query.limit(limit);
+    }
+
+    const { data, error, count } = await query;
+
+    this._throwDbError(error, 'find');
+
+    return {
+      docs: (data ?? []).map(row => this._normalize(row)),
+      count: count ?? 0,
+    };
   }
 
-  // ─── Write ─────────────────────────────────────────────────────────────────
+  // ───────────────────────────────────────────────────────────────────────────
+  // WRITE
+  // ───────────────────────────────────────────────────────────────────────────
 
-  /**
-   * Create a new record.
-   *
-   * @param {object} data     — application-layer payload (camelCase)
-   * @param {string} userId   — for audit fields (created_by / updated_by)
-   * @param {string|null} docId — supply to force a specific ID; leave null for auto
-   * @returns {Promise<object>} the created record (camelCase, with id)
-   */
-  async create(data, userId = 'system', docId = null) {
-    const now = new Date().toISOString();
+  async create(data = {}, userId = 'system', docId = null) {
+    const now = this._now();
+
     const payload = {
       ...this._toSnakeCase(data),
-      id:           docId || crypto.randomUUID(),
-      created_at:   now,
-      updated_at:   now,
-      created_by:   userId,
-      updated_by:   userId,
-      version:      1,
-      status:       'active',
+      id: docId || crypto.randomUUID(),
+      created_at: now,
+      updated_at: now,
+      created_by: userId,
+      updated_by: userId,
+      version: 1,
+      status: 'active',
       soft_deleted: false,
     };
 
-    const { data: inserted, error } = await supabase
+    const { data: inserted, error } = await this.db
       .from(this.table)
       .insert(payload)
-      .select()
+      .select('*')
       .single();
 
-    if (error) {
-      throw new AppError(
-        `DB error in create [${this.table}]`,
-        500,
-        { error: error.message },
-        ErrorCodes.INTERNAL_ERROR
-      );
-    }
-
+    this._throwDbError(error, 'create');
     return this._normalize(inserted);
   }
 
-  /**
-   * Update an existing record (partial update).
-   * Throws 404 if not found; 409 if soft-deleted.
-   *
-   * @param {string} id
-   * @param {object} updates  — fields to update (camelCase)
-   * @param {string} userId
-   * @returns {Promise<object>} the updated record
-   */
-  async update(id, updates, userId = 'system') {
+  async update(id, updates = {}, userId = 'system') {
+    if (!id) {
+      throw new AppError(
+        'Missing document id',
+        400,
+        { table: this.table },
+        ErrorCodes.VALIDATION_ERROR
+      );
+    }
+
     const current = await this.findById(id);
 
     if (!current) {
-      throw new AppError('Document not found', 404, { id }, ErrorCodes.NOT_FOUND);
-    }
-    if (current.softDeleted) {
-      throw new AppError('Cannot update soft-deleted document', 409, { id }, ErrorCodes.CONFLICT);
+      throw new AppError(
+        'Document not found',
+        404,
+        { id },
+        ErrorCodes.NOT_FOUND
+      );
     }
 
     const payload = {
       ...this._toSnakeCase(updates),
-      updated_at: new Date().toISOString(),
+      updated_at: this._now(),
       updated_by: userId,
-      version:    (current.version || 1) + 1,
+      version: Number(current.version ?? 1) + 1,
     };
 
-    const { data: updated, error } = await supabase
+    const { data: updated, error } = await this.db
       .from(this.table)
       .update(payload)
       .eq('id', id)
-      .select()
+      .eq('soft_deleted', false)
+      .select('*')
       .single();
 
-    if (error) {
-      throw new AppError(
-        `DB error in update [${this.table}/${id}]`,
-        500,
-        { error: error.message },
-        ErrorCodes.INTERNAL_ERROR
-      );
-    }
-
+    this._throwDbError(error, 'update', { id });
     return this._normalize(updated);
   }
 
-  /**
-   * Soft-delete: sets soft_deleted=true and status='inactive'.
-   * Record remains in DB and is excluded from all find() calls.
-   *
-   * @param {string} id
-   * @param {string} userId
-   * @returns {Promise<object>}
-   */
   async softDelete(id, userId = 'system') {
-    return await this.update(id, { softDeleted: true, status: 'inactive' }, userId);
+    return this.update(
+      id,
+      {
+        softDeleted: true,
+        status: 'inactive',
+      },
+      userId
+    );
   }
 
-  // ─── Private helpers ───────────────────────────────────────────────────────
+  // ───────────────────────────────────────────────────────────────────────────
+  // INTERNAL HELPERS
+  // ───────────────────────────────────────────────────────────────────────────
 
-  /**
-   * Map a Supabase filter op (Firestore-style) onto the Supabase query builder.
-   *
-   * @param {object} query  — Supabase query chain
-   * @param {string} field
-   * @param {string} op     — Firestore operator string
-   * @param {*}      value
-   * @returns {object}      — updated query chain
-   */
   _applyFilter(query, field, op, value) {
+    const dbField = this._toSnakeKey(field);
+
     switch (op) {
-      case '==':             return query.eq(field, value);
-      case '!=':             return query.neq(field, value);
-      case '>':              return query.gt(field, value);
-      case '>=':             return query.gte(field, value);
-      case '<':              return query.lt(field, value);
-      case '<=':             return query.lte(field, value);
-      case 'in':             return query.in(field, value);
-      case 'array-contains': return query.contains(field, [value]);
-      default: {
-        const logger = require('../utils/logger');
-        logger.error('[BaseRepository] Unknown filter operator', {
-          op,
-          field,
+      case '==': return query.eq(dbField, value);
+      case '!=': return query.neq(dbField, value);
+      case '>': return query.gt(dbField, value);
+      case '>=': return query.gte(dbField, value);
+      case '<': return query.lt(dbField, value);
+      case '<=': return query.lte(dbField, value);
+      case 'in': return query.in(dbField, Array.isArray(value) ? value : [value]);
+      case 'array-contains': return query.contains(dbField, [value]);
+      default:
+        logger.error('[BaseRepository] Unsupported filter operator', {
           table: this.table,
+          field,
+          dbField,
+          op,
           valueType: typeof value,
         });
-        throw new Error(`BaseRepository: unsupported filter operator "${op}" on table "${this.table}"`);
-      }
+
+        throw new AppError(
+          `Unsupported filter operator: ${op}`,
+          400,
+          { field, op, table: this.table },
+          ErrorCodes.VALIDATION_ERROR
+        );
     }
   }
 
-  /**
-   * Convert a Postgres row (snake_case keys, possible Date objects) to the
-   * application-layer format (camelCase keys, ISO strings).
-   *
-   * @param {object} row
-   * @returns {object}
-   */
   _normalize(row) {
-    if (!row) return null;
+    if (!row || typeof row !== 'object') return null;
+
     const out = {};
-    for (const [k, v] of Object.entries(row)) {
-      const camel = k.replace(/_([a-z])/g, (_, c) => c.toUpperCase());
-      out[camel]  = v instanceof Date ? v.toISOString() : v;
+
+    for (const [key, value] of Object.entries(row)) {
+      out[this._toCamelKey(key)] =
+        value instanceof Date ? value.toISOString() : value;
     }
+
     return out;
   }
 
-  /**
-   * Convert an application-layer payload (camelCase) to Postgres column names
-   * (snake_case) before insert / update.
-   *
-   * @param {object} obj
-   * @returns {object}
-   */
   _toSnakeCase(obj) {
-    if (!obj) return obj;
+    if (!obj || typeof obj !== 'object') return {};
+
     const out = {};
-    for (const [k, v] of Object.entries(obj)) {
-      const snake = k.replace(/[A-Z]/g, c => `_${c.toLowerCase()}`);
-      out[snake]  = v;
+
+    for (const [key, value] of Object.entries(obj)) {
+      out[this._toSnakeKey(key)] = value;
     }
+
     return out;
+  }
+
+  _toSnakeKey(key) {
+    return String(key).replace(/[A-Z]/g, c => `_${c.toLowerCase()}`);
+  }
+
+  _toCamelKey(key) {
+    return String(key).replace(/_([a-z])/g, (_, c) => c.toUpperCase());
+  }
+
+  _now() {
+    return new Date().toISOString();
+  }
+
+  _throwDbError(error, operation, meta = {}) {
+    if (!error) return;
+
+    logger.error(`[BaseRepository] ${operation} failed`, {
+      table: this.table,
+      ...meta,
+      code: error.code,
+      message: error.message,
+      details: error.details,
+      hint: error.hint,
+    });
+
+    throw new AppError(
+      `DB error in ${operation} [${this.table}]`,
+      500,
+      {
+        table: this.table,
+        ...meta,
+        error: error.message,
+      },
+      ErrorCodes.INTERNAL_ERROR
+    );
   }
 }
 

@@ -1,135 +1,223 @@
 'use strict';
 
 /**
- * controllers/school.controller.js
+ * src/modules/school/controllers/school.controller.js
  *
  * HTTP controller for the School & Counselor Platform.
- * Thin layer: extract → validate → call service → respond.
+ * Fully Supabase-safe controller layer.
  *
- * All endpoints require authenticate middleware (inherited from route mount).
- * Role-based guards (requireSchoolMember / requireSchoolAdmin) are applied
- * per route in school.routes.js.
+ * Responsibilities:
+ * - Validate HTTP input
+ * - Normalize auth payload
+ * - Delegate business logic to service layer
+ * - Standardize API responses
+ * - Centralize error logging
+ *
+ * Notes:
+ * - Supports both req.user.id (Supabase) and req.user.uid (legacy Firebase)
+ *   for safe zero-downtime rollout.
+ * - No DB logic should exist here.
  */
 
-const logger        = require('../../../utils/logger');
+const logger = require('../../../utils/logger');
 const schoolService = require('../services/school.service');
 
-// ─── Helpers ───────────────────────────────────────────────────────────────────
-
+/* ──────────────────────────────────────────────────────────────
+ * Response helpers
+ * ────────────────────────────────────────────────────────────── */
 function ok(res, data, statusCode = 200) {
-  return res.status(statusCode).json({ success: true, data });
+  return res.status(statusCode).json({
+    success: true,
+    data,
+  });
 }
 
 function fail(res, statusCode, message, code = 'SCHOOL_ERROR') {
-  return res.status(statusCode).json({ success: false, error: { message, code } });
+  return res.status(statusCode).json({
+    success: false,
+    error: {
+      message,
+      code,
+    },
+  });
 }
 
-// ─── POST /api/v1/school ──────────────────────────────────────────────────────
+/* ──────────────────────────────────────────────────────────────
+ * Auth normalization helper
+ * Removes legacy Firebase assumption: req.user.uid
+ * ────────────────────────────────────────────────────────────── */
+function getAuthenticatedUserId(req) {
+  return req?.user?.id || req?.user?.uid || null;
+}
 
+/* ──────────────────────────────────────────────────────────────
+ * Error handling helper
+ * ────────────────────────────────────────────────────────────── */
+function handleControllerError(res, err, context = {}) {
+  logger.error(
+    {
+      err: err?.message,
+      stack: err?.stack,
+      ...context,
+    },
+    '[SchoolController] request failed'
+  );
+
+  return fail(
+    res,
+    err?.statusCode || 500,
+    err?.message || 'Internal server error.',
+    err?.code || 'SCHOOL_ERROR'
+  );
+}
+
+/* ──────────────────────────────────────────────────────────────
+ * POST /api/v1/school
+ * ────────────────────────────────────────────────────────────── */
 async function createSchool(req, res) {
-  const { school_name, location } = req.body;
+  const school_name = req.body?.school_name?.trim();
+  const location = req.body?.location ?? null;
+  const userId = getAuthenticatedUserId(req);
 
-  if (!school_name || !school_name.trim()) {
+  if (!school_name) {
     return fail(res, 400, 'school_name is required.', 'MISSING_SCHOOL_NAME');
   }
 
+  if (!userId) {
+    return fail(res, 401, 'Unauthorized.', 'UNAUTHORIZED');
+  }
+
   try {
-    const result = await schoolService.createSchool(req.user.uid, { school_name, location });
+    const result = await schoolService.createSchool(userId, {
+      school_name,
+      location,
+    });
+
     return ok(res, result, 201);
   } catch (err) {
-    logger.error({ err: err.message }, '[SchoolController] createSchool error');
-    return fail(res, err.statusCode || 500, err.message);
+    return handleControllerError(res, err, { userId });
   }
 }
 
-// ─── GET /api/v1/school/my ────────────────────────────────────────────────────
-
+/* ──────────────────────────────────────────────────────────────
+ * GET /api/v1/school/my
+ * ────────────────────────────────────────────────────────────── */
 async function getMySchools(req, res) {
+  const userId = getAuthenticatedUserId(req);
+
+  if (!userId) {
+    return fail(res, 401, 'Unauthorized.', 'UNAUTHORIZED');
+  }
+
   try {
-    const result = await schoolService.getMySchools(req.user.uid);
+    const result = await schoolService.getMySchools(userId);
     return ok(res, result);
   } catch (err) {
-    return fail(res, err.statusCode || 500, err.message);
+    return handleControllerError(res, err, { userId });
   }
 }
 
-// ─── GET /api/v1/school/:schoolId ─────────────────────────────────────────────
-
+/* ──────────────────────────────────────────────────────────────
+ * GET /api/v1/school/:schoolId
+ * ────────────────────────────────────────────────────────────── */
 async function getSchool(req, res) {
+  const { schoolId } = req.params;
+
   try {
-    const result = await schoolService.getSchool(req.params.schoolId);
+    const result = await schoolService.getSchool(schoolId);
     return ok(res, result);
   } catch (err) {
-    return fail(res, err.statusCode || 500, err.message);
+    return handleControllerError(res, err, { schoolId });
   }
 }
 
-// ─── POST /api/v1/school/:schoolId/counselors ─────────────────────────────────
-
+/* ──────────────────────────────────────────────────────────────
+ * POST /api/v1/school/:schoolId/counselors
+ * ────────────────────────────────────────────────────────────── */
 async function addCounselor(req, res) {
-  const { email } = req.body;
+  const { schoolId } = req.params;
+  const email = req.body?.email?.trim();
 
   if (!email) {
     return fail(res, 400, 'email is required.', 'MISSING_EMAIL');
   }
 
   try {
-    const result = await schoolService.addCounselor(req.params.schoolId, email);
+    const result = await schoolService.addCounselor(schoolId, email);
     return ok(res, result, 201);
   } catch (err) {
-    logger.error({ err: err.message }, '[SchoolController] addCounselor error');
-    return fail(res, err.statusCode || 500, err.message);
+    return handleControllerError(res, err, { schoolId, email });
   }
 }
 
-// ─── GET /api/v1/school/:schoolId/counselors ──────────────────────────────────
-
+/* ──────────────────────────────────────────────────────────────
+ * GET /api/v1/school/:schoolId/counselors
+ * ────────────────────────────────────────────────────────────── */
 async function getCounselors(req, res) {
+  const { schoolId } = req.params;
+
   try {
-    const result = await schoolService.getCounselors(req.params.schoolId);
+    const result = await schoolService.getCounselors(schoolId);
     return ok(res, result);
   } catch (err) {
-    return fail(res, err.statusCode || 500, err.message);
+    return handleControllerError(res, err, { schoolId });
   }
 }
 
-// ─── GET /api/v1/school/:schoolId/students ────────────────────────────────────
-
+/* ──────────────────────────────────────────────────────────────
+ * GET /api/v1/school/:schoolId/students
+ * ────────────────────────────────────────────────────────────── */
 async function listStudents(req, res) {
+  const { schoolId } = req.params;
+
   try {
-    const result = await schoolService.listStudents(req.params.schoolId);
+    const result = await schoolService.listStudents(schoolId);
     return ok(res, result);
   } catch (err) {
-    return fail(res, err.statusCode || 500, err.message);
+    return handleControllerError(res, err, { schoolId });
   }
 }
 
-// ─── POST /api/v1/school/:schoolId/students/import ────────────────────────────
-
+/* ──────────────────────────────────────────────────────────────
+ * POST /api/v1/school/:schoolId/students/import
+ * ────────────────────────────────────────────────────────────── */
 async function importStudents(req, res) {
-  if (!req.file) {
-    return fail(res, 400, 'CSV file is required. Upload a file with field name "file".', 'NO_FILE');
+  const { schoolId } = req.params;
+
+  if (!req.file?.buffer) {
+    return fail(
+      res,
+      400,
+      'CSV file is required. Upload a file with field name "file".',
+      'NO_FILE'
+    );
   }
 
   try {
-    const result = await schoolService.importStudentsCSV(req.params.schoolId, req.file.buffer);
+    const result = await schoolService.importStudentsCSV(
+      schoolId,
+      req.file.buffer
+    );
 
-    const statusCode = result.imported > 0 && result.skipped > 0 ? 207
-      : result.imported > 0 ? 201
-      : 422;
+    const statusCode =
+      result.imported > 0 && result.skipped > 0
+        ? 207
+        : result.imported > 0
+          ? 201
+          : 422;
 
     return res.status(statusCode).json({
       success: result.imported > 0,
-      data:    result,
+      data: result,
     });
   } catch (err) {
-    logger.error({ err: err.message }, '[SchoolController] importStudents error');
-    return fail(res, err.statusCode || 500, err.message);
+    return handleControllerError(res, err, { schoolId });
   }
 }
 
-// ─── POST /api/v1/school/:schoolId/run-assessment/:studentId ─────────────────
-
+/* ──────────────────────────────────────────────────────────────
+ * POST /api/v1/school/:schoolId/run-assessment/:studentId
+ * ────────────────────────────────────────────────────────────── */
 async function runAssessment(req, res) {
   const { schoolId, studentId } = req.params;
 
@@ -137,34 +225,38 @@ async function runAssessment(req, res) {
     const result = await schoolService.runAssessment(schoolId, studentId);
     return ok(res, result);
   } catch (err) {
-    logger.error({ err: err.message, schoolId, studentId }, '[SchoolController] runAssessment error');
-    return fail(res, err.statusCode || 500, err.message);
+    return handleControllerError(res, err, { schoolId, studentId });
   }
 }
 
-// ─── GET /api/v1/school/:schoolId/student-report/:studentId ──────────────────
-
+/* ──────────────────────────────────────────────────────────────
+ * GET /api/v1/school/:schoolId/student-report/:studentId
+ * ────────────────────────────────────────────────────────────── */
 async function getStudentReport(req, res) {
   const { schoolId, studentId } = req.params;
 
   try {
-    const result = await schoolService.getStudentReport(schoolId, studentId);
+    const result = await schoolService.getStudentReport(
+      schoolId,
+      studentId
+    );
     return ok(res, result);
   } catch (err) {
-    logger.error({ err: err.message, schoolId, studentId }, '[SchoolController] getStudentReport error');
-    return fail(res, err.statusCode || 500, err.message);
+    return handleControllerError(res, err, { schoolId, studentId });
   }
 }
 
-// ─── GET /api/v1/school/:schoolId/analytics ───────────────────────────────────
-
+/* ──────────────────────────────────────────────────────────────
+ * GET /api/v1/school/:schoolId/analytics
+ * ────────────────────────────────────────────────────────────── */
 async function getAnalytics(req, res) {
+  const { schoolId } = req.params;
+
   try {
-    const result = await schoolService.getAnalytics(req.params.schoolId);
+    const result = await schoolService.getAnalytics(schoolId);
     return ok(res, result);
   } catch (err) {
-    logger.error({ err: err.message }, '[SchoolController] getAnalytics error');
-    return fail(res, err.statusCode || 500, err.message);
+    return handleControllerError(res, err, { schoolId });
   }
 }
 
@@ -180,12 +272,3 @@ module.exports = {
   getStudentReport,
   getAnalytics,
 };
-
-
-
-
-
-
-
-
-

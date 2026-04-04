@@ -3,129 +3,188 @@
 /**
  * skillDemand.service.js — Skill Demand Intelligence Service
  *
- * Core business logic for skill demand analysis.
- * Compares user skills against role-required skills using the CSV dataset
- * and produces a scored result with gap analysis and recommendations.
- *
- * @module modules/skillDemand/service/skillDemand.service
+ * Supabase-native business logic for:
+ * - role skill gap analysis
+ * - demand-weighted recommendations
+ * - score computation
+ * - optional persistence
  */
 
-const { loadDatasets, lookupSkillDemand, lookupRoleSkills, normalise } = require('../repository/skillDemandDataset');
-const { SkillDemandRepository } = require('../repository/skillDemand.repository');
+const {
+  loadDatasets,
+  lookupSkillDemand,
+  lookupRoleSkills,
+  normalise,
+} = require('../repository/skillDemandDataset');
+
+const {
+  SkillDemandRepository,
+} = require('../repository/skillDemand.repository');
+
 const logger = require('../../../utils/logger');
 
-/**
- * @typedef {Object} SkillDemandResult
- * @property {string}   role
- * @property {number}   skill_score               — 0–100 composite score
- * @property {string[]} user_skills               — normalised user skill list
- * @property {string[]} required_skills           — skills required for the role
- * @property {string[]} skill_gaps                — required skills the user lacks
- * @property {Object[]} top_recommended_skills    — top gap skills sorted by demand
- */
+const MAX_RECOMMENDATIONS = 10;
+const DEFAULT_TOP_DEMAND_LIMIT = 20;
 
 class SkillDemandService {
-  constructor() {
-    this.repo = new SkillDemandRepository();
+  constructor(repository = new SkillDemandRepository()) {
+    this.repo = repository;
   }
 
   /**
-   * Full skill demand analysis for a user vs a role.
-   * Persists result to Firestore when userId is provided.
+   * Analyze a user's skills against a target role.
    *
-   * @param {Object}   params
-   * @param {string}   params.role
-   * @param {string[]} params.skills        — user's current skills
-   * @param {string}   [params.userId]      — if provided, result is persisted
-   * @returns {Promise<SkillDemandResult>}
+   * @param {Object} params
+   * @param {string} params.role
+   * @param {Array<string|{name:string}>} [params.skills]
+   * @param {string|null} [params.userId]
+   * @returns {Promise<Object>}
    */
-  async analyzeSkillDemand({ role, skills = [], userId }) {
-    const { skillDemand: skillDemandMap, roleSkills: roleSkillsMap } = await loadDatasets();
+  async analyzeSkillDemand({ role, skills = [], userId = null }) {
+    if (!role || typeof role !== 'string') {
+      throw new TypeError('role must be a non-empty string');
+    }
+
+    const { skillDemand: skillDemandMap, roleSkills: roleSkillsMap } =
+      await loadDatasets();
 
     const requiredSkills = lookupRoleSkills(roleSkillsMap, role);
-    const normUserSkills = skills.map(s => normalise(typeof s === 'string' ? s : s.name || ''));
 
-    // Identify gaps
-    const skillGaps = requiredSkills.filter(req => {
-      const normReq = normalise(req);
-      return !normUserSkills.some(u => u === normReq || u.includes(normReq) || normReq.includes(u));
-    });
+    const normalizedUserSkillSet = new Set();
+    const originalUserSkills = [];
 
-    // Score matched skills
-    const matchedSkills = requiredSkills.filter(req => !skillGaps.includes(req));
-    const skillScore = requiredSkills.length > 0
+    for (const entry of skills) {
+      const rawSkill =
+        typeof entry === 'string'
+          ? entry
+          : typeof entry?.name === 'string'
+            ? entry.name
+            : '';
+
+      if (!rawSkill) continue;
+
+      originalUserSkills.push(rawSkill);
+
+      const normalized = normalise(rawSkill);
+      if (normalized) {
+        normalizedUserSkillSet.add(normalized);
+      }
+    }
+
+    const skillGaps = [];
+    const matchedSkills = [];
+
+    for (const requiredSkill of requiredSkills) {
+      const normalizedRequired = normalise(requiredSkill);
+
+      let matched = false;
+
+      for (const userSkill of normalizedUserSkillSet) {
+        if (
+          userSkill === normalizedRequired ||
+          userSkill.includes(normalizedRequired) ||
+          normalizedRequired.includes(userSkill)
+        ) {
+          matched = true;
+          break;
+        }
+      }
+
+      if (matched) {
+        matchedSkills.push(requiredSkill);
+      } else {
+        skillGaps.push(requiredSkill);
+      }
+    }
+
+    const skillScore = requiredSkills.length
       ? Math.round((matchedSkills.length / requiredSkills.length) * 100)
       : 0;
 
-    // Rank gap skills by demand data
     const topRecommendedSkills = skillGaps
-      .map(skill => {
+      .map((skill) => {
         const demand = lookupSkillDemand(skillDemandMap, skill);
+
         return {
           skill,
-          demand_score:  demand?.demand_score  ?? 0,
-          growth_rate:   demand?.growth_rate   ?? 0,
-          salary_boost:  demand?.salary_boost  ?? 0,
-          industry:      demand?.industry      ?? 'General',
+          demand_score: demand?.demand_score ?? 0,
+          growth_rate: demand?.growth_rate ?? 0,
+          salary_boost: demand?.salary_boost ?? 0,
+          industry: demand?.industry ?? 'General',
         };
       })
       .sort((a, b) => b.demand_score - a.demand_score)
-      .slice(0, 10);
+      .slice(0, MAX_RECOMMENDATIONS);
 
     const result = {
       role,
-      skill_score:            skillScore,
-      user_skills:            skills.map(s => typeof s === 'string' ? s : s.name || ''),
-      required_skills:        requiredSkills,
-      skill_gaps:             skillGaps,
+      skill_score: skillScore,
+      user_skills: originalUserSkills,
+      required_skills: requiredSkills,
+      skill_gaps: skillGaps,
       top_recommended_skills: topRecommendedSkills,
     };
 
     if (userId) {
-      try {
-        await this.repo.saveAnalysis(userId, result);
-      } catch (err) {
-        logger.warn('[SkillDemandService] Failed to persist analysis', { userId, role, err: err.message });
-      }
+      void this.repo.saveAnalysis(userId, result).catch((error) => {
+        logger.warn('[SkillDemandService] Persist failed', {
+          userId,
+          role,
+          error: error.message,
+        });
+      });
     }
 
-    logger.info('[SkillDemandService] Analysis complete', { role, skillScore, gaps: skillGaps.length });
+    logger.info('[SkillDemandService] Analysis complete', {
+      role,
+      skillScore,
+      requiredSkillCount: requiredSkills.length,
+      gapCount: skillGaps.length,
+    });
+
     return result;
   }
 
   /**
-   * Lightweight adapter for CHI engine — returns only the numeric score.
+   * Lightweight adapter for CHI engine.
    *
-   * @param {string}   role
-   * @param {string[]} skills
-   * @returns {Promise<number>} 0–100
+   * @param {string} role
+   * @param {Array<string|{name:string}>} skills
+   * @returns {Promise<number>}
    */
   async computeChiSkillScore(role, skills) {
-    const { skill_score } = await this.analyzeSkillDemand({ role, skills });
-    return skill_score;
+    const result = await this.analyzeSkillDemand({ role, skills });
+    return result.skill_score;
   }
 
   /**
-   * Return top-demand skills for a given industry (or all industries).
+   * Return highest-demand skills globally or by industry.
    *
    * @param {Object} [options]
    * @param {string} [options.industry]
-   * @param {number} [options.limit=20]
+   * @param {number} [options.limit]
    * @returns {Promise<Object[]>}
    */
-  async getTopDemandSkills({ industry, limit = 20 } = {}) {
+  async getTopDemandSkills({
+    industry,
+    limit = DEFAULT_TOP_DEMAND_LIMIT,
+  } = {}) {
     const { skillDemand: skillDemandMap } = await loadDatasets();
 
     let skills = Array.from(skillDemandMap.values());
 
     if (industry) {
-      const normIndustry = industry.toLowerCase().trim();
-      skills = skills.filter(s => s.industry?.toLowerCase().trim() === normIndustry);
+      const normalizedIndustry = industry.toLowerCase().trim();
+
+      skills = skills.filter(
+        (item) =>
+          item.industry?.toLowerCase().trim() === normalizedIndustry
+      );
     }
 
-    return skills
-      .sort((a, b) => b.demand_score - a.demand_score)
-      .slice(0, limit);
+    skills.sort((a, b) => b.demand_score - a.demand_score);
+
+    return skills.slice(0, limit);
   }
 
   /**
@@ -140,7 +199,7 @@ class SkillDemandService {
   }
 
   /**
-   * Return analysis history for a user.
+   * Return saved user analysis history.
    *
    * @param {string} userId
    * @returns {Promise<Object[]>}
@@ -151,12 +210,3 @@ class SkillDemandService {
 }
 
 module.exports = { SkillDemandService };
-
-
-
-
-
-
-
-
-

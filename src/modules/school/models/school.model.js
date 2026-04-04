@@ -1,112 +1,87 @@
 'use strict';
 
 /**
- * models/school.model.js
+ * src/modules/school/models/school.model.js
  *
- * Firestore collection names and document builders for the
- * School & Counselor Platform (multi-tenant layer).
+ * Supabase/Postgres schema contracts and row builders
+ * for the School & Counselor Platform.
  *
- * Collections (all prefixed sch_ to stay isolated from other modules):
- *   sch_schools        — one doc per school, keyed by auto-ID
- *   sch_school_users   — school staff (admin / counselor) membership docs
- *   sch_school_students— links student user IDs to a school
+ * Tables:
+ *   sch_schools
+ *   sch_school_users
+ *   sch_school_students
  *
- * Role definitions:
- *   school_admin   — manages school, adds counselors, imports students
- *   counselor      — views results, runs assessments, generates reports
- *   student        — personal career dashboard only (no school UI)
- *
- * Data isolation guarantee:
- *   Every service and repository MUST filter by school_id.
- *   No query should ever return data across school boundaries.
+ * Notes:
+ * - Fully removes Firestore terminology
+ * - Row builders are SQL insert-safe
+ * - Timestamps are DB-owned via DEFAULT now()
+ * - No null timestamp placeholders
+ * - Payloads are immutable and explicit
  */
 
-// ─── Collection names ──────────────────────────────────────────────────────────
-
-const COLLECTIONS = {
-  SCHOOLS:         'sch_schools',
-  SCHOOL_USERS:    'sch_school_users',
+/* ──────────────────────────────────────────────────────────────
+ * Table names
+ * ────────────────────────────────────────────────────────────── */
+const TABLES = Object.freeze({
+  SCHOOLS: 'sch_schools',
+  SCHOOL_USERS: 'sch_school_users',
   SCHOOL_STUDENTS: 'sch_school_students',
-};
+});
 
-// ─── Enums ────────────────────────────────────────────────────────────────────
-
-const SCHOOL_ROLES = {
-  ADMIN:     'school_admin',
+/* ──────────────────────────────────────────────────────────────
+ * Role enums
+ * ────────────────────────────────────────────────────────────── */
+const SCHOOL_ROLES = Object.freeze({
+  ADMIN: 'school_admin',
   COUNSELOR: 'counselor',
-};
+});
 
-// ─── Document builders ────────────────────────────────────────────────────────
+/* ──────────────────────────────────────────────────────────────
+ * Row builders
+ * DB owns:
+ * - created_at
+ * - updated_at
+ * via SQL defaults / triggers
+ * ────────────────────────────────────────────────────────────── */
 
 /**
- * sch_schools/{schoolId}
- *
- *   id           — Firestore auto-ID (also stored as field)
- *   school_name  — string
- *   location     — string (city / district)
- *   created_by   — user ID of the user who created the school
- *   created_at   — serverTimestamp
- *   updated_at   — serverTimestamp
+ * Build insert payload for sch_schools
  */
-function buildSchoolDoc(createdBy, fields) {
+function buildSchoolInsert(createdBy, fields = {}) {
   return {
-    school_name: fields.school_name || null,
-    location:    fields.location    || null,
-    created_by:  createdBy,
-    created_at:  null, // set by repository
-    updated_at:  null,
+    school_name: fields.school_name?.trim() || null,
+    location: fields.location?.trim() || null,
+    created_by: createdBy,
   };
 }
 
 /**
- * sch_school_users/{autoId}
- *
- *   school_id  — sch_schools doc ID
- *   user_id    — user ID of the counselor / admin
- *   role       — SCHOOL_ROLES value
- *   created_at — serverTimestamp
+ * Build insert payload for sch_school_users
  */
-function buildSchoolUserDoc(schoolId, userId, role) {
+function buildSchoolUserInsert(schoolId, userId, role) {
   return {
-    school_id:  schoolId,
-    user_id:    userId,
+    school_id: schoolId,
+    user_id: userId,
     role,
-    created_at: null,
   };
 }
 
 /**
- * sch_school_students/{autoId}
- *
- *   school_id  — sch_schools doc ID
- *   student_id — user ID from edu_students
- *   class      — string  e.g. "11", "12"
- *   section    — string  e.g. "A", "B"
- *   created_at — serverTimestamp
+ * Build insert payload for sch_school_students
  */
-function buildSchoolStudentDoc(schoolId, studentId, fields = {}) {
+function buildSchoolStudentInsert(schoolId, studentId, fields = {}) {
   return {
-    school_id:  schoolId,
+    school_id: schoolId,
     student_id: studentId,
-    class:      fields.class   || null,
-    section:    fields.section || null,
-    created_at: null,
+    class: fields.class?.trim() || null,
+    section: fields.section?.trim() || null,
   };
 }
 
 module.exports = {
-  COLLECTIONS,
+  TABLES,
   SCHOOL_ROLES,
-  buildSchoolDoc,
-  buildSchoolUserDoc,
-  buildSchoolStudentDoc,
+  buildSchoolInsert,
+  buildSchoolUserInsert,
+  buildSchoolStudentInsert,
 };
-
-
-
-
-
-
-
-
-

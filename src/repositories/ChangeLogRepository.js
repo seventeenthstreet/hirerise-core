@@ -3,9 +3,12 @@
 const { supabase } = require('../config/supabase');
 const logger = require('../utils/logger');
 
-class ChangeLogRepository {
+const DEFAULT_LIMIT = 50;
+const MAX_BATCH_SIZE = 500;
 
-  constructor() {
+class ChangeLogRepository {
+  constructor(db = supabase) {
+    this.db = db;
     this.table = 'change_logs';
   }
 
@@ -13,45 +16,20 @@ class ChangeLogRepository {
   // CREATE LOG
   // ─────────────────────────────────────────────────────────────
 
-  async logChange(changeData) {
+  async logChange(changeData = {}) {
     try {
-      const {
-        collectionName,
-        documentId,
-        operation,
-        changedFields = {},
-        previousValue = null,
-        newValue = null,
-        userId = 'system',
-        metadata = {},
-      } = changeData;
+      const record = this.#normalizeRecord(changeData);
 
-      if (!collectionName || !documentId || !operation) {
-        logger.warn('[ChangeLog] Missing required fields');
-        return;
-      }
+      if (!record) return;
 
-      const record = {
-        collection_name: collectionName,
-        document_id: documentId,
-        operation,
-        changed_fields: changedFields,
-        previous_value: previousValue,
-        new_value: newValue,
-        user_id: userId,
-        metadata,
-        timestamp: new Date().toISOString(),
-      };
-
-      const { error } = await supabase
+      const { error } = await this.db
         .from(this.table)
         .insert(record);
 
-      if (error) throw error;
-
+      this.#logDbError(error, 'logChange', record);
     } catch (error) {
-      logger.error('[ChangeLog] Failed (non-fatal)', {
-        error: error.message,
+      logger.error('[ChangeLogRepository] logChange failed (non-fatal)', {
+        message: error.message,
       });
     }
   }
@@ -60,82 +38,176 @@ class ChangeLogRepository {
   // BATCH LOG
   // ─────────────────────────────────────────────────────────────
 
-  async logChangesBatch(changes, userId = 'system') {
+  async logChangesBatch(changes = [], userId = 'system') {
     try {
-      if (!Array.isArray(changes) || changes.length === 0) return;
+      if (!Array.isArray(changes) || changes.length === 0) {
+        return;
+      }
 
-      const records = changes.map(change => ({
-        ...change,
-        user_id: userId,
-        timestamp: new Date().toISOString(),
-      }));
+      const timestamp = this.#now();
 
-      const { error } = await supabase
-        .from(this.table)
-        .insert(records);
+      for (let i = 0; i < changes.length; i += MAX_BATCH_SIZE) {
+        const chunk = changes.slice(i, i + MAX_BATCH_SIZE);
 
-      if (error) throw error;
+        const records = chunk
+          .map(change =>
+            this.#normalizeRecord(
+              { ...change, userId },
+              timestamp
+            )
+          )
+          .filter(Boolean);
 
+        if (!records.length) continue;
+
+        const { error } = await this.db
+          .from(this.table)
+          .insert(records);
+
+        this.#logDbError(error, 'logChangesBatch', {
+          chunkSize: records.length,
+        });
+      }
     } catch (error) {
-      logger.error('[ChangeLog] Batch failed (non-fatal)', {
-        error: error.message,
-      });
+      logger.error(
+        '[ChangeLogRepository] logChangesBatch failed (non-fatal)',
+        { message: error.message }
+      );
     }
   }
 
   // ─────────────────────────────────────────────────────────────
-  // GET DOCUMENT HISTORY
+  // GETTERS
   // ─────────────────────────────────────────────────────────────
 
-  async getDocumentHistory(collectionName, documentId, limit = 50) {
-    const { data, error } = await supabase
+  async getDocumentHistory(
+    collectionName,
+    documentId,
+    limit = DEFAULT_LIMIT
+  ) {
+    const { data, error } = await this.db
       .from(this.table)
       .select('*')
       .eq('collection_name', collectionName)
       .eq('document_id', documentId)
       .order('timestamp', { ascending: false })
-      .limit(limit);
+      .limit(this.#safeLimit(limit));
 
-    if (error) throw error;
-    return data || [];
+    this.#throwIfError(error, 'getDocumentHistory');
+    return data ?? [];
   }
 
-  // ─────────────────────────────────────────────────────────────
-  // USER ACTIVITY
-  // ─────────────────────────────────────────────────────────────
-
-  async getUserActivity(userId, limit = 50) {
-    const { data, error } = await supabase
+  async getUserActivity(userId, limit = DEFAULT_LIMIT) {
+    const { data, error } = await this.db
       .from(this.table)
       .select('*')
       .eq('user_id', userId)
       .order('timestamp', { ascending: false })
-      .limit(limit);
+      .limit(this.#safeLimit(limit));
 
-    if (error) throw error;
-    return data || [];
+    this.#throwIfError(error, 'getUserActivity');
+    return data ?? [];
   }
 
-  // ─────────────────────────────────────────────────────────────
-  // RECENT CHANGES
-  // ─────────────────────────────────────────────────────────────
-
   async getRecentChanges(limit = 100) {
-    const { data, error } = await supabase
+    const { data, error } = await this.db
       .from(this.table)
       .select('*')
       .order('timestamp', { ascending: false })
-      .limit(limit);
+      .limit(this.#safeLimit(limit, 500));
 
-    if (error) throw error;
-    return data || [];
+    this.#throwIfError(error, 'getRecentChanges');
+    return data ?? [];
   }
 
+  // ─────────────────────────────────────────────────────────────
+  // INTERNAL HELPERS
+  // ─────────────────────────────────────────────────────────────
+
+  #normalizeRecord(changeData = {}, timestamp = this.#now()) {
+    const {
+      collectionName,
+      collection_name,
+      documentId,
+      document_id,
+      operation,
+      changedFields = {},
+      changed_fields,
+      previousValue = null,
+      previous_value = null,
+      newValue = null,
+      new_value = null,
+      userId = 'system',
+      user_id,
+      metadata = {},
+    } = changeData;
+
+    const finalCollection =
+      collectionName ?? collection_name;
+    const finalDocument =
+      documentId ?? document_id;
+
+    if (!finalCollection || !finalDocument || !operation) {
+      logger.warn(
+        '[ChangeLogRepository] Missing required fields',
+        {
+          collectionName: finalCollection,
+          documentId: finalDocument,
+          operation,
+        }
+      );
+      return null;
+    }
+
+    return {
+      collection_name: finalCollection,
+      document_id: finalDocument,
+      operation,
+      changed_fields: changedFields ?? changed_fields ?? {},
+      previous_value: previousValue ?? previous_value,
+      new_value: newValue ?? new_value,
+      user_id: userId ?? user_id ?? 'system',
+      metadata,
+      timestamp,
+    };
+  }
+
+  #safeLimit(limit, max = DEFAULT_LIMIT) {
+    const value = Number(limit);
+    if (!Number.isInteger(value) || value <= 0) {
+      return DEFAULT_LIMIT;
+    }
+    return Math.min(value, max);
+  }
+
+  #now() {
+    return new Date().toISOString();
+  }
+
+  #logDbError(error, operation, meta = {}) {
+    if (!error) return;
+
+    logger.error(`[ChangeLogRepository] ${operation} DB error`, {
+      ...meta,
+      code: error.code,
+      message: error.message,
+      details: error.details,
+      hint: error.hint,
+    });
+  }
+
+  #throwIfError(error, operation) {
+    if (!error) return;
+
+    logger.error(`[ChangeLogRepository] ${operation} failed`, {
+      code: error.code,
+      message: error.message,
+      details: error.details,
+      hint: error.hint,
+    });
+
+    throw error;
+  }
 }
 
-module.exports = ChangeLogRepository;
-
-
-
-
-
+module.exports = new ChangeLogRepository();

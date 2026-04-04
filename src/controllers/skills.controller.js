@@ -15,9 +15,9 @@ const { AppError, ErrorCodes } = require('../middleware/errorHandler');
 const logger = require('../utils/logger');
 
 const skillGapService = require('../services/skillGap.service');
-const SkillRepository = require('../repositories/skillRepository');
+const skillRepository = require('../repositories/skillRepository');
 
-const skillsRepo = new SkillRepository();
+const skillsRepo = new skillRepository();
 
 // ─────────────────────────────────────────────
 // Helpers

@@ -1,69 +1,76 @@
 'use strict';
 
 /**
- * roles.types.js — Shared constants and type definitions for the Roles module.
+ * src/modules/roles/roles.types.js
  *
- * Keep all magic strings in one place. Both the service layer and the
- * Zod validator import from here — one source of truth, no drift.
+ * Shared constants and module-level type definitions for Roles.
+ *
+ * Supabase-safe source of truth for:
+ *   - tier limits
+ *   - onboarding constraints
+ *   - search defaults
+ *   - shared table names
+ *   - controlled vocabularies
+ *
+ * No Firebase / Firestore terminology remains.
  */
 
-// ─── Tier → max expected roles ────────────────────────────────────────────────
-// Keyed by req.user.plan values set in auth.middleware.js.
-// Any unrecognised plan falls back to FREE_EXPECTED_LIMIT (fail-safe).
-
-const EXPECTED_ROLE_LIMITS = {
-  free:       1,
-  pro:        3,
-  premium:    5,
+// ─────────────────────────────────────────────────────────────────────────────
+// Tier → maximum expected roles
+// ─────────────────────────────────────────────────────────────────────────────
+const EXPECTED_ROLE_LIMITS = Object.freeze({
+  free: 1,
+  pro: 3,
+  premium: 5,
   enterprise: 5,
-};
+});
 
-const FREE_EXPECTED_LIMIT = 1; // hard floor — never grant more than this to unknown tiers
+const FREE_EXPECTED_LIMIT = 1;
 
-// ─── Constraints ──────────────────────────────────────────────────────────────
-
-const MAX_PREVIOUS_ROLES   = 3;
-const MAX_EXPECTED_ROLES   = 5; // absolute ceiling across all tiers
-const MAX_SEARCH_RESULTS   = 50;
+// ─────────────────────────────────────────────────────────────────────────────
+// Hard validation constraints
+// ─────────────────────────────────────────────────────────────────────────────
+const MAX_PREVIOUS_ROLES = 3;
+const MAX_EXPECTED_ROLES = 5;
+const MAX_SEARCH_RESULTS = 50;
 const DEFAULT_SEARCH_LIMIT = 20;
 
-// ─── Career history constraints ───────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// Career history constraints
+// ─────────────────────────────────────────────────────────────────────────────
+const MAX_CAREER_HISTORY_ENTRIES = 5;
+const MAX_DURATION_MONTHS = 600;
 
-const MAX_CAREER_HISTORY_ENTRIES = 5;  // max total roles in careerHistory[]
-const MAX_DURATION_MONTHS        = 600; // 50 years — sanity ceiling
+// ─────────────────────────────────────────────────────────────────────────────
+// Shared database table names
+// ─────────────────────────────────────────────────────────────────────────────
+const ROLES_TABLE = 'roles';
+const USER_PROFILES_TABLE = 'user_profiles';
 
-// ─── Role document field names (for Firestore queries) ───────────────────────
-
-const ROLES_COLLECTION     = 'roles';
-const PROFILES_COLLECTION  = 'userProfiles';
-
-// ─── GAP-07: Industry sector controlled vocabulary ────────────────────────────
-// Keyed by industryId (used in Firestore + salary band lookups).
-// Value is the human-readable display label.
-// Frontend sends industryId; unknown values fall back to 'other' with
-// the raw string preserved as industryText.
-
+// ─────────────────────────────────────────────────────────────────────────────
+// GAP-07: Industry sector controlled vocabulary
+// ─────────────────────────────────────────────────────────────────────────────
 const INDUSTRY_SECTORS = Object.freeze({
-  technology:    'Technology & Software',
-  fintech:       'Financial Services & Fintech',
-  healthcare:    'Healthcare & Pharma',
-  ecommerce:     'E-Commerce & Retail',
+  technology: 'Technology & Software',
+  fintech: 'Financial Services & Fintech',
+  healthcare: 'Healthcare & Pharma',
+  ecommerce: 'E-Commerce & Retail',
   manufacturing: 'Manufacturing & Industrial',
-  consulting:    'Consulting & Professional Services',
-  media:         'Media, Marketing & Advertising',
-  education:     'Education & EdTech',
-  logistics:     'Logistics & Supply Chain',
-  realestate:    'Real Estate & Construction',
-  telecom:       'Telecom & Networking',
-  energy:        'Energy & Utilities',
-  banking:       'Banking & Insurance',
-  government:    'Government & Public Sector',
-  nonprofit:     'Non-Profit & NGO',
-  hospitality:   'Hospitality & Travel',
-  agriculture:   'Agriculture & Food',
-  automotive:    'Automotive & Mobility',
-  aerospace:     'Aerospace & Defence',
-  other:         'Other',
+  consulting: 'Consulting & Professional Services',
+  media: 'Media, Marketing & Advertising',
+  education: 'Education & EdTech',
+  logistics: 'Logistics & Supply Chain',
+  realestate: 'Real Estate & Construction',
+  telecom: 'Telecom & Networking',
+  energy: 'Energy & Utilities',
+  banking: 'Banking & Insurance',
+  government: 'Government & Public Sector',
+  nonprofit: 'Non-Profit & NGO',
+  hospitality: 'Hospitality & Travel',
+  agriculture: 'Agriculture & Food',
+  automotive: 'Automotive & Mobility',
+  aerospace: 'Aerospace & Defence',
+  other: 'Other',
 });
 
 module.exports = {
@@ -75,15 +82,7 @@ module.exports = {
   DEFAULT_SEARCH_LIMIT,
   MAX_CAREER_HISTORY_ENTRIES,
   MAX_DURATION_MONTHS,
-  ROLES_COLLECTION,
-  PROFILES_COLLECTION,
+  ROLES_TABLE,
+  USER_PROFILES_TABLE,
   INDUSTRY_SECTORS,
 };
-
-
-
-
-
-
-
-

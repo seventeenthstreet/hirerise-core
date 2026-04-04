@@ -1,242 +1,169 @@
-/**
- * RoleRepository — Role Entity Data Access
- *
- * ENTERPRISE PATTERN: Domain-Specific Repository
- *
- * Purpose:
- *   - Encapsulate role-specific business rules
- *   - Enforce referential integrity (jobFamilyId must exist)
- *   - Provide domain-specific query methods
- *   - Handle role lifecycle operations
- *
- * CRITICAL BUSINESS RULES:
- *   - Role must belong to existing job family
- *   - Role ID format: {family}-{level}-{track} slug
- *   - Salary bands must exist before role can be active
- *   - Deleting a role requires checking career path dependencies
- *
- * @module repositories/RoleRepository
- */
-
 'use strict';
 
 const BaseRepository = require('./BaseRepository');
 const { AppError, ErrorCodes } = require('../middleware/errorHandler');
 const logger = require('../utils/logger');
 
+const VALID_TRACKS = Object.freeze([
+  'individual_contributor',
+  'management',
+  'specialist',
+]);
+
 class RoleRepository extends BaseRepository {
   constructor() {
     super('roles');
-    this.jobFamiliesRepo = null; // Will be injected to avoid circular dependency
+    this.jobFamiliesRepo = null;
     this.salaryBandsRepo = null;
     this.careerPathsRepo = null;
   }
 
-  /**
-   * Set dependencies (called after all repositories are instantiated)
-   */
-  setDependencies({ jobFamiliesRepo, salaryBandsRepo, careerPathsRepo }) {
+  setDependencies({
+    jobFamiliesRepo,
+    salaryBandsRepo,
+    careerPathsRepo,
+  }) {
     this.jobFamiliesRepo = jobFamiliesRepo;
     this.salaryBandsRepo = salaryBandsRepo;
     this.careerPathsRepo = careerPathsRepo;
   }
 
-  /**
-   * Create role with referential integrity validation
-   *
-   * @param {object} roleData
-   * @param {string} userId
-   * @returns {Promise<object>}
-   * @throws {AppError} If jobFamilyId doesn't exist
-   */
   async create(roleData, userId = 'system', docId = null) {
-    // GOVERNANCE: Validate foreign key
-    await this._validateJobFamilyExists(roleData.jobFamilyId);
+    const normalized = this.#normalizeRoleInput(roleData);
 
-    // GOVERNANCE: Validate required fields
-    this._validateRoleData(roleData);
+    this._validateRoleData(normalized);
+    await this._validateJobFamilyExists(normalized.jobFamilyId);
 
-    return await super.create(roleData, userId, docId);
+    return super.create(normalized, userId, docId);
   }
 
-  /**
-   * Update role with referential integrity validation
-   *
-   * @param {string} roleId
-   * @param {object} updates
-   * @param {string} userId
-   * @returns {Promise<object>}
-   */
   async update(roleId, updates, userId = 'system') {
-    // If changing jobFamilyId, validate new family exists
-    if (updates.jobFamilyId) {
-      await this._validateJobFamilyExists(updates.jobFamilyId);
+    const normalized = this.#normalizeRoleInput(updates);
+
+    if (normalized.jobFamilyId) {
+      await this._validateJobFamilyExists(
+        normalized.jobFamilyId
+      );
     }
 
-    return await super.update(roleId, updates, userId);
+    if (
+      normalized.seniorityLevel ||
+      normalized.track ||
+      normalized.roleName
+    ) {
+      this._validateRoleData({
+        ...normalized,
+        jobFamilyId:
+          normalized.jobFamilyId || 'preserved',
+      });
+    }
+
+    return super.update(roleId, normalized, userId);
   }
 
-  /**
-   * Soft delete role with dependency checking
-   *
-   * CRITICAL: Before deleting, check if role is referenced by:
-   *   - Active career paths
-   *   - Salary bands
-   *   - User profiles (external check)
-   *
-   * @param {string} roleId
-   * @param {string} userId
-   * @param {boolean} force - Skip dependency checks (dangerous!)
-   * @returns {Promise<void>}
-   * @throws {AppError} If role has dependencies
-   */
   async softDelete(roleId, userId = 'system', force = false) {
     if (!force) {
       await this._checkDependencies(roleId);
     }
 
-    return await super.softDelete(roleId, userId);
+    return super.softDelete(roleId, userId);
   }
 
-  // ═══════════════════════════════════════════════════════════════════════════
-  //  DOMAIN-SPECIFIC QUERIES
-  // ═══════════════════════════════════════════════════════════════════════════
+  // ───────────────────────────────────────────
+  // DOMAIN QUERIES (camelCase only)
+  // ───────────────────────────────────────────
 
-  /**
-   * Find all roles in a job family
-   *
-   * @param {string} jobFamilyId
-   * @param {object} options
-   * @returns {Promise<Array>}
-   */
   async findByJobFamily(jobFamilyId, options = {}) {
-    const filters = [
-      { field: 'jobFamilyId', op: '==', value: jobFamilyId },
-    ];
-
-    const queryOptions = {
-      ...options,
-      orderBy: { field: 'level', direction: 'asc' },
-    };
-
-    const result = await this.find(filters, queryOptions);
-    return result.docs;
-  }
-
-  /**
-   * Find roles by level (e.g., all L3 roles across families)
-   *
-   * @param {string} level - 'L1', 'L2', etc.
-   * @param {object} options
-   * @returns {Promise<Array>}
-   */
-  async findByLevel(level, options = {}) {
-    const filters = [
-      { field: 'level', op: '==', value: level },
-    ];
-
-    const result = await this.find(filters, options);
-    return result.docs;
-  }
-
-  /**
-   * Find roles by track (IC, management, specialist)
-   *
-   * @param {string} track
-   * @param {object} options
-   * @returns {Promise<Array>}
-   */
-  async findByTrack(track, options = {}) {
-    const filters = [
-      { field: 'track', op: '==', value: track },
-    ];
-
-    const result = await this.find(filters, options);
-    return result.docs;
-  }
-
-  /**
-   * Search roles by title (case-insensitive substring match)
-   *
-   * NOTE: Firestore doesn't support full-text search natively
-   * For production, integrate Algolia or Elasticsearch
-   *
-   * @param {string} titleFragment
-   * @param {number} limit
-   * @returns {Promise<Array>}
-   */
-  async searchByTitle(titleFragment, limit = 20) {
-    // WORKAROUND: Fetch all roles and filter in memory
-    // For production scale, use external search service
-    const result = await this.find([], { limit: 1000 });
-    
-    const searchTerm = titleFragment.toLowerCase();
-    const matches = result.docs.filter(role => 
-      role.title.toLowerCase().includes(searchTerm) ||
-      (role.alternativeTitles || []).some(alt => 
-        alt.toLowerCase().includes(searchTerm)
-      )
+    const result = await this.find(
+      [{ field: 'roleFamily', op: '==', value: jobFamilyId }],
+      {
+        ...options,
+        orderBy: {
+          field: 'seniorityLevel',
+          direction: 'asc',
+        },
+      }
     );
 
-    return matches.slice(0, limit);
+    return result.docs;
   }
 
-  /**
-   * Get role progression path within a job family
-   *
-   * Returns roles ordered by level for career visualization
-   *
-   * @param {string} jobFamilyId
-   * @param {string} track
-   * @returns {Promise<Array>}
-   */
+  async findByLevel(level, options = {}) {
+    const result = await this.find(
+      [{ field: 'seniorityLevel', op: '==', value: level }],
+      options
+    );
+
+    return result.docs;
+  }
+
+  async findByTrack(track, options = {}) {
+    const result = await this.find(
+      [{ field: 'track', op: '==', value: track }],
+      options
+    );
+
+    return result.docs;
+  }
+
+  async searchByTitle(titleFragment, limit = 20) {
+    const term = String(titleFragment || '').trim();
+    if (!term) return [];
+
+    const { data, error } = await this.db
+      .from(this.table)
+      .select('*')
+      .eq('soft_deleted', false)
+      .or(
+        `role_name.ilike.%${term}%,alternative_titles.cs.{${term}}`
+      )
+      .limit(Math.min(Number(limit) || 20, 100));
+
+    if (error) {
+      logger.error('[RoleRepository] searchByTitle failed', {
+        term,
+        message: error.message,
+      });
+      throw error;
+    }
+
+    return (data ?? []).map(row => this._normalize(row));
+  }
+
   async getProgressionPath(jobFamilyId, track) {
-    const filters = [
-      { field: 'jobFamilyId', op: '==', value: jobFamilyId },
-      { field: 'track', op: '==', value: track },
-    ];
-
-    const result = await this.find(filters, {
-      orderBy: { field: 'level', direction: 'asc' },
-    });
+    const result = await this.find(
+      [
+        { field: 'roleFamily', op: '==', value: jobFamilyId },
+        { field: 'track', op: '==', value: track },
+      ],
+      {
+        orderBy: {
+          field: 'seniorityLevel',
+          direction: 'asc',
+        },
+      }
+    );
 
     return result.docs;
   }
 
-  /**
-   * Get roles with demand trend filter
-   *
-   * Useful for recommending high-growth roles
-   *
-   * @param {string} trend - 'growing' | 'stable' | 'declining'
-   * @param {number} limit
-   * @returns {Promise<Array>}
-   */
   async findByDemandTrend(trend, limit = 50) {
-    const filters = [
-      { field: 'demandTrend', op: '==', value: trend },
-    ];
+    const result = await this.find(
+      [{ field: 'demandTrend', op: '==', value: trend }],
+      { limit }
+    );
 
-    const result = await this.find(filters, { limit });
     return result.docs;
   }
 
-  // ═══════════════════════════════════════════════════════════════════════════
-  //  PRIVATE VALIDATION METHODS
-  // ═══════════════════════════════════════════════════════════════════════════
-
-  /**
-   * Validate job family exists
-   * @private
-   */
   async _validateJobFamilyExists(jobFamilyId) {
     if (!this.jobFamiliesRepo) {
-      logger.warn('[RoleRepo] jobFamiliesRepo not injected, skipping validation');
+      logger.warn('[RoleRepository] jobFamiliesRepo not injected');
       return;
     }
 
     const family = await this.jobFamiliesRepo.findById(jobFamilyId);
-    
+
     if (!family) {
       throw new AppError(
         `Job family not found: ${jobFamilyId}`,
@@ -247,15 +174,17 @@ class RoleRepository extends BaseRepository {
     }
   }
 
-  /**
-   * Validate role data structure
-   * @private
-   */
-  _validateRoleData(roleData) {
-    const required = ['title', 'level', 'track', 'jobFamilyId'];
+  _validateRoleData(roleData = {}) {
+    const required = [
+      'roleName',
+      'seniorityLevel',
+      'track',
+      'jobFamilyId',
+    ];
+
     const missing = required.filter(field => !roleData[field]);
 
-    if (missing.length > 0) {
+    if (missing.length) {
       throw new AppError(
         `Missing required fields: ${missing.join(', ')}`,
         400,
@@ -264,21 +193,18 @@ class RoleRepository extends BaseRepository {
       );
     }
 
-    // Validate level format
-    if (!/^L[1-6]$/.test(roleData.level)) {
+    if (!/^L[1-6]$/.test(roleData.seniorityLevel)) {
       throw new AppError(
-        'Invalid level format. Must be L1, L2, L3, L4, L5, or L6',
+        'Invalid level format. Must be L1-L6',
         400,
-        { level: roleData.level },
+        { level: roleData.seniorityLevel },
         ErrorCodes.VALIDATION_ERROR
       );
     }
 
-    // Validate track
-    const validTracks = ['individual_contributor', 'management', 'specialist'];
-    if (!validTracks.includes(roleData.track)) {
+    if (!VALID_TRACKS.includes(roleData.track)) {
       throw new AppError(
-        `Invalid track. Must be one of: ${validTracks.join(', ')}`,
+        `Invalid track. Must be one of: ${VALID_TRACKS.join(', ')}`,
         400,
         { track: roleData.track },
         ErrorCodes.VALIDATION_ERROR
@@ -286,41 +212,64 @@ class RoleRepository extends BaseRepository {
     }
   }
 
-  /**
-   * Check for dependencies before deletion
-   * @private
-   */
+  #normalizeRoleInput(data = {}) {
+    return {
+      ...data,
+      roleName: data.roleName ?? data.role_name ?? data.title,
+      seniorityLevel:
+        data.seniorityLevel ??
+        data.seniority_level ??
+        data.level,
+      roleFamily:
+        data.roleFamily ??
+        data.role_family ??
+        data.jobFamilyId,
+      jobFamilyId:
+        data.jobFamilyId ??
+        data.roleFamily ??
+        data.role_family,
+    };
+  }
+
   async _checkDependencies(roleId) {
     const dependencies = [];
 
-    // Check career paths
-    if (this.careerPathsRepo) {
-      const pathsFrom = await this.careerPathsRepo.find([
-        { field: 'fromRoleId', op: '==', value: roleId },
+    const [pathsFrom, pathsTo, salaryBand] =
+      await Promise.all([
+        this.careerPathsRepo
+          ? this.careerPathsRepo.find([
+              { field: 'fromRoleId', op: '==', value: roleId },
+            ])
+          : { docs: [] },
+
+        this.careerPathsRepo
+          ? this.careerPathsRepo.find([
+              { field: 'toRoleId', op: '==', value: roleId },
+            ])
+          : { docs: [] },
+
+        this.salaryBandsRepo
+          ? this.salaryBandsRepo.findById(roleId)
+          : null,
       ]);
 
-      const pathsTo = await this.careerPathsRepo.find([
-        { field: 'toRoleId', op: '==', value: roleId },
-      ]);
-
-      if (pathsFrom.docs.length > 0) {
-        dependencies.push(`${pathsFrom.docs.length} career paths originating from this role`);
-      }
-
-      if (pathsTo.docs.length > 0) {
-        dependencies.push(`${pathsTo.docs.length} career paths leading to this role`);
-      }
+    if (pathsFrom.docs.length) {
+      dependencies.push(
+        `${pathsFrom.docs.length} outgoing career paths`
+      );
     }
 
-    // Check salary bands
-    if (this.salaryBandsRepo) {
-      const salaryBand = await this.salaryBandsRepo.findById(roleId);
-      if (salaryBand) {
-        dependencies.push('Salary band exists for this role');
-      }
+    if (pathsTo.docs.length) {
+      dependencies.push(
+        `${pathsTo.docs.length} incoming career paths`
+      );
     }
 
-    if (dependencies.length > 0) {
+    if (salaryBand) {
+      dependencies.push('Salary band exists');
+    }
+
+    if (dependencies.length) {
       throw new AppError(
         'Cannot delete role with active dependencies',
         409,
@@ -332,12 +281,3 @@ class RoleRepository extends BaseRepository {
 }
 
 module.exports = RoleRepository;
-
-
-
-
-
-
-
-
-

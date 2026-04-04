@@ -1,26 +1,26 @@
 'use strict';
 
 /**
- * salaryData.routes.js — Salary Data API Routes
+ * src/modules/salary/salary.routes.js
  *
- * Mounted in server.js as:
- *   app.use(`${API_PREFIX}/salary-data`, authenticate, requireAdmin, require('./modules/salary/salary.routes'));
+ * Salary Data API Routes
  *
- * Public aggregation endpoint:
- *   app.use(`${API_PREFIX}/salary-data`, authenticate, require('./modules/salary/salary.routes'));
- *
- * Routes:
- *   GET  /api/v1/salary-data/:roleId            → aggregated salary intelligence
- *   GET  /api/v1/salary-data/:roleId/records    → raw salary records
- *   POST /api/v1/salary-data                    → manual admin entry (admin only)
+ * Supabase-aligned route layer:
+ * - validation contract matches salary_data schema
+ * - legacy medianSalary removed
+ * - filter query validation added
+ * - admin/public access behavior preserved
+ * - route ordering hardened
  *
  * @module modules/salary/salary.routes
  */
 
 const express = require('express');
-const { param, body } = require('express-validator');
-const { validate }    = require('../../middleware/requestValidator');
+const { param, body, query } = require('express-validator');
+
+const { validate } = require('../../middleware/requestValidator');
 const { requireAdmin } = require('../../middleware/auth.middleware');
+
 const {
   getAggregated,
   getRawRecords,
@@ -29,23 +29,50 @@ const {
 
 const router = express.Router();
 
-// ── Validation chains ─────────────────────────────────────────────────────────
-
+// ─────────────────────────────────────────────────────────────────────────────
+// Shared validation
+// ─────────────────────────────────────────────────────────────────────────────
 const roleIdParam = param('roleId')
-  .isString().trim().notEmpty().isLength({ max: 100 })
+  .isString()
+  .trim()
+  .notEmpty()
+  .isLength({ max: 100 })
   .withMessage('roleId must be a non-empty string');
 
+const aggregationQueryValidation = [
+  query('location')
+    .optional()
+    .isString()
+    .trim()
+    .isLength({ max: 120 })
+    .withMessage('location must be a valid string'),
+
+  query('experienceLevel')
+    .optional()
+    .isIn(['Entry', 'Mid', 'Senior', 'Lead', 'Principal', 'Executive'])
+    .withMessage('Invalid experienceLevel'),
+
+  query('industry')
+    .optional()
+    .isString()
+    .trim()
+    .isLength({ max: 120 })
+    .withMessage('industry must be a valid string'),
+];
+
 const salaryBodyValidation = [
-  body('roleId').isString().trim().notEmpty()
+  body('roleId')
+    .isString()
+    .trim()
+    .notEmpty()
     .withMessage('roleId is required'),
 
-  body('minSalary').isFloat({ min: 0 })
+  body('minSalary')
+    .isFloat({ min: 0 })
     .withMessage('minSalary must be a non-negative number'),
 
-  body('medianSalary').isFloat({ min: 0 })
-    .withMessage('medianSalary must be a non-negative number'),
-
-  body('maxSalary').isFloat({ min: 0 })
+  body('maxSalary')
+    .isFloat({ min: 0 })
     .withMessage('maxSalary must be a non-negative number'),
 
   body('sourceType')
@@ -62,25 +89,57 @@ const salaryBodyValidation = [
     .optional()
     .isFloat({ min: 0, max: 1 })
     .withMessage('confidenceScore must be between 0 and 1'),
+
+  body('location')
+    .optional()
+    .isString()
+    .trim()
+    .isLength({ max: 120 })
+    .withMessage('location must be a valid string'),
+
+  body('industry')
+    .optional()
+    .isString()
+    .trim()
+    .isLength({ max: 120 })
+    .withMessage('industry must be a valid string'),
+
+  body('sourceName')
+    .optional()
+    .isString()
+    .trim()
+    .isLength({ max: 120 })
+    .withMessage('sourceName must be a valid string'),
 ];
 
-// ── Routes ────────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// Routes
+// ─────────────────────────────────────────────────────────────────────────────
 
-// GET /api/v1/salary-data/:roleId — aggregated salary intelligence (any authenticated user)
-router.get('/:roleId', validate([roleIdParam]), getAggregated);
+// GET /api/v1/salary-data/:roleId/records
+// Raw salary records (admin only)
+router.get(
+  '/:roleId/records',
+  requireAdmin,
+  validate([roleIdParam]),
+  getRawRecords
+);
 
-// GET /api/v1/salary-data/:roleId/records — raw records (admin only)
-router.get('/:roleId/records', requireAdmin, validate([roleIdParam]), getRawRecords);
+// GET /api/v1/salary-data/:roleId
+// Aggregated salary intelligence (authenticated users)
+router.get(
+  '/:roleId',
+  validate([roleIdParam, ...aggregationQueryValidation]),
+  getAggregated
+);
 
-// POST /api/v1/salary-data — manual admin salary entry (admin only)
-router.post('/', requireAdmin, validate(salaryBodyValidation), createRecord);
+// POST /api/v1/salary-data
+// Manual admin salary entry
+router.post(
+  '/',
+  requireAdmin,
+  validate(salaryBodyValidation),
+  createRecord
+);
 
 module.exports = router;
-
-
-
-
-
-
-
-

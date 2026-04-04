@@ -1,122 +1,108 @@
-"use strict";
+'use strict';
 
-/**
- * SalaryImpactRepository
- *
- * Responsibility:
- *   - Provide normalized salary impact data per skill for a given role
- *   - Abstract underlying data source (Firestore, API, skillMarketRepo, etc.)
- *   - Enforce soft-delete safety
- *   - Ensure null-safe structured output
- *
- * Design Philosophy:
- *   - Engine must never know where salary data comes from
- *   - Repository returns clean, predictable structure
- *   - Future-ready for advanced salary modeling (percentile, region, etc.)
- */
+const logger = require('../utils/logger');
 
 class SalaryImpactRepository {
-  /**
-   * @param {Object} dependencies
-   * @param {Object} dependencies.skillMarketRepo - existing repository (temporary source)
-   * @param {Object} dependencies.salaryDataSource - optional future dedicated salary source
-   */
-  constructor({ skillMarketRepo, salaryDataSource }) {
-    this._skillMarketRepo = skillMarketRepo;
-    this._salaryDataSource = salaryDataSource;
+  constructor({
+    skillMarketRepo,
+    salaryDataSource,
+  } = {}) {
+    this._skillMarketRepo = skillMarketRepo ?? null;
+    this._salaryDataSource = salaryDataSource ?? null;
   }
 
-  /**
-   * Fetch salary impact data by role ID.
-   *
-   * Expected return shape:
-   * {
-   *   skillId: {
-   *     salaryDelta: number (0–100 normalized),
-   *     percentileBoost?: number,
-   *     regionMultiplier?: number
-   *   }
-   * }
-   *
-   * @param {string} roleId
-   * @returns {Promise<Object>}
-   */
   async getSalaryImpactByRoleId(roleId) {
-    if (!roleId || typeof roleId !== "string") {
-      throw this._validationError("roleId must be a non-empty string.");
+    if (!roleId || typeof roleId !== 'string') {
+      throw this._validationError(
+        'roleId must be a non-empty string.'
+      );
     }
 
     try {
-      // 🔹 If future dedicated salary source exists, prefer that
-      if (this._salaryDataSource?.getByRoleId) {
-        const raw = await this._salaryDataSource.getByRoleId(roleId);
-        return this._normalizeSalaryImpact(raw);
-      }
+      const raw = await this.#resolveSource(roleId);
+      return this._normalizeSalaryImpact(raw);
+    } catch (error) {
+      logger.error(
+        '[SalaryImpactRepository] Failed resolving salary impact',
+        {
+          roleId,
+          message: error.message,
+        }
+      );
 
-      // 🔹 Fallback to skillMarketRepo for backward compatibility
-      if (this._skillMarketRepo?.getSalaryImpactByRoleId) {
-        const raw = await this._skillMarketRepo.getSalaryImpactByRoleId(roleId);
-        return this._normalizeSalaryImpact(raw);
-      }
-
-      return {};
-    } catch (err) {
-      // Fail safe — never break engine
+      // fail-safe contract preserved
       return {};
     }
   }
 
-  /**
-   * Normalize raw salary impact structure.
-   *
-   * Ensures:
-   * - salaryDelta is number between 0–100
-   * - No soft-deleted entries
-   * - Clean object keyed by skillId
-   */
   _normalizeSalaryImpact(rawData) {
-    if (!rawData || typeof rawData !== "object") {
+    if (!rawData || typeof rawData !== 'object') {
       return {};
     }
 
     const normalized = {};
 
     for (const [skillId, data] of Object.entries(rawData)) {
-      if (!data || data.isDeleted === true) {
-        continue; // Soft delete safe
+      if (!data || this.#isSoftDeleted(data)) {
+        continue;
       }
 
-      const salaryDelta = this._safeNumber(data.salaryDelta);
-
-      normalized[skillId] = {
-        salaryDelta: Math.min(100, Math.max(0, salaryDelta)),
-        percentileBoost: this._safeNumber(data.percentileBoost, 0),
-        regionMultiplier: this._safeNumber(data.regionMultiplier, 1),
-      };
+      normalized[skillId] = Object.freeze({
+        salaryDelta: this.#clampPercent(
+          this._safeNumber(data.salaryDelta)
+        ),
+        percentileBoost: this._safeNumber(
+          data.percentileBoost,
+          0
+        ),
+        regionMultiplier: this._safeNumber(
+          data.regionMultiplier,
+          1
+        ),
+      });
     }
 
-    return normalized;
+    return Object.freeze(normalized);
   }
 
   _safeNumber(value, fallback = 0) {
-    return typeof value === "number" && !isNaN(value) ? value : fallback;
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : fallback;
   }
 
   _validationError(message) {
-    const err = new Error(message);
-    err.name = "SalaryImpactRepositoryValidationError";
-    err.statusCode = 422;
-    return err;
+    const error = new Error(message);
+    error.name = 'SalaryImpactRepositoryValidationError';
+    error.statusCode = 422;
+    return error;
+  }
+
+  async #resolveSource(roleId) {
+    if (this._salaryDataSource?.getByRoleId) {
+      return this._salaryDataSource.getByRoleId(roleId);
+    }
+
+    if (this._skillMarketRepo?.getSalaryImpactByRoleId) {
+      return this._skillMarketRepo.getSalaryImpactByRoleId(
+        roleId
+      );
+    }
+
+    return {};
+  }
+
+  #isSoftDeleted(data) {
+    return (
+      data.isDeleted === true ||
+      data.is_deleted === true ||
+      data.softDeleted === true ||
+      data.soft_deleted === true
+    );
+  }
+
+  #clampPercent(value) {
+    return Math.min(100, Math.max(0, value));
   }
 }
 
 module.exports = SalaryImpactRepository;
-
-
-
-
-
-
-
-
-

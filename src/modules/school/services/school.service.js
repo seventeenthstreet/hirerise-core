@@ -1,52 +1,75 @@
 'use strict';
 
 const { v4: uuidv4 } = require('uuid');
+const { createClient } = require('@supabase/supabase-js');
+
 const logger = require('../../../utils/logger');
 const { supabase } = require('../../../config/supabase');
-const { createClient } = require('@supabase/supabase-js');
 
 const schoolRepo = require('../repositories/school.repository');
 const { SCHOOL_ROLES } = require('../models/school.model');
-const { COLLECTIONS: EDU_COLLECTIONS } = require('../../education-intelligence/models/student.model');
+
+const {
+  TABLES: EDU_TABLES,
+} = require('../../education-intelligence/models/student.model');
+
 const studentRepo = require('../../education-intelligence/repositories/student.repository');
 const orchestrator = require('../../education-intelligence/orchestrator/education.orchestrator');
 const { parseCSVBuffer } = require('../../admin/import/csvParser.util');
 
-// ─── Supabase Admin Client ─────────────────────────────
-
+/* ──────────────────────────────────────────────────────────────
+ * Shared admin client singleton
+ * ────────────────────────────────────────────────────────────── */
 let _admin = null;
+
 function getAdmin() {
   if (_admin) return _admin;
 
   _admin = createClient(
     process.env.SUPABASE_URL,
     process.env.SUPABASE_SERVICE_ROLE_KEY,
-    { auth: { persistSession: false, autoRefreshToken: false } }
+    {
+      auth: {
+        persistSession: false,
+        autoRefreshToken: false,
+      },
+    }
   );
 
   return _admin;
 }
 
-// ─── School CRUD ───────────────────────────────────────
-
+/* ──────────────────────────────────────────────────────────────
+ * Schools
+ * ────────────────────────────────────────────────────────────── */
 async function createSchool(userId, fields) {
-  if (!fields.school_name) {
+  if (!fields?.school_name?.trim()) {
     throw new Error('school_name is required');
   }
 
   const school = await schoolRepo.createSchool(userId, {
-    school_name: fields.school_name.trim(),
-    location: (fields.location || '').trim(),
+    school_name: fields.school_name,
+    location: fields.location || null,
   });
 
-  await schoolRepo.addSchoolUser(school.id, userId, SCHOOL_ROLES.ADMIN);
+  await schoolRepo.addSchoolUser(
+    school.id,
+    userId,
+    SCHOOL_ROLES.ADMIN
+  );
 
   return { school };
 }
 
 async function getSchool(schoolId) {
   const school = await schoolRepo.getSchool(schoolId);
-  if (!school) throw new Error('School not found');
+
+  if (!school) {
+    const err = new Error('School not found');
+    err.statusCode = 404;
+    throw err;
+  }
+
   return { school };
 }
 
@@ -55,14 +78,25 @@ async function getMySchools(userId) {
   return { schools };
 }
 
-// ─── Counselor ─────────────────────────────────────────
-
+/* ──────────────────────────────────────────────────────────────
+ * Counselors
+ * ────────────────────────────────────────────────────────────── */
 async function addCounselor(schoolId, email) {
-  const { data } = await getAdmin().auth.admin.listUsers();
+  const normalizedEmail = email?.trim().toLowerCase();
 
-  const user = data.users.find(u => u.email === email);
+  const { data, error } = await getAdmin().auth.admin.listUsers();
 
-  if (!user) throw new Error('User not found');
+  if (error) throw error;
+
+  const user = data.users.find(
+    u => u.email?.toLowerCase() === normalizedEmail
+  );
+
+  if (!user) {
+    const err = new Error('User not found');
+    err.statusCode = 404;
+    throw err;
+  }
 
   const membership = await schoolRepo.addSchoolUser(
     schoolId,
@@ -75,36 +109,46 @@ async function addCounselor(schoolId, email) {
 
 async function getCounselors(schoolId) {
   const members = await schoolRepo.getSchoolUsers(schoolId);
-  return { counselors: members.filter(m => m.role === SCHOOL_ROLES.COUNSELOR) };
+
+  return {
+    counselors: members.filter(
+      member => member.role === SCHOOL_ROLES.COUNSELOR
+    ),
+  };
 }
 
-// ─── Students ──────────────────────────────────────────
-
+/* ──────────────────────────────────────────────────────────────
+ * Students
+ * ────────────────────────────────────────────────────────────── */
 async function listStudents(schoolId) {
   const links = await schoolRepo.getSchoolStudentIds(schoolId);
   if (!links.length) return { students: [] };
 
-  const ids = links.map(l => l.student_id);
+  const ids = links.map(link => link.student_id);
 
   const { data, error } = await supabase
-    .from(EDU_COLLECTIONS.STUDENTS)
+    .from(EDU_TABLES.STUDENTS)
     .select('*')
     .in('id', ids);
 
   if (error) throw error;
 
+  const studentMap = new Map(
+    (data || []).map(student => [student.id, student])
+  );
+
   const students = links.map(link => {
-    const s = data.find(d => d.id === link.student_id) || {};
+    const student = studentMap.get(link.student_id) || {};
 
     return {
       link_id: link.link_id,
       student_id: link.student_id,
       class: link.class,
       section: link.section,
-      name: s.name || 'Unknown',
-      email: s.email || null,
-      education_level: s.education_level || null,
-      onboarding_step: s.onboarding_step || null,
+      name: student.name || 'Unknown',
+      email: student.email || null,
+      education_level: student.education_level || null,
+      onboarding_step: student.onboarding_step || null,
       assessment_done: false,
     };
   });
@@ -112,11 +156,25 @@ async function listStudents(schoolId) {
   return { students };
 }
 
-// ─── CSV Import ────────────────────────────────────────
-
+/* ──────────────────────────────────────────────────────────────
+ * CSV import
+ * ────────────────────────────────────────────────────────────── */
 async function importStudentsCSV(schoolId, fileBuffer) {
   const rows = parseCSVBuffer(fileBuffer);
-  const results = { imported: 0, skipped: 0, errors: [], students: [] };
+  const results = {
+    imported: 0,
+    skipped: 0,
+    errors: [],
+    students: [],
+  };
+
+  const { data: userList, error } = await getAdmin().auth.admin.listUsers();
+
+  if (error) throw error;
+
+  const emailToUser = new Map(
+    userList.users.map(user => [user.email?.toLowerCase(), user])
+  );
 
   for (const row of rows) {
     const name = row.name?.trim();
@@ -128,50 +186,79 @@ async function importStudentsCSV(schoolId, fileBuffer) {
     }
 
     try {
-      const { data } = await getAdmin().auth.admin.listUsers();
-      let user = data.users.find(u => u.email === email);
+      let user = emailToUser.get(email);
 
       if (!user) {
-        const { data: created } = await getAdmin().auth.admin.createUser({
-          email,
-          password: uuidv4() + 'Aa1!',
-        });
+        const { data: created, error: createError } =
+          await getAdmin().auth.admin.createUser({
+            email,
+            password: `${uuidv4()}Aa1!`,
+          });
+
+        if (createError) throw createError;
+
         user = created.user;
+        emailToUser.set(email, user);
       }
 
       await studentRepo.upsertStudent(user.id, { name, email });
-      await schoolRepo.addStudentToSchool(schoolId, user.id, {});
+      await schoolRepo.addStudentToSchool(schoolId, user.id);
 
       results.imported++;
       results.students.push({ name, email });
-
     } catch (err) {
+      logger.warn(
+        { schoolId, email, err: err.message },
+        '[SchoolService] import student failed'
+      );
+
       results.skipped++;
-      results.errors.push({ email, reason: err.message });
+      results.errors.push({
+        email,
+        reason: err.message,
+      });
     }
   }
 
   return results;
 }
 
-// ─── Assessment ────────────────────────────────────────
-
+/* ──────────────────────────────────────────────────────────────
+ * Assessment
+ * ────────────────────────────────────────────────────────────── */
 async function runAssessment(schoolId, studentId) {
-  const ok = await schoolRepo.isStudentInSchool(schoolId, studentId);
-  if (!ok) throw new Error('Not allowed');
+  const allowed = await schoolRepo.isStudentInSchool(
+    schoolId,
+    studentId
+  );
+
+  if (!allowed) {
+    const err = new Error('Not allowed');
+    err.statusCode = 403;
+    throw err;
+  }
 
   const result = await orchestrator.run(studentId);
   return { result };
 }
 
-// ─── Report ────────────────────────────────────────────
-
+/* ──────────────────────────────────────────────────────────────
+ * Student report
+ * ────────────────────────────────────────────────────────────── */
 async function getStudentReport(schoolId, studentId) {
-  const ok = await schoolRepo.isStudentInSchool(schoolId, studentId);
-  if (!ok) throw new Error('Not allowed');
+  const allowed = await schoolRepo.isStudentInSchool(
+    schoolId,
+    studentId
+  );
+
+  if (!allowed) {
+    const err = new Error('Not allowed');
+    err.statusCode = 403;
+    throw err;
+  }
 
   const { data, error } = await supabase
-    .from(EDU_COLLECTIONS.STUDENTS)
+    .from(EDU_TABLES.STUDENTS)
     .select('*')
     .eq('id', studentId)
     .single();
@@ -184,8 +271,9 @@ async function getStudentReport(schoolId, studentId) {
   };
 }
 
-// ─── Analytics ─────────────────────────────────────────
-
+/* ──────────────────────────────────────────────────────────────
+ * Analytics
+ * ────────────────────────────────────────────────────────────── */
 async function getAnalytics(schoolId) {
   const links = await schoolRepo.getSchoolStudentIds(schoolId);
 

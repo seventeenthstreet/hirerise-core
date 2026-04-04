@@ -1,20 +1,18 @@
 'use strict';
 
 const BaseRepository = require('./BaseRepository');
-const { supabase } = require('../config/supabase');
-
 const { AppError, ErrorCodes } = require('../middleware/errorHandler');
 
 class SalaryBandRepository extends BaseRepository {
   constructor() {
-    super('salaryBands');
+    super('salary_bands');
   }
 
   // ─────────────────────────────────────────────────────────
-  // Find by Role ID
+  // PRIMARY LOOKUP
   // ─────────────────────────────────────────────────────────
-  async findByRoleId(roleId) {
 
+  async findByRoleId(roleId) {
     if (!roleId) {
       throw new AppError(
         'roleId is required',
@@ -24,73 +22,41 @@ class SalaryBandRepository extends BaseRepository {
       );
     }
 
-    return await this.findById(roleId);
+    return this.findById(roleId);
   }
 
   // ─────────────────────────────────────────────────────────
-  // Legacy find
+  // LEGACY COMPATIBILITY
   // ─────────────────────────────────────────────────────────
-  async findByRoleIdLegacy(roleId) {
 
+  async findByRoleIdLegacy(roleId) {
     const result = await this.find(
       [{ field: 'roleId', op: '==', value: roleId }],
       { limit: 1 }
     );
 
-    return result?.length > 0 ? result[0] : null;
+    return result.docs?.[0] ?? null;
   }
 
   // ─────────────────────────────────────────────────────────
-  // FIXED: Transaction → Safe Update
+  // BACKWARD-COMPAT SAFE UPDATE
   // ─────────────────────────────────────────────────────────
-  async updateWithTransaction(id, updates, userId = 'system') {
 
-    // 1. Read existing record
-    const { data: existing, error: readError } = await supabase
-      .from('salaryBands')
-      .select('*')
-      .eq('id', id)
-      .maybeSingle();
-
-    if (readError) throw readError;
-
-    if (!existing) {
+  async updateWithTransaction(
+    id,
+    updates,
+    userId = 'system'
+  ) {
+    if (!id) {
       throw new AppError(
-        'Salary band not found',
-        404,
+        'Salary band id is required',
+        400,
         { id },
-        ErrorCodes.NOT_FOUND
+        ErrorCodes.VALIDATION_ERROR
       );
     }
 
-    if (existing.softDeleted) { // ⚠️ snake_case: soft_deleted
-      throw new AppError(
-        'Cannot update soft deleted salary band',
-        409,
-        { id },
-        ErrorCodes.CONFLICT
-      );
-    }
-
-    // 2. Metadata (same logic preserved)
-    const metadata = this._getUpdateMetadata(userId);
-
-    // 3. Update
-    const { error: updateError } = await supabase
-      .from('salaryBands')
-      .update({
-        ...updates,
-        ...metadata
-      })
-      .eq('id', id);
-
-    if (updateError) throw updateError;
-
-    // 4. Return merged result (same behavior)
-    return {
-      ...existing,
-      ...updates
-    };
+    return this.update(id, updates, userId);
   }
 }
 
