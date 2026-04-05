@@ -1,62 +1,73 @@
 'use strict';
 
 /**
- * resumeGrowth.routes.js
+ * routes/resumeGrowth.routes.js
  *
- * CHANGES (remediation sprint):
- *   FIX-9: Added express-validator chains for both routes using the validate()
- *           factory from requestValidator.js. Previously there was zero input
- *           validation middleware — all validation was done with ad-hoc if/else
- *           checks in the controller returning inconsistent error shapes.
+ * Resume growth analysis + latest result routes
  */
 
 const express = require('express');
 const { body, param } = require('express-validator');
 
 const resumeGrowthController = require('../modules/resumeGrowth/resumeGrowth.controller');
-const { validate }           = require('../middleware/requestValidator');
+const { validate } = require('../middleware/requestValidator');
 
 const router = express.Router();
 
-// POST /api/v1/resume-growth/analyze
+// ─────────────────────────────────────────────────────────────
+// Constants
+// ─────────────────────────────────────────────────────────────
+const MAX_ROLE_ID_LENGTH = 100;
+
+// ─────────────────────────────────────────────────────────────
+// Shared validators
+// ─────────────────────────────────────────────────────────────
+const roleIdBodyValidator = body('roleId')
+  .isString()
+  .trim()
+  .notEmpty()
+  .isLength({ max: MAX_ROLE_ID_LENGTH })
+  .withMessage(
+    `roleId must be 1-${MAX_ROLE_ID_LENGTH} characters`
+  );
+
+const roleIdParamValidator = param('roleId')
+  .isString()
+  .trim()
+  .notEmpty()
+  .isLength({ max: MAX_ROLE_ID_LENGTH })
+  .withMessage(
+    `roleId must be 1-${MAX_ROLE_ID_LENGTH} characters`
+  );
+
+// ─────────────────────────────────────────────────────────────
+// POST /analyze
+// ─────────────────────────────────────────────────────────────
 router.post(
   '/analyze',
   validate([
-    body('roleId')
-      .isString().withMessage('roleId must be a string')
-      .trim()
-      .notEmpty().withMessage('roleId is required')
-      .isLength({ max: 100 }).withMessage('roleId must be 100 characters or fewer'),
+    roleIdBodyValidator,
+
     body('resume')
-      .isObject().withMessage('resume must be an object')
-      .notEmpty().withMessage('resume is required'),
+      .isObject()
+      .notEmpty()
+      .withMessage('resume is required'),
+
     body('persist')
       .optional()
-      .isBoolean().withMessage('persist must be a boolean'),
+      .isBoolean()
+      .withMessage('persist must be a boolean'),
   ]),
   resumeGrowthController.analyze
 );
 
-// GET /api/v1/resume-growth/latest/:roleId
+// ─────────────────────────────────────────────────────────────
+// GET /latest/:roleId
+// ─────────────────────────────────────────────────────────────
 router.get(
   '/latest/:roleId',
-  validate([
-    param('roleId')
-      .isString().withMessage('roleId must be a string')
-      .trim()
-      .notEmpty().withMessage('roleId is required')
-      .isLength({ max: 100 }).withMessage('roleId must be 100 characters or fewer'),
-  ]),
+  validate([roleIdParamValidator]),
   resumeGrowthController.getLatest
 );
 
 module.exports = router;
-
-
-
-
-
-
-
-
-

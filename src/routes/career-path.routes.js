@@ -1,106 +1,121 @@
 'use strict';
 
 /**
- * career-path.routes.js — Standalone Career Path Prediction Routes
+ * routes/career-path.routes.js
+ * Standalone Career Path Prediction Routes
  *
- * Mounted in server.js:
- *   app.use(`${API_PREFIX}/career-path`, authenticate, require('./routes/career-path.routes'));
- *
- * ┌────────────────────────────────────────────────────────────────────────┐
- * │ Method │ Path                          │ Description                   │
- * ├────────────────────────────────────────────────────────────────────────┤
- * │ POST   │ /predict                      │ Predict full career path       │
- * │ GET    │ /chain/:role                  │ Raw progression chain for role │
- * └────────────────────────────────────────────────────────────────────────┘
- *
- * All routes require authenticate middleware (applied in server.js).
- *
- * @module routes/career-path.routes
+ * Mounted at:
+ * /api/v1/career-path
  */
 
-const express       = require('express');
-const { body, param } = require('express-validator');
-const { validate }    = require('../middleware/requestValidator');
-const { AppError, ErrorCodes } = require('../middleware/errorHandler');
-const { predictCareerPath, getProgressionChain } = require('../engines/career-path.engine');
+const express = require('express');
+const { body, param, query } = require('express-validator');
+
+const { validate } = require('../middleware/requestValidator');
+const {
+  predictCareerPath,
+  getProgressionChain,
+} = require('../engines/career-path.engine');
 const logger = require('../utils/logger');
 
 const router = express.Router();
 
-// ─── Validation schemas ───────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────
+// Constants
+// ─────────────────────────────────────────────────────────────
+const MAX_ROLE_LENGTH = 200;
+const MAX_SKILLS = 100;
+const MAX_SKILL_LENGTH = 150;
+const MAX_INDUSTRY_LENGTH = 100;
+const MAX_EXPERIENCE = 60;
 
+// ─────────────────────────────────────────────────────────────
+// Helpers
+// ─────────────────────────────────────────────────────────────
+function resolveUserId(req) {
+  return (
+    req?.user?.id ||
+    req?.user?.uid ||
+    req?.auth?.userId ||
+    req?.user?.user_id ||
+    null
+  );
+}
+
+// ─────────────────────────────────────────────────────────────
+// Validation
+// ─────────────────────────────────────────────────────────────
 const predictValidation = [
   body('role')
-    .isString().trim().notEmpty()
-    .withMessage('role is required and must be a non-empty string')
-    .isLength({ min: 1, max: 200 })
-    .withMessage('role must be between 1 and 200 characters'),
+    .isString()
+    .trim()
+    .notEmpty()
+    .isLength({ min: 1, max: MAX_ROLE_LENGTH })
+    .withMessage(
+      `role must be between 1 and ${MAX_ROLE_LENGTH} characters`
+    ),
 
   body('experience_years')
     .optional({ nullable: true })
-    .isFloat({ min: 0, max: 60 })
-    .withMessage('experience_years must be a number between 0 and 60')
-    .toFloat(),
+    .isFloat({ min: 0, max: MAX_EXPERIENCE })
+    .toFloat()
+    .withMessage(
+      `experience_years must be between 0 and ${MAX_EXPERIENCE}`
+    ),
 
   body('skills')
     .optional()
-    .isArray({ max: 100 })
-    .withMessage('skills must be an array with at most 100 items'),
+    .isArray({ max: MAX_SKILLS })
+    .withMessage(`skills must contain max ${MAX_SKILLS} items`),
 
   body('skills.*')
     .optional()
-    .isString().trim().notEmpty()
-    .withMessage('Each skill must be a non-empty string')
-    .isLength({ max: 150 })
-    .withMessage('Each skill name must not exceed 150 characters'),
+    .isString()
+    .trim()
+    .notEmpty()
+    .isLength({ max: MAX_SKILL_LENGTH })
+    .withMessage(
+      `Each skill name must not exceed ${MAX_SKILL_LENGTH} characters`
+    ),
 
   body('industry')
     .optional({ nullable: true })
-    .isString().trim()
-    .isLength({ max: 100 })
-    .withMessage('industry must be a string up to 100 characters'),
+    .isString()
+    .trim()
+    .isLength({ max: MAX_INDUSTRY_LENGTH })
+    .withMessage(
+      `industry must not exceed ${MAX_INDUSTRY_LENGTH} characters`
+    ),
 ];
 
-// ─── Handlers ─────────────────────────────────────────────────────────────────
+const chainValidation = [
+  param('role')
+    .isString()
+    .trim()
+    .notEmpty()
+    .isLength({ max: MAX_ROLE_LENGTH })
+    .withMessage('role param is required'),
 
-/**
- * POST /api/v1/career-path/predict
- *
- * Predicts the full career progression chain from a user's current role.
- * Accounts for existing experience to adjust the timeline.
- *
- * Request body:
- * {
- *   "role": "Junior Accountant",
- *   "experience_years": 2,
- *   "skills": ["Excel", "Tally"],    // optional — future: skill-gated transitions
- *   "industry": "Finance"            // optional — prefers industry-matching paths
- * }
- *
- * Response:
- * {
- *   "success": true,
- *   "data": {
- *     "current_role": "Junior Accountant",
- *     "experience_years": 2,
- *     "career_path": [
- *       { "role": "Senior Accountant", "estimated_years": 0.5, "years_to_reach": 0.5, ... },
- *       { "role": "Finance Manager",   "estimated_years": 3.5, "years_to_reach": 3 },
- *       ...
- *     ],
- *     "total_estimated_years": 11.5,
- *     "next_role": "Senior Accountant",
- *     "steps": 4,
- *     "source": "csv"
- *   }
- * }
- */
+  query('industry')
+    .optional()
+    .isString()
+    .trim()
+    .isLength({ max: MAX_INDUSTRY_LENGTH })
+    .withMessage(
+      `industry must not exceed ${MAX_INDUSTRY_LENGTH} characters`
+    ),
+];
+
+// ─────────────────────────────────────────────────────────────
+// Handlers
+// ─────────────────────────────────────────────────────────────
 async function handlePredict(req, res, next) {
   try {
     const { role, experience_years, skills, industry } = req.body;
+    const userId = resolveUserId(req);
 
     logger.info('[CareerPathRoutes] Predict request', {
-      user_id: req.user?.uid,
+      userId,
       role,
       experience_years,
     });
@@ -108,52 +123,29 @@ async function handlePredict(req, res, next) {
     const result = await predictCareerPath({
       role,
       experience_years: experience_years ?? 0,
-      skills:           skills           ?? [],
-      industry:         industry         ?? null,
+      skills: skills ?? [],
+      industry: industry ?? null,
     });
 
     return res.status(200).json({
       success: true,
-      data:    result,
+      data: result,
+    });
+  } catch (error) {
+    logger.error('[CareerPathRoutes] Predict failed', {
+      userId: resolveUserId(req),
+      role: req?.body?.role ?? null,
+      error: error.message,
     });
 
-  } catch (err) {
-    next(err);
+    return next(error);
   }
 }
 
-/**
- * GET /api/v1/career-path/chain/:role
- *
- * Returns the raw progression chain for a given role from the CSV dataset.
- * Lightweight endpoint — no Firestore enrichment, no experience adjustment.
- * Useful for the frontend "Career Explorer" widget.
- *
- * Path param: role (URL-encoded, e.g. "Junior%20Accountant")
- *
- * Query param: industry (optional filter)
- *
- * Response:
- * {
- *   "success": true,
- *   "data": {
- *     "role": "Junior Accountant",
- *     "chain": [
- *       { "role": "Junior Accountant", "next_role": "Senior Accountant", "years_to_next": 2, ... },
- *       ...
- *     ],
- *     "steps": 4
- *   }
- * }
- */
 async function handleGetChain(req, res, next) {
   try {
-    const role     = decodeURIComponent(req.params.role || '').trim();
+    const role = req.params.role.trim();
     const industry = req.query.industry?.trim() ?? null;
-
-    if (!role) {
-      throw new AppError('role param is required', 400, {}, ErrorCodes.VALIDATION_ERROR);
-    }
 
     const chain = await getProgressionChain(role, industry);
 
@@ -165,39 +157,29 @@ async function handleGetChain(req, res, next) {
         steps: chain.length,
       },
     });
+  } catch (error) {
+    logger.error('[CareerPathRoutes] Chain lookup failed', {
+      role: req?.params?.role ?? null,
+      error: error.message,
+    });
 
-  } catch (err) {
-    next(err);
+    return next(error);
   }
 }
 
-// ─── Route declarations ───────────────────────────────────────────────────────
-
-/**
- * POST /api/v1/career-path/predict
- * Full career path prediction with experience adjustment and Firestore enrichment.
- */
+// ─────────────────────────────────────────────────────────────
+// Routes
+// ─────────────────────────────────────────────────────────────
 router.post(
   '/predict',
   validate(predictValidation),
   handlePredict
 );
 
-/**
- * GET /api/v1/career-path/chain/:role
- * Raw CSV progression chain — fast, no Firestore.
- */
 router.get(
   '/chain/:role',
+  validate(chainValidation),
   handleGetChain
 );
 
 module.exports = router;
-
-
-
-
-
-
-
-

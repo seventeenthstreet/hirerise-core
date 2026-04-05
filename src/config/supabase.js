@@ -175,6 +175,7 @@ verifyConnection();
 // ─────────────────────────────────────────────
 
 module.exports = {
+  supabase: getClient(),
   getClient,
   withRetry,
   FieldValue,

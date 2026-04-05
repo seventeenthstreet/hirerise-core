@@ -1,61 +1,107 @@
 'use strict';
 
-const logger    = require('../utils/logger');
-const supabase  = require('../config/supabase');
+/**
+ * @file src/services/careerDomain.service.js
+ * @description
+ * Supabase-native career taxonomy + domain detection service.
+ *
+ * Optimized for:
+ * - snake_case Supabase schema
+ * - deterministic ordering
+ * - safer null handling
+ * - low-overfetch queries
+ * - map-based grouping
+ * - clean service boundaries
+ */
 
-// ── Helpers ──────────────────────────────────────────────────────────────────
+const logger = require('../utils/logger');
+const { supabase } = require('../config/supabase');
 
-async function _fetch(table, filters = []) {
-  let query = supabase.from(table).select('*');
+// ─────────────────────────────────────────────────────────────────────────────
+// Query helper
+// ─────────────────────────────────────────────────────────────────────────────
+async function fetchRows(table, {
+  filters = [],
+  columns = '*',
+  orderBy = null,
+} = {}) {
+  let query = supabase.from(table).select(columns);
 
-  for (const f of filters) {
-    query = query.eq(f.field, f.value);
+  for (const filter of filters) {
+    query = query.eq(filter.field, filter.value);
+  }
+
+  if (orderBy?.column) {
+    query = query.order(orderBy.column, {
+      ascending: orderBy.ascending ?? true,
+    });
   }
 
   const { data, error } = await query;
-  if (error) throw new Error(error.message);
 
-  return data || [];
+  if (error) {
+    logger.error('[CareerDomainService] fetchRows failed', {
+      table,
+      error: error.message,
+    });
+    throw error;
+  }
+
+  return Array.isArray(data) ? data : [];
 }
 
-// ── Taxonomy helpers ──────────────────────────────────────────────────────────
-
+// ─────────────────────────────────────────────────────────────────────────────
+// Taxonomy helpers
+// ─────────────────────────────────────────────────────────────────────────────
 async function getAllCareerDomains() {
-  return _fetch('cms_career_domains', [
-    { field: 'softDeleted', value: false },
-    { field: 'status', value: 'active' },
-  ]);
+  return fetchRows('cms_career_domains', {
+    filters: [
+      { field: 'soft_deleted', value: false },
+      { field: 'status', value: 'active' },
+    ],
+    columns: 'id,name,status',
+    orderBy: { column: 'name', ascending: true },
+  });
 }
 
 async function getSkillClusters(domainId = null) {
   const filters = [
-    { field: 'softDeleted', value: false },
+    { field: 'soft_deleted', value: false },
     { field: 'status', value: 'active' },
   ];
 
   if (domainId) {
-    filters.push({ field: 'domainId', value: domainId });
+    filters.push({ field: 'domain_id', value: domainId });
   }
 
-  return _fetch('cms_skill_clusters', filters);
+  return fetchRows('cms_skill_clusters', {
+    filters,
+    columns: 'id,name,domain_id,status',
+    orderBy: { column: 'name', ascending: true },
+  });
 }
 
 async function getCareerRoles(domainId = null) {
   const filters = [
-    { field: 'softDeleted', value: false },
+    { field: 'soft_deleted', value: false },
     { field: 'status', value: 'active' },
   ];
 
   if (domainId) {
-    filters.push({ field: 'domainId', value: domainId });
+    filters.push({ field: 'domain_id', value: domainId });
   }
 
-  return _fetch('cms_roles', filters);
+  return fetchRows('cms_roles', {
+    filters,
+    columns: 'id,name,domain_id,job_family_id,status',
+    orderBy: { column: 'name', ascending: true },
+  });
 }
 
-// ── Domain Detection ──────────────────────────────────────────────────────────
-
-async function detectCareerDomain(profile) {
+// ─────────────────────────────────────────────────────────────────────────────
+// Domain detection
+// ─────────────────────────────────────────────────────────────────────────────
+async function detectCareerDomain(profile = {}) {
   try {
     const [domains, clusters] = await Promise.all([
       getAllCareerDomains(),
@@ -63,51 +109,70 @@ async function detectCareerDomain(profile) {
     ]);
 
     if (!domains.length) {
-      return { domainId: null, domainName: null, confidence: 0, scores: [] };
+      return {
+        domainId: null,
+        domainName: null,
+        confidence: 0,
+        scores: [],
+      };
     }
 
     const profileSkills = new Set(
-      (profile.skills ?? []).map(s => s.toLowerCase().trim())
+      (Array.isArray(profile.skills) ? profile.skills : [])
+        .map((skill) => String(skill).toLowerCase().trim())
+        .filter(Boolean)
     );
 
-    const titleTokens = (profile.currentTitle ?? '')
+    const titleTokens = String(profile.currentTitle || '')
       .toLowerCase()
       .split(/\W+/)
       .filter(Boolean);
 
-    const clustersByDomain = {};
+    const clustersByDomain = new Map();
+
     for (const cluster of clusters) {
-      if (!clustersByDomain[cluster.domainId]) {
-        clustersByDomain[cluster.domainId] = [];
+      const key = cluster.domain_id;
+      if (!clustersByDomain.has(key)) {
+        clustersByDomain.set(key, []);
       }
-      clustersByDomain[cluster.domainId].push(cluster);
+      clustersByDomain.get(key).push(cluster);
     }
 
-    const scores = [];
-
-    for (const domain of domains) {
+    const scores = domains.map((domain) => {
       let score = 0;
 
-      const domainClusters = clustersByDomain[domain.id] ?? [];
+      const domainClusters = clustersByDomain.get(domain.id) || [];
 
       for (const cluster of domainClusters) {
-        const clusterTokens = cluster.name.toLowerCase().split(/\W+/).filter(Boolean);
-        const matchCount = clusterTokens.filter(t => profileSkills.has(t)).length;
+        const clusterTokens = String(cluster.name)
+          .toLowerCase()
+          .split(/\W+/)
+          .filter(Boolean);
+
+        const matchCount = clusterTokens.filter((token) =>
+          profileSkills.has(token)
+        ).length;
+
         score += matchCount * 0.15;
       }
 
-      const domainTokens = domain.name.toLowerCase().split(/\W+/).filter(Boolean);
-      const titleMatch = titleTokens.filter(t => domainTokens.includes(t)).length;
+      const domainTokens = String(domain.name)
+        .toLowerCase()
+        .split(/\W+/)
+        .filter(Boolean);
+
+      const titleMatch = titleTokens.filter((token) =>
+        domainTokens.includes(token)
+      ).length;
+
       score += titleMatch * 0.25;
 
-      const confidence = Math.min(score, 1);
-
-      scores.push({
+      return {
         domainId: domain.id,
         domainName: domain.name,
-        confidence,
-      });
-    }
+        confidence: Math.min(score, 1),
+      };
+    });
 
     scores.sort((a, b) => b.confidence - a.confidence);
 
@@ -115,55 +180,86 @@ async function detectCareerDomain(profile) {
     const MIN_CONFIDENCE = 0.1;
 
     return {
-      domainId:   best?.confidence >= MIN_CONFIDENCE ? best.domainId   : null,
-      domainName: best?.confidence >= MIN_CONFIDENCE ? best.domainName : null,
+      domainId:
+        best?.confidence >= MIN_CONFIDENCE ? best.domainId : null,
+      domainName:
+        best?.confidence >= MIN_CONFIDENCE ? best.domainName : null,
       confidence: best?.confidence || 0,
       scores,
     };
   } catch (err) {
     logger.error('[CareerDomainService] detectCareerDomain failed', {
-      error: err.message,
+      error: err?.message || 'Unknown detection error',
     });
-    return { domainId: null, domainName: null, confidence: 0, scores: [] };
+
+    return {
+      domainId: null,
+      domainName: null,
+      confidence: 0,
+      scores: [],
+    };
   }
 }
 
-// ── Full Taxonomy Tree ───────────────────────────────────────────────────────
-
+// ─────────────────────────────────────────────────────────────────────────────
+// Full taxonomy tree
+// ─────────────────────────────────────────────────────────────────────────────
 async function getDomainsWithFamilies() {
   try {
     const [domains, families, roles] = await Promise.all([
-      _fetch('cms_career_domains', [{ field: 'softDeleted', value: false }]),
-      _fetch('cms_job_families',   [{ field: 'softDeleted', value: false }]),
-      _fetch('cms_roles',          [{ field: 'softDeleted', value: false }]),
+      fetchRows('cms_career_domains', {
+        filters: [{ field: 'soft_deleted', value: false }],
+        columns: 'id,name,status',
+        orderBy: { column: 'name' },
+      }),
+      fetchRows('cms_job_families', {
+        filters: [{ field: 'soft_deleted', value: false }],
+        columns: 'id,name,domain_id',
+        orderBy: { column: 'name' },
+      }),
+      fetchRows('cms_roles', {
+        filters: [{ field: 'soft_deleted', value: false }],
+        columns: 'id,name,job_family_id,domain_id',
+        orderBy: { column: 'name' },
+      }),
     ]);
 
-    const familiesByDomain = {};
-    for (const f of families) {
-      const key = f.domainId ?? '__unassigned__';
-      if (!familiesByDomain[key]) familiesByDomain[key] = [];
-      familiesByDomain[key].push(f);
+    const familiesByDomain = new Map();
+    for (const family of families) {
+      const key = family.domain_id ?? '__unassigned__';
+      if (!familiesByDomain.has(key)) {
+        familiesByDomain.set(key, []);
+      }
+      familiesByDomain.get(key).push(family);
     }
 
-    const rolesByFamily = {};
-    for (const r of roles) {
-      const key = r.jobFamilyId ?? '__unassigned__';
-      if (!rolesByFamily[key]) rolesByFamily[key] = [];
-      rolesByFamily[key].push(r);
+    const rolesByFamily = new Map();
+    for (const role of roles) {
+      const key = role.job_family_id ?? '__unassigned__';
+      if (!rolesByFamily.has(key)) {
+        rolesByFamily.set(key, []);
+      }
+      rolesByFamily.get(key).push(role);
     }
 
-    return domains.map(domain => {
-      const domainFamilies = (familiesByDomain[domain.id] ?? []).map(family => ({
-        ...family,
-        roles: rolesByFamily[family.id] ?? [],
-      }));
+    return domains.map((domain) => {
+      const domainFamilies = (familiesByDomain.get(domain.id) || []).map(
+        (family) => ({
+          ...family,
+          roles: rolesByFamily.get(family.id) || [],
+        })
+      );
 
-      return { ...domain, jobFamilies: domainFamilies };
+      return {
+        ...domain,
+        jobFamilies: domainFamilies,
+      };
     });
   } catch (err) {
     logger.error('[CareerDomainService] getDomainsWithFamilies failed', {
-      error: err.message,
+      error: err?.message || 'Unknown taxonomy error',
     });
+
     return [];
   }
 }
@@ -175,8 +271,3 @@ module.exports = {
   getCareerRoles,
   getDomainsWithFamilies,
 };
-
-
-
-
-

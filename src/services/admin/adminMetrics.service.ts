@@ -1,15 +1,17 @@
-'use strict';
-
-const { supabase } = require('../../config/supabase');
-const { usageLogsRepository } = require('./usageLogs.repository');
-const { MARGIN_THRESHOLDS, FREE_BURN_THRESHOLDS } = require('../../config/pricing.config');
-
-// ─── TYPES ──────────────────────────────────────────────────────────────────
+// eslint-disable-next-line @typescript-eslint/no-require-imports
+const { supabase } = require('../../config/supabase') as {
+  supabase: ReturnType<typeof import('../../config/supabase').getClient>;
+};
+import { usageLogsRepository } from './usageLogs.repository';
+import {
+  MARGIN_THRESHOLDS,
+  FREE_BURN_THRESHOLDS,
+} from '../../config/pricing.config';
 
 type CostRow = {
   userId: string;
   feature: string;
-  model?: string;
+  model?: string | null;
   costUSD: number;
   revenueUSD: number;
   totalTokens: number;
@@ -23,146 +25,198 @@ type PeriodWindow = {
   days: number;
 };
 
-// ─── Period ────────────────────────────────────────────────────────────────
+type MetricsParams = {
+  period?: '7d' | '30d' | '90d' | '1y';
+  startDate?: string;
+  endDate?: string;
+};
 
-const PERIOD_DAYS: Record<string, number> = {
+const PERIOD_DAYS: Record<NonNullable<MetricsParams['period']>, number> = {
   '7d': 7,
   '30d': 30,
   '90d': 90,
   '1y': 365,
 };
 
-function resolvePeriodWindow(params: any): PeriodWindow {
+const INR_TO_USD = 0.012;
+
+function round(value: number, precision = 6): number {
+  return Number((value || 0).toFixed(precision));
+}
+
+function formatDate(date: Date): string {
+  return date.toISOString().split('T')[0];
+}
+
+function resolvePeriodWindow(params: MetricsParams = {}): PeriodWindow {
   const now = new Date();
   const endDate = new Date(now);
   endDate.setHours(23, 59, 59, 999);
 
   if (params.startDate && params.endDate) {
-    const start = new Date(params.startDate);
-    const end = new Date(params.endDate);
-    end.setHours(23, 59, 59, 999);
+    const startDate = new Date(params.startDate);
+    const customEnd = new Date(params.endDate);
+    customEnd.setHours(23, 59, 59, 999);
 
-    const days = Math.ceil((end.getTime() - start.getTime()) / (1000 * 60 * 60 * 24));
-    return { startDate: start, endDate: end, label: `${params.startDate} to ${params.endDate}`, days };
+    const days = Math.max(
+      1,
+      Math.ceil((customEnd.getTime() - startDate.getTime()) / 86400000)
+    );
+
+    return {
+      startDate,
+      endDate: customEnd,
+      label: `${params.startDate} to ${params.endDate}`,
+      days,
+    };
   }
 
   const preset = params.period ?? '30d';
-  const days = PERIOD_DAYS[preset] ?? 30;
+  const days = PERIOD_DAYS[preset];
 
-  const start = new Date(now);
-  start.setDate(start.getDate() - days);
-  start.setHours(0, 0, 0, 0);
+  const startDate = new Date(now);
+  startDate.setDate(startDate.getDate() - days);
+  startDate.setHours(0, 0, 0, 0);
 
-  return { startDate: start, endDate, label: preset, days };
+  return {
+    startDate,
+    endDate,
+    label: preset,
+    days,
+  };
 }
 
-// ─── Helpers ───────────────────────────────────────────────────────────────
-
 function computeTopFeatures(rows: CostRow[]) {
-  const counts: Record<string, number> = {};
+  const counts = new Map<string, number>();
 
-  for (const r of rows) {
-    counts[r.feature] = (counts[r.feature] ?? 0) + 1;
+  for (const row of rows) {
+    counts.set(row.feature, (counts.get(row.feature) ?? 0) + 1);
   }
 
-  return Object.entries(counts)
+  return [...counts.entries()]
     .map(([feature, count]) => ({ feature, count }))
     .sort((a, b) => b.count - a.count)
     .slice(0, 10);
 }
 
 function computeModelBreakdown(rows: CostRow[]) {
-  const models: Record<string, { cost: number; tokens: number; calls: number }> = {};
+  const models = new Map<
+    string,
+    { cost: number; tokens: number; calls: number }
+  >();
 
-  for (const r of rows) {
-    const m = r.model || 'unknown';
+  for (const row of rows) {
+    const model = row.model || 'unknown';
+    const current = models.get(model) ?? {
+      cost: 0,
+      tokens: 0,
+      calls: 0,
+    };
 
-    if (!models[m]) {
-      models[m] = { cost: 0, tokens: 0, calls: 0 };
-    }
+    current.cost += row.costUSD ?? 0;
+    current.tokens += row.totalTokens ?? 0;
+    current.calls += 1;
 
-    models[m].cost += r.costUSD;
-    models[m].tokens += r.totalTokens;
-    models[m].calls += 1;
+    models.set(model, current);
   }
 
-  return Object.entries(models)
-    .map(([model, d]) => ({
+  return [...models.entries()]
+    .map(([model, data]) => ({
       model,
-      totalCostUSD: +d.cost.toFixed(6),
-      totalTokens: d.tokens,
-      callCount: d.calls,
-      avgCostPerCall: d.calls ? +(d.cost / d.calls).toFixed(8) : 0,
+      totalCostUSD: round(data.cost, 6),
+      totalTokens: data.tokens,
+      callCount: data.calls,
+      avgCostPerCall: data.calls
+        ? round(data.cost / data.calls, 8)
+        : 0,
     }))
     .sort((a, b) => b.totalCostUSD - a.totalCostUSD);
 }
 
-function computeHealthAlerts(grossMarginPercent: number, freeTierCostUSD: number, totalCostUSD: number) {
-  let marginHealthStatus: string = 'HEALTHY';
+function computeHealthAlerts(
+  grossMarginPercent: number,
+  freeTierCostUSD: number,
+  totalCostUSD: number
+) {
+  let marginHealthStatus: 'HEALTHY' | 'WARNING' | 'CRITICAL' =
+    'HEALTHY';
   let marginWarning: string | undefined;
+  let freeBurnAlert: string | undefined;
 
   if (grossMarginPercent < MARGIN_THRESHOLDS.CRITICAL_PERCENT) {
     marginHealthStatus = 'CRITICAL';
     marginWarning = 'CRITICAL margin';
-  } else if (grossMarginPercent < MARGIN_THRESHOLDS.HEALTHY_PERCENT) {
+  } else if (
+    grossMarginPercent < MARGIN_THRESHOLDS.HEALTHY_PERCENT
+  ) {
     marginHealthStatus = 'WARNING';
     marginWarning = 'Low margin';
   }
 
   const freeBurnPercent = totalCostUSD
-    ? +((freeTierCostUSD / totalCostUSD) * 100).toFixed(1)
+    ? round((freeTierCostUSD / totalCostUSD) * 100, 1)
     : 0;
+
+  if (freeBurnPercent >= FREE_BURN_THRESHOLDS.CRITICAL_PERCENT) {
+    freeBurnAlert = `CRITICAL: Free tier consuming ${freeBurnPercent}% of total AI cost.`;
+  } else if (
+    freeBurnPercent >= FREE_BURN_THRESHOLDS.WARNING_PERCENT
+  ) {
+    freeBurnAlert = `WARNING: Free tier consuming ${freeBurnPercent}% of total AI cost.`;
+  }
 
   return {
     marginHealthStatus,
     marginWarning,
     freeBurnPercent,
+    freeBurnAlert,
   };
 }
-
-// ─── Revenue ───────────────────────────────────────────────────────────────
 
 async function estimateRevenueFromUsers() {
   const { data, error } = await supabase
     .from('users')
-    .select('planAmount')
+    .select('plan_amount')
     .neq('tier', 'free')
-    .eq('subscriptionStatus', 'active');
+    .eq('subscription_status', 'active');
 
-  if (error) throw error;
+  if (error) {
+    throw new Error(`Revenue estimation failed: ${error.message}`);
+  }
 
   let totalRevenueUSD = 0;
   let paidUserCount = 0;
 
-  for (const u of data || []) {
-    paidUserCount++;
-    totalRevenueUSD += (u.planAmount ?? 0) * 0.012;
+  for (const row of data ?? []) {
+    paidUserCount += 1;
+    totalRevenueUSD += (row.plan_amount ?? 0) * INR_TO_USD;
   }
 
   return {
-    totalRevenueUSD: +totalRevenueUSD.toFixed(2),
+    totalRevenueUSD: round(totalRevenueUSD, 2),
     paidUserCount,
   };
 }
 
-// ─── Active users ───────────────────────────────────────────────────────────
-
 function computeActiveUsers(rows: CostRow[]): number {
-  return new Set(rows.map((r: CostRow) => r.userId)).size;
+  return new Set(rows.map((row) => row.userId)).size;
 }
 
-// ─── SERVICE ────────────────────────────────────────────────────────────────
-
 class AdminMetricsService {
-
-  async getMetrics(params: any) {
+  async getMetrics(params: MetricsParams = {}) {
     const period = resolvePeriodWindow(params);
 
     const { rows, docCount, capped } =
-      await usageLogsRepository.getByDateRange(period.startDate, period.endDate);
+      await usageLogsRepository.getByDateRange(
+        period.startDate,
+        period.endDate
+      );
 
-    const totalUsers = await usageLogsRepository.getTotalUserCount();
-    const activeUsers = computeActiveUsers(rows);
+    const totalUsers =
+      await usageLogsRepository.getTotalUserCount();
+
+    const typedRows = rows as CostRow[];
+    const activeUsers = computeActiveUsers(typedRows);
 
     let totalTokens = 0;
     let totalCostUSD = 0;
@@ -172,61 +226,81 @@ class AdminMetricsService {
 
     const paidUserIds = new Set<string>();
 
-    for (const r of rows as CostRow[]) {
-      totalTokens += r.totalTokens;
-      totalCostUSD += r.costUSD;
-      totalRevenueUSD += r.revenueUSD;
+    for (const row of typedRows) {
+      totalTokens += row.totalTokens ?? 0;
+      totalCostUSD += row.costUSD ?? 0;
+      totalRevenueUSD += row.revenueUSD ?? 0;
 
-      if (r.tier === 'free') {
-        freeTierCostUSD += r.costUSD;
+      if (row.tier === 'free') {
+        freeTierCostUSD += row.costUSD ?? 0;
       } else {
-        paidTierCostUSD += r.costUSD;
-        paidUserIds.add(r.userId);
+        paidTierCostUSD += row.costUSD ?? 0;
+        if (row.userId) paidUserIds.add(row.userId);
       }
     }
 
     let paidUserCount = paidUserIds.size;
 
-    if (!(rows as CostRow[]).some((r: CostRow) => r.revenueUSD > 0)) {
-      const est = await estimateRevenueFromUsers();
-      totalRevenueUSD = est.totalRevenueUSD;
-      paidUserCount = est.paidUserCount;
+    if (!typedRows.some((row) => row.revenueUSD > 0)) {
+      const estimate = await estimateRevenueFromUsers();
+      totalRevenueUSD = estimate.totalRevenueUSD;
+      paidUserCount = estimate.paidUserCount;
     }
 
-    const grossMarginUSD = +(totalRevenueUSD - totalCostUSD).toFixed(6);
+    const grossMarginUSD = round(
+      totalRevenueUSD - totalCostUSD,
+      6
+    );
+
     const grossMarginPercent = totalRevenueUSD
-      ? +((grossMarginUSD / totalRevenueUSD) * 100).toFixed(2)
+      ? round((grossMarginUSD / totalRevenueUSD) * 100, 2)
       : 0;
 
     return {
       period: period.label,
-      startDate: period.startDate.toISOString().split('T')[0],
-      endDate: period.endDate.toISOString().split('T')[0],
+      startDate: formatDate(period.startDate),
+      endDate: formatDate(period.endDate),
 
       totalUsers,
       activeUsers,
 
-      totalRequests: rows.length,
+      totalRequests: typedRows.length,
       totalTokens,
 
-      totalCostUSD,
-      totalRevenueUSD,
+      totalCostUSD: round(totalCostUSD, 6),
+      totalRevenueUSD: round(totalRevenueUSD, 4),
       grossMarginUSD,
       grossMarginPercent,
 
-      freeTierCostUSD,
-      paidTierCostUSD,
+      freeTierCostUSD: round(freeTierCostUSD, 6),
+      paidTierCostUSD: round(paidTierCostUSD, 6),
 
-      avgCostPerRequest: rows.length ? totalCostUSD / rows.length : 0,
-      avgRevenuePerPaidUser: paidUserCount ? totalRevenueUSD / paidUserCount : 0,
+      avgCostPerRequest: typedRows.length
+        ? round(totalCostUSD / typedRows.length, 8)
+        : 0,
 
-      topFeatures: computeTopFeatures(rows as CostRow[]),
-      modelBreakdown: computeModelBreakdown(rows as CostRow[]),
-      healthAlerts: computeHealthAlerts(grossMarginPercent, freeTierCostUSD, totalCostUSD),
+      avgRevenuePerPaidUser: paidUserCount
+        ? round(totalRevenueUSD / paidUserCount, 4)
+        : 0,
 
-      dataSource: capped ? 'hybrid' : 'live',
+      topFeatures: computeTopFeatures(typedRows),
+      modelBreakdown: computeModelBreakdown(typedRows),
+
+      healthAlerts: computeHealthAlerts(
+        grossMarginPercent,
+        freeTierCostUSD,
+        totalCostUSD
+      ),
+
+      dataSource:
+        docCount === 0 ? 'aggregated' : capped ? 'hybrid' : 'live',
+
       generatedAt: new Date().toISOString(),
       periodDays: period.days,
+
+      ...(capped && {
+        _warning: `Query returned ${docCount} docs (limit: 10,000). Use /admin/metrics/aggregated for large periods.`,
+      }),
     };
   }
 }

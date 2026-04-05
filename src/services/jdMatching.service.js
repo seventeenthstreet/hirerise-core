@@ -1,12 +1,16 @@
 'use strict';
 
 /**
- * jdMatching.service.js — Optimized + Supabase Ready
+ * @file src/services/jdMatching.service.js
+ * @description
+ * JD ↔ profile keyword matching service.
  *
- * ✅ Crash-safe
- * ✅ Performance-aware
- * ✅ Supabase logging ready
- * ✅ Cleaned + hardened
+ * Optimized for:
+ * - stable cache keys
+ * - bounded in-memory cache
+ * - lower stem recomputation
+ * - deterministic keyword extraction
+ * - Supabase-safe analytics logging
  */
 
 const natural = require('natural');
@@ -19,72 +23,147 @@ const tokenizer = new natural.WordTokenizer();
 const stemmer = natural.PorterStemmer;
 const TfIdf = natural.TfIdf;
 
-// Optional: in-memory cache (can replace with Redis)
+const MAX_JD_LENGTH = 10000;
+const MAX_CACHE_SIZE = 500;
+
+// lightweight bounded cache
 const cache = new Map();
 
-// ─────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────
+// Helpers
+// ─────────────────────────────────────────────────────────────
+function normalizeText(text) {
+  return String(text || '')
+    .slice(0, MAX_JD_LENGTH)
+    .toLowerCase()
+    .trim();
+}
+
+function normalizeTerm(term) {
+  return String(term || '')
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, '')
+    .trim();
+}
+
+function getCacheKey(rawJobDescription, skills) {
+  const normalizedSkills = [...new Set(
+    skills
+      .map((s) =>
+        typeof s === 'string'
+          ? normalizeTerm(s)
+          : normalizeTerm(s?.name)
+      )
+      .filter(Boolean)
+      .sort()
+  )];
+
+  return JSON.stringify({
+    jd: normalizeText(rawJobDescription).slice(0, 300),
+    skills: normalizedSkills,
+  });
+}
+
+function boundedCacheSet(key, value) {
+  if (cache.size >= MAX_CACHE_SIZE) {
+    const firstKey = cache.keys().next().value;
+    if (firstKey) {
+      cache.delete(firstKey);
+    }
+  }
+
+  cache.set(key, value);
+}
+
+function getMatchCategory(score) {
+  if (score >= 80) return 'excellent_match';
+  if (score >= 60) return 'good_match';
+  return 'low_match';
+}
+
+// ─────────────────────────────────────────────────────────────
 // Keyword Extraction
-// ─────────────────────────────────────────────
-const extractKeywordsFromJD = (rawText) => {
-  const normalizedText = rawText.toLowerCase();
+// ─────────────────────────────────────────────────────────────
+function extractKeywordsFromJD(rawText) {
+  const normalizedText = normalizeText(rawText);
   const extracted = new Set();
 
-  // Tokenization
   const tokens = tokenizer.tokenize(normalizedText) || [];
 
   const cleanTokens = removeStopwords(tokens, eng)
-    .filter(t => t.length > 2)
-    .filter(t => !/^\d+$/.test(t));
+    .filter((token) => token.length > 2)
+    .filter((token) => !/^\d+$/.test(token));
+
+  if (!cleanTokens.length) {
+    return [];
+  }
 
   const tfidf = new TfIdf();
   tfidf.addDocument(cleanTokens.join(' '));
 
-  tfidf.listTerms(0)
+  tfidf
+    .listTerms(0)
     .slice(0, 60)
-    .forEach(term => {
-      if (term.tfidf > 0.1) extracted.add(term.term);
+    .forEach((term) => {
+      if (term.tfidf > 0.1) {
+        extracted.add(term.term);
+      }
     });
 
-  return Array.from(extracted);
-};
+  return [...extracted];
+}
 
-// ─────────────────────────────────────────────
-// Normalize
-// ─────────────────────────────────────────────
-const normalizeTerm = (term) =>
-  term?.toLowerCase()?.replace(/[^a-z0-9\s]/g, '').trim();
-
-// ─────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────
 // Match Logic
-// ─────────────────────────────────────────────
-const termMatchesUserSkill = (jdTerm, userSkillNames) => {
+// ─────────────────────────────────────────────────────────────
+function buildSkillMatchers(skills) {
+  return skills
+    .map((skill) =>
+      typeof skill === 'string'
+        ? skill
+        : skill?.name
+    )
+    .filter(Boolean)
+    .map((skill) => {
+      const normalized = normalizeTerm(skill);
+      return {
+        raw: normalized,
+        stem: stemmer.stem(normalized),
+      };
+    });
+}
+
+function termMatchesUserSkill(jdTerm, skillMatchers) {
   const jd = normalizeTerm(jdTerm);
+
   if (!jd) return false;
 
   const jdStem = stemmer.stem(jd);
 
-  return userSkillNames.some(skill => {
-    const s = normalizeTerm(skill);
-    if (!s) return false;
-
-    const sStem = stemmer.stem(s);
+  return skillMatchers.some((skill) => {
+    if (!skill.raw) return false;
 
     return (
-      jd === s ||
-      jdStem === sStem ||
-      s.includes(jd) ||
-      jd.includes(s)
+      jd === skill.raw ||
+      jdStem === skill.stem ||
+      skill.raw.includes(jd) ||
+      jd.includes(skill.raw)
     );
   });
-};
+}
 
-// ─────────────────────────────────────────────
-// MAIN FUNCTION
-// ─────────────────────────────────────────────
-const matchJD = async ({ userProfile, rawJobDescription }) => {
+// ─────────────────────────────────────────────────────────────
+// Main
+// ─────────────────────────────────────────────────────────────
+async function matchJD({
+  userProfile,
+  rawJobDescription,
+}) {
   const start = Date.now();
 
-  if (!rawJobDescription || rawJobDescription.length < 50) {
+  const safeJD = normalizeText(rawJobDescription);
+
+  if (!safeJD || safeJD.length < 50) {
     throw new AppError(
       'JD too short',
       422,
@@ -93,7 +172,10 @@ const matchJD = async ({ userProfile, rawJobDescription }) => {
     );
   }
 
-  if (!userProfile || !Array.isArray(userProfile.skills)) {
+  if (
+    !userProfile ||
+    !Array.isArray(userProfile.skills)
+  ) {
     throw new AppError(
       'Invalid user profile',
       422,
@@ -102,75 +184,86 @@ const matchJD = async ({ userProfile, rawJobDescription }) => {
     );
   }
 
-  // 🔥 Cache key
-  const cacheKey = JSON.stringify({
-    jd: rawJobDescription.slice(0, 200),
-    skills: userProfile.skills
-  });
+  const cacheKey = getCacheKey(
+    safeJD,
+    userProfile.skills
+  );
 
-  if (cache.has(cacheKey)) {
-    return cache.get(cacheKey);
+  const cached = cache.get(cacheKey);
+  if (cached) {
+    return cached;
   }
 
   try {
-    const jdKeywords = extractKeywordsFromJD(rawJobDescription);
-
-    const userSkillNames = userProfile.skills
-      .map(s => (typeof s === 'string' ? s : s?.name))
-      .filter(Boolean);
+    const jdKeywords = extractKeywordsFromJD(safeJD);
+    const skillMatchers = buildSkillMatchers(
+      userProfile.skills
+    );
 
     const matched = [];
     const missing = [];
 
-    for (const kw of jdKeywords) {
-      if (termMatchesUserSkill(kw, userSkillNames)) {
-        matched.push(kw);
+    for (const keyword of jdKeywords) {
+      if (termMatchesUserSkill(keyword, skillMatchers)) {
+        matched.push(keyword);
       } else {
-        missing.push(kw);
+        missing.push(keyword);
       }
     }
 
     const keywordScore = jdKeywords.length
-      ? Math.round((matched.length / jdKeywords.length) * 100)
+      ? Math.round(
+          (matched.length / jdKeywords.length) * 100
+        )
       : 50;
 
     const result = {
       matchScore: keywordScore,
-      matchCategory:
-        keywordScore >= 80 ? 'excellent_match' :
-        keywordScore >= 60 ? 'good_match' :
-        'low_match',
+      matchCategory: getMatchCategory(keywordScore),
       matchedKeywords: matched.slice(0, 30),
       missingKeywords: missing.slice(0, 30),
       summary: `Match score: ${keywordScore}%`,
     };
 
-    // 🔥 Save to cache
-    cache.set(cacheKey, result);
+    boundedCacheSet(cacheKey, result);
 
-    // 🔥 Optional: store in Supabase (analytics)
-    try {
-      await supabase.from('jd_analysis_logs').insert({
+    // non-blocking analytics
+    void supabase
+      .from('jd_analysis_logs')
+      .insert({
         match_score: result.matchScore,
-        skills_count: userSkillNames.length,
-        created_at: new Date().toISOString()
+        skills_count: skillMatchers.length,
+        created_at: new Date().toISOString(),
+      })
+      .then(({ error }) => {
+        if (error) {
+          logger.warn('[JDMatching] analytics log failed', {
+            error: error.message,
+          });
+        }
+      })
+      .catch((error) => {
+        logger.warn('[JDMatching] analytics unexpected failure', {
+          error: error?.message || 'Unknown analytics error',
+        });
       });
-    } catch (_) {}
 
     logger.info('[JDMatching] completed', {
       score: keywordScore,
-      timeMs: Date.now() - start
+      time_ms: Date.now() - start,
+      keywords: jdKeywords.length,
     });
 
     return result;
-
   } catch (err) {
     logger.error('[JDMatching] failed', {
-      error: err.message
+      error: err?.message || 'Unknown matching error',
     });
 
     throw err;
   }
-};
+}
 
-module.exports = { matchJD };
+module.exports = {
+  matchJD,
+};

@@ -1,295 +1,419 @@
 'use strict';
 
 /**
- * semantic.routes.js — Semantic AI Upgrade Routes
- *
- * Registers all 4 upgrade endpoints on the existing Express app.
- * Drop this file into src/routes/ and add one line to server.js.
- *
- * Routes added:
- *   GET  /api/v1/skills/similar          (Upgrade 1 — Semantic Skill Intelligence)
- *   POST /api/v1/skills/embed            (Upgrade 1 — generate skill embedding)
- *   GET  /api/v1/job-seeker/jobs/semantic-match  (Upgrade 2 — Semantic Job Matching)
- *   GET  /api/v1/career/advice           (Upgrade 3 — AI Career Advisor)
- *   GET  /api/v1/skills/learning-path    (Upgrade 4 — Learning Path Generation)
- *
- * Auth: all routes require Firebase auth (existing auth.middleware).
- * Rate limiting: inherits existing aiRateLimit middleware where needed.
- *
- * To register — add ONE line to server.js (after existing routes):
- *   app.use('/api/v1', require('./routes/semantic.routes'));
+ * routes/semantic.routes.js
+ * Semantic AI upgrade routes
  */
 
-const express               = require('express');
-const router                = express.Router();
+const express = require('express');
+const { body, query } = require('express-validator');
 
-const { authenticate }      = require('../middleware/auth.middleware');
-const logger                = require('../utils/logger');
+const router = express.Router();
 
-// ─── Engines ──────────────────────────────────────────────────────────────────
+const { authenticate } = require('../middleware/auth.middleware');
+const { validate } = require('../middleware/requestValidator');
+const logger = require('../utils/logger');
 
-const semanticSkillEngine   = require('../engines/semanticSkill.engine');
-const semanticJobEngine     = require('../engines/semanticJobMatching.engine');
-const careerAdvisorEngine   = require('../engines/careerAdvisor.engine');
-const learningPathEngine    = require('../engines/learningPath.engine');
+// ─────────────────────────────────────────────────────────────
+// Engines
+// ─────────────────────────────────────────────────────────────
+const semanticSkillEngine = require('../engines/semanticSkill.engine');
+const semanticJobEngine = require('../engines/semanticJobMatching.engine');
+const careerAdvisorEngine = require('../engines/careerAdvisor.engine');
+const learningPathEngine = require('../engines/learningPath.engine');
 
-// ─── Existing services (reuse) ────────────────────────────────────────────────
-
-let _skillGraphSvc  = null;
-let _jobMatchSvc    = null;
-let _marketSvc      = null;
+// ─────────────────────────────────────────────────────────────
+// Lazy-loaded shared services
+// ─────────────────────────────────────────────────────────────
+let skillGraphSvc = null;
+let jobMatchSvc = null;
+let marketSvc = null;
 
 function getSkillGraphSvc() {
-  if (!_skillGraphSvc) _skillGraphSvc = require('../modules/jobSeeker/skillGraphEngine.service');
-  return _skillGraphSvc;
+  if (!skillGraphSvc) {
+    skillGraphSvc = require('../modules/jobSeeker/skillGraphEngine.service');
+  }
+  return skillGraphSvc;
 }
 
 function getJobMatchSvc() {
-  if (!_jobMatchSvc) _jobMatchSvc = require('../modules/jobSeeker/jobMatchingEngine.service');
-  return _jobMatchSvc;
+  if (!jobMatchSvc) {
+    jobMatchSvc = require('../modules/jobSeeker/jobMatchingEngine.service');
+  }
+  return jobMatchSvc;
 }
 
 function getMarketSvc() {
-  if (!_marketSvc) {
-    try { _marketSvc = require('../modules/labor-market-intelligence/services/marketTrend.service'); }
-    catch (_) {}
+  if (!marketSvc) {
+    try {
+      marketSvc = require('../modules/labor-market-intelligence/services/marketTrend.service');
+    } catch (_) {
+      marketSvc = null;
+    }
   }
-  return _marketSvc;
+  return marketSvc;
 }
 
-// ─── Response helpers ─────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────
+// Helpers
+// ─────────────────────────────────────────────────────────────
+function resolveUserId(req) {
+  return (
+    req?.user?.id ||
+    req?.user?.uid ||
+    req?.auth?.userId ||
+    req?.user?.user_id ||
+    null
+  );
+}
 
-const ok  = (res, data)  => res.status(200).json({ success: true,  data });
-const err = (res, msg, code = 500) => res.status(code).json({ success: false, error: msg });
+function ok(res, data) {
+  return res.status(200).json({
+    success: true,
+    data,
+  });
+}
 
-// ─────────────────────────────────────────────────────────────────────────────
-// UPGRADE 1 — GET /skills/similar?skill=Excel&topK=5
-// Returns semantically similar skills via cosine similarity.
-// ─────────────────────────────────────────────────────────────────────────────
+function fail(res, message, code = 500) {
+  return res.status(code).json({
+    success: false,
+    error: {
+      code: code === 400 ? 'VALIDATION_ERROR' : 'INTERNAL_ERROR',
+      message,
+    },
+  });
+}
 
-router.get('/skills/similar', authenticate, async (req, res) => {
-  const { skill, topK = 5, minScore = 0.6 } = req.query;
+// ─────────────────────────────────────────────────────────────
+// GET /skills/similar
+// ─────────────────────────────────────────────────────────────
+router.get(
+  '/skills/similar',
+  authenticate,
+  validate([
+    query('skill')
+      .isString()
+      .trim()
+      .isLength({ min: 2, max: 100 })
+      .withMessage('skill must be 2-100 characters'),
 
-  if (!skill || String(skill).trim().length < 2) {
-    return err(res, 'Query param "skill" is required (min 2 chars)', 400);
-  }
+    query('topK')
+      .optional()
+      .isInt({ min: 1, max: 20 })
+      .toInt(),
 
-  try {
-    const result = await semanticSkillEngine.findSimilarSkills(
-      String(skill).trim(),
-      { topK: Math.min(parseInt(topK) || 5, 20), minScore: parseFloat(minScore) || 0.6 }
-    );
-    ok(res, result);
-  } catch (e) {
-    logger.error('[Route] skills/similar', { err: e.message });
-    err(res, 'Failed to find similar skills', 500);
-  }
-});
-
-// ─────────────────────────────────────────────────────────────────────────────
-// UPGRADE 1 — POST /skills/embed   { skill: "Power BI" }
-// Manually trigger embedding generation for a skill (admin/import use).
-// ─────────────────────────────────────────────────────────────────────────────
-
-router.post('/skills/embed', authenticate, async (req, res) => {
-  const { skill, skills } = req.body;
-
-  // Support single or batch
-  if (skills && Array.isArray(skills)) {
+    query('minScore')
+      .optional()
+      .isFloat({ min: 0, max: 1 })
+      .toFloat(),
+  ]),
+  async (req, res) => {
     try {
-      const result = await semanticSkillEngine.batchGenerateEmbeddings(skills);
-      ok(res, result);
-    } catch (e) {
-      logger.error('[Route] skills/embed batch', { err: e.message });
-      err(res, 'Batch embedding failed', 500);
-    }
-    return;
-  }
+      const skill = req.query.skill;
+      const topK = req.query.topK ?? 5;
+      const minScore = req.query.minScore ?? 0.6;
 
-  if (!skill || String(skill).trim().length < 2) {
-    return err(res, '"skill" or "skills[]" required in body', 400);
-  }
+      const result =
+        await semanticSkillEngine.findSimilarSkills(skill, {
+          topK,
+          minScore,
+        });
 
-  try {
-    const result = await semanticSkillEngine.generateSkillEmbedding(String(skill).trim());
-    ok(res, { skill: result.skill_name, status: 'embedded' });
-  } catch (e) {
-    logger.error('[Route] skills/embed single', { err: e.message });
-    err(res, 'Embedding generation failed', 500);
-  }
-});
-
-// ─────────────────────────────────────────────────────────────────────────────
-// UPGRADE 2 — GET /job-seeker/jobs/semantic-match?limit=10&minScore=30
-// Returns semantically matched jobs with scores and missing skills.
-// ─────────────────────────────────────────────────────────────────────────────
-
-router.get('/job-seeker/jobs/semantic-match', authenticate, async (req, res) => {
-  const userId  = req.user?.uid || req.user?.id;
-  const limit   = Math.min(parseInt(req.query.limit)    || 10, 30);
-  const minScore = parseInt(req.query.minScore) || 30;
-
-  if (!userId) return err(res, 'Unauthenticated', 401);
-
-  try {
-    const skillGraphSvc = getSkillGraphSvc();
-
-    // Load user profile + skill graph (reuse existing service)
-    const [userGraph, jobMatchData] = await Promise.allSettled([
-      skillGraphSvc.getUserSkillGap(userId),
-      getJobMatchSvc().getJobMatches(userId, { limit: 50 }), // fetch more candidates
-    ]);
-
-    const skillGapData  = userGraph.status   === 'fulfilled' ? userGraph.value   : {};
-    const candidateJobs = jobMatchData.status === 'fulfilled'
-      ? (jobMatchData.value?.recommended_jobs || []).map(j => ({
-          id:            j.id || j.roleId,
-          title:         j.title,
-          description:   j.description || '',
-          skills:        j.required_skills || j.missing_skills || [],
-          company:       j.company || null,
-          location:      j.location || null,
-          yearsRequired: j.yearsRequired || 0,
-          industry:      j.sector || null,
-        }))
-      : [];
-
-    const userProfile = {
-      userId,
-      skills:          skillGapData.existing_skills || [],
-      yearsExperience: skillGapData.years_experience || 0,
-      industry:        skillGapData.industry || '',
-      location:        '',
-    };
-
-    const { recommended_jobs } = await semanticJobEngine.getSemanticJobRecommendations(
-      userProfile,
-      candidateJobs,
-      { topN: limit, minScore }
-    );
-
-    ok(res, {
-      recommended_jobs,
-      total_evaluated: candidateJobs.length,
-      user_skills_count: userProfile.skills.length,
-      scoring_weights:   semanticJobEngine.WEIGHTS,
-    });
-  } catch (e) {
-    logger.error('[Route] job-seeker/jobs/semantic-match', { userId, err: e.message });
-    err(res, 'Semantic job matching failed', 500);
-  }
-});
-
-// ─────────────────────────────────────────────────────────────────────────────
-// UPGRADE 3 — GET /career/advice
-// Returns AI-generated career insight for the authenticated user.
-// ─────────────────────────────────────────────────────────────────────────────
-
-router.get('/career/advice', authenticate, async (req, res) => {
-  const userId = req.user?.uid || req.user?.id;
-  if (!userId) return err(res, 'Unauthenticated', 401);
-
-  try {
-    const skillGraphSvc = getSkillGraphSvc();
-    const marketSvc     = getMarketSvc();
-
-    // Load data in parallel
-    const [skillGapRes, jobMatchRes, marketRes] = await Promise.allSettled([
-      skillGraphSvc.getUserSkillGap(userId),
-      getJobMatchSvc().getJobMatches(userId, { limit: 5 }),
-      marketSvc ? marketSvc.getTrendingSkills() : Promise.resolve(null),
-    ]);
-
-    const skillGap     = skillGapRes.status   === 'fulfilled' ? skillGapRes.value   : {};
-    const jobMatches   = jobMatchRes.status   === 'fulfilled' ? jobMatchRes.value?.recommended_jobs || [] : [];
-    const marketDemand = marketRes.status     === 'fulfilled' ? marketRes.value : null;
-
-    // Build profile from skill gap data
-    const profile = {
-      skills:          skillGap.existing_skills   || [],
-      yearsExperience: skillGap.years_experience  || 0,
-      targetRole:      skillGap.target_role       || null,
-      industry:        skillGap.industry          || null,
-    };
-
-    const result = await careerAdvisorEngine.generateCareerAdvice({
-      userId,
-      profile,
-      skillGap,
-      marketDemand,
-      topJobMatches: jobMatches,
-    });
-
-    ok(res, result);
-  } catch (e) {
-    logger.error('[Route] career/advice', { userId, err: e.message });
-    err(res, 'Career advice generation failed', 500);
-  }
-});
-
-// ─────────────────────────────────────────────────────────────────────────────
-// UPGRADE 4 — GET /skills/learning-path?skill=Power+BI
-//           — GET /skills/learning-path?skills=Power+BI,Python,SQL (multi)
-// Returns structured learning path(s) for missing skill(s).
-// ─────────────────────────────────────────────────────────────────────────────
-
-router.get('/skills/learning-path', authenticate, async (req, res) => {
-  const userId  = req.user?.uid || req.user?.id;
-  const { skill, skills: skillsParam, targetRole } = req.query;
-
-  // Parse skills — support comma-separated or single
-  let skillList = [];
-  if (skillsParam) {
-    skillList = String(skillsParam).split(',').map(s => s.trim()).filter(Boolean);
-  } else if (skill) {
-    skillList = [String(skill).trim()];
-  }
-
-  if (skillList.length === 0) {
-    return err(res, 'Query param "skill" or "skills" is required', 400);
-  }
-
-  try {
-    // Load user's existing skills for prerequisite filtering
-    let userSkills = [];
-    if (userId) {
-      try {
-        const skillGap = await getSkillGraphSvc().getUserSkillGap(userId);
-        userSkills = skillGap?.existing_skills || [];
-      } catch (_) {}
-    }
-
-    let result;
-    if (skillList.length === 1) {
-      result = await learningPathEngine.generateLearningPath({
-        skill:      skillList[0],
-        userSkills,
-        targetRole: targetRole || '',
+      return ok(res, result);
+    } catch (error) {
+      logger.error('[SemanticRoutes] skills/similar failed', {
+        error: error.message,
       });
-    } else {
-      result = await learningPathEngine.generateMultiSkillPaths({
-        skills:     skillList,
-        userSkills,
-        targetRole: targetRole || '',
+      return fail(res, 'Failed to find similar skills');
+    }
+  }
+);
+
+// ─────────────────────────────────────────────────────────────
+// POST /skills/embed
+// ─────────────────────────────────────────────────────────────
+router.post(
+  '/skills/embed',
+  authenticate,
+  validate([
+    body('skill')
+      .optional()
+      .isString()
+      .trim()
+      .isLength({ min: 2, max: 150 }),
+
+    body('skills')
+      .optional()
+      .isArray({ min: 1, max: 100 }),
+
+    body('skills.*')
+      .optional()
+      .isString()
+      .trim()
+      .isLength({ min: 2, max: 150 }),
+  ]),
+  async (req, res) => {
+    try {
+      const { skill, skills } = req.body;
+
+      if (Array.isArray(skills)) {
+        const result =
+          await semanticSkillEngine.batchGenerateEmbeddings(
+            skills
+          );
+        return ok(res, result);
+      }
+
+      if (!skill) {
+        return fail(
+          res,
+          '"skill" or "skills[]" required in body',
+          400
+        );
+      }
+
+      const result =
+        await semanticSkillEngine.generateSkillEmbedding(skill);
+
+      return ok(res, {
+        skill: result.skill_name,
+        status: 'embedded',
       });
+    } catch (error) {
+      logger.error('[SemanticRoutes] skills/embed failed', {
+        error: error.message,
+      });
+      return fail(res, 'Embedding generation failed');
+    }
+  }
+);
+
+// ─────────────────────────────────────────────────────────────
+// GET /job-seeker/jobs/semantic-match
+// ─────────────────────────────────────────────────────────────
+router.get(
+  '/job-seeker/jobs/semantic-match',
+  authenticate,
+  validate([
+    query('limit').optional().isInt({ min: 1, max: 30 }).toInt(),
+    query('minScore').optional().isInt({ min: 0, max: 100 }).toInt(),
+  ]),
+  async (req, res) => {
+    const userId = resolveUserId(req);
+    if (!userId) return fail(res, 'Unauthenticated', 401);
+
+    try {
+      const limit = req.query.limit ?? 10;
+      const minScore = req.query.minScore ?? 30;
+
+      const [userGraph, jobMatchData] =
+        await Promise.allSettled([
+          getSkillGraphSvc().getUserSkillGap(userId),
+          getJobMatchSvc().getJobMatches(userId, {
+            limit: 50,
+          }),
+        ]);
+
+      const skillGapData =
+        userGraph.status === 'fulfilled'
+          ? userGraph.value
+          : {};
+
+      const candidateJobs =
+        jobMatchData.status === 'fulfilled'
+          ? (
+              jobMatchData.value?.recommended_jobs || []
+            ).map((j) => ({
+              id: j.id || j.roleId,
+              title: j.title,
+              description: j.description || '',
+              skills:
+                j.required_skills ||
+                j.missing_skills ||
+                [],
+              company: j.company || null,
+              location: j.location || null,
+              yearsRequired: j.yearsRequired || 0,
+              industry: j.sector || null,
+            }))
+          : [];
+
+      const userProfile = {
+        userId,
+        skills: skillGapData.existing_skills || [],
+        yearsExperience:
+          skillGapData.years_experience || 0,
+        industry: skillGapData.industry || '',
+        location: '',
+      };
+
+      const { recommended_jobs } =
+        await semanticJobEngine.getSemanticJobRecommendations(
+          userProfile,
+          candidateJobs,
+          { topN: limit, minScore }
+        );
+
+      return ok(res, {
+        recommended_jobs,
+        total_evaluated: candidateJobs.length,
+        user_skills_count:
+          userProfile.skills.length,
+        scoring_weights:
+          semanticJobEngine.WEIGHTS,
+      });
+    } catch (error) {
+      logger.error(
+        '[SemanticRoutes] semantic-match failed',
+        {
+          userId,
+          error: error.message,
+        }
+      );
+      return fail(res, 'Semantic job matching failed');
+    }
+  }
+);
+
+// ─────────────────────────────────────────────────────────────
+// GET /career/advice
+// ─────────────────────────────────────────────────────────────
+router.get(
+  '/career/advice',
+  authenticate,
+  async (req, res) => {
+    const userId = resolveUserId(req);
+    if (!userId) return fail(res, 'Unauthenticated', 401);
+
+    try {
+      const [skillGapRes, jobMatchRes, marketRes] =
+        await Promise.allSettled([
+          getSkillGraphSvc().getUserSkillGap(userId),
+          getJobMatchSvc().getJobMatches(userId, {
+            limit: 5,
+          }),
+          getMarketSvc()
+            ? getMarketSvc().getTrendingSkills()
+            : Promise.resolve(null),
+        ]);
+
+      const skillGap =
+        skillGapRes.status === 'fulfilled'
+          ? skillGapRes.value
+          : {};
+
+      const jobMatches =
+        jobMatchRes.status === 'fulfilled'
+          ? jobMatchRes.value?.recommended_jobs || []
+          : [];
+
+      const marketDemand =
+        marketRes.status === 'fulfilled'
+          ? marketRes.value
+          : null;
+
+      const profile = {
+        skills: skillGap.existing_skills || [],
+        yearsExperience:
+          skillGap.years_experience || 0,
+        targetRole: skillGap.target_role || null,
+        industry: skillGap.industry || null,
+      };
+
+      const result =
+        await careerAdvisorEngine.generateCareerAdvice({
+          userId,
+          profile,
+          skillGap,
+          marketDemand,
+          topJobMatches: jobMatches,
+        });
+
+      return ok(res, result);
+    } catch (error) {
+      logger.error('[SemanticRoutes] advice failed', {
+        userId,
+        error: error.message,
+      });
+      return fail(res, 'Career advice generation failed');
+    }
+  }
+);
+
+// ─────────────────────────────────────────────────────────────
+// GET /skills/learning-path
+// ─────────────────────────────────────────────────────────────
+router.get(
+  '/skills/learning-path',
+  authenticate,
+  async (req, res) => {
+    const userId = resolveUserId(req);
+    const { skill, skills, targetRole } = req.query;
+
+    let skillList = [];
+    if (skills) {
+      skillList = String(skills)
+        .split(',')
+        .map((s) => s.trim())
+        .filter(Boolean);
+    } else if (skill) {
+      skillList = [String(skill).trim()];
     }
 
-    ok(res, result);
-  } catch (e) {
-    logger.error('[Route] skills/learning-path', { userId, err: e.message });
-    err(res, 'Learning path generation failed', 500);
-  }
-});
+    if (!skillList.length) {
+      return fail(
+        res,
+        'Query param "skill" or "skills" is required',
+        400
+      );
+    }
 
-// ─── Export ───────────────────────────────────────────────────────────────────
+    try {
+      let userSkills = [];
+
+      if (userId) {
+        try {
+          const skillGap =
+            await getSkillGraphSvc().getUserSkillGap(
+              userId
+            );
+          userSkills =
+            skillGap?.existing_skills || [];
+        } catch (_) {}
+      }
+
+      const result =
+        skillList.length === 1
+          ? await learningPathEngine.generateLearningPath(
+              {
+                skill: skillList[0],
+                userSkills,
+                targetRole: targetRole || '',
+              }
+            )
+          : await learningPathEngine.generateMultiSkillPaths(
+              {
+                skills: skillList,
+                userSkills,
+                targetRole: targetRole || '',
+              }
+            );
+
+      return ok(res, result);
+    } catch (error) {
+      logger.error(
+        '[SemanticRoutes] learning-path failed',
+        {
+          userId,
+          error: error.message,
+        }
+      );
+      return fail(
+        res,
+        'Learning path generation failed'
+      );
+    }
+  }
+);
 
 module.exports = router;
-
-
-
-
-
-
-
-
-

@@ -1,59 +1,105 @@
 'use strict';
 
 /**
- * path: src/services/jobSync.service.js
+ * @file src/services/jobSync.service.js
+ * @description
+ * Production-grade job sync orchestration service.
+ *
+ * Improvements:
+ * - unified lock + logging flow
+ * - duplicate orchestration removed
+ * - consistent failure accounting
+ * - safe lock release semantics
+ * - modular batch processor
+ * - repository-friendly for Supabase RPC upgrades
  */
 
 const { SyncCoordinator } = require('../sync/SyncCoordinator');
 const { SyncLockManager, ConflictError } = require('../sync/SyncLockManager');
 const { SyncLogger } = require('../sync/SyncLogger');
-const logger = require('../../utils/logger');
+const logger = require('../utils/logger');
 const jobRepository = require('../repositories/job.repository');
+
+const SOURCE_TYPE = 'jobSync';
 
 const jobSyncCoordinator = new SyncCoordinator({
   logger,
-  sourceType: 'jobSync',
+  sourceType: SOURCE_TYPE,
 });
 
+const lockManager = new SyncLockManager({ logger });
+
+const syncLogger = new SyncLogger({
+  logger,
+  sourceType: SOURCE_TYPE,
+});
+
+function buildRequestContext(context = {}) {
+  return {
+    requestId: context.requestId || `sync-${Date.now()}`,
+    initiatedBy: context.initiatedBy || 'cron',
+  };
+}
+
+async function processPendingJobs(requestId) {
+  const jobs = await jobRepository.fetchPendingJobs();
+
+  let successCount = 0;
+  let failCount = 0;
+  const errors = [];
+
+  for (const job of jobs) {
+    try {
+      await jobRepository.processJob(job);
+      successCount++;
+    } catch (error) {
+      failCount++;
+      errors.push({
+        jobId: job?.id || null,
+        message: error.message,
+      });
+
+      logger.warn(
+        {
+          requestId,
+          jobId: job?.id,
+          error: error.message,
+        },
+        'Job processing failed'
+      );
+    }
+  }
+
+  return {
+    totalCount: jobs.length,
+    successCount,
+    failCount,
+    errors,
+  };
+}
+
 async function runJobSync(context = {}) {
-  const {
-    requestId = `sync-${Date.now()}`,
-    initiatedBy = 'cron',
-  } = context;
+  const { requestId, initiatedBy } = buildRequestContext(context);
 
   try {
     return await jobSyncCoordinator.runWithLockAndLogging(
       async ({ requestId: reqId }) => {
-        const jobs = await jobRepository.fetchPendingJobs();
-
-        let successCount = 0;
-        let failCount = 0;
-
-        for (const job of jobs) {
-          try {
-            await jobRepository.processJob(job);
-            successCount++;
-          } catch (err) {
-            logger.warn(
-              { err, jobId: job.id, reqId },
-              'Job processing failed'
-            );
-            failCount++;
-          }
-        }
+        const result = await processPendingJobs(reqId);
 
         return {
-          successCount,
-          failCount,
+          success: result.failCount === 0,
+          successCount: result.successCount,
+          failCount: result.failCount,
+          totalCount: result.totalCount,
         };
       },
       { requestId, initiatedBy }
     );
-  } catch (err) {
-    if (err instanceof ConflictError) {
+  } catch (error) {
+    if (error instanceof ConflictError) {
       logger.info(
-        { requestId, err: err.meta },
-        'Job sync skipped — lock conflict'
+        { requestId, conflict: error.meta },
+        'Job sync skipped due to active lock'
       );
 
       return {
@@ -63,91 +109,85 @@ async function runJobSync(context = {}) {
     }
 
     logger.error(
-      { err, requestId },
+      {
+        requestId,
+        error: error.message,
+      },
       'Job sync failed unexpectedly'
     );
 
-    throw err;
+    throw error;
   }
 }
 
-const lockManager = new SyncLockManager({ logger });
-
-const syncLogger = new SyncLogger({
-  logger,
-  sourceType: 'jobSync',
-});
-
 async function runJobSyncManual(context = {}) {
-  const {
-    requestId = `sync-${Date.now()}`,
-    initiatedBy = 'cron',
-  } = context;
-
+  const { requestId, initiatedBy } = buildRequestContext(context);
   const startTime = Date.now();
 
   try {
     await lockManager.acquire({ requestId, initiatedBy });
-  } catch (err) {
-    if (err instanceof ConflictError) {
-      return { skipped: true };
+  } catch (error) {
+    if (error instanceof ConflictError) {
+      logger.info(
+        { requestId },
+        'Manual job sync skipped due to active lock'
+      );
+
+      return {
+        skipped: true,
+        reason: 'lock_conflict',
+      };
     }
 
-    throw err;
+    throw error;
   }
 
-  let successCount = 0;
-  let failCount = 0;
-  const errors = [];
-
   try {
-    const jobs = await jobRepository.fetchPendingJobs();
-
-    for (const job of jobs) {
-      try {
-        await jobRepository.processJob(job);
-        successCount++;
-      } catch (err) {
-        failCount++;
-        errors.push({
-          jobId: job.id,
-          message: err.message,
-        });
-      }
-    }
+    const result = await processPendingJobs(requestId);
 
     await syncLogger.logSummary({
-      successCount,
-      failCount,
+      successCount: result.successCount,
+      failCount: result.failCount,
       startTime,
-      errors,
+      errors: result.errors,
       requestId,
     });
 
     return {
-      success: failCount === 0,
-      successCount,
-      failCount,
+      success: result.failCount === 0,
+      successCount: result.successCount,
+      failCount: result.failCount,
+      totalCount: result.totalCount,
     };
-  } catch (err) {
+  } catch (error) {
     await syncLogger.logFailure({
-      error: err,
+      error,
       startTime,
-      totalCount: failCount,
+      totalCount: 0,
       requestId,
     });
 
-    throw err;
+    throw error;
   } finally {
-    await lockManager.release({
-      requestId,
-      initiatedBy,
-    });
+    try {
+      await lockManager.release({
+        requestId,
+        initiatedBy,
+      });
+    } catch (releaseError) {
+      logger.error(
+        {
+          requestId,
+          error: releaseError.message,
+        },
+        'Failed to release sync lock'
+      );
+    }
   }
 }
 
 async function runLightweightTask(context = {}) {
-  const { requestId, initiatedBy = 'cron' } = context;
+  const { requestId, initiatedBy } = buildRequestContext(context);
 
   return lockManager.runWithLock(
     async () => {

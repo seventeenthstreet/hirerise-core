@@ -1,98 +1,121 @@
-/**
- * salary.routes.js — Salary Benchmark API Routes (Enterprise Hardened)
- *
- * Responsibilities:
- *   - Define URL paths and HTTP methods
- *   - Attach input validation chains
- *   - Delegate to controller (zero business logic here)
- *
- * All routes are prefixed with /api/v1/salary by server.js
- */
-
 'use strict';
+
+/**
+ * routes/salary.routes.js
+ * Salary Benchmark API Routes
+ *
+ * Mounted at:
+ * /api/v1/salary
+ */
 
 const express = require('express');
 const { body, param, query } = require('express-validator');
+
 const { validate } = require('../middleware/requestValidator');
 const salaryController = require('../controllers/salary.controller');
-const { aiRateLimit }  = require('../middleware/aiRateLimit.middleware'); // AI cost protection
+const { aiRateLimit } = require('../middleware/aiRateLimit.middleware');
 
 const router = express.Router();
 
 // ─────────────────────────────────────────────────────────────
-// POST /api/v1/salary/benchmark
+// Constants
+// ─────────────────────────────────────────────────────────────
+const MAX_ROLE_ID_LENGTH = 100;
+const MAX_EXPERIENCE = 60;
+const MAX_INDUSTRY_LENGTH = 50;
+
+const VALID_LOCATIONS = Object.freeze([
+  'metro',
+  'tier1',
+  'tier2',
+  'tier3',
+]);
+
+// ─────────────────────────────────────────────────────────────
+// POST /benchmark
 // ─────────────────────────────────────────────────────────────
 router.post(
   '/benchmark',
-  aiRateLimit,          // burst protection — max 5 AI calls/60s per user
+  aiRateLimit,
   validate([
     body('roleId')
       .isString()
       .trim()
       .notEmpty()
-      .isLength({ max: 100 })
-      .withMessage('roleId is required and must be a non-empty string'),
+      .isLength({ max: MAX_ROLE_ID_LENGTH })
+      .withMessage(
+        'roleId is required and must be a non-empty string'
+      ),
 
     body('experienceYears')
-      .isInt({ min: 0, max: 60 })
+      .isInt({ min: 0, max: MAX_EXPERIENCE })
       .toInt()
-      .withMessage('experienceYears must be an integer between 0 and 60'),
+      .withMessage(
+        `experienceYears must be between 0 and ${MAX_EXPERIENCE}`
+      ),
 
     body('location')
-      .optional({ nullable: true })   // FIX: allow null, default to 'metro' in service
+      .optional({ nullable: true })
       .isString()
       .trim()
-      .isIn(['metro', 'tier1', 'tier2', 'tier3'])
-      .withMessage('location must be one of: metro, tier1, tier2, tier3'),
+      .isIn(VALID_LOCATIONS)
+      .withMessage(
+        `location must be one of: ${VALID_LOCATIONS.join(', ')}`
+      ),
   ]),
   salaryController.getBenchmark
 );
 
 // ─────────────────────────────────────────────────────────────
-// POST /api/v1/salary/intelligence
+// POST /intelligence
 // ─────────────────────────────────────────────────────────────
-// Advanced salary intelligence analysis
 router.post(
   '/intelligence',
-  aiRateLimit,          // burst protection — max 5 AI calls/60s per user
+  aiRateLimit,
   validate([
     body('roleId')
       .isString()
       .trim()
       .notEmpty()
-      .isLength({ max: 100 })
+      .isLength({ max: MAX_ROLE_ID_LENGTH })
       .withMessage('roleId is required'),
 
     body('experienceYears')
-      .isInt({ min: 0, max: 60 })
+      .isInt({ min: 0, max: MAX_EXPERIENCE })
       .toInt()
-      .withMessage('experienceYears must be between 0 and 60'),
+      .withMessage(
+        `experienceYears must be between 0 and ${MAX_EXPERIENCE}`
+      ),
 
     body('location')
-      .optional()
+      .optional({ nullable: true })
       .isString()
       .trim()
-      .isIn(['metro', 'tier1', 'tier2', 'tier3'])
-      .withMessage('location must be one of: metro, tier1, tier2, tier3'),
+      .isIn(VALID_LOCATIONS)
+      .withMessage(
+        `location must be one of: ${VALID_LOCATIONS.join(', ')}`
+      ),
 
     body('industry')
-      .optional({ nullable: true })   // FIX: frontend sends null explicitly
+      .optional({ nullable: true })
       .isString()
       .trim()
-      .isLength({ max: 50 })
+      .isLength({ max: MAX_INDUSTRY_LENGTH })
       .withMessage('industry must be a valid string'),
 
     body('currentSalary')
-      .optional({ nullable: true })   // FIX: frontend sends null explicitly
+      .optional({ nullable: true })
       .isInt({ min: 0 })
       .toInt()
-      .withMessage('currentSalary must be a positive integer'),
+      .withMessage(
+        'currentSalary must be a positive integer'
+      ),
   ]),
   salaryController.getIntelligence
 );
 
 // ─────────────────────────────────────────────────────────────
-// GET /api/v1/salary/bands/:roleId
+// GET /bands/:roleId
 // ─────────────────────────────────────────────────────────────
 router.get(
   '/bands/:roleId',
@@ -101,14 +124,14 @@ router.get(
       .isString()
       .trim()
       .notEmpty()
-      .isLength({ max: 100 })
+      .isLength({ max: MAX_ROLE_ID_LENGTH })
       .withMessage('roleId path parameter is required'),
   ]),
   salaryController.getSalaryBands
 );
 
 // ─────────────────────────────────────────────────────────────
-// GET /api/v1/salary/compare
+// GET /compare
 // ─────────────────────────────────────────────────────────────
 router.get(
   '/compare',
@@ -116,29 +139,28 @@ router.get(
     query('roleIds')
       .notEmpty()
       .withMessage('roleIds query parameter is required')
-      .customSanitizer(value =>
+      .customSanitizer((value) =>
         typeof value === 'string'
-          ? value.split(',').map(v => v.trim())
+          ? value
+              .split(',')
+              .map((v) => v.trim())
+              .filter(Boolean)
           : value
       )
       .isArray({ min: 2, max: 5 })
-      .withMessage('Provide between 2 and 5 roleIds for comparison'),
+      .withMessage(
+        'Provide between 2 and 5 roleIds for comparison'
+      ),
 
     query('experienceYears')
       .optional()
-      .isInt({ min: 0, max: 60 })
+      .isInt({ min: 0, max: MAX_EXPERIENCE })
       .toInt()
-      .withMessage('experienceYears must be an integer between 0 and 60'),
+      .withMessage(
+        `experienceYears must be between 0 and ${MAX_EXPERIENCE}`
+      ),
   ]),
   salaryController.compareSalaries
 );
 
 module.exports = router;
-
-
-
-
-
-
-
-

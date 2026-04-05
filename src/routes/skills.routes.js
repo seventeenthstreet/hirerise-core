@@ -1,336 +1,469 @@
-/**
- * skills.routes.js — Skill Gap Engine Routes (Enterprise Hardened)
- *
- * All routes prefixed with /api/v1/skills by server.js mount:
- *   app.use(`${API_PREFIX}/skills`, authenticate, require('./routes/skills.routes'));
- *
- * ┌─────────────────────────────────────────────────────────────────────────┐
- * │ Method │ Path                        │ Auth             │ Description    │
- * ├─────────────────────────────────────────────────────────────────────────┤
- * │ GET    │ /api/v1/skills              │ authenticate     │ List skills    │
- * │ POST   │ /api/v1/skills              │ + requireAdmin   │ Create skill   │
- * │ GET    │ /api/v1/skills/:id          │ authenticate     │ Get by id      │
- * │ PUT    │ /api/v1/skills/:id          │ + requireAdmin   │ Update skill   │
- * │ DELETE │ /api/v1/skills/:id          │ + requireAdmin   │ Delete skill   │
- * │ POST   │ /api/v1/skills/gap-analysis │ authenticate     │ Gap analysis   │
- * │ POST   │ /api/v1/skills/bulk-gap     │ authenticate     │ Bulk gap       │
- * │ GET    │ /api/v1/skills/role/:roleId │ authenticate     │ Skills by role │
- * │ GET    │ /api/v1/skills/search       │ authenticate     │ Search skills  │
- * └─────────────────────────────────────────────────────────────────────────┘
- *
- * ROOT CAUSE FIX:
- *   "Endpoint not found: GET /api/v1/skills" occurred because the five CRUD
- *   routes (GET /, POST /, GET /:id, PUT /:id, DELETE /:id) were entirely
- *   absent. Requests fell through to notFoundHandler in errorHandler.js.
- *
- *   Also added corresponding controller handlers and service methods below.
- *
- * ROUTE ORDER NOTE:
- *   Static paths (/search, /gap-analysis, /bulk-gap, /role/:roleId) are
- *   declared BEFORE /:id so Express does not treat "search" as an :id value.
- */
-
 'use strict';
+
+/**
+ * routes/skills.routes.js
+ *
+ * Enterprise-hardened skill routes
+ * Fully Supabase-aligned
+ */
 
 const express = require('express');
 const { body, param, query } = require('express-validator');
+
 const { validate } = require('../middleware/requestValidator');
 const { requireAdmin } = require('../middleware/auth.middleware');
+const { asyncHandler } = require('../utils/helpers');
+const { AppError, ErrorCodes } = require('../middleware/errorHandler');
+const logger = require('../utils/logger');
+const supabase = require('../lib/supabaseClient');
+
 const skillsController = require('../controllers/skills.controller');
+const {
+  getSkillRecommendations,
+  addSkillsToProfile,
+} = require('../modules/skillDemand/skillRecommendations.service');
+
 const router = express.Router();
 
+const VALID_CATEGORIES = Object.freeze([
+  'technical',
+  'soft',
+  'domain',
+  'tool',
+  'language',
+  'framework',
+]);
+
+const VALID_PROFICIENCY = Object.freeze([
+  'beginner',
+  'intermediate',
+  'advanced',
+  'expert',
+]);
+
+const MAX_SKILLS = 50;
+const MAX_SKILL_LENGTH = 100;
+
 // ─────────────────────────────────────────────────────────────
-// GET /api/v1/skills
-// FIX: Was MISSING — caused the reported "Endpoint not found" 404.
+// Helpers
+// ─────────────────────────────────────────────────────────────
+
+function getUserId(req) {
+  const userId =
+    req.user?.id ||
+    req.auth?.userId ||
+    req.user?.user_id ||
+    req.user?.uid; // legacy fallback
+
+  if (!userId || typeof userId !== 'string') {
+    throw new AppError(
+      'Unauthorized',
+      401,
+      {},
+      ErrorCodes.UNAUTHORIZED,
+    );
+  }
+
+  return userId;
+}
+
+function normalizeSkillNames(skills = []) {
+  const seen = new Set();
+  const normalized = [];
+
+  for (const raw of skills) {
+    if (typeof raw !== 'string') continue;
+
+    const skill = raw.trim();
+    if (!skill) continue;
+
+    if (skill.length > MAX_SKILL_LENGTH) continue;
+
+    const key = skill.toLowerCase();
+    if (seen.has(key)) continue;
+
+    seen.add(key);
+    normalized.push(skill);
+  }
+
+  return normalized;
+}
+
+/**
+ * Remove skills through Supabase RPC.
+ *
+ * RPC must return:
+ * {
+ *   removed_count: number,
+ *   updated_skills: jsonb
+ * }
+ */
+async function removeSkillsFromProfile(userId, skills) {
+  const { data, error } = await supabase.rpc('remove_user_skills', {
+    p_user_id: userId,
+    p_skill_names: skills,
+  });
+
+  if (error) {
+    logger.error('[Skills] remove_user_skills RPC failed', {
+      userId,
+      code: error.code,
+      message: error.message,
+      hint: error.hint,
+    });
+
+    throw new AppError(
+      error.message || 'Failed to remove skills',
+      500,
+      {
+        supabaseCode: error.code,
+        hint: error.hint,
+      },
+      ErrorCodes.INTERNAL_ERROR,
+    );
+  }
+
+  /**
+   * IMPORTANT:
+   * Supabase jsonb RPCs may return:
+   * - null
+   * - plain object
+   * - single-element array
+   * depending on client config/version
+   */
+  const payload = Array.isArray(data) ? data[0] : data;
+
+  if (!payload || typeof payload !== 'object') {
+    logger.warn('[Skills] remove_user_skills returned empty payload', {
+      userId,
+      requestedCount: skills.length,
+    });
+
+    return {
+      removedCount: 0,
+      updatedSkills: [],
+    };
+  }
+
+  return {
+    removedCount: Number(payload.removed_count) || 0,
+    updatedSkills: Array.isArray(payload.updated_skills)
+      ? payload.updated_skills
+      : [],
+  };
+}
+
+// ─────────────────────────────────────────────────────────────
+// GET /
 // ─────────────────────────────────────────────────────────────
 router.get(
   '/',
   validate([
     query('limit')
-      .optional().isInt({ min: 1, max: 500 })
-      .withMessage('limit must be an integer between 1 and 500'),
+      .optional()
+      .isInt({ min: 1, max: 500 }),
     query('category')
-      .optional().isIn(['technical', 'soft', 'domain', 'tool', 'language', 'framework'])
-      .withMessage('category must be: technical, soft, domain, tool, language, or framework')
+      .optional()
+      .isIn(VALID_CATEGORIES),
   ]),
-  skillsController.listSkills
+  skillsController.listSkills,
 );
 
 // ─────────────────────────────────────────────────────────────
-// POST /api/v1/skills  (Admin only)
-// FIX: Was MISSING.
+// POST /
 // ─────────────────────────────────────────────────────────────
 router.post(
   '/',
   requireAdmin,
   validate([
     body('name')
-      .isString().trim().notEmpty().isLength({ min: 1, max: 150 })
-      .withMessage('name is required and must be 1-150 characters'),
+      .isString()
+      .trim()
+      .notEmpty()
+      .isLength({ min: 1, max: 150 }),
     body('category')
-      .optional().isIn(['technical', 'soft', 'domain', 'tool', 'language', 'framework'])
-      .withMessage('category must be: technical, soft, domain, tool, language, or framework'),
+      .optional()
+      .isIn(VALID_CATEGORIES),
     body('aliases')
-      .optional().isArray({ max: 20 })
-      .withMessage('aliases must be an array of max 20 items'),
+      .optional()
+      .isArray({ max: 20 }),
     body('aliases.*')
-      .optional().isString().trim().isLength({ max: 100 }),
+      .optional()
+      .isString()
+      .trim()
+      .isLength({ max: MAX_SKILL_LENGTH }),
     body('description')
-      .optional().isString().trim().isLength({ max: 500 }),
+      .optional()
+      .isString()
+      .trim()
+      .isLength({ max: 500 }),
     body('demandScore')
-      .optional().isInt({ min: 0, max: 100 })
-      .withMessage('demandScore must be 0-100')
+      .optional()
+      .isInt({ min: 0, max: 100 }),
   ]),
-  skillsController.createSkill
+  skillsController.createSkill,
 );
 
 // ─────────────────────────────────────────────────────────────
-// POST /api/v1/skills/gap-analysis
-// Static path declared before /:id to avoid route collision.
+// POST /gap-analysis
 // ─────────────────────────────────────────────────────────────
 router.post(
   '/gap-analysis',
   validate([
     body('targetRoleId')
-      .isString().trim().notEmpty().isLength({ max: 100 })
-      .withMessage('targetRoleId is required'),
+      .isString()
+      .trim()
+      .notEmpty()
+      .isLength({ max: 100 }),
     body('userSkills')
-      .isArray({ min: 0, max: 200 })
-      .withMessage('userSkills must be an array (max 200 skills)'),
+      .isArray({ min: 0, max: 200 }),
     body('userSkills.*.name')
-      .isString().trim().notEmpty()
-      .withMessage('Each skill must have a non-empty name'),
+      .isString()
+      .trim()
+      .notEmpty(),
     body('userSkills.*.proficiencyLevel')
-      .optional().isIn(['beginner', 'intermediate', 'advanced', 'expert'])
-      .withMessage('proficiencyLevel must be: beginner, intermediate, advanced, or expert'),
+      .optional()
+      .isIn(VALID_PROFICIENCY),
     body('userSkills.*.yearsOfExperience')
-      .optional().isFloat({ min: 0, max: 50 }).toFloat()
-      .withMessage('yearsOfExperience must be between 0 and 50'),
+      .optional()
+      .isFloat({ min: 0, max: 50 })
+      .toFloat(),
     body('includeRecommendations')
-      .optional().isBoolean().toBoolean()
-      .withMessage('includeRecommendations must be a boolean')
+      .optional()
+      .isBoolean()
+      .toBoolean(),
   ]),
-  skillsController.analyzeGap
+  skillsController.analyzeGap,
 );
 
 // ─────────────────────────────────────────────────────────────
-// POST /api/v1/skills/bulk-gap
+// POST /bulk-gap
 // ─────────────────────────────────────────────────────────────
 router.post(
   '/bulk-gap',
   validate([
     body('targetRoleIds')
-      .isArray({ min: 1, max: 10 })
-      .withMessage('targetRoleIds must be an array of 1-10 role IDs'),
+      .isArray({ min: 1, max: 10 }),
     body('targetRoleIds.*')
-      .isString().trim().notEmpty().isLength({ max: 100 })
-      .withMessage('Each targetRoleId must be a non-empty string'),
+      .isString()
+      .trim()
+      .notEmpty()
+      .isLength({ max: 100 }),
     body('userSkills')
-      .isArray({ min: 0, max: 200 })
-      .withMessage('userSkills must be an array (max 200 skills)'),
+      .isArray({ min: 0, max: 200 }),
     body('userSkills.*.name')
-      .isString().trim().notEmpty()
-      .withMessage('Each skill must have a non-empty name')
+      .isString()
+      .trim()
+      .notEmpty(),
   ]),
-  skillsController.bulkGapAnalysis
+  skillsController.bulkGapAnalysis,
 );
 
 // ─────────────────────────────────────────────────────────────
-// GET /api/v1/skills/search
+// GET /search
 // ─────────────────────────────────────────────────────────────
 router.get(
   '/search',
   validate([
     query('q')
-      .isString().trim().isLength({ min: 2, max: 50 })
-      .withMessage('Query must be between 2 and 50 characters'),
+      .isString()
+      .trim()
+      .isLength({ min: 2, max: 50 }),
     query('category')
-      .optional().isIn(['technical', 'soft', 'domain', 'tool', 'language', 'framework'])
-      .withMessage('Invalid skill category')
+      .optional()
+      .isIn(VALID_CATEGORIES),
   ]),
-  skillsController.searchSkills
+  skillsController.searchSkills,
 );
 
 // ─────────────────────────────────────────────────────────────
-// GET /api/v1/skills/role/:roleId
+// GET /role/:roleId
 // ─────────────────────────────────────────────────────────────
 router.get(
   '/role/:roleId',
   validate([
     param('roleId')
-      .isString().trim().notEmpty().isLength({ max: 100 })
-      .withMessage('roleId is required')
+      .isString()
+      .trim()
+      .notEmpty()
+      .isLength({ max: 100 }),
   ]),
-  skillsController.getRoleSkills
+  skillsController.getRoleSkills,
 );
 
 // ─────────────────────────────────────────────────────────────
-// GET /api/v1/skills/recommendations
-// Must be declared BEFORE /:id to prevent Express treating
-// "recommendations" as an :id parameter value.
+// GET /recommendations
 // ─────────────────────────────────────────────────────────────
 router.get(
   '/recommendations',
-  require('../utils/helpers').asyncHandler(async (req, res) => {
-    const userId = req.user?.uid;
-    if (!userId) {
-      return res.status(401).json({ success: false, error: 'Unauthorized' });
-    }
-    const { getSkillRecommendations } = require('../modules/skillDemand/skillRecommendations.service');
+  asyncHandler(async (req, res) => {
+    const userId = getUserId(req);
+
+    logger.info('[Skills] Fetching recommendations', { userId });
+
     const data = await getSkillRecommendations(userId);
-    return res.json({ success: true, data });
-  })
+
+    return res.status(200).json({
+      success: true,
+      data,
+    });
+  }),
 );
 
 // ─────────────────────────────────────────────────────────────
-// POST /api/v1/skills/add
-// Must be declared BEFORE /:id for the same reason.
+// POST /add
 // ─────────────────────────────────────────────────────────────
 router.post(
   '/add',
-  require('../middleware/requestValidator').validate([
-    require('express-validator').body('skills')
-      .isArray({ min: 1, max: 50 })
-      .withMessage('skills must be a non-empty array (max 50)'),
-    require('express-validator').body('skills.*')
-      .isString().trim().notEmpty().isLength({ max: 100 })
-      .withMessage('Each skill must be a non-empty string under 100 chars')
+  validate([
+    body('skills')
+      .isArray({ min: 1, max: MAX_SKILLS }),
+    body('skills.*')
+      .isString()
+      .trim()
+      .notEmpty()
+      .isLength({ max: MAX_SKILL_LENGTH }),
   ]),
-  require('../utils/helpers').asyncHandler(async (req, res) => {
-    const userId = req.user?.uid;
-    if (!userId) {
-      return res.status(401).json({ success: false, error: 'Unauthorized' });
+  asyncHandler(async (req, res) => {
+    const userId = getUserId(req);
+    const skills = normalizeSkillNames(req.body.skills);
+
+    if (skills.length === 0) {
+      throw new AppError(
+        'No valid skill names provided',
+        400,
+        {},
+        ErrorCodes.VALIDATION_ERROR,
+      );
     }
-    const { addSkillsToProfile } = require('../modules/skillDemand/skillRecommendations.service');
-    const result = await addSkillsToProfile(userId, req.body.skills);
-    return res.json({ success: true, data: result });
-  })
+
+    logger.info('[Skills] Adding skills', {
+      userId,
+      requested: req.body.skills.length,
+      normalized: skills.length,
+    });
+
+    const result = await addSkillsToProfile(userId, skills);
+
+    return res.status(200).json({
+      success: true,
+      data: result,
+    });
+  }),
 );
 
 // ─────────────────────────────────────────────────────────────
-// POST /api/v1/skills/remove
-// Removes one or more skills from the current user's profile.
-// Must be declared BEFORE /:id so Express does not treat "remove" as an id.
+// POST /remove
 // ─────────────────────────────────────────────────────────────
 router.post(
   '/remove',
-  require('../middleware/requestValidator').validate([
-    require('express-validator').body('skills')
-      .isArray({ min: 1, max: 50 })
-      .withMessage('skills must be a non-empty array (max 50)'),
-    require('express-validator').body('skills.*')
-      .isString().trim().notEmpty().isLength({ max: 100 })
-      .withMessage('Each skill must be a non-empty string under 100 chars')
+  validate([
+    body('skills')
+      .isArray({ min: 1, max: MAX_SKILLS }),
+    body('skills.*')
+      .isString()
+      .trim()
+      .notEmpty()
+      .isLength({ max: MAX_SKILL_LENGTH }),
   ]),
-  require('../utils/helpers').asyncHandler(async (req, res) => {
-    const userId = req.user?.uid;
-    if (!userId) {
-      return res.status(401).json({ success: false, error: 'Unauthorized' });
+  asyncHandler(async (req, res) => {
+    const userId = getUserId(req);
+    const skills = normalizeSkillNames(req.body.skills);
+
+    if (skills.length === 0) {
+      throw new AppError(
+        'No valid skill names provided',
+        400,
+        {},
+        ErrorCodes.VALIDATION_ERROR,
+      );
     }
-    const { supabase } = require('../config/supabase');
-    const toRemove = new Set(req.body.skills.map(s => String(s).trim().toLowerCase()));
 
-    // Fetch current skills from users table
-    const { data: userRow } = await supabase
-      .from('users')
-      .select('skills')
-      .eq('id', userId)
-      .maybeSingle();
-    const existing = userRow?.skills ?? [];
-
-    // Filter from both string-format (users table) and object-format
-    const updatedFlat = existing.filter(s => {
-      const name = (typeof s === 'string' ? s : s?.name ?? '').toLowerCase();
-      return !toRemove.has(name);
+    logger.info('[Skills] Removing skills via RPC', {
+      userId,
+      requested: req.body.skills.length,
+      normalized: skills.length,
     });
 
-    // Fetch current skills from user_profiles table
-    const { data: profileRow } = await supabase
-      .from('user_profiles')
-      .select('skills')
-      .eq('id', userId)
-      .maybeSingle();
-    const profileSkills = profileRow?.skills ?? [];
+    const result = await removeSkillsFromProfile(userId, skills);
 
-    const updatedProfile = profileSkills.filter(s => {
-      const name = (typeof s === 'string' ? s : s?.name ?? '').toLowerCase();
-      return !toRemove.has(name);
+    logger.info('[Skills] Skills removed', {
+      userId,
+      requested: skills.length,
+      removed: result.removedCount,
     });
 
-    const now = new Date().toISOString();
-
-    // Update both tables in parallel
-    const [usersResult, profilesResult] = await Promise.all([
-      supabase
-        .from('users')
-        .upsert([{ id: userId, skills: updatedFlat, updatedAt: now }]),
-      supabase
-        .from('user_profiles')
-        .upsert([{ id: userId, skills: updatedProfile, updatedAt: now }])
-    ]);
-
-    if (usersResult.error) throw usersResult.error;
-    if (profilesResult.error) throw profilesResult.error;
-
-    return res.json({
+    return res.status(200).json({
       success: true,
-      data: { removed: toRemove.size, skills: updatedFlat }
+      data: result,
     });
-  })
+  }),
 );
 
 // ─────────────────────────────────────────────────────────────
-// GET /api/v1/skills/:id
-// FIX: Was MISSING.
+// GET /:id
 // ─────────────────────────────────────────────────────────────
 router.get(
   '/:id',
   validate([
     param('id')
-      .isString().trim().notEmpty().isLength({ max: 128 })
-      .withMessage('id is required')
+      .isString()
+      .trim()
+      .notEmpty()
+      .isLength({ max: 128 }),
   ]),
-  skillsController.getSkillById
+  skillsController.getSkillById,
 );
 
 // ─────────────────────────────────────────────────────────────
-// PUT /api/v1/skills/:id  (Admin only)
-// FIX: Was MISSING.
+// PUT /:id
 // ─────────────────────────────────────────────────────────────
 router.put(
   '/:id',
   requireAdmin,
   validate([
     param('id')
-      .isString().trim().notEmpty().isLength({ max: 128 })
-      .withMessage('id is required'),
+      .isString()
+      .trim()
+      .notEmpty()
+      .isLength({ max: 128 }),
     body('name')
-      .optional().isString().trim().isLength({ min: 1, max: 150 }),
+      .optional()
+      .isString()
+      .trim()
+      .isLength({ min: 1, max: 150 }),
     body('category')
-      .optional().isIn(['technical', 'soft', 'domain', 'tool', 'language', 'framework']),
+      .optional()
+      .isIn(VALID_CATEGORIES),
     body('aliases')
-      .optional().isArray({ max: 20 }),
+      .optional()
+      .isArray({ max: 20 }),
     body('description')
-      .optional().isString().trim().isLength({ max: 500 }),
+      .optional()
+      .isString()
+      .trim()
+      .isLength({ max: 500 }),
     body('demandScore')
-      .optional().isInt({ min: 0, max: 100 })
+      .optional()
+      .isInt({ min: 0, max: 100 }),
   ]),
-  skillsController.updateSkill
+  skillsController.updateSkill,
 );
 
 // ─────────────────────────────────────────────────────────────
-// DELETE /api/v1/skills/:id  (Admin only — soft delete)
-// FIX: Was MISSING.
+// DELETE /:id
 // ─────────────────────────────────────────────────────────────
 router.delete(
   '/:id',
   requireAdmin,
   validate([
     param('id')
-      .isString().trim().notEmpty().isLength({ max: 128 })
-      .withMessage('id is required')
+      .isString()
+      .trim()
+      .notEmpty()
+      .isLength({ max: 128 }),
   ]),
-  skillsController.deleteSkill
+  skillsController.deleteSkill,
 );
 
 module.exports = router;

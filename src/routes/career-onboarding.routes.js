@@ -1,70 +1,113 @@
 'use strict';
 
 /**
- * career-onboarding.routes.js
+ * routes/career-onboarding.routes.js
  * Mounted at: /api/v1/career-onboarding
  *
- * POST /complete — submit professional wizard payload, create Professional
- *                  Career Profile, set professional_onboarding_complete = true
- *
- * Note: CV upload (Step 1) is handled by the existing
- *   POST /api/v1/onboarding/upload-cv endpoint (multer route).
- * Draft auto-save (Steps 2–5) uses PATCH /api/v1/onboarding/draft.
- * Both existing routes are reused without modification.
- *
- * Supabase tables written:
- *   users                        — professional_onboarding_complete: true, resumeUploaded
- *   user_profiles                — professional career profile fields
- *   professional_career_profiles — full structured profile document
+ * POST /complete
+ * Completes professional onboarding using a single atomic Supabase RPC.
  */
+
 const { Router } = require('express');
 const { body } = require('express-validator');
 const { validate } = require('../middleware/requestValidator');
 const { supabase } = require('../config/supabase');
 const logger = require('../utils/logger');
+
 const router = Router();
 
-function uid(req) {
-  return req.user?.uid ?? null;
-}
+const MAX_TEXT = 150;
+const MAX_SKILLS = 20;
+const MAX_EXPERIENCE = 60;
 
-// ─── POST /complete ────────────────────────────────────────────────────────────
+function resolveUserId(req) {
+  return (
+    req?.user?.id ||
+    req?.user?.uid ||
+    req?.auth?.userId ||
+    req?.user?.user_id ||
+    null
+  );
+}
 
 router.post(
   '/complete',
   validate([
     body('jobTitle')
-      .isString().trim().notEmpty().isLength({ max: 150 })
+      .isString()
+      .trim()
+      .notEmpty()
+      .isLength({ max: MAX_TEXT })
       .withMessage('jobTitle is required'),
+
     body('yearsExperience')
-      .isFloat({ min: 0, max: 60 })
-      .withMessage('yearsExperience must be a positive number'),
+      .isFloat({ min: 0, max: MAX_EXPERIENCE })
+      .toFloat()
+      .withMessage(
+        `yearsExperience must be between 0 and ${MAX_EXPERIENCE}`
+      ),
+
     body('industry')
-      .isString().trim().notEmpty()
+      .isString()
+      .trim()
+      .notEmpty()
+      .isLength({ max: MAX_TEXT })
       .withMessage('industry is required'),
+
     body('educationLevel')
-      .isString().trim().notEmpty()
+      .isString()
+      .trim()
+      .notEmpty()
+      .isLength({ max: MAX_TEXT })
       .withMessage('educationLevel is required'),
+
     body('country')
-      .isString().trim().notEmpty()
+      .isString()
+      .trim()
+      .notEmpty()
+      .isLength({ max: MAX_TEXT })
       .withMessage('country is required'),
+
     body('city')
-      .isString().trim().notEmpty()
+      .isString()
+      .trim()
+      .notEmpty()
+      .isLength({ max: MAX_TEXT })
       .withMessage('city is required'),
+
     body('salaryRange')
-      .optional({ nullable: true }).isString().trim(),
+      .optional({ nullable: true })
+      .isString()
+      .trim()
+      .isLength({ max: MAX_TEXT }),
+
     body('careerGoals')
-      .isArray({ min: 1 })
+      .isArray({ min: 1, max: 20 })
       .withMessage('at least one career goal is required'),
+
     body('skills')
-      .optional().isArray({ max: 20 }),
+      .optional()
+      .isArray({ max: MAX_SKILLS })
+      .withMessage(`skills must be max ${MAX_SKILLS}`),
+
     body('cvUploaded')
-      .optional().isBoolean()
+      .optional()
+      .isBoolean()
+      .toBoolean(),
   ]),
   async (req, res, next) => {
     try {
-      const userId = uid(req);
-      if (!userId) return res.status(401).json({ success: false, message: 'Unauthorized' });
+      const userId = resolveUserId(req);
+
+      if (!userId) {
+        return res.status(401).json({
+          success: false,
+          error: {
+            code: 'UNAUTHORIZED',
+            message: 'Authentication required.',
+          },
+        });
+      }
 
       const {
         jobTitle,
@@ -76,91 +119,58 @@ router.post(
         salaryRange = null,
         careerGoals = [],
         skills = [],
-        cvUploaded = false
+        cvUploaded = false,
       } = req.body;
 
-      const now = new Date().toISOString();
+      const { error } = await supabase.rpc(
+        'complete_professional_onboarding',
+        {
+          p_user_id: userId,
+          p_job_title: jobTitle,
+          p_years_experience: yearsExperience,
+          p_industry: industry,
+          p_education_level: educationLevel,
+          p_country: country,
+          p_city: city,
+          p_salary_range: salaryRange,
+          p_career_goals: careerGoals,
+          p_skills: skills,
+          p_cv_uploaded: cvUploaded,
+        }
+      );
 
-      // 1. Mark onboarding complete on users table
-      const { error: usersError } = await supabase
-        .from('users')
-        .upsert([{
-          id: userId,
-          professional_onboarding_complete: true,
-          user_type: 'professional',
-          resumeUploaded: cvUploaded,
-          targetRole: jobTitle,
-          experienceYears: parseFloat(yearsExperience),
-          location: `${city}, ${country}`,
-          updatedAt: now
-        }]);
-      if (usersError) throw usersError;
-
-      // 2. Update user_profiles table — read by AI engines (CHI, Skill Gap, etc.)
-      const { error: profilesError } = await supabase
-        .from('user_profiles')
-        .upsert([{
-          id: userId,
-          professional_onboarding_complete: true,
-          professionalProfile: {
-            jobTitle,
-            yearsExperience: parseFloat(yearsExperience),
-            industry,
-            educationLevel,
-            country,
-            city,
-            salaryRange,
-            careerGoals,
-            skills,
-            cvUploaded
-          },
-          skills,
-          targetRole: jobTitle,
-          experienceYears: parseFloat(yearsExperience),
-          updatedAt: now
-        }]);
-      if (profilesError) throw profilesError;
-
-      // 3. Create dedicated professional_career_profiles record
-      const { error: careerProfileError } = await supabase
-        .from('professional_career_profiles')
-        .upsert([{
-          id: userId,
-          userId,
-          jobTitle,
-          yearsExperience: parseFloat(yearsExperience),
-          industry,
-          educationLevel,
-          country,
-          city,
-          salaryRange,
-          careerGoals,
-          skills,
-          cvUploaded,
-          createdAt: now,
-          updatedAt: now,
-          profileVersion: 1
-        }]);
-      if (careerProfileError) throw careerProfileError;
+      if (error) throw error;
 
       logger.info(
-        '[CareerOnboarding] Professional profile created and onboarding marked complete',
+        '[CareerOnboarding] Professional onboarding completed',
         {
           userId,
           jobTitle,
           industry,
           cvUploaded,
           goalsCount: careerGoals.length,
-          skillsCount: skills.length
+          skillsCount: skills.length,
         }
       );
 
-      return res.json({
+      return res.status(200).json({
         success: true,
-        data: { message: 'Professional career profile created. Onboarding complete.' }
+        data: {
+          message:
+            'Professional career profile created. Onboarding complete.',
+        },
       });
-    } catch (err) {
-      return next(err);
+    } catch (error) {
+      logger.error(
+        '[CareerOnboarding] Failed to complete onboarding',
+        {
+          userId: resolveUserId(req),
+          error: error.message,
+          stack: error.stack,
+        }
+      );
+
+      return next(error);
     }
   }
 );

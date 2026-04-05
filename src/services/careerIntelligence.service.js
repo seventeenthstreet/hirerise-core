@@ -1,48 +1,101 @@
-// src/services/careerIntelligence.service.js
+'use strict';
 
-const resumeScoreService = require("./resumeScore.service");
-const salaryService = require("./salary.service");
-const careerGraphRepository = require("../repositories/career.repository");
-const llmClient = require("../utils/llmClient");
-const validator = require("../utils/careerOutput.validator");
-const cache = require("../utils/cache");
+/**
+ * @file src/services/careerIntelligence.service.js
+ * @description
+ * Production-grade career intelligence orchestration service.
+ *
+ * Optimized for:
+ * - deterministic role cache keys
+ * - cache-safe orchestration
+ * - cleaner async flow
+ * - structured logging
+ * - stronger null safety
+ * - modular override resolution
+ */
 
-const HARDENED_ENTERPRISE_PROMPT_V2 = require("../prompts/careerIntelligence.prompt");
+const resumeScoreService = require('./resumeScore.service');
+const salaryService = require('./salary.service');
+const careerGraphRepository = require('../repositories/career.repository');
+const llmClient = require('../utils/llmClient');
+const validator = require('../utils/careerOutput.validator');
+const cache = require('../utils/cache');
+const logger = require('../utils/logger');
 
+const HARDENED_ENTERPRISE_PROMPT_V2 = require('../prompts/careerIntelligence.prompt');
+
+// ─────────────────────────────────────────────────────────────────────────────
 // TTL Config
-const CAREER_INTEL_TTL = 1800; // 30 minutes
-const SALARY_TTL = 3600;       // 1 hour
-const GRAPH_TTL = 3600;        // 1 hour
+// ─────────────────────────────────────────────────────────────────────────────
+const CAREER_INTEL_TTL = 1800; // 30 min
+const SALARY_TTL = 3600; // 1 hour
+const GRAPH_TTL = 3600; // 1 hour
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Helpers
+// ─────────────────────────────────────────────────────────────────────────────
+function normalizeRoleKey(role) {
+  return String(role || '')
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, '-');
+}
+
+function resolveOverride(value, fallbackFn) {
+  return value !== undefined && value !== null
+    ? value
+    : fallbackFn();
+}
+
+async function getCachedOrLoad(key, ttl, loader) {
+  const cached = cache.get(key);
+  if (cached) {
+    return cached;
+  }
+
+  const value = await loader();
+
+  if (value !== undefined && value !== null) {
+    cache.set(key, value, ttl);
+  }
+
+  return value;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Main service
+// ─────────────────────────────────────────────────────────────────────────────
 async function generateCareerIntelligence({
   userId,
   advancedMode = false,
-  overrides = {}
+  overrides = {},
 }) {
   try {
-    if (!userId) throw new Error("User ID is required");
+    const safeUserId = String(userId || '').trim();
 
-    /**
-     * -------------------------------------------------
-     * 1️⃣ Resume Score (USER-BASED)
-     * -------------------------------------------------
-     */
-    const resumeScore = overrides.resumeScore
-      ? overrides.resumeScore
-      : await resumeScoreService.calculate(userId);
-
-    if (!resumeScore || !resumeScore.roleFit) {
-      throw new Error("Resume score calculation failed");
+    if (!safeUserId) {
+      throw new Error('User ID is required');
     }
 
-    const roleKey = resumeScore.roleFit.toLowerCase().replace(/\s+/g, "-");
+    // 1) Resume score (user-based)
+    const resumeScore = await resolveOverride(
+      overrides.resumeScore,
+      () => resumeScoreService.calculate(safeUserId)
+    );
 
-    /**
-     * -------------------------------------------------
-     * 🧠 ROLE-BASED CAREER INTEL CACHE
-     * -------------------------------------------------
-     */
-    const careerIntelCacheKey = `career-intel:${roleKey}:${advancedMode}`;
+    if (!resumeScore?.roleFit) {
+      throw new Error('Resume score calculation failed');
+    }
+
+    const roleKey = normalizeRoleKey(resumeScore.roleFit);
+
+    if (!roleKey) {
+      throw new Error('Invalid role generated from resume score');
+    }
+
+    // 2) Hot path: full response role cache
+    const careerIntelCacheKey =
+      `career-intel:${roleKey}:${Boolean(advancedMode)}`;
 
     const cachedIntel = cache.get(careerIntelCacheKey);
     if (cachedIntel) {
@@ -52,127 +105,112 @@ async function generateCareerIntelligence({
       };
     }
 
-    /**
-     * -------------------------------------------------
-     * 2️⃣ Salary Band (ROLE-BASED CACHE)
-     * -------------------------------------------------
-     */
-    const salaryCacheKey = `salary-band:${roleKey}`;
-
-    let salaryBand = cache.get(salaryCacheKey);
+    // 3) Parallel role-based dependencies
+    const [salaryBand, careerGraph] = await Promise.all([
+      getCachedOrLoad(
+        `salary-band:${roleKey}`,
+        SALARY_TTL,
+        async () =>
+          resolveOverride(
+            overrides.salaryBand,
+            () => salaryService.getAllBandsForRole(resumeScore.roleFit)
+          )
+      ),
+      getCachedOrLoad(
+        `career-graph:${roleKey}`,
+        GRAPH_TTL,
+        async () =>
+          resolveOverride(
+            overrides.careerGraph,
+            () =>
+              careerGraphRepository.getNextRoles(
+                resumeScore.roleFit
+              )
+          )
+      ),
+    ]);
 
     if (!salaryBand) {
-      salaryBand = overrides.salaryBand
-        ? overrides.salaryBand
-        : await salaryService.getAllBandsForRole(resumeScore.roleFit);
-
-      if (!salaryBand) {
-        throw new Error("Salary band not found for role");
-      }
-
-      cache.set(salaryCacheKey, salaryBand, SALARY_TTL);
+      throw new Error('Salary band not found for role');
     }
-
-    /**
-     * -------------------------------------------------
-     * 3️⃣ Career Graph (ROLE-BASED CACHE)
-     * -------------------------------------------------
-     */
-    const graphCacheKey = `career-graph:${roleKey}`;
-
-    let careerGraph = cache.get(graphCacheKey);
 
     if (!careerGraph) {
-      careerGraph = overrides.careerGraph
-        ? overrides.careerGraph
-        : await careerGraphRepository.getNextRoles(resumeScore.roleFit);
-
-      if (!careerGraph) {
-        throw new Error("Career graph adjacency not found");
-      }
-
-      cache.set(graphCacheKey, careerGraph, GRAPH_TTL);
+      throw new Error('Career graph adjacency not found');
     }
 
-    /**
-     * -------------------------------------------------
-     * 4️⃣ Prepare LLM Input
-     * -------------------------------------------------
-     */
+    // 4) Prepare LLM input
     const llmInput = {
       resumeScore,
       salaryBand,
       careerGraph,
-      advancedMode,
+      advancedMode: Boolean(advancedMode),
       systemConstraints: {
-        currency: "INR",
+        currency: 'INR',
         enforceMonotonicProbability: true,
         enforceRiskScale: true,
         enforceNumericSalary: true,
       },
     };
 
-    /**
-     * -------------------------------------------------
-     * 5️⃣ LLM Generation
-     * -------------------------------------------------
-     */
-    const llmResponse = overrides.mockLLMResponse
-      ? overrides.mockLLMResponse
-      : await llmClient.generate({
+    // 5) LLM generation
+    const llmResponse = await resolveOverride(
+      overrides.mockLLMResponse,
+      () =>
+        llmClient.generate({
           systemPrompt: HARDENED_ENTERPRISE_PROMPT_V2,
           input: llmInput,
           temperature: 0.2,
-        });
+        })
+    );
 
     if (!llmResponse) {
-      throw new Error("LLM returned empty response");
+      throw new Error('LLM returned empty response');
     }
 
-    /**
-     * -------------------------------------------------
-     * 6️⃣ Enterprise Validation
-     * -------------------------------------------------
-     */
+    // 6) Enterprise validation
     validator.validateCareerOutput(llmResponse);
 
     const finalResponse = {
       success: true,
       generatedAt: new Date().toISOString(),
       role: resumeScore.roleFit,
-      advancedMode,
+      advancedMode: Boolean(advancedMode),
       data: llmResponse,
     };
 
-    /**
-     * -------------------------------------------------
-     * 💾 Store Career Intelligence ROLE-BASED
-     * -------------------------------------------------
-     */
-    cache.set(careerIntelCacheKey, finalResponse, CAREER_INTEL_TTL);
+    cache.set(
+      careerIntelCacheKey,
+      finalResponse,
+      CAREER_INTEL_TTL
+    );
 
     return finalResponse;
-
   } catch (error) {
-    console.error("Career Intelligence Generation Failed:", error);
+    logger.error(
+      '[CareerIntelligenceService] Generation failed',
+      {
+        user_id: userId || null,
+        error: error?.message || 'Unknown generation error',
+      }
+    );
 
     return {
       success: false,
       error: {
-        message: "Career intelligence generation failed",
-        details: error.message,
+        message: 'Career intelligence generation failed',
+        details: error?.message || 'Unknown error',
       },
     };
   }
 }
 
-/**
- * -------------------------------------------------
- * 🗑 Role-Based Invalidation
- * -------------------------------------------------
- */
+// ─────────────────────────────────────────────────────────────────────────────
+// Role-based invalidation
+// ─────────────────────────────────────────────────────────────────────────────
 function invalidateRoleCache(role) {
-  const roleKey = role.toLowerCase().replace(/\s+/g, "-");
+  const roleKey = normalizeRoleKey(role);
+
+  if (!roleKey) return;
 
   cache.del(`salary-band:${roleKey}`);
   cache.del(`career-graph:${roleKey}`);
@@ -184,12 +222,3 @@ module.exports = {
   generateCareerIntelligence,
   invalidateRoleCache,
 };
-
-
-
-
-
-
-
-
-

@@ -11,6 +11,10 @@
  * - health-aware failover
  * - prompt-size routing
  * - low-cost provider prioritization
+ * - O(1) provider lookup
+ * - stronger null safety
+ * - cleaner modular provider registry
+ * - consistent structured logging
  */
 
 const logger = require('../utils/logger');
@@ -35,7 +39,11 @@ const LARGE_PROMPT_THRESHOLD = 12000;
 function safeLoad(path) {
   try {
     return require(path);
-  } catch {
+  } catch (error) {
+    logger.warn('[AI Router] Provider failed to load', {
+      path,
+      error: error?.message || 'Unknown module load error',
+    });
     return null;
   }
 }
@@ -51,7 +59,7 @@ const providerModules = Object.freeze({
 function createProvider(name) {
   return {
     name,
-    module: providerModules[name],
+    module: providerModules[name] || null,
     health: {
       status: 'up',
       failures: 0,
@@ -60,27 +68,43 @@ function createProvider(name) {
   };
 }
 
-const PROVIDERS = [
+const PROVIDERS = Object.freeze([
   createProvider('OpenRouter'),
   createProvider('Claude'),
   createProvider('Gemini'),
   createProvider('Fireworks'),
   createProvider('Mistral'),
-];
+]);
+
+const PROVIDER_MAP = new Map(
+  PROVIDERS.map((provider) => [provider.name, provider])
+);
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Health helpers
 // ─────────────────────────────────────────────────────────────────────────────
 function isAvailable(provider) {
-  const health = provider.health;
+  if (!provider?.module) return false;
 
-  if (!provider.module) return false;
-  if (health.status === 'up') return true;
+  const { health } = provider;
 
-  if (health.retryAfter && Date.now() >= health.retryAfter) {
+  if (health.status === 'up') {
+    return true;
+  }
+
+  if (
+    health.retryAfter &&
+    Number.isFinite(health.retryAfter) &&
+    Date.now() >= health.retryAfter
+  ) {
     health.status = 'up';
     health.failures = 0;
     health.retryAfter = null;
+
+    logger.info('[AI Router] Provider cooldown expired', {
+      provider: provider.name,
+    });
+
     return true;
   }
 
@@ -88,6 +112,8 @@ function isAvailable(provider) {
 }
 
 function recordFailure(provider) {
+  if (!provider) return;
+
   provider.health.failures += 1;
 
   if (provider.health.failures >= FAILURE_THRESHOLD) {
@@ -96,12 +122,15 @@ function recordFailure(provider) {
 
     logger.warn('[AI Router] Provider marked down', {
       provider: provider.name,
+      failures: provider.health.failures,
       cooldown_ms: COOLDOWN_MS,
     });
   }
 }
 
 function resetHealth(provider) {
+  if (!provider) return;
+
   provider.health.status = 'up';
   provider.health.failures = 0;
   provider.health.retryAfter = null;
@@ -110,8 +139,8 @@ function resetHealth(provider) {
 // ─────────────────────────────────────────────────────────────────────────────
 // Timeout-safe execution
 // ─────────────────────────────────────────────────────────────────────────────
-function withTimeout(promise, ms, label) {
-  let timeoutId;
+function withTimeout(taskPromise, ms, label) {
+  let timeoutId = null;
 
   const timeoutPromise = new Promise((_, reject) => {
     timeoutId = setTimeout(() => {
@@ -119,8 +148,8 @@ function withTimeout(promise, ms, label) {
     }, ms);
   });
 
-  return Promise.race([promise, timeoutPromise]).finally(() => {
-    clearTimeout(timeoutId);
+  return Promise.race([taskPromise, timeoutPromise]).finally(() => {
+    if (timeoutId) clearTimeout(timeoutId);
   });
 }
 
@@ -128,8 +157,9 @@ function withTimeout(promise, ms, label) {
 // Smart provider routing
 // ─────────────────────────────────────────────────────────────────────────────
 function getProviderOrder(prompt, options = {}) {
-  const promptLength = prompt.length;
-  const modelHint = String(options.model || '').toLowerCase();
+  const safePrompt = String(prompt || '');
+  const promptLength = safePrompt.length;
+  const modelHint = String(options?.model || '').toLowerCase();
 
   // large grounded prompts → strongest context providers first
   if (promptLength >= LARGE_PROMPT_THRESHOLD) {
@@ -148,34 +178,42 @@ function getProviderOrder(prompt, options = {}) {
 // Main router
 // ─────────────────────────────────────────────────────────────────────────────
 async function generateAIResponse(prompt, options = {}) {
-  if (!prompt || typeof prompt !== 'string' || !prompt.trim()) {
+  const safePrompt = String(prompt || '').trim();
+
+  if (!safePrompt) {
     throw new Error('[AI Router] prompt must be a non-empty string');
   }
 
   let lastError = null;
   let anyAttempted = false;
 
-  const providerOrder = getProviderOrder(prompt, options);
+  const providerOrder = getProviderOrder(safePrompt, options);
 
   for (const providerName of providerOrder) {
-    const provider = PROVIDERS.find((item) => item.name === providerName);
-    if (!provider || !isAvailable(provider)) continue;
+    const provider = PROVIDER_MAP.get(providerName);
+
+    if (!provider || !isAvailable(provider)) {
+      continue;
+    }
 
     anyAttempted = true;
 
     try {
-      const { generate } = provider.module;
-      if (typeof generate !== 'function') {
+      const generateFn = provider.module?.generate;
+
+      if (typeof generateFn !== 'function') {
         throw new Error(`${provider.name} missing generate()`);
       }
 
       const result = await withTimeout(
-        generate(prompt, options),
+        Promise.resolve(generateFn(safePrompt, options)),
         PROVIDER_TIMEOUT_MS,
         provider.name
       );
 
-      if (!result?.text || typeof result.text !== 'string') {
+      const text = result?.text;
+
+      if (typeof text !== 'string' || !text.trim()) {
         throw new Error(`${provider.name} returned invalid response`);
       }
 
@@ -183,17 +221,17 @@ async function generateAIResponse(prompt, options = {}) {
 
       logger.debug('[AI Router] Provider success', {
         provider: provider.name,
-        prompt_length: prompt.length,
+        prompt_length: safePrompt.length,
       });
 
-      return result.text;
+      return text;
     } catch (error) {
       lastError = error;
       recordFailure(provider);
 
       logger.warn('[AI Router] Provider failed', {
         provider: provider.name,
-        error: error.message,
+        error: error?.message || 'Unknown provider error',
       });
     }
   }
@@ -214,7 +252,7 @@ function getProviderHealth() {
     retryAfter: provider.health.retryAfter
       ? new Date(provider.health.retryAfter).toISOString()
       : null,
-    loaded: !!provider.module,
+    loaded: Boolean(provider.module),
   }));
 }
 

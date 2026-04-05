@@ -1,66 +1,107 @@
 'use strict';
 
 /**
- * radar.service.js (PRODUCTION OPTIMIZED)
+ * @file src/services/radar.service.js
+ * @description
+ * Radar skill matching service.
  *
- * ✅ Uses Supabase RPC (match_skills)
- * ✅ Removes heavy Node computation
- * ✅ Adds Redis caching layer
- * ✅ Fast (<150ms target)
+ * Architecture:
+ * - Supabase RPC first
+ * - Redis durable short TTL cache
+ * - stale-safe null handling
+ * - thin service layer
  */
 
 const { supabase } = require('../config/supabase');
 const cacheManager = require('../core/cache/cache.manager');
 const logger = require('../utils/logger');
 
-const CACHE_TTL = 300; // 5 minutes
-const CACHE_PREFIX = 'radar:skills:';
+const cache = cacheManager.getClient();
 
-/**
- * Get Radar Skills (Optimized)
- * @param {string} userId
- */
+const CACHE_TTL_SECONDS = 300;
+const CACHE_PREFIX = 'radar:skills:';
+const RPC_NAME = 'match_skills';
+
+function buildCacheKey(userId) {
+  return `${CACHE_PREFIX}${userId}`;
+}
+
+async function getCachedRadar(cacheKey) {
+  try {
+    const cached = await cache.get(cacheKey);
+    return cached ? JSON.parse(cached) : null;
+  } catch (error) {
+    logger.warn('[Radar] Cache read failed', {
+      cacheKey,
+      error: error.message,
+    });
+    return null;
+  }
+}
+
+async function setCachedRadar(cacheKey, payload) {
+  try {
+    await cache.set(
+      cacheKey,
+      JSON.stringify(payload),
+      CACHE_TTL_SECONDS
+    );
+  } catch (error) {
+    logger.warn('[Radar] Cache write failed', {
+      cacheKey,
+      error: error.message,
+    });
+  }
+}
+
 async function getRadarSkills(userId) {
-  const cacheKey = `${CACHE_PREFIX}${userId}`;
+  if (!userId) {
+    throw new Error('userId is required');
+  }
+
+  const cacheKey = buildCacheKey(userId);
 
   try {
-    // 🔥 STEP 3 — Check Cache First
-    const cached = await cacheManager.get(cacheKey);
+    const cached = await getCachedRadar(cacheKey);
     if (cached) {
-      logger.info('[Radar] cache hit', { userId });
-      return JSON.parse(cached);
+      logger.info('[Radar] Cache hit', { userId });
+      return cached;
     }
 
-    logger.info('[Radar] cache miss → calling RPC', { userId });
+    logger.info('[Radar] Cache miss → RPC lookup', {
+      userId,
+      rpc: RPC_NAME,
+    });
 
-    // 🔥 STEP 1 & 2 — Call Supabase RPC (thin layer)
-    const { data, error } = await supabase.rpc('match_skills', {
-      input_user_id: userId
+    const { data, error } = await supabase.rpc(RPC_NAME, {
+      input_user_id: userId,
     });
 
     if (error) {
-      logger.error('[Radar] RPC error', { userId, error: error.message });
+      logger.error('[Radar] RPC failed', {
+        userId,
+        rpc: RPC_NAME,
+        error: error.message,
+      });
+
       throw new Error(error.message);
     }
 
-    // 🔥 Cache result
-    await cacheManager.set(
-      cacheKey,
-      JSON.stringify(data),
-      CACHE_TTL
-    );
+    const safeData = Array.isArray(data) ? data : [];
 
-    return data;
+    await setCachedRadar(cacheKey, safeData);
 
-  } catch (err) {
-    logger.error('[Radar] failed', {
+    return safeData;
+  } catch (error) {
+    logger.error('[Radar] Service failed', {
       userId,
-      error: err.message
+      error: error.message,
     });
-    throw err;
+
+    throw error;
   }
 }
 
 module.exports = {
-  getRadarSkills
+  getRadarSkills,
 };

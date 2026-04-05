@@ -1,16 +1,18 @@
 'use strict';
 
 /**
- * services/jobAnalyzer.service.js — Job Fit Analyzer (Premium Feature)
+ * @file services/jobAnalyzer.service.js
+ * @description
+ * Premium Job Fit Analyzer service (Supabase-native).
  *
- * Compares a user's extracted skills against a job description.
- * Returns a jobFitScore, matchedSkills[], and missingSkills[].
- *
- * Storage: job_analyses/{analysisId}
- *
- * Usage:
- *   const { analyzeJobFit } = require('./jobAnalyzer.service');
- *   const result = await analyzeJobFit(userId, { jobDescription: '...', jobUrl: '...' });
+ * Features:
+ * - deterministic Supabase row-based persistence
+ * - minimal column selection
+ * - strict null-safe payload normalization
+ * - resilient AI JSON parsing
+ * - production-safe logging
+ * - isolated non-fatal dashboard update
+ * - optimized history retrieval
  */
 
 const crypto = require('crypto');
@@ -18,21 +20,45 @@ const { supabase } = require('../config/supabase');
 const { AppError, ErrorCodes } = require('../middleware/errorHandler');
 const logger = require('../utils/logger');
 
-const getAnthropicClient = () => {
-  if (process.env.NODE_ENV === 'test') return null;
-  return require('../config/anthropic.client');
-};
-
 const MODEL = process.env.ANTHROPIC_MODEL || 'claude-sonnet-4-20250514';
 
-function stripJson(text) {
-  return text
+function getAnthropicClient() {
+  if (process.env.NODE_ENV === 'test') return null;
+  return require('../config/anthropic.client');
+}
+
+function stripJson(text = '') {
+  return String(text)
     .replace(/^```(?:json)?\s*/i, '')
     .replace(/\s*```$/i, '')
     .trim();
 }
 
-// ─── System prompt ────────────────────────────────────────────────────────────
+function normalizeStringArray(value) {
+  if (!Array.isArray(value)) return [];
+  return value
+    .filter((v) => typeof v === 'string')
+    .map((v) => v.trim())
+    .filter(Boolean);
+}
+
+function normalizeAnalysisResult(result = {}) {
+  return {
+    jobTitle:
+      typeof result.jobTitle === 'string' && result.jobTitle.trim()
+        ? result.jobTitle.trim()
+        : 'Unknown',
+    jobSkills: normalizeStringArray(result.jobSkills),
+    matchedSkills: normalizeStringArray(result.matchedSkills),
+    missingSkills: normalizeStringArray(result.missingSkills),
+    jobFitScore: Number.isFinite(result.jobFitScore)
+      ? Math.max(0, Math.min(100, Math.round(result.jobFitScore)))
+      : 0,
+    fitSummary:
+      typeof result.fitSummary === 'string' ? result.fitSummary.trim() : '',
+    topRecommendations: normalizeStringArray(result.topRecommendations),
+  };
+}
 
 const JOB_ANALYZER_PROMPT = `You are a senior technical recruiter and career coach.
 
@@ -55,23 +81,180 @@ Return this exact structure:
 
 Scoring guide:
 - 80-100: Strong fit — candidate meets most requirements
-- 60-79:  Good fit — some gaps but strong foundation
-- 40-59:  Moderate fit — significant skill gaps to address
-- 0-39:   Poor fit — major upskilling required`;
+- 60-79: Good fit — some gaps but strong foundation
+- 40-59: Moderate fit — significant skill gaps to address
+- 0-39: Poor fit — major upskilling required`;
 
-// ─── Main function ────────────────────────────────────────────────────────────
+async function fetchUserSkills(userId) {
+  const { data, error } = await supabase
+    .from('users')
+    .select('skills')
+    .eq('id', userId)
+    .maybeSingle();
 
-/**
- * analyzeJobFit(userId, payload)
- *
- * @param {string} userId
- * @param {{ jobDescription?: string, jobUrl?: string }} payload
- * @returns {Promise<JobFitResult>}
- */
-async function analyzeJobFit(userId, payload) {
-  if (!userId) throw new AppError('userId is required', 400, {}, ErrorCodes.VALIDATION_ERROR);
+  if (error) {
+    throw new AppError(
+      error.message,
+      500,
+      { userId, stage: 'fetch_user_skills' },
+      ErrorCodes.INTERNAL_ERROR
+    );
+  }
 
-  const { jobDescription, jobUrl } = payload || {};
+  const skills = normalizeStringArray(data?.skills);
+
+  if (!skills.length) {
+    throw new AppError(
+      'No skills found on your profile. Please upload a resume first.',
+      422,
+      { userId },
+      ErrorCodes.VALIDATION_ERROR
+    );
+  }
+
+  return skills;
+}
+
+async function runAIJobAnalysis(userSkills, jobText, userId) {
+  const anthropic = getAnthropicClient();
+
+  if (!anthropic) {
+    throw new AppError(
+      'Anthropic client unavailable in current environment.',
+      500,
+      { userId },
+      ErrorCodes.INTERNAL_ERROR
+    );
+  }
+
+  const startMs = Date.now();
+
+  try {
+    const response = await anthropic.messages.create({
+      model: MODEL,
+      max_tokens: 1000,
+      system: JOB_ANALYZER_PROMPT,
+      messages: [
+        {
+          role: 'user',
+          content: `Candidate Skills: ${JSON.stringify(
+            userSkills
+          )}\n\nJob Description:\n${jobText}`,
+        },
+      ],
+    });
+
+    const rawText = response.content
+      .filter((block) => block.type === 'text')
+      .map((block) => block.text)
+      .join('');
+
+    const parsed = JSON.parse(stripJson(rawText));
+    const normalized = normalizeAnalysisResult(parsed);
+
+    logger.info('[JobAnalyzer] AI analysis completed', {
+      userId,
+      latencyMs: Date.now() - startMs,
+      score: normalized.jobFitScore,
+      matchedSkills: normalized.matchedSkills.length,
+      missingSkills: normalized.missingSkills.length,
+    });
+
+    return normalized;
+  } catch (error) {
+    logger.error('[JobAnalyzer] AI analysis failed', {
+      userId,
+      error: error.message,
+    });
+
+    throw new AppError(
+      'Job analysis failed. Please try again.',
+      502,
+      { userId },
+      ErrorCodes.EXTERNAL_SERVICE_ERROR
+    );
+  }
+}
+
+async function persistAnalysis(userId, payload) {
+  const { jobDescription, jobUrl, userSkills, analysis } = payload;
+
+  const analysisId = crypto.randomUUID();
+  const now = new Date().toISOString();
+
+  const row = {
+    id: analysisId,
+    analysisId,
+    userId,
+    jobTitle: analysis.jobTitle,
+    jobUrl: jobUrl || null,
+    jobDescription: jobDescription?.slice(0, 5000) || null,
+    jobSkills: analysis.jobSkills,
+    matchedSkills: analysis.matchedSkills,
+    missingSkills: analysis.missingSkills,
+    jobFitScore: analysis.jobFitScore,
+    fitSummary: analysis.fitSummary,
+    topRecommendations: analysis.topRecommendations,
+    userSkillsSnapshot: userSkills,
+    createdAt: now,
+    updatedAt: now,
+  };
+
+  const { error } = await supabase
+    .from('job_analyses')
+    .upsert(row, { onConflict: 'id' });
+
+  if (error) {
+    logger.error('[JobAnalyzer] Failed to persist analysis', {
+      userId,
+      error: error.message,
+    });
+
+    throw new AppError(
+      error.message,
+      500,
+      { userId, stage: 'persist_analysis' },
+      ErrorCodes.INTERNAL_ERROR
+    );
+  }
+
+  return { analysisId, now };
+}
+
+async function updateLatestJobFit(userId, analysisId, analysis, timestamp) {
+  const { error } = await supabase
+    .from('users')
+    .update({
+      latestJobFit: {
+        analysisId,
+        jobTitle: analysis.jobTitle,
+        score: analysis.jobFitScore,
+        analyzedAt: timestamp,
+      },
+      updatedAt: timestamp,
+    })
+    .eq('id', userId);
+
+  if (error) {
+    logger.warn('[JobAnalyzer] Failed latestJobFit dashboard update', {
+      userId,
+      error: error.message,
+    });
+  }
+}
+
+async function analyzeJobFit(userId, payload = {}) {
+  if (!userId) {
+    throw new AppError(
+      'userId is required',
+      400,
+      {},
+      ErrorCodes.VALIDATION_ERROR
+    );
+  }
+
+  const { jobDescription, jobUrl } = payload;
+
   if (!jobDescription && !jobUrl) {
     throw new AppError(
       'Either jobDescription or jobUrl is required.',
@@ -81,164 +264,67 @@ async function analyzeJobFit(userId, payload) {
     );
   }
 
-  // ── Fetch user's skills from users table ──────────────────────────────────
-  const { data: userData, error: userError } = await supabase
-    .from('users')
-    .select('*')
-    .eq('id', userId)
-    .maybeSingle();
+  const userSkills = await fetchUserSkills(userId);
+  const jobText = jobDescription || `Job URL: ${jobUrl}`;
 
-  if (userError) {
-    throw new AppError(userError.message, 500, { userId }, ErrorCodes.INTERNAL_ERROR);
-  }
+  const analysis = await runAIJobAnalysis(userSkills, jobText, userId);
 
-  const userSkills = (userData && userData.skills) ? userData.skills : [];
-  if (userSkills.length === 0) {
+  const { analysisId, now } = await persistAnalysis(userId, {
+    jobDescription,
+    jobUrl,
+    userSkills,
+    analysis,
+  });
+
+  await updateLatestJobFit(userId, analysisId, analysis, now);
+
+  return {
+    analysisId,
+    ...analysis,
+  };
+}
+
+async function getJobAnalysisHistory(userId, limit = 10) {
+  if (!userId) {
     throw new AppError(
-      'No skills found on your profile. Please upload a resume first.',
-      422,
-      { userId },
+      'userId is required',
+      400,
+      {},
       ErrorCodes.VALIDATION_ERROR
     );
   }
 
-  // ── If URL provided, use the description as-is (URL fetching is client-side) ─
-  const jobText = jobDescription || `Job URL: ${jobUrl}`;
-
-  // ── Call Claude ───────────────────────────────────────────────────────────
-  const anthropic = getAnthropicClient();
-  const startMs = Date.now();
-  let analysisResult;
-  try {
-    const response = await anthropic.messages.create({
-      model: MODEL,
-      max_tokens: 1000,
-      system: JOB_ANALYZER_PROMPT,
-      messages: [
-        {
-          role: 'user',
-          content: `Candidate Skills: ${JSON.stringify(userSkills)}\n\nJob Description:\n${jobText}`,
-        },
-      ],
-    });
-    const rawText = response.content
-      .filter((b) => b.type === 'text')
-      .map((b) => b.text)
-      .join('');
-    analysisResult = JSON.parse(stripJson(rawText));
-    logger.info('[JobAnalyzer] Analysis complete', {
-      userId,
-      latencyMs: Date.now() - startMs,
-      score: analysisResult.jobFitScore,
-    });
-  } catch (err) {
-    logger.error('[JobAnalyzer] Claude call failed', { userId, error: err.message });
-    throw new AppError(
-      'Job analysis failed. Please try again.',
-      502,
-      { userId },
-      ErrorCodes.EXTERNAL_SERVICE_ERROR
-    );
-  }
-
-  // ── Persist to job_analyses table — upsert to prevent duplicates ─────────
-  const analysisId = crypto.randomUUID();
-  const now = new Date().toISOString();
-
-  const analysisDoc = {
-    id: analysisId,
-    analysisId,
-    userId,
-    jobTitle: analysisResult.jobTitle || 'Unknown',
-    jobUrl: jobUrl || null,
-    jobDescription: jobDescription ? jobDescription.slice(0, 2000) : null,
-    jobSkills: analysisResult.jobSkills || [],
-    matchedSkills: analysisResult.matchedSkills || [],
-    missingSkills: analysisResult.missingSkills || [],
-    jobFitScore: analysisResult.jobFitScore || 0,
-    fitSummary: analysisResult.fitSummary || '',
-    topRecommendations: analysisResult.topRecommendations || [],
-    userSkillsSnapshot: userSkills,
-    createdAt: now,
-    updatedAt: now,
-  };
-
-  const { error: insertError } = await supabase
-    .from('job_analyses')
-    .upsert([analysisDoc]);
-
-  if (insertError) {
-    logger.error('[JobAnalyzer] Failed to persist analysis', { userId, error: insertError.message });
-    throw new AppError(insertError.message, 500, { userId }, ErrorCodes.INTERNAL_ERROR);
-  }
-
-  // Update user record with latest job fit score for dashboard card
-  const { error: updateError } = await supabase
-    .from('users')
-    .update({
-      latestJobFit: {
-        analysisId,
-        jobTitle: analysisResult.jobTitle || 'Unknown',
-        score: analysisResult.jobFitScore || 0,
-        analyzedAt: now,
-      },
-      updatedAt: now,
-    })
-    .eq('id', userId);
-
-  if (updateError) {
-    // Non-fatal: log but do not throw — the analysis was already stored
-    logger.warn('[JobAnalyzer] Failed to update user latestJobFit', {
-      userId,
-      error: updateError.message,
-    });
-  }
-
-  return {
-    analysisId,
-    jobTitle: analysisResult.jobTitle,
-    jobFitScore: analysisResult.jobFitScore,
-    matchedSkills: analysisResult.matchedSkills,
-    missingSkills: analysisResult.missingSkills,
-    fitSummary: analysisResult.fitSummary,
-    topRecommendations: analysisResult.topRecommendations,
-    jobSkills: analysisResult.jobSkills,
-  };
-}
-
-/**
- * getJobAnalysisHistory(userId, limit)
- * Returns past job analyses for the user.
- */
-async function getJobAnalysisHistory(userId, limit = 10) {
-  if (!userId) throw new AppError('userId is required', 400, {}, ErrorCodes.VALIDATION_ERROR);
+  const safeLimit = Math.min(Math.max(Number(limit) || 10, 1), 100);
 
   const { data, error } = await supabase
     .from('job_analyses')
-    .select('*')
+    .select(
+      `
+      analysisId,
+      jobTitle,
+      jobFitScore,
+      matchedSkills,
+      missingSkills,
+      createdAt
+    `
+    )
     .eq('userId', userId)
     .order('createdAt', { ascending: false })
-    .limit(limit);
+    .limit(safeLimit);
 
-  if (error) throw new AppError(error.message, 500, { userId }, ErrorCodes.INTERNAL_ERROR);
-
-  if (!data || data.length === 0) {
-    return { userId, analyses: [], total: 0 };
+  if (error) {
+    throw new AppError(
+      error.message,
+      500,
+      { userId, stage: 'history_fetch' },
+      ErrorCodes.INTERNAL_ERROR
+    );
   }
-
-  const analyses = data.map((d) => ({
-    analysisId: d.analysisId,
-    jobTitle: d.jobTitle,
-    jobFitScore: d.jobFitScore,
-    matchedSkills: d.matchedSkills,
-    missingSkills: d.missingSkills,
-    createdAt: d.createdAt,
-  }));
 
   return {
     userId,
-    analyses,
-    total: analyses.length,
+    analyses: data || [],
+    total: data?.length || 0,
   };
 }
 

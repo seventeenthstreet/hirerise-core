@@ -1,256 +1,451 @@
 'use strict';
 
 /**
- * adminContributors.routes.js
+ * src/routes/admin/adminContributors.routes.js
  *
- * MIGRATION: firebase-admin removed.
+ * Fully Supabase-native contributor management.
+ * Uses shared production singleton from config/supabase.js
  *
- * Changes from original:
- *   - require('firebase-admin') + admin.auth().setCustomUserClaims()  → REMOVED
- *   - require('../../config/supabase') (db shim)                      → REMOVED
- *   - All DB reads/writes now use Supabase directly (service-role key)
- *   - Role claims now set via supabase.auth.admin.updateUserById()
- *     which writes to Supabase Auth app_metadata — the same field that
- *     auth.middleware.js reads (user.app_metadata.role).
- *   - Column names normalised to snake_case to match the Supabase users table:
- *       contributorPromotedAt → contributor_promoted_at
- *       contributorPromotedBy → contributor_promoted_by
- *       createdAt             → created_at
- *       displayName           → display_name
- *
- * Mount in server.js:
- *   app.use(
- *     `${API_PREFIX}/admin/contributors`,
- *     authenticate, requireAdmin,
- *     require('./routes/admin/adminContributors.routes')
- *   );
- *
- * Endpoints:
- *   GET    /admin/contributors           → list all contributors
- *   POST   /admin/contributors/promote   → grant contributor role to a user
- *   POST   /admin/contributors/demote    → revoke contributor role
- *
- * Environment variables required:
- *   SUPABASE_URL
- *   SUPABASE_SERVICE_ROLE_KEY
+ * Features:
+ *  - Router-level admin authorization
+ *  - roles[] + app_metadata.role + role compatibility
+ *  - Cursor pagination
+ *  - Already contributor protection
+ *  - Peer admin protection
+ *  - Partial failure surfacing (207)
+ *  - Retry-safe Supabase operations
+ *  - Backward-compatible API responses
  */
 
-const express          = require('express');
-const { body }         = require('express-validator');
-const { createClient } = require('@supabase/supabase-js');
-const { validate }     = require('../../middleware/requestValidator');
+const express = require('express');
+const { body, query } = require('express-validator');
+
+const { validate } = require('../../middleware/requestValidator');
 const { asyncHandler } = require('../../utils/helpers');
-const logger           = require('../../utils/logger');
+const { getClient, withRetry } = require('../../config/supabase');
+const logger = require('../../utils/logger');
 
 const router = express.Router();
 
-// ─── Supabase service-role client (singleton) ─────────────────────────────────
-// Service-role key is required for auth.admin.updateUserById().
-// Never expose this key to the browser.
+// ─────────────────────────────────────────────
+// Constants
+// ─────────────────────────────────────────────
+const ADMIN_ROLES = new Set([
+  'admin',
+  'super_admin',
+  'MASTER_ADMIN',
+]);
 
-let _supabase = null;
+const PAGE_LIMIT_DEFAULT = 50;
+const PAGE_LIMIT_MAX = 200;
 
-function getSupabase() {
-  if (_supabase) return _supabase;
+// ─────────────────────────────────────────────
+// Authorization helpers
+// ─────────────────────────────────────────────
+function hasAdminAccess(req) {
+  const directRole = req.user?.role;
+  const metadataRole = req.user?.app_metadata?.role;
+  const roles = Array.isArray(req.user?.roles) ? req.user.roles : [];
 
-  const url = process.env.SUPABASE_URL;
-  const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
-
-  if (!url || !key) {
-    throw new Error(
-      '[adminContributors] SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY must be set.'
-    );
-  }
-
-  _supabase = createClient(url, key, {
-    auth: { persistSession: false, autoRefreshToken: false },
-  });
-
-  return _supabase;
+  return (
+    ADMIN_ROLES.has(directRole) ||
+    ADMIN_ROLES.has(metadataRole) ||
+    roles.some(role => ADMIN_ROLES.has(role))
+  );
 }
 
-// ── GET /admin/contributors ───────────────────────────────────────────────────
+router.use((req, res, next) => {
+  if (!hasAdminAccess(req)) {
+    return res.status(403).json({
+      success: false,
+      errorCode: 'FORBIDDEN',
+      message: 'Insufficient privileges.',
+    });
+  }
 
+  return next();
+});
+
+// ─────────────────────────────────────────────
+// Helpers
+// ─────────────────────────────────────────────
+function getActorId(req) {
+  return req.user?.uid ?? req.user?.id ?? null;
+}
+
+function mapContributor(row) {
+  return {
+    uid: row.id,
+    email: row.email,
+    displayName: row.display_name,
+    role: row.role,
+    createdAt: row.created_at,
+    promotedAt: row.contributor_promoted_at ?? null,
+    promotedBy: row.contributor_promoted_by ?? null,
+  };
+}
+
+// ─────────────────────────────────────────────
+// GET /
+// Cursor pagination: ?cursor=<ISO>&limit=<n>
+// ─────────────────────────────────────────────
 router.get(
   '/',
-  asyncHandler(async (req, res) => {
-    const supabase = getSupabase();
-
-    const { data, error } = await supabase
-      .from('users')
-      .select('id, email, display_name, role, created_at, contributor_promoted_at, contributor_promoted_by')
-      .eq('role', 'contributor')
-      .order('created_at', { ascending: false })
-      .limit(200);
-
-    if (error) {
-      logger.error('[Contributors] Failed to list contributors', { error: error.message });
-      return res.status(500).json({ success: false, errorCode: 'DB_ERROR', message: error.message });
-    }
-
-    const contributors = (data ?? []).map(row => ({
-      uid:         row.id,
-      email:       row.email,
-      displayName: row.display_name,
-      role:        row.role,
-      createdAt:   row.created_at,
-      promotedAt:  row.contributor_promoted_at ?? null,
-      promotedBy:  row.contributor_promoted_by ?? null,
-    }));
-
-    return res.json({ success: true, data: { contributors, total: contributors.length } });
-  })
-);
-
-// ── POST /admin/contributors/promote ─────────────────────────────────────────
-
-router.post(
-  '/promote',
   validate([
-    body('uid').isString().trim().notEmpty().withMessage('uid is required'),
+    query('limit')
+      .optional()
+      .isInt({ min: 1, max: PAGE_LIMIT_MAX })
+      .toInt()
+      .withMessage(`limit must be between 1 and ${PAGE_LIMIT_MAX}`),
+
+    query('cursor')
+      .optional()
+      .isISO8601()
+      .withMessage('cursor must be a valid ISO 8601 timestamp'),
   ]),
   asyncHandler(async (req, res) => {
-    const { uid }  = req.body;
-    const adminUid = req.user.uid;
-    const supabase = getSupabase();
+    const db = getClient();
+    const limit = req.query.limit ?? PAGE_LIMIT_DEFAULT;
+    const cursor = req.query.cursor ?? null;
 
-    // Verify target user exists in the users table
-    const { data: userData, error: fetchErr } = await supabase
+    let queryBuilder = db
       .from('users')
-      .select('id, role')
-      .eq('id', uid)
-      .single();
+      .select(`
+        id,
+        email,
+        display_name,
+        role,
+        created_at,
+        contributor_promoted_at,
+        contributor_promoted_by
+      `)
+      .eq('role', 'contributor')
+      .order('created_at', { ascending: false })
+      .limit(limit);
 
-    if (fetchErr || !userData) {
-      return res.status(404).json({
-        success: false, errorCode: 'NOT_FOUND', message: 'User not found.',
+    if (cursor) {
+      queryBuilder = queryBuilder.lt('created_at', cursor);
+    }
+
+    const { data, error } = await withRetry(() => queryBuilder);
+
+    if (error) {
+      logger.error('[Contributors] Failed to list contributors', {
+        error: error.message,
+      });
+
+      return res.status(500).json({
+        success: false,
+        errorCode: 'DB_ERROR',
+        message: 'Failed to fetch contributors.',
       });
     }
 
-    if (['admin', 'super_admin', 'MASTER_ADMIN'].includes(userData.role)) {
+    const contributors = (data ?? []).map(mapContributor);
+
+    const nextCursor =
+      contributors.length === limit
+        ? contributors[contributors.length - 1].createdAt
+        : null;
+
+    return res.json({
+      success: true,
+      data: {
+        contributors,
+        total: contributors.length,
+        nextCursor,
+      },
+    });
+  })
+);
+
+// ─────────────────────────────────────────────
+// POST /promote
+// ─────────────────────────────────────────────
+router.post(
+  '/promote',
+  validate([
+    body('uid')
+      .isString()
+      .trim()
+      .notEmpty()
+      .withMessage('uid is required'),
+  ]),
+  asyncHandler(async (req, res) => {
+    const db = getClient();
+    const actorId = getActorId(req);
+
+    if (!actorId) {
+      return res.status(401).json({
+        success: false,
+        message: 'Unauthenticated',
+      });
+    }
+
+    const { uid } = req.body;
+
+    const { data: user, error: fetchErr } = await withRetry(() =>
+      db
+        .from('users')
+        .select('id, role')
+        .eq('id', uid)
+        .maybeSingle()
+    );
+
+    if (fetchErr) {
+      logger.error('[Contributors] Failed to fetch target user', {
+        uid,
+        error: fetchErr.message,
+      });
+
+      return res.status(500).json({
+        success: false,
+        errorCode: 'DB_ERROR',
+        message: 'Failed to verify user.',
+      });
+    }
+
+    if (!user) {
+      return res.status(404).json({
+        success: false,
+        errorCode: 'NOT_FOUND',
+        message: 'User not found.',
+      });
+    }
+
+    if (user.role === 'contributor') {
       return res.status(409).json({
-        success: false, errorCode: 'ALREADY_ADMIN',
+        success: false,
+        errorCode: 'ALREADY_CONTRIBUTOR',
+        message: 'User is already a contributor.',
+      });
+    }
+
+    if (ADMIN_ROLES.has(user.role)) {
+      return res.status(409).json({
+        success: false,
+        errorCode: 'ALREADY_ADMIN',
         message: 'User already has admin or higher privileges.',
       });
     }
 
     const now = new Date().toISOString();
 
-    // 1. Set role claim in Supabase Auth app_metadata.
-    //    auth.middleware.js reads user.app_metadata.role — this is the correct place.
-    const { error: authErr } = await supabase.auth.admin.updateUserById(uid, {
-      app_metadata: { role: 'contributor', admin: false },
-    });
+    const { error: authErr } = await withRetry(() =>
+      db.auth.admin.updateUserById(uid, {
+        app_metadata: {
+          role: 'contributor',
+          admin: false,
+        },
+      })
+    );
 
     if (authErr) {
-      logger.error('[Contributors] Failed to set Supabase Auth claim', {
-        uid, error: authErr.message,
+      logger.error('[Contributors] Failed auth metadata update', {
+        uid,
+        error: authErr.message,
       });
+
       return res.status(500).json({
-        success: false, errorCode: 'AUTH_UPDATE_FAILED', message: authErr.message,
+        success: false,
+        errorCode: 'AUTH_UPDATE_FAILED',
+        message: 'Failed to update auth role.',
       });
     }
 
-    // 2. Update the users table (snake_case column names).
-    const { error: dbErr } = await supabase
-      .from('users')
-      .update({
-        role:                    'contributor',
-        contributor_promoted_at: now,
-        contributor_promoted_by: adminUid,
-        updated_at:              now,
-      })
-      .eq('id', uid);
+    const { error: dbErr } = await withRetry(() =>
+      db
+        .from('users')
+        .update({
+          role: 'contributor',
+          contributor_promoted_at: now,
+          contributor_promoted_by: actorId,
+          updated_at: now,
+        })
+        .eq('id', uid)
+    );
 
     if (dbErr) {
-      // Auth claim was already set — log the inconsistency but don't fail the request.
-      // The table will self-correct on the user's next profile update.
-      logger.error('[Contributors] users table update failed after auth claim was set', {
-        uid, error: dbErr.message,
+      logger.error(
+        '[Contributors] Mirror table sync failed after auth promote',
+        {
+          uid,
+          error: dbErr.message,
+        }
+      );
+
+      return res.status(207).json({
+        success: true,
+        warning:
+          `Auth metadata updated but database sync failed. ` +
+          `Manual reconciliation required for uid: ${uid}`,
+        data: {
+          uid,
+          role: 'contributor',
+          promotedAt: now,
+          promotedBy: actorId,
+        },
       });
     }
 
-    logger.info('[Contributors] User promoted to contributor', { uid, adminUid });
+    logger.info('[Contributors] User promoted', {
+      uid,
+      promotedBy: actorId,
+    });
 
     return res.json({
       success: true,
-      data: { uid, role: 'contributor', promotedAt: now, promotedBy: adminUid },
+      data: {
+        uid,
+        role: 'contributor',
+        promotedAt: now,
+        promotedBy: actorId,
+      },
     });
   })
 );
 
-// ── POST /admin/contributors/demote ──────────────────────────────────────────
-
+// ─────────────────────────────────────────────
+// POST /demote
+// ─────────────────────────────────────────────
 router.post(
   '/demote',
   validate([
-    body('uid').isString().trim().notEmpty().withMessage('uid is required'),
+    body('uid')
+      .isString()
+      .trim()
+      .notEmpty()
+      .withMessage('uid is required'),
   ]),
   asyncHandler(async (req, res) => {
-    const { uid }  = req.body;
-    const adminUid = req.user.uid;
-    const supabase = getSupabase();
+    const db = getClient();
+    const actorId = getActorId(req);
 
-    // Cannot demote yourself
-    if (uid === adminUid) {
+    if (!actorId) {
+      return res.status(401).json({
+        success: false,
+        message: 'Unauthenticated',
+      });
+    }
+
+    const { uid } = req.body;
+
+    if (uid === actorId) {
       return res.status(400).json({
-        success: false, errorCode: 'SELF_DEMOTE',
+        success: false,
+        errorCode: 'SELF_DEMOTE',
         message: 'You cannot demote yourself.',
       });
     }
 
-    const { data: userData, error: fetchErr } = await supabase
-      .from('users')
-      .select('id')
-      .eq('id', uid)
-      .single();
+    const { data: user, error: fetchErr } = await withRetry(() =>
+      db
+        .from('users')
+        .select('id, role')
+        .eq('id', uid)
+        .maybeSingle()
+    );
 
-    if (fetchErr || !userData) {
+    if (fetchErr) {
+      logger.error(
+        '[Contributors] Failed to fetch target user for demotion',
+        {
+          uid,
+          error: fetchErr.message,
+        }
+      );
+
+      return res.status(500).json({
+        success: false,
+        errorCode: 'DB_ERROR',
+        message: 'Failed to verify user.',
+      });
+    }
+
+    if (!user) {
       return res.status(404).json({
-        success: false, errorCode: 'NOT_FOUND', message: 'User not found.',
+        success: false,
+        errorCode: 'NOT_FOUND',
+        message: 'User not found.',
+      });
+    }
+
+    if (ADMIN_ROLES.has(user.role)) {
+      return res.status(403).json({
+        success: false,
+        errorCode: 'CANNOT_DEMOTE_ADMIN',
+        message: 'Cannot demote a user with admin privileges.',
       });
     }
 
     const now = new Date().toISOString();
 
-    // 1. Revert Supabase Auth claim back to regular user.
-    const { error: authErr } = await supabase.auth.admin.updateUserById(uid, {
-      app_metadata: { role: 'user', admin: false },
-    });
+    const { error: authErr } = await withRetry(() =>
+      db.auth.admin.updateUserById(uid, {
+        app_metadata: {
+          role: 'user',
+          admin: false,
+        },
+      })
+    );
 
     if (authErr) {
-      logger.error('[Contributors] Failed to revert Supabase Auth claim', {
-        uid, error: authErr.message,
+      logger.error('[Contributors] Failed auth demotion', {
+        uid,
+        error: authErr.message,
       });
+
       return res.status(500).json({
-        success: false, errorCode: 'AUTH_UPDATE_FAILED', message: authErr.message,
+        success: false,
+        errorCode: 'AUTH_UPDATE_FAILED',
+        message: 'Failed to update auth role.',
       });
     }
 
-    // 2. Update the users table.
-    const { error: dbErr } = await supabase
-      .from('users')
-      .update({ role: 'user', updated_at: now })
-      .eq('id', uid);
+    const { error: dbErr } = await withRetry(() =>
+      db
+        .from('users')
+        .update({
+          role: 'user',
+          updated_at: now,
+        })
+        .eq('id', uid)
+    );
 
     if (dbErr) {
-      logger.error('[Contributors] users table update failed after demotion', {
-        uid, error: dbErr.message,
+      logger.error(
+        '[Contributors] Mirror table sync failed after auth demote',
+        {
+          uid,
+          error: dbErr.message,
+        }
+      );
+
+      return res.status(207).json({
+        success: true,
+        warning:
+          `Auth metadata updated but database sync failed. ` +
+          `Manual reconciliation required for uid: ${uid}`,
+        data: {
+          uid,
+          role: 'user',
+        },
       });
     }
 
-    logger.info('[Contributors] Contributor demoted', { uid, adminUid });
+    logger.info('[Contributors] User demoted', {
+      uid,
+      demotedBy: actorId,
+    });
 
-    return res.json({ success: true, data: { uid, role: 'user' } });
+    return res.json({
+      success: true,
+      data: {
+        uid,
+        role: 'user',
+      },
+    });
   })
 );
 
 module.exports = router;
-
-
-
-
-
-
-
-

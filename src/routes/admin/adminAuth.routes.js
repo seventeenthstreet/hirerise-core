@@ -1,130 +1,260 @@
 'use strict';
 
 /**
- * adminAuth.routes.js — Admin Session Management
+ * src/routes/admin/adminAuth.routes.js
+ *
+ * Admin Session Management (Supabase-ready)
  *
  * Mount in server.js:
- *   app.use(`${API_PREFIX}/admin/auth`, authenticate, require('./routes/admin/adminAuth.routes'));
+ *   app.use(
+ *     `${API_PREFIX}/admin/auth`,
+ *     authenticate,
+ *     require('./routes/admin/adminAuth.routes')
+ *   );
  *
  * Endpoints:
- *   POST /admin/auth/session   → refresh admin session (call on every dashboard load)
- *   GET  /admin/auth/me        → get current admin principal info
- *   POST /admin/auth/grant     → MASTER_ADMIN grants admin access to a user
- *   POST /admin/auth/revoke    → MASTER_ADMIN revokes admin access
- *   GET  /admin/auth/principals → list all active admin principals
+ *   POST /session      → refresh admin session
+ *   GET  /me           → get current admin principal info
+ *   POST /grant        → MASTER_ADMIN grants admin access
+ *   POST /revoke       → MASTER_ADMIN revokes admin access
+ *   GET  /principals   → list all active admin principals
  *
- * This solves the "principal not found or session expired" 403 error.
- * Call POST /admin/auth/session on every admin dashboard load.
- * refreshSession() auto-provisions the Supabase record if it doesn't exist.
+ * Notes:
+ * - Session refresh should be called on every admin dashboard load
+ * - Repository layer handles Supabase persistence and upsert logic
+ * - No Firebase/Firestore dependencies remain
  */
 
 const express = require('express');
-const { body, param } = require('express-validator');
-const { validate }    = require('../../middleware/requestValidator');
+const { body } = require('express-validator');
+
+const { validate } = require('../../middleware/requestValidator');
 const { requireAdmin } = require('../../middleware/auth.middleware');
 const { asyncHandler } = require('../../utils/helpers');
 const adminPrincipalRepo = require('../../modules/admin/repository/adminPrincipal.repository');
 const logger = require('../../utils/logger');
 
 const router = express.Router();
-const SESSION_TTL_MS = 24 * 60 * 60 * 1000;
 
-function isMasterAdmin(req) {
-  return req.user?.role === 'MASTER_ADMIN' ||
-    (req.user?.roles ?? []).includes('MASTER_ADMIN');
+const SESSION_TTL_MS = 24 * 60 * 60 * 1000;
+const ALLOWED_ADMIN_ROLES = Object.freeze([
+  'admin',
+  'super_admin',
+  'MASTER_ADMIN',
+]);
+
+/**
+ * Resolve authenticated user identifier safely.
+ * Keeps backward compatibility with existing auth middleware
+ * while supporting Supabase-standard `id`.
+ */
+function getAuthenticatedUserId(req) {
+  return req.user?.uid ?? req.user?.id ?? null;
 }
 
-// ── POST /session — refresh session (call on every admin page load) ───────────
-// This auto-provisions the admin_principals record if it doesn't exist yet,
-// which fixes the "principal not found or session expired" 403 error.
-router.post('/session',
+/**
+ * Check whether current user is MASTER_ADMIN.
+ */
+function isMasterAdmin(req) {
+  const role = req.user?.role;
+  const roles = Array.isArray(req.user?.roles) ? req.user.roles : [];
+
+  return role === 'MASTER_ADMIN' || roles.includes('MASTER_ADMIN');
+}
+
+/**
+ * Standard unauthenticated response.
+ */
+function unauthenticated(res) {
+  return res.status(401).json({
+    success: false,
+    message: 'Unauthenticated',
+  });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// POST /session — refresh admin session
+// Auto-provisions principal row if missing
+// ─────────────────────────────────────────────────────────────────────────────
+router.post(
+  '/session',
   asyncHandler(async (req, res) => {
-    const uid = req.user?.uid;
-    if (!uid) return res.status(401).json({ success: false, message: 'Unauthenticated' });
+    const userId = getAuthenticatedUserId(req);
 
-    await adminPrincipalRepo.refreshSession(uid);
+    if (!userId) {
+      return unauthenticated(res);
+    }
 
-    logger.info('[AdminAuth] Session refreshed', { uid });
+    await adminPrincipalRepo.refreshSession(userId);
+
+    const expiresAt = new Date(Date.now() + SESSION_TTL_MS).toISOString();
+
+    logger.info('[AdminAuth] Session refreshed', {
+      userId,
+      route: '/admin/auth/session',
+    });
+
     return res.json({
-      success:   true,
-      message:   'Admin session refreshed',
-      uid,
-      expiresAt: new Date(Date.now() + SESSION_TTL_MS).toISOString(),
+      success: true,
+      message: 'Admin session refreshed',
+      uid: userId, // preserve API response compatibility
+      expiresAt,
     });
   })
 );
 
-// ── GET /me — current principal info ─────────────────────────────────────────
-router.get('/me',
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /me — current principal info
+// ─────────────────────────────────────────────────────────────────────────────
+router.get(
+  '/me',
   asyncHandler(async (req, res) => {
-    const uid = req.user?.uid;
-    if (!uid) return res.status(401).json({ success: false });
+    const userId = getAuthenticatedUserId(req);
 
-    const principal = await adminPrincipalRepo.verify(uid);
+    if (!userId) {
+      return unauthenticated(res);
+    }
+
+    const principal = await adminPrincipalRepo.verify(userId);
+
     return res.json({
-      success:      true,
-      data:         principal,
-      sessionValid: !!principal,
+      success: true,
+      data: principal,
+      sessionValid: Boolean(principal),
     });
   })
 );
 
-// ── POST /grant — MASTER_ADMIN grants admin access ────────────────────────────
-router.post('/grant',
+// ─────────────────────────────────────────────────────────────────────────────
+// POST /grant — MASTER_ADMIN grants admin access
+// ─────────────────────────────────────────────────────────────────────────────
+router.post(
+  '/grant',
   requireAdmin,
   validate([
-    body('uid').isString().trim().notEmpty().withMessage('uid is required'),
-    body('role').isIn(['admin', 'super_admin', 'MASTER_ADMIN'])
-      .withMessage('role must be admin, super_admin, or MASTER_ADMIN'),
+    body('uid')
+      .isString()
+      .trim()
+      .notEmpty()
+      .withMessage('uid is required'),
+
+    body('role')
+      .isIn(ALLOWED_ADMIN_ROLES)
+      .withMessage(
+        `role must be one of: ${ALLOWED_ADMIN_ROLES.join(', ')}`
+      ),
   ]),
   asyncHandler(async (req, res) => {
+    const actorId = getAuthenticatedUserId(req);
+
+    if (!actorId) {
+      return unauthenticated(res);
+    }
+
     if (!isMasterAdmin(req)) {
-      return res.status(403).json({ success: false, message: 'Only MASTER_ADMIN can grant admin access.' });
+      return res.status(403).json({
+        success: false,
+        message: 'Only MASTER_ADMIN can grant admin access.',
+      });
     }
 
     const { uid, role } = req.body;
-    await adminPrincipalRepo.grant(uid, role, req.user.uid);
 
-    logger.info('[AdminAuth] Access granted', { uid, role, grantedBy: req.user.uid });
-    return res.json({ success: true, message: `Admin access granted to ${uid} with role ${role}` });
+    await adminPrincipalRepo.grant(uid, role, actorId);
+
+    logger.info('[AdminAuth] Access granted', {
+      targetUserId: uid,
+      role,
+      grantedBy: actorId,
+    });
+
+    return res.json({
+      success: true,
+      message: `Admin access granted to ${uid} with role ${role}`,
+    });
   })
 );
 
-// ── POST /revoke — MASTER_ADMIN revokes admin access ─────────────────────────
-router.post('/revoke',
+// ─────────────────────────────────────────────────────────────────────────────
+// POST /revoke — MASTER_ADMIN revokes admin access
+// ─────────────────────────────────────────────────────────────────────────────
+router.post(
+  '/revoke',
   requireAdmin,
-  validate([body('uid').isString().trim().notEmpty().withMessage('uid is required')]),
+  validate([
+    body('uid')
+      .isString()
+      .trim()
+      .notEmpty()
+      .withMessage('uid is required'),
+  ]),
   asyncHandler(async (req, res) => {
-    if (!isMasterAdmin(req)) {
-      return res.status(403).json({ success: false, message: 'Only MASTER_ADMIN can revoke admin access.' });
-    }
-    if (req.body.uid === req.user.uid) {
-      return res.status(400).json({ success: false, message: 'Cannot revoke your own access.' });
+    const actorId = getAuthenticatedUserId(req);
+
+    if (!actorId) {
+      return unauthenticated(res);
     }
 
-    await adminPrincipalRepo.revoke(req.body.uid, req.user.uid);
-    return res.json({ success: true, message: `Admin access revoked for ${req.body.uid}` });
+    if (!isMasterAdmin(req)) {
+      return res.status(403).json({
+        success: false,
+        message: 'Only MASTER_ADMIN can revoke admin access.',
+      });
+    }
+
+    const targetUid = req.body.uid;
+
+    if (targetUid === actorId) {
+      return res.status(400).json({
+        success: false,
+        message: 'Cannot revoke your own access.',
+      });
+    }
+
+    await adminPrincipalRepo.revoke(targetUid, actorId);
+
+    logger.info('[AdminAuth] Access revoked', {
+      targetUserId: targetUid,
+      revokedBy: actorId,
+    });
+
+    return res.json({
+      success: true,
+      message: `Admin access revoked for ${targetUid}`,
+    });
   })
 );
 
-// ── GET /principals — list active principals ──────────────────────────────────
-router.get('/principals',
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /principals — list active principals
+// ─────────────────────────────────────────────────────────────────────────────
+router.get(
+  '/principals',
   requireAdmin,
   asyncHandler(async (req, res) => {
-    if (!isMasterAdmin(req)) {
-      return res.status(403).json({ success: false, message: 'Only MASTER_ADMIN can list principals.' });
+    const actorId = getAuthenticatedUserId(req);
+
+    if (!actorId) {
+      return unauthenticated(res);
     }
+
+    if (!isMasterAdmin(req)) {
+      return res.status(403).json({
+        success: false,
+        message: 'Only MASTER_ADMIN can list principals.',
+      });
+    }
+
     const principals = await adminPrincipalRepo.listActive();
-    return res.json({ success: true, data: { principals, total: principals.length } });
+
+    return res.json({
+      success: true,
+      data: {
+        principals,
+        total: principals.length,
+      },
+    });
   })
 );
 
 module.exports = router;
-
-
-
-
-
-
-
-

@@ -1,105 +1,164 @@
 'use strict';
 
 /**
- * skillRecommendations.routes.js
+ * routes/skillRecommendations.routes.js
  *
  * Mounted in server.js:
- *   app.use(`${API_PREFIX}/skills`, authenticate, require('./routes/skillRecommendations.routes'));
+ *   app.use(
+ *     `${API_PREFIX}/skills`,
+ *     authenticate,
+ *     require('./routes/skillRecommendations.routes')
+ *   );
  *
- * ┌────────────────────────────────────────────────────────────────────────────┐
- * │ Method │ Path                  │ Description                               │
- * ├────────────────────────────────────────────────────────────────────────────┤
- * │ GET    │ /recommendations      │ Get skill recs for authenticated user     │
- * │ POST   │ /add                  │ Add one or more skills to user profile    │
- * └────────────────────────────────────────────────────────────────────────────┘
+ * Endpoints:
+ *   GET  /recommendations
+ *   POST /add
  */
 
-const express      = require('express');
-const { body }     = require('express-validator');
+const express = require('express');
+const { body } = require('express-validator');
+
 const { validate } = require('../middleware/requestValidator');
 const { asyncHandler } = require('../utils/helpers');
 const { AppError, ErrorCodes } = require('../middleware/errorHandler');
-const { getSkillRecommendations, addSkillsToProfile } = require('../modules/skillDemand/skillRecommendations.service');
+const {
+  getSkillRecommendations,
+  addSkillsToProfile,
+} = require('../modules/skillDemand/skillRecommendations.service');
 const logger = require('../utils/logger');
 
 const router = express.Router();
 
-// ── GET /api/v1/skills/recommendations ────────────────────────────────────────
+const MAX_SKILLS_PER_REQUEST = 50;
+const MAX_SKILL_LENGTH = 100;
+
 /**
- * Returns personalised skill recommendations for the authenticated user.
- * Derives target role + current skills from CHI / userProfiles automatically.
- * No body required — uses req.user.uid from the authenticate middleware.
+ * Extract authenticated user ID in a provider-agnostic way.
  *
- * Response:
- *  { success: true, data: {
- *      missingSkills:    string[],
- *      recommendedSkills: { name, demandScore, matchScoreImpact }[],
- *      matchScore:       number,
- *      matchScoreImpact: number,
- *      targetRole:       string | null,
- *      hasTargetRole:    boolean,
- *      explanation:      string,
- *  }}
+ * Supports:
+ * - Supabase JWT middleware → req.user.id
+ * - normalized auth middleware → req.auth.userId
+ * - legacy compatibility → req.user.uid
+ *
+ * This safely removes Firebase-specific assumptions while
+ * preserving backward compatibility during rollout.
+ *
+ * @param {import('express').Request} req
+ * @returns {string}
  */
+function getAuthenticatedUserId(req) {
+  const userId =
+    req.user?.id ||
+    req.auth?.userId ||
+    req.user?.user_id ||
+    req.user?.uid; // legacy fallback during migration
+
+  if (!userId || typeof userId !== 'string') {
+    throw new AppError(
+      'Unauthorized',
+      401,
+      {},
+      ErrorCodes.UNAUTHORIZED,
+    );
+  }
+
+  return userId;
+}
+
+/**
+ * Normalize incoming skills:
+ * - trim whitespace
+ * - remove empty values
+ * - deduplicate case-insensitively
+ * - preserve original casing of first occurrence
+ *
+ * @param {string[]} skills
+ * @returns {string[]}
+ */
+function normalizeSkills(skills) {
+  if (!Array.isArray(skills)) return [];
+
+  const seen = new Set();
+  const normalized = [];
+
+  for (const rawSkill of skills) {
+    if (typeof rawSkill !== 'string') continue;
+
+    const skill = rawSkill.trim();
+    if (!skill) continue;
+
+    const key = skill.toLowerCase();
+    if (seen.has(key)) continue;
+
+    seen.add(key);
+    normalized.push(skill);
+  }
+
+  return normalized;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /api/v1/skills/recommendations
+// ─────────────────────────────────────────────────────────────────────────────
 router.get(
   '/recommendations',
   asyncHandler(async (req, res) => {
-    const userId = req.user?.uid;
-    if (!userId) {
-      throw new AppError('Unauthorized', 401, {}, ErrorCodes.UNAUTHORIZED);
-    }
+    const userId = getAuthenticatedUserId(req);
 
-    logger.info('[SkillRecommendations] GET /recommendations', { userId });
+    logger.info('[SkillRecommendations] Fetching recommendations', {
+      userId,
+      route: 'GET /recommendations',
+    });
 
     const data = await getSkillRecommendations(userId);
 
-    return res.json({ success: true, data });
+    return res.status(200).json({
+      success: true,
+      data,
+    });
   }),
 );
 
-// ── POST /api/v1/skills/add ────────────────────────────────────────────────────
-/**
- * Adds one or more skills to the authenticated user's profile.
- * Deduplicates — safe to call multiple times with the same skill names.
- *
- * Body: { skills: string[] }
- *
- * Response:
- *  { success: true, data: { added: number, skills: string[] } }
- */
+// ─────────────────────────────────────────────────────────────────────────────
+// POST /api/v1/skills/add
+// ─────────────────────────────────────────────────────────────────────────────
 router.post(
   '/add',
   validate([
     body('skills')
-      .isArray({ min: 1, max: 50 })
-      .withMessage('skills must be a non-empty array (max 50)'),
+      .isArray({ min: 1, max: MAX_SKILLS_PER_REQUEST })
+      .withMessage(
+        `skills must be a non-empty array (max ${MAX_SKILLS_PER_REQUEST})`,
+      ),
     body('skills.*')
-      .isString().trim().notEmpty()
+      .isString()
+      .withMessage('Each skill must be a string')
+      .trim()
+      .notEmpty()
       .withMessage('Each skill must be a non-empty string')
-      .isLength({ max: 100 })
-      .withMessage('Each skill name must be under 100 characters'),
+      .isLength({ max: MAX_SKILL_LENGTH })
+      .withMessage(
+        `Each skill name must be under ${MAX_SKILL_LENGTH} characters`,
+      ),
   ]),
   asyncHandler(async (req, res) => {
-    const userId = req.user?.uid;
-    if (!userId) {
-      throw new AppError('Unauthorized', 401, {}, ErrorCodes.UNAUTHORIZED);
-    }
+    const userId = getAuthenticatedUserId(req);
+    const normalizedSkills = normalizeSkills(req.body.skills);
 
-    const { skills } = req.body;
-    logger.info('[SkillRecommendations] POST /add', { userId, count: skills.length });
+    logger.info('[SkillRecommendations] Adding skills to profile', {
+      userId,
+      route: 'POST /add',
+      requestedCount: req.body.skills.length,
+      normalizedCount: normalizedSkills.length,
+    });
 
-    const result = await addSkillsToProfile(userId, skills);
+    const result = await addSkillsToProfile(userId, normalizedSkills);
 
-    return res.json({ success: true, data: result });
+    return res.status(200).json({
+      success: true,
+      data: result,
+    });
   }),
 );
 
 module.exports = router;
-
-
-
-
-
-
-
-

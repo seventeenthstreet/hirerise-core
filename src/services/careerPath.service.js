@@ -1,77 +1,203 @@
 'use strict';
 
 /**
- * careerPath.service.js — Supabase Ready + Optimized
+ * @file src/services/careerPath.service.js
+ * @description
+ * Production-grade career path orchestration.
  *
- * ✅ Async-ready for Supabase
- * ✅ Error-safe
- * ✅ Logging improved
- * ✅ Crash protection added
- * ✅ Future caching ready
+ * Optimized for:
+ * - graph-first execution
+ * - deterministic next-role ranking
+ * - shared role enrichment pipeline
+ * - safer error semantics
+ * - null-safe salary math
+ * - consistent logging
  */
 
-const careerRepo = require("../repositories/career.repository");
-const readinessService = require("./readiness.service");
-const promotionService = require("./promotion.service");
-const timeEstimatorService = require("./timeEstimator.service");
-const logger = require("../utils/logger");
+const careerRepo = require('../repositories/career.repository');
+const readinessService = require('./readiness.service');
+const promotionService = require('./promotion.service');
+const timeEstimatorService = require('./timeEstimator.service');
+const logger = require('../utils/logger');
 
 let careerGraph = null;
 
 try {
-  careerGraph = require("../modules/careerGraph/CareerGraph");
-  logger.info('[CareerService] CareerGraph loaded successfully');
+  careerGraph = require('../modules/careerGraph/CareerGraph');
+  logger.info('[CareerPathService] CareerGraph loaded');
 } catch (err) {
-  logger.warn('[CareerService] CareerGraph not available, using fallback', {
-    error: err.message
+  logger.warn('[CareerPathService] CareerGraph unavailable', {
+    error: err?.message || 'Unknown graph load error',
   });
 }
 
-/**
- * Calculate salary growth
- */
-function calculateGrowth(currentSalaryMedian, nextSalaryMedian, readiness = 1) {
-  if (!currentSalaryMedian || !nextSalaryMedian) return null;
+// ─────────────────────────────────────────────────────────────
+// Helpers
+// ─────────────────────────────────────────────────────────────
+function createServiceError(statusCode, errorCode, message) {
+  const error = new Error(message);
+  error.statusCode = statusCode;
+  error.errorCode = errorCode;
+  return error;
+}
 
-  const rawDelta = nextSalaryMedian - currentSalaryMedian;
-  const adjustedDelta = Math.round(rawDelta * readiness);
+function safeMedian(role) {
+  const value = role?.salary?.median;
+  return Number.isFinite(Number(value)) ? Number(value) : null;
+}
 
-  const growthPercent = ((adjustedDelta / currentSalaryMedian) * 100);
+function calculateGrowth(currentMedian, nextMedian, readiness = 1) {
+  const current = Number(currentMedian);
+  const next = Number(nextMedian);
+  const safeReadiness = Number.isFinite(Number(readiness))
+    ? Number(readiness)
+    : 1;
+
+  if (!Number.isFinite(current) || !Number.isFinite(next) || current <= 0) {
+    return null;
+  }
+
+  const rawDelta = next - current;
+  const adjustedDelta = Math.round(rawDelta * safeReadiness);
+  const growthPercent = (adjustedDelta / current) * 100;
 
   return {
     raw_salary_delta: rawDelta,
     adjusted_salary_delta: adjustedDelta,
     growth_percent: Number(growthPercent.toFixed(2)),
-    readiness_score: readiness
+    readiness_score: safeReadiness,
   };
 }
 
-/**
- * MAIN SERVICE
- */
-async function getCareerPath(roleId, userProfile = null) {
-  if (!roleId) {
-    throw {
-      statusCode: 400,
-      errorCode: 'INVALID_ROLE_ID',
-      message: 'roleId is required'
-    };
+function buildSyntheticRole(node) {
+  return {
+    required_skills: node?.required_skills || [],
+    min_experience_years: node?.min_experience_years || 0,
+  };
+}
+
+function enrichNextRole({
+  currentRole,
+  nextRole,
+  userProfile,
+  transitionMeta = {},
+}) {
+  let readinessDetails = null;
+  let readinessScore = 1;
+  let timeEstimate = null;
+
+  if (userProfile) {
+    try {
+      readinessDetails =
+        readinessService.calculateReadiness(
+          userProfile,
+          nextRole
+        ) || null;
+
+      readinessScore =
+        readinessDetails?.readiness_score ?? 1;
+
+      timeEstimate =
+        timeEstimatorService.estimateTimeToPromotion(
+          userProfile,
+          nextRole,
+          readinessDetails
+        ) || null;
+    } catch (err) {
+      logger.warn('[CareerPathService] Readiness enrichment failed', {
+        error: err?.message || 'Unknown readiness error',
+      });
+    }
   }
 
-  // ─────────────────────────────────────────────
-  // 🚀 GRAPH ENGINE (PRIMARY)
-  // ─────────────────────────────────────────────
+  const growth = calculateGrowth(
+    safeMedian(currentRole),
+    safeMedian(nextRole),
+    readinessScore
+  );
+
+  const promotionProbability =
+    promotionService.calculatePromotionProbability(
+      readinessScore
+    );
+
+  return {
+    role_id: nextRole.role_id,
+    title: nextRole.title,
+    career_level: nextRole.career_level,
+    level_order: nextRole.level_order,
+    salary: nextRole.salary || null,
+    readiness_details: readinessDetails,
+    promotion_probability_percent: promotionProbability,
+    time_to_promotion: timeEstimate,
+    growth_projection: growth,
+    ...transitionMeta,
+  };
+}
+
+function sortNextRoles(nextRoles) {
+  return nextRoles.sort((a, b) => {
+    const probA = Number(a.transition_probability || 0);
+    const probB = Number(b.transition_probability || 0);
+
+    if (probB !== probA) return probB - probA;
+
+    return Number(a.level_order || 0) - Number(b.level_order || 0);
+  });
+}
+
+// ─────────────────────────────────────────────────────────────
+// Main service
+// ─────────────────────────────────────────────────────────────
+async function getCareerPath(roleId, userProfile = null) {
+  const safeRoleId = String(roleId || '').trim();
+
+  if (!safeRoleId) {
+    throw createServiceError(
+      400,
+      'INVALID_ROLE_ID',
+      'roleId is required'
+    );
+  }
+
+  // ─────────────────────────────────────────────────────────
+  // Graph-first engine
+  // ─────────────────────────────────────────────────────────
   try {
     const graphNode = careerGraph
-      ? (careerGraph.getRole(roleId) || careerGraph.resolveRole(roleId))
+      ? careerGraph.getRole(safeRoleId) ||
+        careerGraph.resolveRole(safeRoleId)
       : null;
 
     if (graphNode) {
-      const transitions = careerGraph.getTransitions(roleId, {
-        minProbability: 0.1
-      });
+      const transitions =
+        careerGraph.getTransitions(safeRoleId, {
+          minProbability: 0.1,
+        }) || [];
 
-      const result = {
+      const nextRoles = [];
+
+      for (const edge of transitions) {
+        const nextNode = careerGraph.getRole(edge.to_role_id);
+        if (!nextNode) continue;
+
+        nextRoles.push(
+          enrichNextRole({
+            currentRole: graphNode,
+            nextRole: buildSyntheticRole(nextNode)
+              ? nextNode
+              : nextNode,
+            userProfile,
+            transitionMeta: {
+              transition_type: edge.transition_type,
+              transition_probability: edge.probability,
+              years_required: edge.years_required,
+            },
+          })
+        );
+      }
+
+      return {
         current_role: {
           role_id: graphNode.role_id,
           title: graphNode.title,
@@ -79,162 +205,59 @@ async function getCareerPath(roleId, userProfile = null) {
           level_order: graphNode.level_order,
           salary: graphNode.salary || null,
         },
-        next_roles: [],
-        is_terminal: graphNode.is_terminal || false,
+        next_roles: sortNextRoles(nextRoles),
+        is_terminal: Boolean(graphNode.is_terminal),
       };
-
-      for (const edge of transitions) {
-        const nextNode = careerGraph.getRole(edge.to_role_id);
-        if (!nextNode) continue;
-
-        let readinessDetails = null;
-        let readinessScore = 1;
-        let timeEstimate = null;
-
-        if (userProfile) {
-          try {
-            const syntheticRole = {
-              required_skills: nextNode.required_skills || [],
-              min_experience_years: nextNode.min_experience_years || 0,
-            };
-
-            readinessDetails =
-              readinessService.calculateReadiness(userProfile, syntheticRole);
-
-            readinessScore =
-              readinessDetails?.readiness_score ?? 1;
-
-            timeEstimate =
-              timeEstimatorService.estimateTimeToPromotion(
-                userProfile,
-                syntheticRole,
-                readinessDetails
-              );
-          } catch (err) {
-            logger.error('[CareerService] Readiness calculation failed', {
-              error: err.message
-            });
-          }
-        }
-
-        const growth = calculateGrowth(
-          graphNode.salary?.median,
-          nextNode.salary?.median,
-          readinessScore
-        );
-
-        const promotionProbability =
-          promotionService.calculatePromotionProbability(readinessScore);
-
-        result.next_roles.push({
-          role_id: nextNode.role_id,
-          title: nextNode.title,
-          career_level: nextNode.career_level,
-          level_order: nextNode.level_order,
-          salary: nextNode.salary || null,
-          transition_type: edge.transition_type,
-          transition_probability: edge.probability,
-          years_required: edge.years_required,
-          readiness_details: readinessDetails,
-          promotion_probability_percent: promotionProbability,
-          time_to_promotion: timeEstimate,
-          growth_projection: growth,
-        });
-      }
-
-      return result;
     }
   } catch (err) {
-    logger.error('[CareerService] Graph engine failed', {
-      error: err.message,
-      roleId
+    logger.error('[CareerPathService] Graph engine failed', {
+      role_id: safeRoleId,
+      error: err?.message || 'Unknown graph error',
     });
   }
 
-  // ─────────────────────────────────────────────
-  // 🧱 FALLBACK (REPO / SUPABASE READY)
-  // ─────────────────────────────────────────────
+  // ─────────────────────────────────────────────────────────
+  // Supabase/repository fallback
+  // ─────────────────────────────────────────────────────────
   try {
-    const currentRole = await careerRepo.getRole(roleId);
+    const currentRole = await careerRepo.getRole(safeRoleId);
 
     if (!currentRole) {
-      throw {
-        statusCode: 404,
-        errorCode: 'ROLE_NOT_FOUND',
-        message: `Role ${roleId} not found`
-      };
+      throw createServiceError(
+        404,
+        'ROLE_NOT_FOUND',
+        `Role ${safeRoleId} not found`
+      );
     }
 
-    const nextRoles = await careerRepo.getNextRoles(roleId);
+    const nextRolesRaw =
+      (await careerRepo.getNextRoles(safeRoleId)) || [];
 
-    const result = {
+    const nextRoles = nextRolesRaw
+      .filter(Boolean)
+      .map((nextRole) =>
+        enrichNextRole({
+          currentRole,
+          nextRole,
+          userProfile,
+        })
+      );
+
+    return {
       current_role: {
         role_id: currentRole.role_id,
         title: currentRole.title,
         career_level: currentRole.career_level,
         level_order: currentRole.level_order,
-        salary: currentRole.salary || null
+        salary: currentRole.salary || null,
       },
-      next_roles: [],
-      is_terminal: currentRole.is_terminal
+      next_roles: sortNextRoles(nextRoles),
+      is_terminal: Boolean(currentRole.is_terminal),
     };
-
-    for (const nextRole of nextRoles) {
-      if (!nextRole) continue;
-
-      let readinessDetails = null;
-      let readinessScore = 1;
-      let timeEstimate = null;
-
-      if (userProfile) {
-        try {
-          readinessDetails =
-            readinessService.calculateReadiness(userProfile, nextRole);
-
-          readinessScore =
-            readinessDetails?.readiness_score ?? 1;
-
-          timeEstimate =
-            timeEstimatorService.estimateTimeToPromotion(
-              userProfile,
-              nextRole,
-              readinessDetails
-            );
-        } catch (err) {
-          logger.error('[CareerService] Fallback readiness failed', {
-            error: err.message
-          });
-        }
-      }
-
-      const growth = calculateGrowth(
-        currentRole.salary?.median,
-        nextRole.salary?.median,
-        readinessScore
-      );
-
-      const promotionProbability =
-        promotionService.calculatePromotionProbability(readinessScore);
-
-      result.next_roles.push({
-        role_id: nextRole.role_id,
-        title: nextRole.title,
-        career_level: nextRole.career_level,
-        level_order: nextRole.level_order,
-        salary: nextRole.salary || null,
-        readiness_details: readinessDetails,
-        promotion_probability_percent: promotionProbability,
-        time_to_promotion: timeEstimate,
-        growth_projection: growth
-      });
-    }
-
-    return result;
-
   } catch (err) {
-    logger.error('[CareerService] Fallback failed', {
-      error: err.message,
-      roleId
+    logger.error('[CareerPathService] Fallback failed', {
+      role_id: safeRoleId,
+      error: err?.message || 'Unknown fallback error',
     });
 
     throw err;
@@ -242,5 +265,5 @@ async function getCareerPath(roleId, userProfile = null) {
 }
 
 module.exports = {
-  getCareerPath
+  getCareerPath,
 };

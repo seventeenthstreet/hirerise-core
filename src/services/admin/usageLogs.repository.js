@@ -1,16 +1,30 @@
 'use strict';
 
 /**
- * usageLogs.repository.js — FULLY FIXED (Production Safe)
+ * src/services/admin/usageLogs.repository.js
+ * Production-ready Supabase-native repository
  */
 
-const { supabase } = require('../../config/supabase'); // ✅ FIXED
+const { supabase } = require('../../config/supabase');
 
-const TABLE = 'usage_logs'; // ✅ FIXED
+const TABLE = 'usage_logs';
 const DOC_LIMIT = 10_000;
+const BATCH_INSERT_SIZE = 500;
+
+const SELECT_COLUMNS = `
+  user_id,
+  feature,
+  tier,
+  model,
+  input_tokens,
+  output_tokens,
+  total_tokens,
+  cost_usd,
+  revenue_usd,
+  created_at
+`;
 
 class UsageLogsRepository {
-
   // ─────────────────────────────────────────
   async logUsage({
     userId,
@@ -20,92 +34,137 @@ class UsageLogsRepository {
     inputTokens,
     outputTokens,
     costUSD,
-    revenueUSD
+    revenueUSD,
   }) {
     try {
-      const totalTokens = inputTokens + outputTokens;
-      const marginUSD = parseFloat((revenueUSD - costUSD).toFixed(8));
-      const createdAt = new Date().toISOString();
+      const row = this._buildInsertRow({
+        userId,
+        feature,
+        tier,
+        model,
+        inputTokens,
+        outputTokens,
+        costUSD,
+        revenueUSD,
+      });
 
       const { data, error } = await supabase
         .from(TABLE)
-        .insert([{
-          user_id: userId,                // ✅ FIXED
-          feature,
-          tier,
-          model,
-          input_tokens: inputTokens,      // ✅ FIXED
-          output_tokens: outputTokens,    // ✅ FIXED
-          total_tokens: totalTokens,      // ✅ FIXED
-          cost_usd: costUSD,              // ✅ FIXED
-          revenue_usd: revenueUSD,        // ✅ FIXED
-          margin_usd: marginUSD,          // ✅ FIXED
-          created_at: createdAt           // ✅ FIXED
-        }])
+        .insert([row])
         .select('id')
-        .maybeSingle(); // ✅ FIXED
+        .maybeSingle();
 
-      if (error) throw error;
+      if (error) {
+        throw new Error(`Insert failed: ${error.message}`);
+      }
 
       return data?.id ?? null;
-
-    } catch (err) {
-      console.error('[UsageLogsRepository] Failed to write log:', err?.message);
+    } catch (error) {
+      console.error('[UsageLogsRepository.logUsage]', error);
       return null;
     }
   }
 
   // ─────────────────────────────────────────
-  async batchWriteLogs(entries) {
+  async batchWriteLogs(entries = []) {
+    if (!Array.isArray(entries) || entries.length === 0) {
+      return;
+    }
 
-    const chunks = this._chunk(entries, 500);
+    const chunks = this._chunk(entries, BATCH_INSERT_SIZE);
 
     for (const chunk of chunks) {
-      const createdAt = new Date().toISOString();
-
-      const rows = chunk.map(params => {
-        const totalTokens = params.inputTokens + params.outputTokens;
-
-        return {
-          user_id: params.userId,
-          feature: params.feature,
-          tier: params.tier,
-          model: params.model,
-          input_tokens: params.inputTokens,
-          output_tokens: params.outputTokens,
-          total_tokens: totalTokens,
-          cost_usd: params.costUSD,
-          revenue_usd: params.revenueUSD,
-          margin_usd: parseFloat((params.revenueUSD - params.costUSD).toFixed(8)),
-          created_at: createdAt
-        };
-      });
+      const rows = chunk.map((entry) => this._buildInsertRow(entry));
 
       const { error } = await supabase
         .from(TABLE)
         .insert(rows);
 
-      if (error) throw error;
+      if (error) {
+        throw new Error(
+          `[UsageLogsRepository.batchWriteLogs] Insert failed: ${error.message}`
+        );
+      }
     }
   }
 
   // ─────────────────────────────────────────
   async getByDateRange(startDate, endDate) {
+    const startISO =
+      startDate instanceof Date ? startDate.toISOString() : startDate;
 
-    const startISO = startDate instanceof Date ? startDate.toISOString() : startDate;
-    const endISO = endDate instanceof Date ? endDate.toISOString() : endDate;
+    const endISO =
+      endDate instanceof Date ? endDate.toISOString() : endDate;
 
     const { data, error } = await supabase
       .from(TABLE)
-      .select('*')
-      .gte('created_at', startISO) // ✅ FIXED
-      .lte('created_at', endISO)   // ✅ FIXED
-      .order('created_at', { ascending: true }) // ✅ FIXED
+      .select(SELECT_COLUMNS)
+      .gte('created_at', startISO)
+      .lte('created_at', endISO)
+      .order('created_at', { ascending: true })
       .limit(DOC_LIMIT);
 
-    if (error) throw error;
+    if (error) {
+      throw new Error(
+        `[UsageLogsRepository.getByDateRange] Query failed: ${error.message}`
+      );
+    }
 
-    const rows = (data ?? []).map(row => ({
+    const rows = (data ?? []).map((row) => this._mapRow(row));
+
+    return {
+      rows,
+      docCount: rows.length,
+      capped: rows.length >= DOC_LIMIT,
+    };
+  }
+
+  // ─────────────────────────────────────────
+  async getTotalUserCount() {
+    const { count, error } = await supabase
+      .from('users')
+      .select('*', { count: 'exact', head: true });
+
+    if (error) {
+      throw new Error(
+        `[UsageLogsRepository.getTotalUserCount] Count failed: ${error.message}`
+      );
+    }
+
+    return count ?? 0;
+  }
+
+  // ─────────────────────────────────────────
+  _buildInsertRow({
+    userId,
+    feature,
+    tier,
+    model,
+    inputTokens = 0,
+    outputTokens = 0,
+    costUSD = 0,
+    revenueUSD = 0,
+  }) {
+    const totalTokens = inputTokens + outputTokens;
+
+    return {
+      user_id: userId,
+      feature,
+      tier,
+      model,
+      input_tokens: inputTokens,
+      output_tokens: outputTokens,
+      total_tokens: totalTokens,
+      cost_usd: costUSD,
+      revenue_usd: revenueUSD,
+      margin_usd: Number((revenueUSD - costUSD).toFixed(8)),
+      created_at: new Date().toISOString(),
+    };
+  }
+
+  // ─────────────────────────────────────────
+  _mapRow(row) {
+    return {
       userId: row.user_id,
       feature: row.feature,
       tier: row.tier,
@@ -115,40 +174,24 @@ class UsageLogsRepository {
       totalTokens: row.total_tokens ?? 0,
       costUSD: row.cost_usd ?? 0,
       revenueUSD: row.revenue_usd ?? 0,
-      date: row.created_at ? row.created_at.split('T')[0] : ''
-    }));
-
-    return {
-      rows,
-      docCount: rows.length,
-      capped: rows.length >= DOC_LIMIT
+      date: row.created_at
+        ? row.created_at.split('T')[0]
+        : '',
     };
-  }
-
-  // ─────────────────────────────────────────
-  async getTotalUserCount() {
-
-    const { count, error } = await supabase
-      .from('users')
-      .select('*', { count: 'exact', head: true });
-
-    if (error) throw error;
-
-    return count ?? 0;
   }
 
   // ─────────────────────────────────────────
   _chunk(arr, size) {
     const chunks = [];
+
     for (let i = 0; i < arr.length; i += size) {
       chunks.push(arr.slice(i, i + size));
     }
+
     return chunks;
   }
 }
 
-const usageLogsRepository = new UsageLogsRepository();
-
 module.exports = {
-  usageLogsRepository
+  usageLogsRepository: new UsageLogsRepository(),
 };

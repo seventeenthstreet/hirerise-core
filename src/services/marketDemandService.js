@@ -1,366 +1,307 @@
 'use strict';
 
 /**
- * marketDemandService.js
+ * @file src/services/marketDemandService.js
+ * @description
+ * Supabase-native labor market demand signal service.
  *
- * Fetches labor market demand signals from configured external APIs.
- * Credentials are retrieved ONLY from Secret Manager — never from Supabase
- * or environment variables that could be logged.
- *
- * Supported providers:
- *   - Adzuna     (App ID + App Key)
- *   - SerpAPI    (API Key + search engine)
- *   - Custom API (Base URL + API Key + Auth Type)
- *
- * Output signals stored in Supabase table: role_market_demand
- *   { role, country, job_postings, salary_median, growth_rate, remote_ratio, fetchedAt, provider }
- *
- * @module services/marketDemandService
+ * Fixes applied:
+ * - fetchMarketDemand row: 'role' → 'role_id', 'fetchedAt' → 'updated_at'
+ * - fetchMarketDemand row: removed 'provider' (column does not exist)
+ * - getProviderStatus select/order: 'fetchedAt' → 'updated_at'
+ * - getProviderStatus return: 'lastSync' now reads data.updated_at
+ * - buildSignalId remains unchanged (used as row id only)
  */
 
 const { getSecret } = require('../modules/secrets');
 const { supabase } = require('../config/supabase');
 const logger = require('../utils/logger');
 
-// ─── Constants ────────────────────────────────────────────────────────────────
-
-const COLLECTION = 'role_market_demand';
+const TABLE_NAME = 'role_market_demand';
 const ADZUNA_BASE_URL = 'https://api.adzuna.com/v1/api/jobs';
 const SERPAPI_BASE_URL = 'https://serpapi.com/search';
+const FETCH_TIMEOUT_MS = 15000;
 
-// ─── Internal helpers ─────────────────────────────────────────────────────────
-
-/**
- * Retrieve credentials from Secret Manager and return provider config.
- * NEVER logs or serializes the returned credentials.
- */
-async function _getProviderConfig() {
-  let provider;
-  try {
-    provider = await getSecret('MARKET_API_PROVIDER');
-  } catch {
-    throw Object.assign(
-      new Error('Market API provider not configured. Please set MARKET_API_PROVIDER in Secret Manager.'),
-      { statusCode: 503, code: 'MARKET_API_NOT_CONFIGURED' }
-    );
-  }
-
-  provider = provider.trim().toLowerCase();
-
-  if (provider === 'adzuna') {
-    const [appId, appKey, country] = await Promise.all([
-      getSecret('MARKET_API_APP_ID'),
-      getSecret('MARKET_API_APP_KEY'),
-      getSecret('MARKET_API_COUNTRY').catch(() => 'in'), // default: India
-    ]);
-    return { provider: 'adzuna', appId, appKey, country: country.trim().toLowerCase() };
-  }
-
-  if (provider === 'serpapi') {
-    const [apiKey, searchEngine] = await Promise.all([
-      getSecret('MARKET_API_APP_KEY'),
-      getSecret('MARKET_API_SEARCH_ENGINE').catch(() => 'google_jobs_listing'),
-    ]);
-    return { provider: 'serpapi', apiKey, searchEngine };
-  }
-
-  if (provider === 'custom') {
-    const [baseUrl, apiKey, authType] = await Promise.all([
-      getSecret('MARKET_API_BASE_URL'),
-      getSecret('MARKET_API_APP_KEY'),
-      getSecret('MARKET_API_AUTH_TYPE').catch(() => 'bearer'),
-    ]);
-    return { provider: 'custom', baseUrl, apiKey, authType: authType.trim().toLowerCase() };
-  }
-
-  throw Object.assign(new Error(`Unknown market API provider: ${provider}`), {
-    statusCode: 400,
-    code: 'INVALID_PROVIDER',
-  });
+function normalizeCountry(country = 'in') {
+  return String(country || 'in').trim().toLowerCase();
 }
 
-/**
- * Fetch from Adzuna API.
- * Docs: https://developer.adzuna.com/activedocs
- */
-async function _fetchFromAdzuna(config, role, country) {
-  const targetCountry = country || config.country || 'in';
-  const query = encodeURIComponent(role);
-  const url =
-    `${ADZUNA_BASE_URL}/${targetCountry}/search/1` +
-    `?app_id=${encodeURIComponent(config.appId)}` +
-    `&app_key=${encodeURIComponent(config.appKey)}` +
-    `&results_per_page=10` +
-    `&what=${query}` +
-    `&content-type=application/json`;
+function buildSignalId(role, country) {
+  const safeRole = String(role)
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '_')
+    .replace(/^_+|_+$/g, '');
 
-  const res = await fetch(url, {
-    headers: { Accept: 'application/json' },
-    signal: AbortSignal.timeout(15_000),
+  return `${safeRole}_${normalizeCountry(country)}`;
+}
+
+async function fetchJson(url, options = {}) {
+  const response = await fetch(url, {
+    ...options,
+    signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
   });
 
-  if (!res.ok) {
-    const body = await res.text().catch(() => '');
-    throw Object.assign(
-      new Error(`Adzuna API error: ${res.status} ${res.statusText}. ${body}`),
-      { statusCode: res.status >= 500 ? 502 : 400, code: 'ADZUNA_API_ERROR' }
+  if (!response.ok) {
+    const body = await response.text().catch(() => '');
+    const error = new Error(
+      `API error ${response.status}: ${body.slice(0, 500)}`
     );
+    error.statusCode = response.status >= 500 ? 502 : 400;
+    throw error;
   }
 
-  const data = await res.json();
+  return response.json();
+}
 
-  // Extract signals from Adzuna response
-  const jobPostings = data.count ?? data.results?.length ?? 0;
-  const results = data.results ?? [];
+async function getProviderConfig() {
+  const provider = (
+    await getSecret('MARKET_API_PROVIDER')
+  ).trim().toLowerCase();
+
+  switch (provider) {
+    case 'adzuna': {
+      const [appId, appKey, country] = await Promise.all([
+        getSecret('MARKET_API_APP_ID'),
+        getSecret('MARKET_API_APP_KEY'),
+        getSecret('MARKET_API_COUNTRY').catch(() => 'in'),
+      ]);
+
+      return {
+        provider,
+        appId,
+        appKey,
+        country: normalizeCountry(country),
+      };
+    }
+
+    case 'serpapi': {
+      const [apiKey, searchEngine] = await Promise.all([
+        getSecret('MARKET_API_APP_KEY'),
+        getSecret('MARKET_API_SEARCH_ENGINE').catch(
+          () => 'google_jobs_listing'
+        ),
+      ]);
+
+      return {
+        provider,
+        apiKey,
+        searchEngine,
+      };
+    }
+
+    case 'custom': {
+      const [baseUrl, apiKey, authType] = await Promise.all([
+        getSecret('MARKET_API_BASE_URL'),
+        getSecret('MARKET_API_APP_KEY'),
+        getSecret('MARKET_API_AUTH_TYPE').catch(() => 'bearer'),
+      ]);
+
+      return {
+        provider,
+        baseUrl: baseUrl.replace(/\/$/, ''),
+        apiKey,
+        authType: String(authType).trim().toLowerCase(),
+      };
+    }
+
+    default:
+      throw new Error(`Unknown market provider: ${provider}`);
+  }
+}
+
+async function fetchFromAdzuna(config, role, country) {
+  const targetCountry = normalizeCountry(country || config.country);
+  const url = new URL(
+    `${ADZUNA_BASE_URL}/${targetCountry}/search/1`
+  );
+
+  url.searchParams.set('app_id', config.appId);
+  url.searchParams.set('app_key', config.appKey);
+  url.searchParams.set('results_per_page', '10');
+  url.searchParams.set('what', role);
+  url.searchParams.set('content-type', 'application/json');
+
+  const data = await fetchJson(url.toString(), {
+    headers: { Accept: 'application/json' },
+  });
+
+  const results = Array.isArray(data?.results) ? data.results : [];
   const salaryValues = results
     .filter((r) => r.salary_min && r.salary_max)
     .map((r) => (r.salary_min + r.salary_max) / 2);
-  const salaryMedian = salaryValues.length
-    ? Math.round(salaryValues.reduce((a, b) => a + b, 0) / salaryValues.length)
-    : null;
+
   const remoteCount = results.filter(
     (r) =>
       r.description?.toLowerCase().includes('remote') ||
       r.title?.toLowerCase().includes('remote')
   ).length;
-  const remoteRatio = results.length ? +(remoteCount / results.length).toFixed(2) : 0;
 
   return {
-    job_postings: jobPostings,
-    salary_median: salaryMedian,
-    growth_rate: null, // Adzuna doesn't provide growth rate directly
-    remote_ratio: remoteRatio,
-    raw_count: jobPostings,
+    job_postings: data?.count ?? results.length,
+    growth_rate: null,
+    remote_ratio: results.length
+      ? +(remoteCount / results.length).toFixed(2)
+      : 0,
   };
 }
 
-/**
- * Fetch from SerpAPI Google Jobs.
- * Docs: https://serpapi.com/google-jobs-api
- */
-async function _fetchFromSerpAPI(config, role, country) {
-  const countryCode = country || 'in';
-  const query = encodeURIComponent(`${role} ${countryCode.toUpperCase()}`);
-  const url =
-    `${SERPAPI_BASE_URL}` +
-    `?engine=${encodeURIComponent(config.searchEngine || 'google_jobs_listing')}` +
-    `&q=${query}` +
-    `&api_key=${encodeURIComponent(config.apiKey)}` +
-    `&hl=en` +
-    `&gl=${countryCode}`;
+async function fetchFromSerpAPI(config, role, country) {
+  const targetCountry = normalizeCountry(country);
+  const url = new URL(SERPAPI_BASE_URL);
 
-  const res = await fetch(url, {
+  url.searchParams.set(
+    'engine',
+    config.searchEngine || 'google_jobs_listing'
+  );
+  url.searchParams.set('q', `${role} ${targetCountry.toUpperCase()}`);
+  url.searchParams.set('api_key', config.apiKey);
+  url.searchParams.set('hl', 'en');
+  url.searchParams.set('gl', targetCountry);
+
+  const data = await fetchJson(url.toString(), {
     headers: { Accept: 'application/json' },
-    signal: AbortSignal.timeout(15_000),
   });
 
-  if (!res.ok) {
-    const body = await res.text().catch(() => '');
-    throw Object.assign(
-      new Error(`SerpAPI error: ${res.status} ${res.statusText}. ${body}`),
-      { statusCode: res.status >= 500 ? 502 : 400, code: 'SERPAPI_ERROR' }
-    );
-  }
+  const jobs = Array.isArray(data?.jobs_results)
+    ? data.jobs_results
+    : [];
 
-  const data = await res.json();
-  const jobs = data.jobs_results ?? [];
-  const count = jobs.length;
-
-  // Extract salary hints from job descriptions
-  const salaryPattern = /[\$₹£€]?\s*(\d[\d,]+)\s*(?:k|K|lpa|LPA)?/g;
-  const salaries = [];
-  jobs.forEach((j) => {
-    const text = [j.title, j.description, j.salary].filter(Boolean).join(' ');
-    let m;
-    while ((m = salaryPattern.exec(text)) !== null) {
-      const val = parseFloat(m[1].replace(/,/g, ''));
-      if (val > 1000 && val < 10_000_000) salaries.push(val);
-    }
-  });
-  const salaryMedian = salaries.length
-    ? Math.round(salaries.sort((a, b) => a - b)[Math.floor(salaries.length / 2)])
-    : null;
   const remoteCount = jobs.filter(
-    (j) =>
-      j.detected_extensions?.work_from_home ||
-      j.description?.toLowerCase().includes('remote')
+    (job) =>
+      job.detected_extensions?.work_from_home ||
+      job.description?.toLowerCase().includes('remote')
   ).length;
 
   return {
-    job_postings: count,
-    salary_median: salaryMedian,
+    job_postings: jobs.length,
     growth_rate: null,
-    remote_ratio: count ? +(remoteCount / count).toFixed(2) : 0,
-    raw_count: count,
+    remote_ratio: jobs.length
+      ? +(remoteCount / jobs.length).toFixed(2)
+      : 0,
   };
 }
 
-/**
- * Fetch from a Custom API.
- * Assumes the API returns JSON with job listings.
- */
-async function _fetchFromCustomAPI(config, role, country) {
-  const query = encodeURIComponent(role);
-  const baseUrl = config.baseUrl.replace(/\/$/, '');
-  const url = `${baseUrl}?q=${query}&country=${country || 'in'}`;
+async function fetchFromCustomAPI(config, role, country) {
+  const targetCountry = normalizeCountry(country);
+  const url = new URL(config.baseUrl);
+
+  url.searchParams.set('q', role);
+  url.searchParams.set('country', targetCountry);
 
   const headers = { Accept: 'application/json' };
+
   if (config.authType === 'bearer') {
-    headers['Authorization'] = `Bearer ${config.apiKey}`;
+    headers.Authorization = `Bearer ${config.apiKey}`;
   } else if (config.authType === 'apikey') {
     headers['X-API-Key'] = config.apiKey;
-  } else if (config.authType === 'basic') {
-    headers['Authorization'] = `Basic ${Buffer.from(`:${config.apiKey}`).toString('base64')}`;
   }
 
-  const res = await fetch(url, {
-    headers,
-    signal: AbortSignal.timeout(15_000),
-  });
+  const data = await fetchJson(url.toString(), { headers });
 
-  if (!res.ok) {
-    const body = await res.text().catch(() => '');
-    throw Object.assign(
-      new Error(`Custom API error: ${res.status} ${res.statusText}. ${body}`),
-      { statusCode: res.status >= 500 ? 502 : 400, code: 'CUSTOM_API_ERROR' }
-    );
-  }
-
-  const data = await res.json();
   const count =
-    data.count ?? data.total ?? data.results?.length ?? data.jobs?.length ?? 0;
+    data?.count ??
+    data?.total ??
+    data?.results?.length ??
+    data?.jobs?.length ??
+    0;
 
   return {
     job_postings: count,
-    salary_median: data.salary_median ?? null,
-    growth_rate: data.growth_rate ?? null,
-    remote_ratio: data.remote_ratio ?? 0,
-    raw_count: count,
+    growth_rate: data?.growth_rate ?? null,
+    remote_ratio: data?.remote_ratio ?? 0,
   };
 }
 
-// ─── Public API ───────────────────────────────────────────────────────────────
-
-/**
- * fetchMarketDemand(role, country)
- *
- * Main entry point. Retrieves credentials from Secret Manager,
- * calls the configured API, and stores results in Supabase.
- *
- * @param {string} role    — e.g. "Software Engineer"
- * @param {string} country — ISO 2-letter code, e.g. "in" for India
- * @returns {Promise<MarketDemandSignal>}
- */
-async function fetchMarketDemand(role, country = 'in') {
-  if (!role || typeof role !== 'string') {
-    throw Object.assign(new Error('role is required'), { statusCode: 400 });
-  }
-
-  const config = await _getProviderConfig();
-  let signals;
-
-  logger.info('[MarketDemand] Fetching demand signals', {
-    provider: config.provider,
-    role,
-    country,
-  });
-
+async function fetchProviderSignals(config, role, country) {
   switch (config.provider) {
     case 'adzuna':
-      signals = await _fetchFromAdzuna(config, role, country);
-      break;
+      return fetchFromAdzuna(config, role, country);
     case 'serpapi':
-      signals = await _fetchFromSerpAPI(config, role, country);
-      break;
+      return fetchFromSerpAPI(config, role, country);
     case 'custom':
-      signals = await _fetchFromCustomAPI(config, role, country);
-      break;
+      return fetchFromCustomAPI(config, role, country);
     default:
       throw new Error(`Unhandled provider: ${config.provider}`);
   }
+}
 
-  const docId = `${role.toLowerCase().replace(/\s+/g, '_')}_${country}`;
+async function fetchMarketDemand(role, country = 'in') {
+  if (!role || typeof role !== 'string') {
+    throw new Error('role is required');
+  }
 
-  const record = {
-    id: docId,
-    role,
-    country,
+  const normalizedCountry = normalizeCountry(country);
+  const config = await getProviderConfig();
+
+  logger.info('[MarketDemand] Fetching signals', {
     provider: config.provider,
-    job_postings: signals.job_postings,
-    salary_median: signals.salary_median,
-    growth_rate: signals.growth_rate,
-    remote_ratio: signals.remote_ratio,
-    fetchedAt: new Date().toISOString(),
+    role,
+    country: normalizedCountry,
+  });
+
+  const signals = await fetchProviderSignals(
+    config,
+    role,
+    normalizedCountry
+  );
+
+  const now = new Date().toISOString();
+
+  const row = {
+    id: buildSignalId(role, normalizedCountry),
+    role_id: role,              // Fix: was 'role' (column does not exist)
+    country: normalizedCountry,
+    // removed: provider       // Fix: column does not exist in role_market_demand
+    ...signals,
+    updated_at: now,            // Fix: was 'fetchedAt' (column does not exist)
+    last_updated: now,          // kept: exists as text column
   };
 
-  // Store in Supabase — processed signals only, never credentials
-  // upsert merges on id so re-fetching a role/country updates the existing row
   const { error } = await supabase
-    .from(COLLECTION)
-    .upsert([record]);
+    .from(TABLE_NAME)
+    .upsert(row, { onConflict: 'id' });
 
   if (error) {
-    logger.warn('[MarketDemand] Failed to store signals in Supabase (non-fatal)', {
-      docId,
+    logger.warn('[MarketDemand] Durable write failed', {
+      id: row.id,
       error: error.message,
-    });
-  } else {
-    logger.info('[MarketDemand] Signals stored', {
-      docId,
-      job_postings: record.job_postings,
-      provider: config.provider,
     });
   }
 
-  return record;
+  return row;
 }
 
-/**
- * testConnection()
- *
- * Fires a test query ("Software Engineer India") and returns
- * connection health + sample output.
- *
- * @returns {Promise<{ success: boolean, provider: string, job_postings: number, message: string }>}
- */
 async function testConnection() {
-  const config = await _getProviderConfig();
-  const result = await fetchMarketDemand('Software Engineer', 'in');
+  const config = await getProviderConfig();
+  const result = await fetchMarketDemand(
+    'Software Engineer',
+    'in'
+  );
+
   return {
     success: true,
     provider: config.provider,
     job_postings: result.job_postings,
-    salary_median: result.salary_median,
-    message: `Connection Successful. Job postings detected: ${result.job_postings.toLocaleString()}`,
+    message: `Connection successful. Job postings: ${result.job_postings.toLocaleString()}`,
   };
 }
 
-/**
- * getProviderStatus()
- *
- * Returns the configured provider name and last sync time — safe for API responses.
- * Credentials are NEVER included.
- *
- * @returns {Promise<{ provider: string|null, lastSync: string|null, isConfigured: boolean }>}
- */
 async function getProviderStatus() {
   try {
     const provider = await getSecret('MARKET_API_PROVIDER');
 
-    // Find last sync from Supabase
-    const { data, error } = await supabase
-      .from(COLLECTION)
-      .select('fetchedAt')
-      .order('fetchedAt', { ascending: false })
+    const { data } = await supabase
+      .from(TABLE_NAME)
+      .select('updated_at')                          // Fix: was 'fetchedAt'
+      .order('updated_at', { ascending: false })     // Fix: was 'fetchedAt'
       .limit(1)
       .maybeSingle();
-
-    const lastSync = (!error && data) ? data.fetchedAt : null;
 
     return {
       provider: provider.trim(),
       isConfigured: true,
-      lastSync,
+      lastSync: data?.updated_at || null,            // Fix: was data?.fetchedAt
     };
   } catch {
     return {

@@ -1,63 +1,65 @@
 'use strict';
 
 /**
- * routes/careerPrediction.routes.js
+ * modules/education-intelligence/routes/careerPrediction.routes.js
  *
  * Education Intelligence — Career Success Probability Engine routes.
  *
- * Mounted in server.js alongside existing education routes:
- *   app.use(`${API_PREFIX}/education`, authenticate,
- *     require('./modules/education-intelligence/routes/careerPrediction.routes'));
- *
- * Endpoints:
- *   POST /api/v1/education/career-prediction/:studentId
- *     → Run CSPE, store + return ranked top_careers
- *
- *   GET  /api/v1/education/career-prediction/:studentId
- *     → Return previously stored predictions (no re-run)
+ * Mounted at:
+ * /api/v1/education
  */
 
 const { Router } = require('express');
+const { param } = require('express-validator');
+
 const controller = require('../controllers/careerPrediction.controller');
+const { validate } = require('../../../middleware/requestValidator');
+const { asyncHandler } = require('../../../utils/helpers');
 
 const router = Router();
 
+// ─────────────────────────────────────────────────────────────
+// Constants
+// ─────────────────────────────────────────────────────────────
+const MAX_STUDENT_ID_LENGTH = 100;
+
+// ─────────────────────────────────────────────────────────────
+// Validation
+// ─────────────────────────────────────────────────────────────
+const studentIdValidation = [
+  param('studentId')
+    .isString()
+    .trim()
+    .notEmpty()
+    .isLength({ max: MAX_STUDENT_ID_LENGTH })
+    .matches(/^[A-Za-z0-9_-]+$/)
+    .withMessage(
+      `studentId must be 1-${MAX_STUDENT_ID_LENGTH} chars and contain only letters, numbers, underscores, or hyphens`
+    ),
+];
+
+// ─────────────────────────────────────────────────────────────
+// Routes
+// ─────────────────────────────────────────────────────────────
+
 /**
  * POST /api/v1/education/career-prediction/:studentId
- *
- * Runs the Career Success Probability Engine for a student and
- * returns the top 5 ranked careers with probability scores.
- *
- * Response 200:
- * {
- *   success: true,
- *   data: {
- *     top_careers: [
- *       { career: "Software Engineer",  probability: 82 },
- *       { career: "AI / ML Engineer",   probability: 78 },
- *       { career: "Data Scientist",     probability: 74 },
- *       { career: "Systems Architect",  probability: 70 },
- *       { career: "Cybersecurity Specialist", probability: 67 }
- *     ]
- *   }
- * }
+ * Run CSPE, persist, and return ranked top careers.
  */
-router.post('/career-prediction/:studentId', controller.predictCareers);
+router.post(
+  '/career-prediction/:studentId',
+  validate(studentIdValidation),
+  asyncHandler(controller.predictCareers)
+);
 
 /**
  * GET /api/v1/education/career-prediction/:studentId
- *
- * Returns previously stored career predictions.
- * Response 404 if no predictions exist.
+ * Return previously stored predictions.
  */
-router.get('/career-prediction/:studentId', controller.getCareers);
+router.get(
+  '/career-prediction/:studentId',
+  validate(studentIdValidation),
+  asyncHandler(controller.getCareers)
+);
 
 module.exports = router;
-
-
-
-
-
-
-
-

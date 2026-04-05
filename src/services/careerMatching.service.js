@@ -1,46 +1,63 @@
 'use strict';
 
 /**
- * careerMatching.service.js — PRODUCTION SAFE VERSION
+ * @file src/services/careerMatching.service.js
+ * @description
+ * Production-safe CHI scoring + role matching service.
  *
- * Improvements:
- *  - Pagination (no 200 row cap issue)
- *  - Optimized queries (select only needed fields)
- *  - Safe merging of activity_events + ava_memory
- *  - Normalized skill comparison
- *  - Clean loop performance
- *  - Ready for Redis caching (optional hook included)
+ * Optimized for:
+ * - snake_case Supabase schema
+ * - stronger null safety
+ * - deterministic ordering
+ * - safer upserts
+ * - reusable normalization helpers
+ * - lower overfetch
+ *
+ * Schema fixes applied:
+ * - domain_id resolved via cms_job_families (not directly on cms_roles)
+ * - removed camelCase fallbacks — schema is fully snake_case
+ * - market_demand, required_skills, experience_min/max now exist on cms_roles
  */
 
 const logger = require('../utils/logger');
 const careerGraph = require('../modules/careerGraph/CareerGraph');
 const { supabase } = require('../config/supabase');
 
-// OPTIONAL: plug Redis here if available
-// const redis = require('../config/redis');
+// ─────────────────────────────────────────────────────────────
+// Helpers
+// ─────────────────────────────────────────────────────────────
+function normalizeSkills(skills) {
+  return new Set(
+    (Array.isArray(skills) ? skills : [])
+      .map((s) => String(s).toLowerCase().trim())
+      .filter(Boolean)
+  );
+}
+
+function safeNumber(value, fallback = 0) {
+  const num = Number(value);
+  return Number.isFinite(num) ? num : fallback;
+}
+
+function clamp(value, min, max) {
+  return Math.min(max, Math.max(min, value));
+}
 
 // ─────────────────────────────────────────────────────────────
-// Learning Progress (Robust + Accurate)
+// Learning Progress
 // ─────────────────────────────────────────────────────────────
-
 async function computeLearningProgress(userId) {
-  if (!userId) return 0;
+  const safeUserId = String(userId || '').trim();
+  if (!safeUserId) return 0;
 
   try {
-    const cacheKey = `learning_progress:${userId}`;
-
-    // ── Optional Cache Layer ──
-    /*
-    const cached = await redis.get(cacheKey);
-    if (cached) return JSON.parse(cached);
-    */
-
-    const thirtyDaysAgo = new Date(Date.now() - 30 * 86400000).toISOString();
+    const thirtyDaysAgo = new Date(
+      Date.now() - 30 * 86400000
+    ).toISOString();
 
     let skillsAdded = 0;
     let coursesStarted = 0;
 
-    // ── Pagination (NO DATA LOSS) ──
     let from = 0;
     const pageSize = 500;
 
@@ -48,67 +65,62 @@ async function computeLearningProgress(userId) {
       const { data, error } = await supabase
         .from('activity_events')
         .select('event_type')
-        .eq('user_id', userId)
+        .eq('user_id', safeUserId)
         .gte('created_at', thirtyDaysAgo)
+        .in('event_type', ['skill_added', 'course_started'])
+        .order('created_at', { ascending: false })
         .range(from, from + pageSize - 1);
 
       if (error) throw error;
-      if (!data || data.length === 0) break;
+      if (!data?.length) break;
 
-      for (const { event_type } of data) {
-        if (event_type === 'skill_added') skillsAdded++;
-        else if (event_type === 'course_started') coursesStarted++;
+      for (const row of data) {
+        if (row.event_type === 'skill_added') skillsAdded += 1;
+        else if (row.event_type === 'course_started') coursesStarted += 1;
       }
 
       if (data.length < pageSize) break;
       from += pageSize;
     }
 
-    // ── Ava Memory (Supplementary Signal) ──
     try {
-      const { data: avaRows, error: avaError } = await supabase
+      const { data, error } = await supabase
         .from('ava_memory')
         .select('skills_added')
-        .eq('user_id', userId)
-        .limit(1);
+        .eq('user_id', safeUserId)
+        .limit(1)
+        .maybeSingle();
 
-      if (!avaError && avaRows && avaRows.length > 0) {
-        const weekly = avaRows[0]?.skills_added ?? 0;
+      if (!error && data) {
+        const weekly = safeNumber(data.skills_added, 0);
         const estimatedMonthly = Math.round(weekly * 2);
-
-        // Merge signals safely (not override)
         skillsAdded += Math.round(estimatedMonthly * 0.5);
       }
     } catch (_) {
-      // Non-blocking
+      // intentionally non-blocking
     }
 
-    // ── Compute Score ──
-    const skillComponent = Math.min(1, skillsAdded / 5) * 50;
-    const courseComponent = Math.min(1, coursesStarted / 3) * 50;
+    const skillComponent = clamp(skillsAdded / 5, 0, 1) * 50;
+    const courseComponent = clamp(coursesStarted / 3, 0, 1) * 50;
 
     const result = Math.round(
-      Math.min(100, Math.max(0, skillComponent + courseComponent))
+      clamp(skillComponent + courseComponent, 0, 100)
     );
 
     logger.debug('[CareerMatching] Learning progress computed', {
-      userId,
-      skillsAdded,
-      coursesStarted,
-      learningProgress: result
+      user_id: safeUserId,
+      skills_added: skillsAdded,
+      courses_started: coursesStarted,
+      learning_progress: result,
     });
-
-    // ── Cache Result (optional) ──
-    /*
-    await redis.set(cacheKey, JSON.stringify(result), 'EX', 300);
-    */
 
     return result;
   } catch (err) {
     logger.warn('[CareerMatching] computeLearningProgress failed', {
-      userId,
-      error: err.message
+      user_id: safeUserId,
+      error: err?.message || 'Unknown progress error',
     });
+
     return 0;
   }
 }
@@ -116,49 +128,49 @@ async function computeLearningProgress(userId) {
 // ─────────────────────────────────────────────────────────────
 // Role Scoring
 // ─────────────────────────────────────────────────────────────
+function calculateRoleScore(profile = {}, role = {}, learningProgress = 0) {
+  const profileSkills = normalizeSkills(profile.skills);
 
-function calculateRoleScore(profile, role, learningProgress = 0) {
-  const profileSkills = new Set(
-    (profile.skills ?? []).map(s => s.toLowerCase().trim())
-  );
+  // Schema is fully snake_case — no camelCase fallbacks needed
+  const requiredSkills = (
+    Array.isArray(role.required_skills) ? role.required_skills : []
+  )
+    .map((s) => String(s).toLowerCase().trim())
+    .filter(Boolean);
 
-  const requiredSkills = (role.requiredSkills || role.required_skills || [])
-    .map(s => s.toLowerCase().trim());
-
-  // ── Skill Match ──
   let skillMatch = 0;
+
   if (requiredSkills.length > 0) {
-    const matched = requiredSkills.filter(s => profileSkills.has(s)).length;
+    const matched = requiredSkills.filter((s) =>
+      profileSkills.has(s)
+    ).length;
+
     skillMatch = Math.round((matched / requiredSkills.length) * 100);
   }
 
-  // ── Experience Fit ──
-  const years = profile.experienceYears ?? 0;
-  const expMin = role.experienceMin ?? role.experience_min ?? 0;
-  const expMax = role.experienceMax ?? role.experience_max ?? 20;
+  const years = safeNumber(profile.experience_years, 0);
+  const expMin = safeNumber(role.experience_min, 0);
+  const expMax = safeNumber(role.experience_max, 20);
 
   let experienceFit = 0;
+
   if (years >= expMin && years <= expMax) {
     experienceFit = 100;
   } else if (years < expMin) {
-    experienceFit = Math.max(0, 100 - (expMin - years) * 20);
+    experienceFit = clamp(100 - (expMin - years) * 20, 0, 100);
   } else {
-    experienceFit = Math.max(0, 100 - (years - expMax) * 10);
+    experienceFit = clamp(100 - (years - expMax) * 10, 0, 100);
   }
 
-  // ── Market Demand ──
-  const rawDemand = role.marketDemand ?? role.market_demand ?? 5;
-  const marketDemand = Math.min(100, Math.round((rawDemand / 10) * 100));
+  const rawDemand = safeNumber(role.market_demand, 5);
+  const marketDemand = clamp(Math.round((rawDemand / 10) * 100), 0, 100);
+  const safeLearning = clamp(learningProgress, 0, 100);
 
-  // ── Learning Progress ──
-  const safeLearning = Math.min(100, Math.max(0, learningProgress));
-
-  // ── CHI Score ──
   const chiScore = Math.round(
-    skillMatch * 0.40 +
-    experienceFit * 0.30 +
-    marketDemand * 0.20 +
-    safeLearning * 0.10
+    skillMatch * 0.4 +
+      experienceFit * 0.3 +
+      marketDemand * 0.2 +
+      safeLearning * 0.1
   );
 
   return {
@@ -168,68 +180,114 @@ function calculateRoleScore(profile, role, learningProgress = 0) {
     learningProgress: safeLearning,
     chiScore,
     insights: {
-      missingSkills: requiredSkills.filter(s => !profileSkills.has(s)),
-      experienceGap: years < expMin ? expMin - years : 0
-    }
+      missingSkills: requiredSkills.filter((s) => !profileSkills.has(s)),
+      experienceGap: years < expMin ? expMin - years : 0,
+    },
   };
+}
+
+// ─────────────────────────────────────────────────────────────
+// Domain → job family ID resolution
+// cms_roles has no domain_id column directly —
+// domain maps via cms_roles.job_family_id → cms_job_families.domain_id
+// ─────────────────────────────────────────────────────────────
+async function resolveFamilyIdsForDomain(domainId) {
+  const { data, error } = await supabase
+    .from('cms_job_families')
+    .select('id')
+    .eq('domain_id', domainId)
+    .eq('soft_deleted', false);
+
+  if (error) {
+    logger.error('[CareerMatching] resolveFamilyIdsForDomain failed', {
+      domain_id: domainId,
+      error: error.message,
+    });
+    return null;
+  }
+
+  return (data ?? []).map((f) => f.id);
 }
 
 // ─────────────────────────────────────────────────────────────
 // Role Matching
 // ─────────────────────────────────────────────────────────────
-
-async function matchCareerRoles(profile, domainId, { limit = 10 } = {}) {
+async function matchCareerRoles(profile = {}, domainId, { limit = 10 } = {}) {
   try {
+    const safeLimit = clamp(Number(limit) || 10, 1, 50);
+
     const learningProgress = profile.userId
       ? await computeLearningProgress(profile.userId)
       : 0;
+
+    // Resolve domainId → job_family_ids
+    // domain_id does not exist on cms_roles — must join via cms_job_families
+    let familyIds = null;
+    if (domainId) {
+      familyIds = await resolveFamilyIdsForDomain(domainId);
+
+      if (!familyIds) {
+        // Resolution errored — fail gracefully
+        return [];
+      }
+
+      if (!familyIds.length) {
+        // Valid domain but no families assigned — nothing to match
+        logger.debug('[CareerMatching] No job families found for domain', {
+          domain_id: domainId,
+        });
+        return [];
+      }
+    }
 
     let query = supabase
       .from('cms_roles')
       .select(`
         id,
+        name,
         required_skills,
         experience_min,
         experience_max,
         market_demand
       `)
-      .eq('softDeleted', false)
-      .eq('status', 'active');
+      .eq('soft_deleted', false)
+      .eq('status', 'active')
+      .order('market_demand', { ascending: false });
 
-    if (domainId) {
-      query = query.eq('domainId', domainId);
+    if (familyIds) {
+      query = query.in('job_family_id', familyIds);
     }
 
     const { data, error } = await query;
     if (error) throw error;
 
-    const roles = data ?? [];
+    const roles = Array.isArray(data) ? data : [];
 
-    const scored = roles.map(role => ({
-      role,
-      scores: calculateRoleScore(profile, role, learningProgress)
-    }));
+    const scored = roles
+      .map((role) => ({
+        role,
+        scores: calculateRoleScore(profile, role, learningProgress),
+      }))
+      .sort((a, b) => b.scores.chiScore - a.scores.chiScore)
+      .slice(0, safeLimit)
+      .map((item, idx) => ({
+        ...item,
+        rank: idx + 1,
+      }));
 
-    // Sort by CHI score
-    scored.sort((a, b) => b.scores.chiScore - a.scores.chiScore);
-
-    return scored.slice(0, limit).map((item, idx) => ({
-      ...item,
-      rank: idx + 1
-    }));
-
+    return scored;
   } catch (err) {
     logger.error('[CareerMatchingService] matchCareerRoles failed', {
-      error: err.message
+      error: err?.message || 'Unknown matching error',
     });
+
     return [];
   }
 }
 
 // ─────────────────────────────────────────────────────────────
-// CHI Score Persistence
+// CHI persistence
 // ─────────────────────────────────────────────────────────────
-
 async function saveChiScore(userId, roleId, breakdown) {
   try {
     const payload = {
@@ -241,19 +299,19 @@ async function saveChiScore(userId, roleId, breakdown) {
       market_demand: breakdown.marketDemand,
       learning_progress: breakdown.learningProgress,
       chi_score: breakdown.chiScore,
-      last_updated: new Date().toISOString()
+      last_updated: new Date().toISOString(),
     };
 
     const { error } = await supabase
       .from('chi_scores')
-      .upsert([payload]);
+      .upsert(payload, { onConflict: 'id' });
 
     if (error) throw error;
 
     return { id: payload.id };
   } catch (err) {
     logger.error('[CareerMatchingService] saveChiScore failed', {
-      error: err.message
+      error: err?.message || 'Unknown save error',
     });
     throw err;
   }
@@ -263,7 +321,17 @@ async function getChiScore(userId, roleId) {
   try {
     const { data, error } = await supabase
       .from('chi_scores')
-      .select('*')
+      .select(`
+        id,
+        user_id,
+        role_id,
+        skill_match,
+        experience_fit,
+        market_demand,
+        learning_progress,
+        chi_score,
+        last_updated
+      `)
       .eq('id', `${userId}_${roleId}`)
       .maybeSingle();
 
@@ -271,20 +339,22 @@ async function getChiScore(userId, roleId) {
     return data ?? null;
   } catch (err) {
     logger.error('[CareerMatchingService] getChiScore failed', {
-      error: err.message
+      error: err?.message || 'Unknown fetch error',
     });
+
     return null;
   }
 }
 
 // ─────────────────────────────────────────────────────────────
-// Graph-Based CHI (Advanced)
+// Graph-based CHI
 // ─────────────────────────────────────────────────────────────
+function computeGraphCHIForRole(profile = {}) {
+  if (!profile.targetRoleId && !profile.targetRoleName) {
+    return null;
+  }
 
-function computeGraphCHIForRole(profile) {
-  if (!profile?.targetRoleId && !profile?.targetRoleName) return null;
-
-  let p = { ...profile };
+  const p = { ...profile };
 
   if (!p.targetRoleId && p.targetRoleName) {
     const node = careerGraph.resolveRole(p.targetRoleName);
@@ -307,5 +377,5 @@ module.exports = {
   matchCareerRoles,
   saveChiScore,
   getChiScore,
-  computeGraphCHIForRole
+  computeGraphCHIForRole,
 };

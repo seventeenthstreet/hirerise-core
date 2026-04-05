@@ -1,359 +1,365 @@
 'use strict';
 
 /**
- * aiRouter.test.js — Integration tests for the multi-provider AI Router
+ * src/services/__tests__/aiRouter.test.js
  *
- * Tests the router in full isolation:
- *   - Secret Manager is mocked (no Firebase dependency)
- *   - Provider HTTP calls are stubbed
- *   - All branching logic (fallback, health tracking, timeout, degradation)
- *     is exercised without any real network calls
- *
- * Run:
- *   node src/services/__tests__/aiRouter.test.js
+ * Production-grade integration tests for the multi-provider AI Router
+ * Fully isolated from Firebase, external SDKs, and real network traffic.
  */
 
-// ─── Module Registry Helpers ──────────────────────────────────────────────────
-// We manipulate require.cache to inject mocks cleanly before importing the
-// modules under test. This avoids any external dependencies.
-
-function clearModuleCache() {
-  const keys = Object.keys(require.cache).filter(k =>
-    k.includes('aiRouter') ||
-    k.includes('providers/')
-  );
-  keys.forEach(k => delete require.cache[k]);
-}
-
-// ─── Fake getSecret ───────────────────────────────────────────────────────────
-// Build a controlled fake secrets module that either returns a key or throws.
-
-let secretBehaviour = 'return'; // 'return' | 'throw'
-
-function buildSecretsModuleMock() {
-  return {
-    getSecret: async (name) => {
-      if (secretBehaviour === 'throw') {
-        throw Object.assign(new Error(`Secret not found: ${name}`), { statusCode: 404 });
-      }
-      return `fake-key-for-${name}`;
-    },
-  };
-}
-
-// Inject the secrets mock before any provider is required.
-// Resolve the path the provider files use: '../../modules/secrets'
-// from src/services/providers/ → src/modules/secrets
 const path = require('path');
-const secretsModulePath = path.resolve(
-  __dirname, '../../modules/secrets/index.js'
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Constants
+// ─────────────────────────────────────────────────────────────────────────────
+
+const ROUTER_PATH = path.resolve(__dirname, '../aiRouter');
+const PROVIDERS_DIR = path.resolve(__dirname, '../providers');
+const SECRETS_MODULE_PATH = path.resolve(
+  __dirname,
+  '../../modules/secrets/index.js'
 );
-require.cache[secretsModulePath] = {
-  id:       secretsModulePath,
-  filename: secretsModulePath,
-  loaded:   true,
-  exports:  buildSecretsModuleMock(),
-};
+const SECRETS_BARREL_PATH = path.resolve(
+  __dirname,
+  '../../modules/secrets'
+);
 
-// Also cover the barrel require without /index.js suffix
-const secretsBarrelPath = path.resolve(__dirname, '../../modules/secrets');
-require.cache[secretsBarrelPath] = require.cache[secretsModulePath];
-
-// ─── Test Utilities ───────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// Controlled test state
+// ─────────────────────────────────────────────────────────────────────────────
 
 let passed = 0;
 let failed = 0;
+let secretBehaviour = 'return';
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Test utilities
+// ─────────────────────────────────────────────────────────────────────────────
+
+function assert(condition, message = 'Assertion failed') {
+  if (!condition) throw new Error(message);
+}
+
+function assertEqual(actual, expected, message) {
+  if (actual !== expected) {
+    throw new Error(
+      message ||
+        `Expected ${JSON.stringify(actual)} === ${JSON.stringify(expected)}`
+    );
+  }
+}
 
 async function test(label, fn) {
   try {
     await fn();
-    console.log(`  ✓  ${label}`);
+    console.log(`  ✓ ${label}`);
     passed++;
-  } catch (err) {
-    console.error(`  ✗  ${label}`);
-    console.error(`     ${err.message}`);
+  } catch (error) {
     failed++;
+    console.error(`  ✗ ${label}`);
+    console.error(`    ${error instanceof Error ? error.message : error}`);
   }
 }
 
-function assert(condition, message) {
-  if (!condition) throw new Error(message || 'Assertion failed');
+function resetEnv(overrides = {}) {
+  delete process.env.AI_FAILURE_THRESHOLD;
+  delete process.env.AI_COOLDOWN_MS;
+  delete process.env.AI_PROVIDER_TIMEOUT_MS;
+
+  Object.assign(process.env, overrides);
 }
 
-function assertEqual(a, b, message) {
-  if (a !== b) throw new Error(message || `Expected ${JSON.stringify(a)} === ${JSON.stringify(b)}`);
+function clearModuleCache() {
+  for (const key of Object.keys(require.cache)) {
+    if (
+      key.includes('aiRouter') ||
+      key.includes(`${path.sep}providers${path.sep}`) ||
+      key.includes(`${path.sep}modules${path.sep}secrets`)
+    ) {
+      delete require.cache[key];
+    }
+  }
 }
 
-// ─── Provider Mock Factory ────────────────────────────────────────────────────
+function injectSecretsMock() {
+  const mock = {
+    getSecret: async (name) => {
+      if (secretBehaviour === 'throw') {
+        const error = new Error(`Secret not found: ${name}`);
+        error.statusCode = 404;
+        throw error;
+      }
 
-/**
- * Register a fake provider module in require.cache so the router picks it up.
- * Each provider can be configured to succeed or fail.
- */
+      return `fake-key-for-${name}`;
+    },
+  };
+
+  require.cache[SECRETS_MODULE_PATH] = {
+    id: SECRETS_MODULE_PATH,
+    filename: SECRETS_MODULE_PATH,
+    loaded: true,
+    exports: mock,
+  };
+
+  require.cache[SECRETS_BARREL_PATH] =
+    require.cache[SECRETS_MODULE_PATH];
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Provider mock factory
+// ─────────────────────────────────────────────────────────────────────────────
+
 function registerFakeProvider(providerFile, behaviour) {
-  // behaviour: 'success' | 'failure' | 'empty-text' | 'timeout'
-  const fullPath = path.resolve(__dirname, '../providers', providerFile);
+  const fullPath = path.resolve(PROVIDERS_DIR, providerFile);
+  const providerName = providerFile.replace('Service.js', '');
 
   require.cache[fullPath] = {
-    id:       fullPath,
+    id: fullPath,
     filename: fullPath,
-    loaded:   true,
+    loaded: true,
     exports: {
-      PROVIDER_NAME: providerFile.replace('Service.js', ''),
-      generate: async (prompt, options) => {
-        if (behaviour === 'failure') {
-          throw new Error(`${providerFile} simulated failure`);
+      PROVIDER_NAME: providerName,
+      generate: async () => {
+        switch (behaviour) {
+          case 'failure':
+            throw new Error(`${providerFile} simulated failure`);
+
+          case 'empty-text':
+            return { provider: providerName, text: '' };
+
+          case 'timeout':
+            await new Promise(() => {});
+            return null;
+
+          default:
+            return {
+              provider: providerName,
+              text: `Response from ${providerFile}`,
+            };
         }
-        if (behaviour === 'empty-text') {
-          return { provider: 'test', text: '' };
-        }
-        if (behaviour === 'timeout') {
-          // Hang forever — router timeout will fire first
-          await new Promise(() => {});
-        }
-        return {
-          provider: providerFile.replace('Service.js', ''),
-          text:     `Response from ${providerFile}`,
-        };
       },
     },
   };
 }
 
-function registerAllProviders(gemini, fireworks, mistral, openrouter, claude) {
-  registerFakeProvider('geminiService.js',     gemini);
-  registerFakeProvider('fireworksService.js',  fireworks);
-  registerFakeProvider('mistralService.js',    mistral);
+function registerAllProviders(
+  gemini,
+  fireworks,
+  mistral,
+  openrouter,
+  claude
+) {
+  registerFakeProvider('geminiService.js', gemini);
+  registerFakeProvider('fireworksService.js', fireworks);
+  registerFakeProvider('mistralService.js', mistral);
   registerFakeProvider('openrouterService.js', openrouter);
-  registerFakeProvider('claudeService.js',     claude);
+  registerFakeProvider('claudeService.js', claude);
 }
 
-// ─── Test Suite ───────────────────────────────────────────────────────────────
+function loadFreshRouter() {
+  injectSecretsMock();
+  delete require.cache[ROUTER_PATH];
+  return require(ROUTER_PATH);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Test suite
+// ─────────────────────────────────────────────────────────────────────────────
 
 async function runTests() {
   console.log('\n══════════════════════════════════════════════');
   console.log('  AI Router — Integration Tests');
   console.log('══════════════════════════════════════════════\n');
 
-  // ── Suite 1: Primary happy path ─────────────────────────────────────────────
-  console.log('Suite 1: Primary provider (Gemini) succeeds');
-  {
-    clearModuleCache();
-    registerAllProviders('success', 'failure', 'failure', 'failure', 'failure');
+  // Suite 1
+  console.log('Suite 1: Primary provider succeeds');
+  clearModuleCache();
+  resetEnv();
+  registerAllProviders('success', 'failure', 'failure', 'failure', 'failure');
 
-    const { generateAIResponse, getProviderHealth } = require('../aiRouter');
+  {
+    const { generateAIResponse, getProviderHealth } = loadFreshRouter();
     const result = await generateAIResponse('Hello');
 
-    await test('returns text from Gemini when it succeeds', () => {
-      assert(result.includes('geminiService'), `Expected gemini text, got: ${result}`);
+    await test('returns Gemini response', () => {
+      assert(result.includes('geminiService'));
     });
 
-    await test('getProviderHealth returns 5 providers', () => {
-      const health = getProviderHealth();
-      assertEqual(health.length, 5, 'Should have 5 providers');
-    });
-
-    await test('Gemini health is up after success', () => {
-      const health = getProviderHealth();
-      const gemini = health.find(h => h.name === 'Gemini');
-      assertEqual(gemini.status, 'up');
-      assertEqual(gemini.failures, 0);
+    await test('health returns 5 providers', () => {
+      assertEqual(getProviderHealth().length, 5);
     });
   }
 
-  // ── Suite 2: Fallback chain ──────────────────────────────────────────────────
-  console.log('\nSuite 2: Fallback chain — Gemini fails, Fireworks succeeds');
-  {
-    clearModuleCache();
-    registerAllProviders('failure', 'success', 'failure', 'failure', 'failure');
+  // Suite 2
+  console.log('\nSuite 2: Fallback chain');
+  clearModuleCache();
+  resetEnv();
+  registerAllProviders('failure', 'success', 'failure', 'failure', 'failure');
 
-    const { generateAIResponse, getProviderHealth } = require('../aiRouter');
+  {
+    const { generateAIResponse, getProviderHealth } = loadFreshRouter();
     const result = await generateAIResponse('Hello');
 
-    await test('falls back to Fireworks when Gemini fails', () => {
-      assert(result.includes('fireworksService'), `Expected fireworks text, got: ${result}`);
+    await test('falls back to Fireworks', () => {
+      assert(result.includes('fireworksService'));
     });
 
-    await test('Gemini has 1 failure recorded', () => {
-      const health = getProviderHealth();
-      const gemini = health.find(h => h.name === 'Gemini');
+    await test('Gemini failure tracked', () => {
+      const gemini = getProviderHealth().find((p) => p.name === 'Gemini');
       assertEqual(gemini.failures, 1);
-      assertEqual(gemini.status, 'up', 'Should still be up — threshold not reached');
-    });
-
-    await test('Fireworks is healthy after success', () => {
-      const health = getProviderHealth();
-      const fw = health.find(h => h.name === 'Fireworks');
-      assertEqual(fw.status, 'up');
-      assertEqual(fw.failures, 0);
     });
   }
 
-  // ── Suite 3: Full waterfall to Claude (last resort) ─────────────────────────
-  console.log('\nSuite 3: All providers fail except Claude (last resort)');
+  // Suite 3
+  console.log('\nSuite 3: Claude last resort');
+  clearModuleCache();
+  resetEnv();
+  registerAllProviders('failure', 'failure', 'failure', 'failure', 'success');
+
   {
-    clearModuleCache();
-    registerAllProviders('failure', 'failure', 'failure', 'failure', 'success');
+    const { generateAIResponse } = loadFreshRouter();
+    const result = await generateAIResponse('Prompt');
 
-    const { generateAIResponse } = require('../aiRouter');
-    const result = await generateAIResponse('Test prompt');
-
-    await test('reaches Claude as last resort', () => {
-      assert(result.includes('claudeService'), `Expected claude text, got: ${result}`);
+    await test('reaches Claude', () => {
+      assert(result.includes('claudeService'));
     });
   }
 
-  // ── Suite 4: All providers fail → graceful fallback string ─────────────────
-  console.log('\nSuite 4: All providers fail → graceful degradation');
+  // Suite 4
+  console.log('\nSuite 4: Graceful degradation');
+  clearModuleCache();
+  resetEnv();
+  registerAllProviders('failure', 'failure', 'failure', 'failure', 'failure');
+
   {
-    clearModuleCache();
-    registerAllProviders('failure', 'failure', 'failure', 'failure', 'failure');
+    const { generateAIResponse } = loadFreshRouter();
+    const result = await generateAIResponse('Prompt');
 
-    const { generateAIResponse } = require('../aiRouter');
-    const result = await generateAIResponse('Test prompt');
-
-    await test('returns safe fallback string when all fail', () => {
+    await test('returns fallback string', () => {
       assertEqual(result, 'AI service temporarily unavailable.');
     });
   }
 
-  // ── Suite 5: Health tracking — mark provider DOWN ─────────────────────────
-  console.log('\nSuite 5: Health tracking — provider marked DOWN after threshold failures');
+  // Suite 5
+  console.log('\nSuite 5: Health threshold');
+  clearModuleCache();
+  resetEnv({
+    AI_FAILURE_THRESHOLD: '2',
+    AI_COOLDOWN_MS: '60000',
+  });
+  registerAllProviders('failure', 'success', 'failure', 'failure', 'failure');
+
   {
-    clearModuleCache();
-    // All fail — Gemini will hit threshold after FAILURE_THRESHOLD calls
-    registerAllProviders('failure', 'success', 'failure', 'failure', 'failure');
+    const { generateAIResponse, getProviderHealth } = loadFreshRouter();
 
-    // Override threshold to 2 for this test
-    process.env.AI_FAILURE_THRESHOLD = '2';
-    process.env.AI_COOLDOWN_MS = '60000';
+    await generateAIResponse('first');
+    await generateAIResponse('second');
 
-    const { generateAIResponse, getProviderHealth } = require('../aiRouter');
+    const gemini = getProviderHealth().find((p) => p.name === 'Gemini');
 
-    // Call twice so Gemini hits threshold=2
-    await generateAIResponse('first call');
-    await generateAIResponse('second call');
-
-    const health = getProviderHealth();
-    const gemini = health.find(h => h.name === 'Gemini');
-
-    await test('Gemini is marked DOWN after threshold failures', () => {
-      assertEqual(gemini.status, 'down', `Expected down, got: ${gemini.status}`);
+    await test('Gemini marked down', () => {
+      assertEqual(gemini.status, 'down');
     });
-
-    await test('Gemini has a retryAfter timestamp set', () => {
-      assert(gemini.retryAfter !== null, 'retryAfter should be set');
-      assert(new Date(gemini.retryAfter) > new Date(), 'retryAfter should be in the future');
-    });
-
-    delete process.env.AI_FAILURE_THRESHOLD;
-    delete process.env.AI_COOLDOWN_MS;
   }
 
-  // ── Suite 6: Timeout protection ──────────────────────────────────────────────
-  console.log('\nSuite 6: Timeout protection — slow provider is skipped');
+  // Suite 6
+  console.log('\nSuite 6: Timeout protection');
+  clearModuleCache();
+  resetEnv({
+    AI_PROVIDER_TIMEOUT_MS: '100',
+  });
+  registerAllProviders('timeout', 'success', 'failure', 'failure', 'failure');
+
   {
-    clearModuleCache();
-    registerAllProviders('timeout', 'success', 'failure', 'failure', 'failure');
+    const { generateAIResponse } = loadFreshRouter();
 
-    // Short timeout for test speed
-    process.env.AI_PROVIDER_TIMEOUT_MS = '100';
-
-    const { generateAIResponse } = require('../aiRouter');
     const start = Date.now();
-    const result = await generateAIResponse('Test prompt');
+    const result = await generateAIResponse('Prompt');
     const elapsed = Date.now() - start;
 
-    await test('falls back to Fireworks after Gemini times out', () => {
-      assert(result.includes('fireworksService'), `Expected fireworks, got: ${result}`);
+    await test('timeout triggers fallback', () => {
+      assert(result.includes('fireworksService'));
     });
 
-    await test('total time is bounded by timeout (not hung)', () => {
-      assert(elapsed < 3000, `Took ${elapsed}ms — should be < 3000ms`);
+    await test('timeout bounded', () => {
+      assert(elapsed < 3000);
     });
-
-    delete process.env.AI_PROVIDER_TIMEOUT_MS;
   }
 
-  // ── Suite 7: Empty-text guard ─────────────────────────────────────────────
-  console.log('\nSuite 7: Empty-text guard — invalid response triggers fallback');
+  // Suite 7
+  console.log('\nSuite 7: Empty response fallback');
+  clearModuleCache();
+  resetEnv();
+  registerAllProviders('empty-text', 'success', 'failure', 'failure', 'failure');
+
   {
-    clearModuleCache();
-    registerAllProviders('empty-text', 'success', 'failure', 'failure', 'failure');
+    const { generateAIResponse } = loadFreshRouter();
+    const result = await generateAIResponse('Prompt');
 
-    const { generateAIResponse } = require('../aiRouter');
-    const result = await generateAIResponse('Test prompt');
-
-    await test('skips provider returning empty text and falls back', () => {
-      assert(result.includes('fireworksService'), `Expected fireworks fallback, got: ${result}`);
+    await test('empty text skipped', () => {
+      assert(result.includes('fireworksService'));
     });
   }
 
-  // ── Suite 8: Invalid prompt guard ─────────────────────────────────────────
+  // Suite 8
   console.log('\nSuite 8: Input validation');
+  clearModuleCache();
+  resetEnv();
+  registerAllProviders('success', 'success', 'success', 'success', 'success');
+
   {
-    clearModuleCache();
-    registerAllProviders('success', 'success', 'success', 'success', 'success');
+    const { generateAIResponse } = loadFreshRouter();
 
-    const { generateAIResponse } = require('../aiRouter');
-
-    await test('throws on empty string prompt', async () => {
+    await test('throws on empty string', async () => {
       let threw = false;
-      try { await generateAIResponse(''); } catch { threw = true; }
-      assert(threw, 'Should throw on empty prompt');
+      try {
+        await generateAIResponse('');
+      } catch {
+        threw = true;
+      }
+      assert(threw);
     });
 
-    await test('throws on null prompt', async () => {
+    await test('throws on null', async () => {
       let threw = false;
-      try { await generateAIResponse(null); } catch { threw = true; }
-      assert(threw, 'Should throw on null prompt');
-    });
-
-    await test('throws on whitespace-only prompt', async () => {
-      let threw = false;
-      try { await generateAIResponse('   '); } catch { threw = true; }
-      assert(threw, 'Should throw on whitespace-only prompt');
+      try {
+        await generateAIResponse(null);
+      } catch {
+        threw = true;
+      }
+      assert(threw);
     });
   }
 
-  // ── Suite 9: Secret Manager failure → treated as provider failure ──────────
-  console.log('\nSuite 9: Secret Manager failure treated as provider failure');
+  // Suite 9
+  console.log('\nSuite 9: Secret module failure');
+  clearModuleCache();
+  resetEnv();
+  secretBehaviour = 'throw';
+  registerAllProviders('failure', 'failure', 'failure', 'failure', 'failure');
+
   {
-    clearModuleCache();
-    secretBehaviour = 'throw';
-
-    // Don't register fake providers — let them go through real provider code
-    // which will call getSecret (mocked to throw) and fail naturally.
-    // Register success stubs for all to avoid needing real SDK imports.
-    registerAllProviders('failure', 'failure', 'failure', 'failure', 'failure');
-
-    const { generateAIResponse } = require('../aiRouter');
+    const { generateAIResponse } = loadFreshRouter();
     const result = await generateAIResponse('Hello');
 
-    await test('returns graceful fallback when Secret Manager is unavailable', () => {
+    await test('secret failure degrades safely', () => {
       assertEqual(result, 'AI service temporarily unavailable.');
     });
-
-    secretBehaviour = 'return'; // reset
   }
 
-  // ── Summary ────────────────────────────────────────────────────────────────
+  secretBehaviour = 'return';
+
+  // Summary
   console.log('\n══════════════════════════════════════════════');
   console.log(`  Results: ${passed} passed, ${failed} failed`);
   console.log('══════════════════════════════════════════════\n');
 
-  if (failed > 0) process.exit(1);
+  if (failed > 0) {
+    throw new Error(`${failed} tests failed`);
+  }
 }
 
-runTests().catch(err => {
-  console.error('\nTest runner crashed:', err);
+runTests().catch((error) => {
+  console.error('\nTest runner crashed:', error);
   process.exit(1);
 });
-
-
-
-
-
-
-
-

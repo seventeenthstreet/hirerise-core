@@ -1,7 +1,10 @@
 'use strict';
 
 /**
- * Semantic Skill Engine v4 (FULL RPC - NO NODE VECTOR LOGIC)
+ * src/engines/semanticSkill.engine.js
+ * Semantic Skill Engine v5
+ *
+ * Full RPC + Redis cache
  */
 
 const cacheManager = require('../core/cache/cache.manager');
@@ -11,83 +14,146 @@ const logger = require('../utils/logger');
 const CACHE_TTL = 600;
 const cache = cacheManager?.getClient?.();
 
-// ─────────────────────────────────────────────
-// HELPERS
-// ─────────────────────────────────────────────
-
-function normalize(str) {
-  return (str || '').toLowerCase().trim();
+// ─────────────────────────────────────────────────────────────
+// Helpers
+// ─────────────────────────────────────────────────────────────
+function normalize(value) {
+  return String(value || '')
+    .toLowerCase()
+    .trim();
 }
 
-function buildCacheKey(skills, topK) {
-  return `skill:rpc:${skills.map(normalize).sort().join('|')}:${topK}`;
+function normalizeSkills(input) {
+  if (Array.isArray(input)) {
+    return input
+      .map(normalize)
+      .filter(Boolean);
+  }
+
+  if (typeof input === 'string') {
+    const skill = normalize(input);
+    return skill ? [skill] : [];
+  }
+
+  return [];
 }
 
-// ─────────────────────────────────────────────
-// MAIN FUNCTION (RPC ONLY)
-// ─────────────────────────────────────────────
+function buildCacheKey(skills, topK, minScore) {
+  return [
+    'skill:rpc',
+    skills.slice().sort().join('|'),
+    `k:${topK}`,
+    `min:${minScore}`,
+  ].join(':');
+}
 
-async function findSimilarSkills(skills, opts = {}) {
-  const { topK = 5 } = opts;
+// ─────────────────────────────────────────────────────────────
+// Main
+// ─────────────────────────────────────────────────────────────
+async function findSimilarSkills(input, opts = {}) {
+  const {
+    topK = 5,
+    minScore = 0,
+  } = opts;
 
-  if (!Array.isArray(skills) || skills.length === 0) {
+  const normalizedSkills = normalizeSkills(input);
+
+  if (!normalizedSkills.length) {
     return { similar_skills: [] };
   }
 
-  const normalizedSkills = skills.map(normalize);
-  const cacheKey = buildCacheKey(normalizedSkills, topK);
+  const cacheKey = buildCacheKey(
+    normalizedSkills,
+    topK,
+    minScore
+  );
 
-  // 🔹 Cache
+  // ───────────────────────────────────────────────────────────
+  // Cache read
+  // ───────────────────────────────────────────────────────────
   if (cache) {
     try {
       const cached = await cache.get(cacheKey);
-      if (cached) return JSON.parse(cached);
-    } catch (_) {}
+      if (cached) {
+        return JSON.parse(cached);
+      }
+    } catch (error) {
+      logger.warn('[SemanticSkillEngine] Cache read failed', {
+        error: error.message,
+      });
+    }
   }
 
-  // 🔹 RPC CALL (DB DOES EVERYTHING)
-  let data = [];
+  let rows = [];
 
+  // ───────────────────────────────────────────────────────────
+  // RPC call
+  // ───────────────────────────────────────────────────────────
   try {
-    const res = await supabase.rpc('match_skills_semantic', {
-      input_skills: normalizedSkills,
-      top_k: topK
+    const { data, error } = await supabase.rpc(
+      'match_skills_semantic',
+      {
+        input_skills: normalizedSkills,
+        top_k: topK,
+        min_score: minScore,
+      }
+    );
+
+    if (error) throw error;
+
+    rows = Array.isArray(data) ? data : [];
+  } catch (error) {
+    logger.error('[SemanticSkillEngine] RPC failed', {
+      skills: normalizedSkills,
+      topK,
+      minScore,
+      error: error.message,
     });
-
-    if (res.error) throw res.error;
-
-    data = res.data || [];
-  } catch (err) {
-    logger.error('[Skill RPC] failed', { err: err.message });
 
     return {
       similar_skills: [],
-      meta: { error: 'rpc_failed' }
+      meta: {
+        error: 'rpc_failed',
+      },
     };
   }
 
   const response = {
-    similar_skills: data.map(d => d.skill_name),
-    scores: data.map(d => ({
-      skill: d.skill_name,
-      similarity: Number((d.similarity || 0).toFixed(3))
+    similar_skills: rows.map((row) => row.skill_name),
+    scores: rows.map((row) => ({
+      skill: row.skill_name,
+      similarity: Number(
+        Number(row.similarity || 0).toFixed(3)
+      ),
     })),
     meta: {
-      engine: 'skill-rpc-v1',
-      generated_at: new Date().toISOString()
-    }
+      engine: 'skill-rpc-v2',
+      generated_at: new Date().toISOString(),
+      input_skills: normalizedSkills,
+    },
   };
 
-  // 🔹 Cache write
+  // ───────────────────────────────────────────────────────────
+  // Cache write
+  // ───────────────────────────────────────────────────────────
   if (cache) {
     try {
-      await cache.set(cacheKey, JSON.stringify(response), 'EX', CACHE_TTL);
-    } catch (_) {}
+      await cache.set(
+        cacheKey,
+        JSON.stringify(response),
+        'EX',
+        CACHE_TTL
+      );
+    } catch (error) {
+      logger.warn('[SemanticSkillEngine] Cache write failed', {
+        error: error.message,
+      });
+    }
   }
 
   return response;
 }
 
 module.exports = {
-  findSimilarSkills
+  findSimilarSkills,
 };

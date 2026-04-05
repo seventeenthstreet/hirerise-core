@@ -3,22 +3,23 @@
 /**
  * services/resumeParser/index.js
  *
- * Public API for the Resume Parser Engine.
- * Import from here — never import sub-modules directly from application code.
+ * Public API surface for the Resume Parser domain.
+ * Application code must only import from this module boundary.
+ *
+ * This file intentionally remains infrastructure-agnostic:
+ * - no Firebase dependencies
+ * - no Supabase dependencies
+ * - no provider-specific logic
+ *
+ * All persistence/provider concerns must stay inside downstream services.
  */
 
-const { parseResumeText, mapParsedToOnboardingShape } = require('./resumeParser.service');
-
-module.exports = {
+const {
   parseResumeText,
   mapParsedToOnboardingShape,
-};
+} = require('./resumeParser.service');
 
-
-
-
-
-
-
-
-
+module.exports = Object.freeze({
+  parseResumeText,
+  mapParsedToOnboardingShape,
+});

@@ -1,24 +1,49 @@
-/**
- * jobs.routes.js — Job Roles & Families Routes (Enterprise Hardened)
- * All prefixed with /api/v1/jobs
- */
-
 'use strict';
+
+/**
+ * routes/jobs.routes.js
+ * Job Roles & Families Routes
+ *
+ * Mounted at:
+ * /api/v1/jobs
+ */
 
 const express = require('express');
 const { param, query } = require('express-validator');
+
 const { validate } = require('../middleware/requestValidator');
 const jobController = require('../controllers/job.controller');
 
 const router = express.Router();
 
 // ─────────────────────────────────────────────────────────────
-// GET /api/v1/jobs/families
+// Constants
+// ─────────────────────────────────────────────────────────────
+const MAX_ID_LENGTH = 100;
+const MAX_LIMIT = 100;
+
+const JOB_LEVELS = Object.freeze([
+  'L1',
+  'L2',
+  'L3',
+  'L4',
+  'L5',
+  'L6',
+]);
+
+const JOB_TRACKS = Object.freeze([
+  'individual_contributor',
+  'management',
+  'specialist',
+]);
+
+// ─────────────────────────────────────────────────────────────
+// GET /families
 // ─────────────────────────────────────────────────────────────
 router.get('/families', jobController.listJobFamilies);
 
 // ─────────────────────────────────────────────────────────────
-// GET /api/v1/jobs/roles
+// GET /roles
 // ─────────────────────────────────────────────────────────────
 router.get(
   '/roles',
@@ -27,24 +52,24 @@ router.get(
       .optional()
       .isString()
       .trim()
-      .isLength({ max: 100 })
+      .isLength({ max: MAX_ID_LENGTH })
       .withMessage('familyId must be a valid string'),
 
     query('level')
       .optional()
-      .isIn(['L1', 'L2', 'L3', 'L4', 'L5', 'L6'])
+      .isIn(JOB_LEVELS)
       .withMessage('Invalid level'),
 
     query('track')
       .optional()
-      .isIn(['individual_contributor', 'management', 'specialist'])
+      .isIn(JOB_TRACKS)
       .withMessage('Invalid track'),
 
     query('limit')
       .optional()
-      .isInt({ min: 1, max: 100 })
+      .isInt({ min: 1, max: MAX_LIMIT })
       .toInt()
-      .withMessage('limit must be between 1 and 100'),
+      .withMessage(`limit must be between 1 and ${MAX_LIMIT}`),
 
     query('page')
       .optional()
@@ -56,7 +81,7 @@ router.get(
 );
 
 // ─────────────────────────────────────────────────────────────
-// GET /api/v1/jobs/roles/:roleId
+// GET /roles/:roleId
 // ─────────────────────────────────────────────────────────────
 router.get(
   '/roles/:roleId',
@@ -65,19 +90,10 @@ router.get(
       .isString()
       .trim()
       .notEmpty()
-      .isLength({ max: 100 })
+      .isLength({ max: MAX_ID_LENGTH })
       .withMessage('roleId is required'),
   ]),
   jobController.getRoleById
 );
 
 module.exports = router;
-
-
-
-
-
-
-
-
-

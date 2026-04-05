@@ -1,167 +1,215 @@
 'use strict';
 
 /**
- * skills-priority.routes.js — Skill Prioritization Intelligence API
+ * routes/skills-priority.routes.js
  *
- * Mounted in server.js alongside the existing skillDemandRouter:
- *   app.use(`${API_PREFIX}/skills`, authenticate, require('./routes/skills-priority.routes'));
- *
- * ┌──────────────────────────────────────────────────────────────────────────┐
- * │ Method │ Path          │ Description                                     │
- * ├──────────────────────────────────────────────────────────────────────────┤
- * │ GET    │ /priority     │ Run prioritization engine for the auth user     │
- * └──────────────────────────────────────────────────────────────────────────┘
- *
- * The handler reads the user's profile + CHI snapshot from Supabase to
- * build the engine input — the caller does not need to POST a body.
- * All heavy lifting is cached: the route caches results per user for 30 min.
- *
- * Response shape:
- *   {
- *     success: true,
- *     data: {
- *       meta:              { engineVersion, generatedAt, isPremiumView, skillsReturned, totalEvaluated },
- *       summary:           { totalSkillsAnalyzed, highPriorityCount, avgPriorityScore, estimatedSalaryDelta },
- *       prioritizedSkills: [ { skillId, skillName, priorityScore, priorityLevel, roiCategory,
- *                              estimatedLearningTimeWeeks, marketDemandScore, salaryImpactScore, ... } ],
- *       careerPathInsight: { nextRoleUnlocked, unlockProbabilityIncrease, ... },
- *       confidenceInsight: { confidenceScore, confidenceLevel, factors },
- *       narrative:         string,
- *     }
- *   }
+ * Skill Prioritization Intelligence API
+ * Fully optimized for Supabase production workloads
  */
+
 const express = require('express');
 const { query } = require('express-validator');
+
 const { validate } = require('../middleware/requestValidator');
 const { asyncHandler } = require('../utils/helpers');
-const { supabase } = require('../config/supabase');
+const { AppError, ErrorCodes } = require('../middleware/errorHandler');
+const supabase = require('../lib/supabaseClient');
 const cacheManager = require('../core/cache/cache.manager');
 const logger = require('../utils/logger');
 const engine = require('../modules/skill-prioritization');
+
 const router = express.Router();
 
 const cache = cacheManager.getClient();
-const CACHE_TTL_SECONDS = 1800; // 30 min
+const CACHE_TTL_SECONDS = 1800;
+const DEFAULT_PROFICIENCY = 50;
 
-// ─── GET /priority ────────────────────────────────────────────────────────────
+/**
+ * Auth-provider agnostic user ID extraction
+ */
+function getUserId(req) {
+  const userId =
+    req.user?.id ||
+    req.auth?.userId ||
+    req.user?.user_id ||
+    req.user?.uid;
 
+  if (!userId || typeof userId !== 'string') {
+    throw new AppError(
+      'Unauthenticated',
+      401,
+      {},
+      ErrorCodes.UNAUTHORIZED,
+    );
+  }
+
+  return userId;
+}
+
+function createSkillId(name) {
+  return String(name)
+    .toLowerCase()
+    .replace(/\s+/g, '_')
+    .replace(/[^a-z0-9_]/g, '');
+}
+
+function buildMergedSkills(profileSkills, chiTopSkills) {
+  const profileSkillMap = new Map();
+
+  for (const raw of profileSkills) {
+    const name =
+      typeof raw === 'string'
+        ? raw
+        : raw?.name || raw?.skillName || '';
+
+    if (!name) continue;
+
+    const proficiency =
+      typeof raw === 'object'
+        ? raw.proficiency ||
+          raw.proficiencyLevel ||
+          DEFAULT_PROFICIENCY
+        : DEFAULT_PROFICIENCY;
+
+    profileSkillMap.set(name.toLowerCase(), {
+      name,
+      proficiency,
+    });
+  }
+
+  const merged = [];
+  const seen = new Set();
+
+  for (const name of chiTopSkills) {
+    if (!name) continue;
+
+    const key = name.toLowerCase();
+    const fromProfile = profileSkillMap.get(key);
+
+    merged.push({
+      skillId: createSkillId(name),
+      skillName: name,
+      proficiencyLevel: fromProfile?.proficiency || DEFAULT_PROFICIENCY,
+    });
+
+    seen.add(key);
+  }
+
+  for (const [key, skill] of profileSkillMap.entries()) {
+    if (seen.has(key)) continue;
+
+    merged.push({
+      skillId: createSkillId(skill.name),
+      skillName: skill.name,
+      proficiencyLevel: skill.proficiency,
+    });
+  }
+
+  return merged;
+}
+
+// ─────────────────────────────────────────────────────────────
+// GET /priority
+// ─────────────────────────────────────────────────────────────
 router.get(
   '/priority',
   validate([
     query('refresh')
-      .optional().isBoolean()
-      .withMessage('refresh must be a boolean')
+      .optional()
+      .isBoolean()
+      .withMessage('refresh must be a boolean'),
   ]),
   asyncHandler(async (req, res) => {
-    const userId = req.user?.uid || req.user?.id;
-    if (!userId) {
-      return res.status(401).json({ success: false, error: 'Unauthenticated' });
-    }
-
+    const userId = getUserId(req);
     const forceRefresh = req.query.refresh === 'true';
     const cacheKey = `skill-priority:user:${userId}`;
 
-    // ── 1. Cache check ──────────────────────────────────────────────────────
+    // 1) Cache
     if (!forceRefresh) {
       try {
         const hit = await cache.get(cacheKey);
+
         if (hit) {
           logger.info('[SkillPriorityRoute] Cache hit', { userId });
-          return res.status(200).json({ success: true, data: JSON.parse(hit), cached: true });
+
+          return res.status(200).json({
+            success: true,
+            data: JSON.parse(hit),
+            cached: true,
+          });
         }
-      } catch (_) { /* cache miss is fine */ }
-    }
-
-    // ── 2. Load user profile from Supabase ──────────────────────────────────
-    const [profileResult, progressResult, userResult] = await Promise.all([
-      supabase.from('user_profiles').select('*').eq('id', userId).maybeSingle(),
-      supabase.from('onboarding_progress').select('*').eq('id', userId).maybeSingle(),
-      supabase.from('users').select('*').eq('id', userId).maybeSingle()
-    ]);
-
-    const profile = profileResult.data ?? {};
-    const progress = progressResult.data ?? {};
-    const user = userResult.data ?? {};
-
-    // FIX: Sub-collection chiSnapshots migrated to flat table: chi_snapshots
-    // with columns: id, user_id, data (jsonb), generated_at, soft_deleted
-    let chiData = {};
-    try {
-      const { data: chiRows } = await supabase
-        .from('chi_snapshots')
-        .select('*')
-        .eq('user_id', userId)
-        .eq('soft_deleted', false)
-        .order('generated_at', { ascending: false })
-        .limit(1);
-      if (chiRows && chiRows.length > 0) {
-        chiData = chiRows[0].data ?? chiRows[0];
-      }
-    } catch (_) {
-      // Fallback to legacy flat table
-      try {
-        const { data: chiRows } = await supabase
-          .from('career_health_index')
-          .select('*')
-          .eq('userId', userId)
-          .order('generatedAt', { ascending: false })
-          .limit(1);
-        if (chiRows && chiRows.length > 0) chiData = chiRows[0];
-      } catch (_) {}
-    }
-
-    // Resolve skills — prefer CHI topSkills (CV-extracted) over profile.skills
-    // Check all 3 tables for skills — same pattern as jobMatchingEngine
-    const rawProfileSkills =
-      Array.isArray(profile.skills) && profile.skills.length > 0 ? profile.skills :
-      Array.isArray(user.skills) && user.skills.length > 0 ? user.skills :
-      Array.isArray(progress.skills) && progress.skills.length > 0 ? progress.skills :
-      [];
-
-    // Also pick up targetRole and experienceYears from users table
-    if (!profile.targetRole && !profile.currentJobTitle) {
-      profile.targetRole = user.currentJobTitle || progress.targetRole || null;
-    }
-    if (!profile.experienceYears && !profile.yearsExperience) {
-      profile.experienceYears = user.experience || user.experienceYears || progress.experienceYears || 0;
-    }
-
-    const chiTopSkills = Array.isArray(chiData.topSkills) ? chiData.topSkills : [];
-
-    // Merge: CHI top skills (strings) + profile skills (may have proficiency)
-    const profileSkillMap = {};
-    for (const s of rawProfileSkills) {
-      const name = typeof s === 'string' ? s : s.name || '';
-      const prof = typeof s === 'object' ? s.proficiency || s.proficiencyLevel || 50 : 50;
-      if (name) profileSkillMap[name.toLowerCase()] = { name, proficiency: prof };
-    }
-
-    const mergedSkills = chiTopSkills.map(name => {
-      const key = name.toLowerCase();
-      const fromMap = profileSkillMap[key];
-      return {
-        skillId: name.toLowerCase().replace(/\s+/g, '_').replace(/[^a-z0-9_]/g, ''),
-        skillName: name,
-        proficiencyLevel: fromMap ? fromMap.proficiency : 50
-      };
-    });
-
-    // Add any profile skills not in CHI top skills
-    for (const [, s] of Object.entries(profileSkillMap)) {
-      const id = s.name.toLowerCase().replace(/\s+/g, '_').replace(/[^a-z0-9_]/g, '');
-      if (!mergedSkills.find(m => m.skillId === id)) {
-        mergedSkills.push({
-          skillId: id,
-          skillName: s.name,
-          proficiencyLevel: s.proficiency
+      } catch (error) {
+        logger.warn('[SkillPriorityRoute] Cache read failed', {
+          userId,
+          message: error.message,
         });
       }
     }
 
-    // ── 3. Guard: need at least one skill and a target role ──────────────────
+    // 2) Load only required columns (major Supabase perf win)
+    const [profileResult, progressResult, userResult, chiResult] =
+      await Promise.all([
+        supabase
+          .from('user_profiles')
+          .select(
+            'skills,target_role,current_job_title,current_role,experience_years,years_experience,resume_score,plan,is_premium',
+          )
+          .eq('user_id', userId)
+          .maybeSingle(),
+
+        supabase
+          .from('onboarding_progress')
+          .select('skills,target_role,experience_years')
+          .eq('user_id', userId)
+          .maybeSingle(),
+
+        supabase
+          .from('users')
+          .select(
+            'skills,current_job_title,experience,experience_years',
+          )
+          .eq('id', userId)
+          .maybeSingle(),
+
+        supabase
+          .from('chi_snapshots')
+          .select(
+            'data,generated_at',
+          )
+          .eq('user_id', userId)
+          .eq('soft_deleted', false)
+          .order('generated_at', { ascending: false })
+          .limit(1)
+          .maybeSingle(),
+      ]);
+
+    const profile = profileResult.data || {};
+    const progress = progressResult.data || {};
+    const user = userResult.data || {};
+    const chiData = chiResult.data?.data || {};
+
+    const rawProfileSkills =
+      Array.isArray(profile.skills) && profile.skills.length
+        ? profile.skills
+        : Array.isArray(user.skills) && user.skills.length
+          ? user.skills
+          : Array.isArray(progress.skills)
+            ? progress.skills
+            : [];
+
+    const chiTopSkills = Array.isArray(chiData.topSkills)
+      ? chiData.topSkills
+      : [];
+
+    const mergedSkills = buildMergedSkills(
+      rawProfileSkills,
+      chiTopSkills,
+    );
+
     const targetRole =
-      profile.targetRole ||
-      profile.currentJobTitle ||
+      profile.target_role ||
+      profile.current_job_title ||
+      progress.target_role ||
       chiData.detectedProfession ||
       chiData.currentJobTitle ||
       null;
@@ -170,61 +218,80 @@ router.get(
       return res.status(200).json({
         success: true,
         data: null,
-        message: 'Set your target role in your profile to activate Skill Prioritization.'
+        message:
+          'Set your target role in your profile to activate Skill Prioritization.',
       });
     }
+
     if (mergedSkills.length === 0) {
       return res.status(200).json({
         success: true,
         data: null,
-        message: 'Upload your CV to activate Skill Prioritization. Skills will be extracted automatically.'
+        message:
+          'Upload your CV to activate Skill Prioritization. Skills will be extracted automatically.',
       });
     }
 
-    // ── 4. Build engine input ───────────────────────────────────────────────
     const input = {
       userId,
       targetRoleId: targetRole,
-      currentRoleId: profile.currentRole || profile.currentJobTitle || targetRole,
+      currentRoleId:
+        profile.current_role ||
+        profile.current_job_title ||
+        targetRole,
       experienceYears: Number(
-        profile.experienceYears ||
-        profile.yearsExperience ||
-        chiData.estimatedExperienceYears ||
-        0
+        profile.experience_years ||
+          profile.years_experience ||
+          chiData.estimatedExperienceYears ||
+          0,
       ),
-      // resumeScore: use CHI skillVelocity dimension score as proxy if direct score unavailable
       resumeScore: Number(
-        profile.resumeScore ||
-        chiData.dimensions?.skillVelocity?.score ||
-        chiData.chiScore ||
-        50
+        profile.resume_score ||
+          chiData.dimensions?.skillVelocity?.score ||
+          chiData.chiScore ||
+          50,
       ),
-      skills: mergedSkills
+      skills: mergedSkills,
     };
+
+    const isPremium =
+      profile.plan === 'premium' ||
+      Boolean(profile.is_premium);
 
     logger.info('[SkillPriorityRoute] Running engine', {
       userId,
       targetRole,
-      skillCount: mergedSkills.length
+      skillCount: mergedSkills.length,
     });
 
-    // ── 5. Run engine ────────────────────────────────────────────────────────
-    const isPremium = profile.plan === 'premium' || profile.isPremium || false;
     const result = await engine.run(input, { isPremium });
 
-    // ── 6. Cache result ──────────────────────────────────────────────────────
+    // 3) Cache write
     try {
-      await cache.set(cacheKey, JSON.stringify(result), CACHE_TTL_SECONDS);
-    } catch (_) { /* non-fatal */ }
+      await cache.set(
+        cacheKey,
+        JSON.stringify(result),
+        CACHE_TTL_SECONDS,
+      );
+    } catch (error) {
+      logger.warn('[SkillPriorityRoute] Cache write failed', {
+        userId,
+        message: error.message,
+      });
+    }
 
-    logger.info('[SkillPriorityRoute] Done', {
+    logger.info('[SkillPriorityRoute] Completed', {
       userId,
-      skills: result.meta?.skillsReturned,
-      highPriority: result.summary?.highPriorityCount
+      skillsReturned: result.meta?.skillsReturned,
+      highPriority: result.summary?.highPriorityCount,
     });
 
-    return res.status(200).json({ success: true, data: result, cached: false });
-  })
+    return res.status(200).json({
+      success: true,
+      data: result,
+      cached: false,
+    });
+  }),
 );
 
 module.exports = router;
