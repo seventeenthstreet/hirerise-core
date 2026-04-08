@@ -1,52 +1,71 @@
 'use strict';
 
 /**
- * sla-evaluation.worker.js — PHASE 1 UPDATE: Extends BaseWorker
+ * sla-evaluation.worker.js
  *
- * CHANGE: Class now extends BaseWorker. Core evaluation logic moved from
- * runJob() into process(). runJob() kept as a thin backward-compatible wrapper.
- *
- * IDEMPOTENCY KEY STRATEGY:
- *   hash("sla:" + YYYY-MM-DD)
- *   — One key per target date. Re-running for the same date returns the
- *   cached breach list without re-evaluating SLA contracts. Expires after 48h.
- *
- * Run after daily aggregation completes.
- * Evaluates SLA contracts against freshly aggregated metrics.
+ * Fully Supabase-ready SLA evaluation worker.
+ * No Firebase dependencies remain.
  */
 
 const slaService = require('../ai/observability/sla.service');
 const BaseWorker = require('./shared/BaseWorker');
+const logger = require('../utils/logger');
+
+const WORKER_ID = 'sla-evaluation';
 
 class SLAEvaluationWorker extends BaseWorker {
   constructor() {
-    super('sla-evaluation');
+    super(WORKER_ID);
   }
 
   /**
-   * Core evaluation logic — called by BaseWorker.run() after idempotency check.
+   * Core SLA evaluation logic
    *
    * @param {{ targetDate: string }} payload
    * @returns {Promise<{ date: string, breaches: Array }>}
    */
   async process({ targetDate }) {
-    console.log(`[SLAWorker] Evaluating SLA for ${targetDate}`);
-    const breaches = await slaService.evaluateDailySLA(targetDate);
-    console.log(`[SLAWorker] Found ${breaches.length} SLA breaches`);
-    return { date: targetDate, breaches };
+    const startedAt = Date.now();
+
+    logger.info('[SLAEvaluationWorker] Starting evaluation', {
+      targetDate
+    });
+
+    try {
+      const breaches = await slaService.evaluateDailySLA(targetDate);
+
+      const durationMs = Date.now() - startedAt;
+
+      logger.info('[SLAEvaluationWorker] Evaluation complete', {
+        targetDate,
+        breachCount: Array.isArray(breaches) ? breaches.length : 0,
+        durationMs
+      });
+
+      return {
+        date: targetDate,
+        breaches: Array.isArray(breaches) ? breaches : []
+      };
+    } catch (error) {
+      logger.error('[SLAEvaluationWorker] Evaluation failed', {
+        targetDate,
+        error: error?.message
+      });
+      throw error;
+    }
   }
 
   /**
-   * Backward-compatible wrapper. Existing call sites use runJob(dateStr) unchanged.
+   * Backward-compatible wrapper
    *
-   * @param {string=} dateStr  — YYYY-MM-DD, defaults to yesterday UTC
+   * @param {string|null} dateStr
    */
   async runJob(dateStr = null) {
-    const targetDate = dateStr || this._yesterdayUTC();
+    const targetDate = dateStr ?? this._yesterdayUTC();
 
     const idempotencyKey = BaseWorker.buildIdempotencyKey('system', {
-      job:  'sla-evaluation',
-      date: targetDate,
+      job: WORKER_ID,
+      date: targetDate
     });
 
     const { result } = await this.run({ targetDate }, idempotencyKey);
@@ -54,28 +73,30 @@ class SLAEvaluationWorker extends BaseWorker {
   }
 
   _yesterdayUTC() {
-    const d = new Date();
-    d.setUTCDate(d.getUTCDate() - 1);
-    return d.toISOString().split('T')[0];
+    const date = new Date();
+    date.setUTCDate(date.getUTCDate() - 1);
+    return date.toISOString().slice(0, 10);
   }
 }
 
 const slaWorker = new SLAEvaluationWorker();
 
-// MIGRATION: firebase-admin initializeApp() removed — slaService uses Supabase
-// internally. No Firebase initialisation is needed before running the job.
 if (require.main === module) {
-  slaWorker.runJob(process.argv[2] || null)
-    .then(r => { console.log('SLA job done:', r); process.exit(0); })
-    .catch(e => { console.error(e); process.exit(1); });
+  const dateArg = process.argv[2] ?? null;
+
+  slaWorker
+    .runJob(dateArg)
+    .then(result => {
+      logger.info('[SLAEvaluationWorker] CLI success', result);
+      process.exit(0);
+    })
+    .catch(error => {
+      logger.error('[SLAEvaluationWorker] CLI failed', {
+        error: error?.message,
+        stack: error?.stack
+      });
+      process.exit(1);
+    });
 }
 
 module.exports = slaWorker;
-
-
-
-
-
-
-
-

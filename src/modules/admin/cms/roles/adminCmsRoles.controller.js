@@ -4,7 +4,7 @@
  * adminCmsRoles.controller.js — Supabase Optimized Version
  *
  * Security contract:
- *   adminId = req.user.uid
+ *   adminId = req.user.id
  *   agency  = req.user.agency
  */
 

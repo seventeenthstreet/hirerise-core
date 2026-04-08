@@ -31,7 +31,7 @@ router.get(
   ]),
   async (req, res, next) => {
     try {
-      const userId = req.user.uid;
+      const userId = req.user.id;
       const currentScore =
         req.query.current_score !== undefined
           ? Number(req.query.current_score)
@@ -81,7 +81,7 @@ router.post(
   ]),
   async (req, res, next) => {
     try {
-      const userId = req.user.uid;
+      const userId = req.user.id;
       const { event_type, count, score } = req.body;
 
       // respond instantly
@@ -121,7 +121,7 @@ router.post(
 // ─────────────────────────────────────────────────────────────────────────────
 router.post('/weekly-snapshot', async (req, res, next) => {
   try {
-    const userId = req.user.uid;
+    const userId = req.user.id;
     const result = await service.updateWeeklyMemory(userId);
 
     return res.status(200).json({

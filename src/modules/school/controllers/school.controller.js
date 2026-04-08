@@ -14,7 +14,7 @@
  * - Centralize error logging
  *
  * Notes:
- * - Supports both req.user.id (Supabase) and req.user.uid (legacy Firebase)
+ * - Supports both req.user.id (Supabase) and req.user.id (legacy Firebase)
  *   for safe zero-downtime rollout.
  * - No DB logic should exist here.
  */
@@ -44,7 +44,7 @@ function fail(res, statusCode, message, code = 'SCHOOL_ERROR') {
 
 /* ──────────────────────────────────────────────────────────────
  * Auth normalization helper
- * Removes legacy Firebase assumption: req.user.uid
+ * Removes legacy Firebase assumption: req.user.id
  * ────────────────────────────────────────────────────────────── */
 function getAuthenticatedUserId(req) {
   return req?.user?.id || req?.user?.uid || null;

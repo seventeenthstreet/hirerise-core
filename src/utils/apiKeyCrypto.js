@@ -3,149 +3,183 @@
 /**
  * apiKeyCrypto.js — AES-256-GCM Encryption for External API Keys
  *
- * Uses Node.js built-in crypto module — no external dependencies.
- * Algorithm: AES-256-GCM (authenticated encryption — detects tampering)
- *
- * Environment variable required:
- *   API_KEY_ENCRYPTION_SECRET — must be exactly 32 characters (256 bits)
- *
- * Format of encrypted output (stored in Firestore):
+ * Supabase-safe, database-agnostic encrypted string format:
  *   enc:<iv_hex>:<authTag_hex>:<ciphertext_hex>
  *
- * The "enc:" prefix lets us distinguish encrypted values from legacy
- * plaintext values during a migration period.
- *
- * Usage:
- *   const { encryptApiKey, decryptApiKey } = require('../../utils/apiKeyCrypto');
- *   const stored  = encryptApiKey('sk_live_abc123');
- *   const original = decryptApiKey(stored);
+ * Supported secret formats:
+ * - 32-byte UTF-8 raw string
+ * - 64-char hex string
+ * - base64-encoded 32-byte key
  */
 
 const crypto = require('crypto');
 const logger = require('./logger');
 
-const ALGORITHM   = 'aes-256-gcm';
-const IV_LENGTH   = 16; // bytes
-const TAG_LENGTH  = 16; // bytes (GCM auth tag)
-const PREFIX      = 'enc:';
+const ALGORITHM = 'aes-256-gcm';
+const IV_LENGTH = 16;
+const TAG_LENGTH = 16;
+const KEY_LENGTH = 32;
+const PREFIX = 'enc:';
 
 /**
- * Get and validate the encryption key from environment.
- * Throws at call time (not module load) so the error surfaces with context.
+ * Parse API_KEY_ENCRYPTION_SECRET from supported formats.
  *
- * @returns {Buffer} 32-byte key buffer
+ * @returns {Buffer}
  */
 function getEncryptionKey() {
   const secret = process.env.API_KEY_ENCRYPTION_SECRET;
 
   if (!secret) {
     throw new Error(
-      '[apiKeyCrypto] API_KEY_ENCRYPTION_SECRET is not set. ' +
-      'Add it to your .env file. Must be exactly 32 characters.'
+      '[apiKeyCrypto] API_KEY_ENCRYPTION_SECRET is not set.'
     );
   }
 
-  if (secret.length !== 32) {
-    throw new Error(
-      `[apiKeyCrypto] API_KEY_ENCRYPTION_SECRET must be exactly 32 characters. ` +
-      `Got ${secret.length}.`
-    );
+  // hex
+  if (/^[a-fA-F0-9]{64}$/.test(secret)) {
+    return Buffer.from(secret, 'hex');
   }
 
-  return Buffer.from(secret, 'utf8');
+  // base64
+  try {
+    const base64Buf = Buffer.from(secret, 'base64');
+    if (base64Buf.length === KEY_LENGTH) {
+      return base64Buf;
+    }
+  } catch (_) {
+    // ignore
+  }
+
+  // utf8 raw
+  const utf8Buf = Buffer.from(secret, 'utf8');
+  if (utf8Buf.length === KEY_LENGTH) {
+    return utf8Buf;
+  }
+
+  throw new Error(
+    `[apiKeyCrypto] API_KEY_ENCRYPTION_SECRET must decode to ${KEY_LENGTH} bytes`
+  );
 }
 
 /**
- * Encrypt an API key using AES-256-GCM.
- * A fresh random IV is generated for every encryption call.
+ * Encrypt API key.
  *
- * @param {string} plaintext — raw API key
- * @returns {string} — "enc:<iv>:<authTag>:<ciphertext>" (all hex)
+ * @param {string} plaintext
+ * @returns {string}
  */
 function encryptApiKey(plaintext) {
-  if (!plaintext || typeof plaintext !== 'string') {
+  if (typeof plaintext !== 'string' || plaintext.length === 0) {
     throw new Error('[apiKeyCrypto] plaintext must be a non-empty string');
   }
 
-  const key    = getEncryptionKey();
-  const iv     = crypto.randomBytes(IV_LENGTH);
-  const cipher = crypto.createCipheriv(ALGORITHM, key, iv);
+  const key = getEncryptionKey();
+  const iv = crypto.randomBytes(IV_LENGTH);
 
-  const encrypted = Buffer.concat([
+  const cipher = crypto.createCipheriv(ALGORITHM, key, iv, {
+    authTagLength: TAG_LENGTH,
+  });
+
+  const ciphertext = Buffer.concat([
     cipher.update(plaintext, 'utf8'),
     cipher.final(),
   ]);
 
   const authTag = cipher.getAuthTag();
 
-  return `${PREFIX}${iv.toString('hex')}:${authTag.toString('hex')}:${encrypted.toString('hex')}`;
+  return `${PREFIX}${iv.toString('hex')}:${authTag.toString('hex')}:${ciphertext.toString('hex')}`;
 }
 
 /**
- * Decrypt an API key encrypted by encryptApiKey().
- * Returns plaintext for plaintext inputs (migration safety).
+ * Decrypt stored API key.
  *
- * @param {string} stored — value from Firestore
- * @returns {string} — decrypted API key
+ * Backward compatible with legacy plaintext rows.
+ *
+ * @param {string} stored
+ * @returns {string}
  */
 function decryptApiKey(stored) {
-  if (!stored || typeof stored !== 'string') {
+  if (typeof stored !== 'string' || stored.length === 0) {
     throw new Error('[apiKeyCrypto] stored value must be a non-empty string');
   }
 
-  // Legacy plaintext value (not yet encrypted) — return as-is
+  // Legacy plaintext support during migration
   if (!stored.startsWith(PREFIX)) {
-    logger.warn('[apiKeyCrypto] Decrypting unencrypted legacy API key — migrate this record');
+    logger.warn('[apiKeyCrypto] Legacy plaintext API key encountered');
     return stored;
   }
 
   const parts = stored.slice(PREFIX.length).split(':');
+
   if (parts.length !== 3) {
-    throw new Error('[apiKeyCrypto] Invalid encrypted format');
+    throw new Error('[apiKeyCrypto] Invalid encrypted API key format');
   }
 
   const [ivHex, authTagHex, ciphertextHex] = parts;
-  const key        = getEncryptionKey();
-  const iv         = Buffer.from(ivHex, 'hex');
-  const authTag    = Buffer.from(authTagHex, 'hex');
+
+  const iv = Buffer.from(ivHex, 'hex');
+  const authTag = Buffer.from(authTagHex, 'hex');
   const ciphertext = Buffer.from(ciphertextHex, 'hex');
 
-  const decipher = crypto.createDecipheriv(ALGORITHM, key, iv);
-  decipher.setAuthTag(authTag);
+  if (
+    iv.length !== IV_LENGTH ||
+    authTag.length !== TAG_LENGTH ||
+    ciphertext.length === 0
+  ) {
+    throw new Error('[apiKeyCrypto] Corrupted encrypted API key payload');
+  }
 
-  const decrypted = Buffer.concat([
-    decipher.update(ciphertext),
-    decipher.final(),
-  ]);
+  try {
+    const decipher = crypto.createDecipheriv(
+      ALGORITHM,
+      getEncryptionKey(),
+      iv
+    );
 
-  return decrypted.toString('utf8');
+    decipher.setAuthTag(authTag);
+
+    const plaintext = Buffer.concat([
+      decipher.update(ciphertext),
+      decipher.final(),
+    ]);
+
+    return plaintext.toString('utf8');
+  } catch (error) {
+    logger.error('[apiKeyCrypto] API key decryption failed', {
+      error: error.message,
+    });
+
+    throw new Error('[apiKeyCrypto] Failed to decrypt API key');
+  }
 }
 
 /**
- * Mask an API key for safe display in API responses.
- * Works on both encrypted stored values and plaintext keys.
+ * Safe masked preview.
  *
- * @param {string} stored — value from Firestore (may be encrypted)
- * @returns {string} — e.g. "sk_l****"
+ * @param {string} stored
+ * @returns {string|null}
  */
 function maskApiKey(stored) {
-  if (!stored) return null;
+  if (typeof stored !== 'string' || stored.length === 0) {
+    return null;
+  }
 
-  // For encrypted values, show the prefix to indicate it's encrypted
   if (stored.startsWith(PREFIX)) {
     return 'enc:****';
   }
 
-  // For legacy plaintext, show first 4 chars
-  return `${stored.substring(0, 4)}****`;
+  return `${stored.slice(0, 4)}****`;
 }
 
-module.exports = { encryptApiKey, decryptApiKey, maskApiKey };
+/**
+ * Validate encryption key during app startup.
+ */
+function validateApiKeyEncryptionSecret() {
+  getEncryptionKey();
+}
 
-
-
-
-
-
-
-
+module.exports = {
+  encryptApiKey,
+  decryptApiKey,
+  maskApiKey,
+  validateApiKeyEncryptionSecret,
+};

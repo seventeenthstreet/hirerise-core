@@ -26,7 +26,7 @@ const { generateCoverLetterForUser } = require('../coverLetter.service');
  * - req.user.sub -> JWT standard fallback
  *
  * Legacy compatibility:
- * - req.user.uid -> old Firebase middleware compatibility
+ * - req.user.id -> old Firebase middleware compatibility
  *
  * @param {import('express').Request} req
  * @returns {string|null}

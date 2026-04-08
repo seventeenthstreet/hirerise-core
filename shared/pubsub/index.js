@@ -3,14 +3,16 @@
 /**
  * shared/pubsub/index.js
  *
- * ✅ Envelope validation added
- * ✅ Deduplication hook ready
- * ✅ Retry classification
- * ✅ Timeout protection
- * ✅ Topic safety
+ * Supabase-native transport layer
+ * ✅ Google Pub/Sub fully removed
+ * ✅ Firebase legacy transport removed
+ * ✅ Postgres outbox pattern
+ * ✅ Retry-safe row lifecycle
+ * ✅ Worker polling subscriber
+ * ✅ SKIP LOCKED concurrency
  */
 
-const { PubSub } = require('@google-cloud/pubsub');
+const { supabase } = require('../supabase');
 const logger = require('../logger');
 const {
   buildEnvelope,
@@ -19,145 +21,176 @@ const {
   getTopicForEvent,
 } = require('../events');
 
-let _client = null;
+const POLL_INTERVAL_MS = 1000;
+const MAX_RETRIES = 5;
 
-function getClient() {
-  if (!_client) {
-    _client = new PubSub({ projectId: process.env.GOOGLE_CLOUD_PROJECT });
-  }
-  return _client;
-}
-
-// ────────────────────────────────────────────
-// Publisher
-// ────────────────────────────────────────────
-
+/**
+ * Publish event into Postgres outbox
+ */
 async function publishEvent(eventType, payload, attributes = {}) {
-  const client = getClient();
+  const route = getTopicForEvent(eventType);
 
-  const topicName = getTopicForEvent(eventType); // ✅ SAFE
+  const envelope = buildEnvelope(
+    eventType,
+    payload,
+    process.env.SERVICE_NAME,
+    attributes
+  );
 
-  const envelope = buildEnvelope(eventType, payload, process.env.SERVICE_NAME);
-  const data = Buffer.from(JSON.stringify(envelope));
+  const { data, error } = await supabase
+    .from('event_outbox')
+    .insert({
+      event_id: envelope.eventId,
+      route,
+      event_type: envelope.eventType,
+      schema_version: envelope.schemaVersion,
+      idempotency_key: envelope.idempotencyKey,
+      payload: envelope,
+      status: 'pending',
+      retry_count: 0,
+      published_at: envelope.publishedAt,
+    })
+    .select('id')
+    .single();
 
-  try {
-    const pubsubMessageId = await client.topic(topicName).publishMessage({
-      data,
-      attributes: {
-        eventType: envelope.eventType,
-        schemaVersion: envelope.schemaVersion,
-        eventId: envelope.eventId,
-        ...attributes,
-      },
-    });
-
-    logger.info('Event published', {
-      eventId: envelope.eventId,
+  if (error) {
+    logger.error('Failed to publish event', {
+      err: error,
       eventType,
-      topicName,
-      pubsubMessageId,
+      eventId: envelope.eventId,
     });
 
-    return { eventId: envelope.eventId, pubsubMessageId };
-
-  } catch (err) {
-    logger.error('Failed to publish event', { err, eventType });
-
-    const wrapped = new Error(`Publish failed: ${err.message}`);
-    wrapped.code = 'PUBSUB_PUBLISH_FAILED';
+    const wrapped = new Error(`Publish failed: ${error.message}`);
+    wrapped.code = 'OUTBOX_PUBLISH_FAILED';
     throw wrapped;
   }
+
+  logger.info('Event published', {
+    eventId: envelope.eventId,
+    eventType,
+    route,
+    outboxId: data.id,
+  });
+
+  return {
+    eventId: envelope.eventId,
+    outboxId: data.id,
+  };
 }
 
-// ────────────────────────────────────────────
-// Subscriber
-// ────────────────────────────────────────────
+/**
+ * Create DB polling subscriber
+ */
+function createSubscriber(route, handler, options = {}) {
+  const timeoutMs = options.timeoutMs ?? 30000;
+  const pollInterval = options.pollIntervalMs ?? POLL_INTERVAL_MS;
+  let stopped = false;
+  let timer = null;
 
-function createSubscriber(subscriptionName, handler, options = {}) {
-  const client = getClient();
-
-  const subscription = client.subscription(subscriptionName, {
-    flowControl: {
-      maxMessages: options.maxMessages ?? 10,
-    },
-    ackDeadline: options.ackDeadlineSeconds ?? 60,
-  });
-
-  subscription.on('message', async (message) => {
-    const pubsubMessageId = message.id;
-    let envelope;
-
-    // ─── Parse ─────────────────────────────
-    try {
-      envelope = JSON.parse(message.data.toString());
-    } catch (err) {
-      logger.error('Invalid JSON', { err, pubsubMessageId });
-      message.ack(); // permanent failure
-      return;
-    }
-
-    // ─── Validate Envelope (FIXED) ─────────
-    const validation = validateEnvelope(envelope);
-    if (!validation.valid) {
-      logger.error('Invalid envelope', {
-        errors: validation.errors,
-        pubsubMessageId,
-      });
-      message.ack(); // bad data → drop
-      return;
-    }
-
-    const childLogger = logger.child({
-      subscriptionName,
-      pubsubMessageId,
-      eventId: envelope.eventId,
-      eventType: envelope.eventType,
-      deliveryAttempt: message.deliveryAttempt,
-    });
+  async function poll() {
+    if (stopped) return;
 
     try {
-      childLogger.info('Message received');
+      const { data: rows, error } = await supabase.rpc(
+        'claim_outbox_events',
+        {
+          p_route: route,
+          p_batch_size: options.maxMessages ?? 10,
+        }
+      );
 
-      // ─── Timeout Protection (FIXED) ──────
-      const timeoutMs = options.timeoutMs ?? 30000;
-
-      await Promise.race([
-        handler(envelope, message),
-        new Promise((_, reject) =>
-          setTimeout(() => reject(new Error('Handler timeout')), timeoutMs)
-        ),
-      ]);
-
-      message.ack();
-      childLogger.info('Message acknowledged');
-
-    } catch (err) {
-      const isRetryable = !err.code || err.code !== 'PERMANENT_ERROR';
-
-      childLogger.error('Handler failed', {
-        err,
-        retryable: isRetryable,
-      });
-
-      if (isRetryable) {
-        message.nack(); // retry
-      } else {
-        message.ack(); // drop
+      if (error) {
+        logger.error('Subscriber poll failed', { err: error, route });
+        return;
       }
+
+      for (const row of rows || []) {
+        const envelope = row.payload;
+
+        const validation = validateEnvelope(envelope);
+
+        if (!validation.valid) {
+          logger.error('Invalid envelope', {
+            route,
+            eventId: row.event_id,
+            errors: validation.errors,
+          });
+
+          await markProcessed(row.id, 'failed_permanent');
+          continue;
+        }
+
+        const childLogger = logger.child({
+          route,
+          eventId: envelope.eventId,
+          outboxId: row.id,
+          retryCount: row.retry_count,
+        });
+
+        try {
+          childLogger.info('Message received');
+
+          await Promise.race([
+            handler(envelope, row),
+            new Promise((_, reject) =>
+              setTimeout(
+                () => reject(new Error('Handler timeout')),
+                timeoutMs
+              )
+            ),
+          ]);
+
+          await markProcessed(row.id, 'processed');
+          childLogger.info('Message acknowledged');
+
+        } catch (err) {
+          const retryable =
+            !err.code || err.code !== 'PERMANENT_ERROR';
+
+          childLogger.error('Handler failed', {
+            err,
+            retryable,
+          });
+
+          if (retryable && row.retry_count < MAX_RETRIES) {
+            await retryEvent(row.id);
+          } else {
+            await markProcessed(row.id, 'failed');
+          }
+        }
+      }
+    } catch (err) {
+      logger.error('Subscriber loop error', { err, route });
     }
+  }
+
+  timer = setInterval(poll, pollInterval);
+
+  logger.info('Subscriber started', { route });
+
+  return {
+    close() {
+      stopped = true;
+      clearInterval(timer);
+      logger.warn('Subscriber closed', { route });
+    },
+  };
+}
+
+async function markProcessed(id, status) {
+  await supabase
+    .from('event_outbox')
+    .update({
+      status,
+      processed_at: new Date().toISOString(),
+    })
+    .eq('id', id);
+}
+
+async function retryEvent(id) {
+  await supabase.rpc('retry_outbox_event', {
+    p_id: id,
   });
-
-  subscription.on('error', (err) => {
-    logger.error('Subscription error', { err, subscriptionName });
-  });
-
-  subscription.on('close', () => {
-    logger.warn('Subscription closed', { subscriptionName });
-  });
-
-  logger.info('Subscriber started', { subscriptionName });
-
-  return subscription;
 }
 
 module.exports = {

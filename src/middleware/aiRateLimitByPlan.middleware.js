@@ -90,7 +90,7 @@ async function aiRateLimitByPlan(req, res, next) {
     });
   }
 
-  const uid = req.user.uid;
+  const uid = req.user.id;
 
   // ─── Admin bypass ─────────────────────────────────────────
   const isAdmin =

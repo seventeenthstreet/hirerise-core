@@ -27,7 +27,7 @@ function fail(res, statusCode, message, code) {
 
 // ─────────────────────────────────────────────────────────────
 // Auth Resolver
-// Removes Firebase req.user.uid dependency
+// Removes Firebase req.user.id dependency
 // ─────────────────────────────────────────────────────────────
 
 function getAuthenticatedUserId(req) {

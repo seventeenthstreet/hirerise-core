@@ -1,48 +1,69 @@
 'use strict';
 
 /**
- * shared/deduplication/index.js — FINAL FIXED
+ * shared/deduplication/index.js
  *
- * ✅ CJS compatible
- * ✅ Redis health-aware
- * ✅ Safe fail-open behavior
- * ✅ Production hardened
+ * Production-ready distributed event deduplication
+ * ✅ Firebase-free
+ * ✅ Supabase worker safe
+ * ✅ Redis fail-open
+ * ✅ Dynamic service scoping
+ * ✅ Safer Redis readiness detection
+ * ✅ Modern Redis SET syntax
+ * ✅ Key normalization
+ * ✅ Better retry semantics
  */
 
 const redis = require('../redis.client');
 const logger = require('../logger');
 
-// Namespace to avoid collisions
-const SERVICE = process.env.SERVICE_NAME || 'unknown-service';
 const NODE_ENV = process.env.NODE_ENV || 'development';
+const TTL_SECONDS = 24 * 60 * 60; // 24h
 
-const KEY_PREFIX = `event:dedup:${NODE_ENV}:${SERVICE}:`;
-const TTL_SECONDS = 24 * 60 * 60; // 24 hours
+function getServiceName() {
+  return process.env.SERVICE_NAME || 'unknown-service';
+}
 
-// ─────────────────────────────────────────────
-// Redis Availability Check (FIXED)
-// ─────────────────────────────────────────────
+function getKeyPrefix() {
+  return `event:dedup:${NODE_ENV}:${getServiceName()}:`;
+}
+
+function normalizeEventId(eventId) {
+  return String(eventId).trim().slice(0, 200);
+}
 
 function isRedisAvailable() {
   try {
-    return (
-      redis &&
-      typeof redis.set === 'function' &&
-      typeof redis.isReady === 'function' &&
-      redis.isReady()
-    );
+    if (!redis) return false;
+
+    if (typeof redis.isReady === 'function') {
+      return redis.isReady();
+    }
+
+    if (typeof redis.isOpen === 'boolean') {
+      return redis.isOpen;
+    }
+
+    if (typeof redis.status === 'string') {
+      return redis.status === 'ready';
+    }
+
+    return typeof redis.set === 'function';
   } catch {
     return false;
   }
 }
 
-// ─────────────────────────────────────────────
-// claimEvent
-// ─────────────────────────────────────────────
-
+/**
+ * Attempt to claim event for processing.
+ * Fail-open by design to avoid blocking core business flow.
+ */
 async function claimEvent(eventId, meta = {}) {
   if (!eventId || typeof eventId !== 'string') {
-    logger.warn('[Deduplication] Invalid eventId — skipping dedup', { eventId });
+    logger.warn('[Deduplication] Invalid eventId — skipping dedup', {
+      eventId,
+      ...meta,
+    });
     return { claimed: true };
   }
 
@@ -54,23 +75,35 @@ async function claimEvent(eventId, meta = {}) {
     return { claimed: true };
   }
 
-  const key = `${KEY_PREFIX}${eventId}`;
+  const normalizedEventId = normalizeEventId(eventId);
+  const key = `${getKeyPrefix()}${normalizedEventId}`;
 
   try {
-    const result = await redis.set(key, '1', 'NX', 'EX', TTL_SECONDS);
+    const result = await redis.set(key, '1', {
+      NX: true,
+      EX: TTL_SECONDS,
+    });
 
-    if (result === 'OK') {
-      logger.debug('[Deduplication] Event claimed', { eventId, ...meta });
+    if (result === 'OK' || result === true) {
+      logger.debug('[Deduplication] Event claimed', {
+        eventId: normalizedEventId,
+        ...meta,
+      });
+
       return { claimed: true };
     }
 
-    logger.info('[Deduplication] Duplicate event skipped', { eventId, ...meta });
+    logger.info('[Deduplication] Duplicate event skipped', {
+      eventId: normalizedEventId,
+      ...meta,
+    });
+
     return { claimed: false };
 
-  } catch (err) {
+  } catch (error) {
     logger.error('[Deduplication] Redis error — fail-open', {
-      eventId,
-      error: err.message,
+      eventId: normalizedEventId,
+      error: error.message,
       ...meta,
     });
 
@@ -78,30 +111,31 @@ async function claimEvent(eventId, meta = {}) {
   }
 }
 
-// ─────────────────────────────────────────────
-// releaseEvent
-// ─────────────────────────────────────────────
-
-async function releaseEvent(eventId) {
+/**
+ * Release dedup lock to allow safe retry after worker failure.
+ */
+async function releaseEvent(eventId, meta = {}) {
   if (!eventId || typeof eventId !== 'string') return;
   if (!isRedisAvailable()) return;
 
-  const key = `${KEY_PREFIX}${eventId}`;
+  const normalizedEventId = normalizeEventId(eventId);
+  const key = `${getKeyPrefix()}${normalizedEventId}`;
 
   try {
     await redis.del(key);
-    logger.debug('[Deduplication] Lock released for retry', { eventId });
-  } catch (err) {
+
+    logger.debug('[Deduplication] Lock released for retry', {
+      eventId: normalizedEventId,
+      ...meta,
+    });
+  } catch (error) {
     logger.warn('[Deduplication] Failed to release lock', {
-      eventId,
-      error: err.message,
+      eventId: normalizedEventId,
+      error: error.message,
+      ...meta,
     });
   }
 }
-
-// ─────────────────────────────────────────────
-// EXPORT
-// ─────────────────────────────────────────────
 
 module.exports = {
   claimEvent,

@@ -31,7 +31,7 @@ const withTimeout = (promise, ms = 5000) => {
 // ─────────────────────────────────────────────
 async function predictCareers(req, res, next) {
   try {
-    const requestingUid = req.user.uid;
+    const requestingUid = req.user.id;
     const studentId = req.params.studentId;
 
     // ── Auth guard ───────────────────────────
@@ -133,7 +133,7 @@ async function predictCareers(req, res, next) {
 // ─────────────────────────────────────────────
 async function getCareers(req, res, next) {
   try {
-    const requestingUid = req.user.uid;
+    const requestingUid = req.user.id;
     const studentId = req.params.studentId;
 
     if (requestingUid !== studentId && !req.user.admin) {

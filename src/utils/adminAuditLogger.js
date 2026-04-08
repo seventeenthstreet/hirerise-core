@@ -3,72 +3,107 @@
 /**
  * adminAuditLogger.js — Admin Action Audit Trail
  *
- * MIGRATION: Removed the lazy require('../config/supabase') inside logAdminAction().
- * The check `if (!db) return` (test-mode guard) is replaced by a try/catch which
- * was already there — behaviour is unchanged in test environments where SUPABASE_URL
- * is unset (the client throw is caught and logged as a warn, never rethrown).
+ * Supabase production-ready audit logger.
  *
- * Write change:
- *   OLD: db.collection('admin_logs').add({ adminId, action, ... })
- *   NEW: supabase.from('admin_logs').insert({ admin_id, action, ... })
- *
- * Schema note: Postgres column names are snake_case.
- *   adminId    → admin_id
- *   entityType → entity_type
- *   entityId   → entity_id
- *   ipAddress  → ip_address
- *   createdAt  → created_at
+ * Design goals:
+ * - Never breaks request flow
+ * - Safe in test / missing-env environments
+ * - Structured snake_case Postgres payloads
+ * - JSONB-safe metadata
+ * - Non-blocking async writes
+ * - Reusable singleton Supabase client
  */
 
 const { supabase } = require('../config/supabase');
-const logger   = require('./logger');
+const logger = require('./logger');
 
 /**
- * Write an audit log entry to the admin_logs table.
- * Fire-and-forget — never throws, never blocks the calling request.
+ * Safely normalize metadata into JSONB-safe object.
  *
- * @param {{
- *   adminId:    string,
- *   action:     string,
- *   entityType: string,
- *   entityId?:  string,
- *   metadata?:  object,
- *   ipAddress?: string,
- * }} params
- * @returns {Promise<void>}
+ * @param {unknown} metadata
+ * @returns {object}
  */
-async function logAdminAction({
+function normalizeMetadata(metadata) {
+  if (!metadata || typeof metadata !== 'object') {
+    return {};
+  }
+
+  try {
+    return JSON.parse(JSON.stringify(metadata));
+  } catch {
+    return {
+      serialization_error: true,
+    };
+  }
+}
+
+/**
+ * Build final insert payload.
+ *
+ * @param {object} params
+ * @returns {object}
+ */
+function buildAuditPayload({
   adminId,
   action,
   entityType,
-  entityId  = null,
-  metadata  = {},
+  entityId = null,
+  metadata = {},
   ipAddress = null,
 }) {
+  return {
+    admin_id: adminId || 'unknown',
+    action: action || 'UNKNOWN_ACTION',
+    entity_type: entityType || 'unknown',
+    entity_id: entityId,
+    metadata: normalizeMetadata(metadata),
+    ip_address: ipAddress,
+    created_at: new Date().toISOString(),
+  };
+}
+
+/**
+ * Write an audit log entry.
+ *
+ * Never throws.
+ * Safe for fire-and-forget usage:
+ *   void logAdminAction(...)
+ *
+ * @param {{
+ *   adminId?: string,
+ *   action?: string,
+ *   entityType?: string,
+ *   entityId?: string | null,
+ *   metadata?: object,
+ *   ipAddress?: string | null,
+ * }} params
+ * @returns {Promise<void>}
+ */
+async function logAdminAction(params = {}) {
   try {
-    const { error } = await supabase.from('admin_logs').insert({
-      admin_id:    adminId    || 'unknown',
-      action:      action     || 'UNKNOWN_ACTION',
-      entity_type: entityType || 'unknown',
-      entity_id:   entityId,
-      metadata:    metadata   || {},
-      ip_address:  ipAddress  || null,
-      created_at:  new Date().toISOString(),
-    });
+    if (!supabase) {
+      return;
+    }
 
-    if (error) throw error;
+    const payload = buildAuditPayload(params);
 
-  } catch (err) {
-    // Never let audit logging failure break the main request flow.
-    // Elevated to error: a failed audit write is a compliance gap, not a minor warning.
+    const { error } = await supabase
+      .from('admin_logs')
+      .insert(payload);
+
+    if (error) {
+      throw error;
+    }
+  } catch (error) {
     logger.error('[AdminAuditLogger] Failed to write audit log', {
-      action,
-      entityType,
-      adminId,
-      error:  err.message,
-      stack:  err.stack,
+      admin_id: params?.adminId || 'unknown',
+      action: params?.action || 'UNKNOWN_ACTION',
+      entity_type: params?.entityType || 'unknown',
+      error: error.message,
     });
   }
 }
 
-module.exports = { logAdminAction };
+module.exports = {
+  logAdminAction,
+};

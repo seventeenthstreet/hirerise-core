@@ -1,14 +1,36 @@
-# .dockerignore — D-07 FIX
-# Prevents node_modules, secrets, and test fixtures from being
-# sent to the Docker build context. Without this, build context
-# can exceed 300 MB (Puppeteer Chromium) and may include .env.
+# ============================================================================
+# .dockerignore — PRODUCTION SAFE (Supabase + monorepo optimized)
+# Prevent large build context, secrets leakage, test payloads, and legacy files
+# ============================================================================
 
+# ============================================================================
+# Node dependencies / package managers
+# ============================================================================
 node_modules
+.pnpm-store
+.npm
+.yarn
+.yarn-cache
+.yarn/*
+!.yarn/releases
+!.yarn/plugins
+
+# ============================================================================
+# Environment / secrets
+# ============================================================================
 .env
 .env.*
+.env.keys
+.env.local
+.env.*.local
 secrets/
+.supabase/
+.branches
+.temp
 
-# Test fixtures and debug scripts (C-04)
+# ============================================================================
+# Test fixtures / payloads / debug scripts
+# ============================================================================
 personal.json
 chi.json
 career.json
@@ -17,28 +39,52 @@ gencv.json
 growth.json
 score.json
 test.json
+
 get-token.js
 get-firebase-token.mjs
 test-tier-integration.js
 
-# Logs and debug output
+# ============================================================================
+# Logs / debug output
+# ============================================================================
 *.log
 firestore-debug.log
-
-# Git
-.git
-.gitignore
-
-# Test coverage
+supabase-debug.log
 coverage/
 __tests__/
 
-# Dev tooling
+# ============================================================================
+# Git / repo metadata
+# ============================================================================
+.git
+.gitignore
+.gitattributes
+.github/
+
+# ============================================================================
+# Dev tooling / local configs
+# ============================================================================
 .eslintrc*
 .prettierrc*
+.editorconfig
 nodemon.json
+.vscode/
+.idea/
 
-# Docs
+# ============================================================================
+# Docs / local notes
+# ============================================================================
 docs/
 README.md
 structure.txt
+*.md
+
+# ============================================================================
+# Build outputs
+# ============================================================================
+dist/
+build/
+.next/
+.nuxt/
+.cache/
+tmp/

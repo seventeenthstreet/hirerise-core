@@ -1,30 +1,64 @@
 'use strict';
 
 /**
- * route-registration.snippet.js (Firebase REMOVED)
- * ================================================
+ * route-registration.snippet.js
+ * ==================================================
+ * Central API route registration
+ * Supabase-native + JWT auth middleware
  *
- * This version uses your central auth middleware (Supabase / JWT based).
- *
- * Replace ALL Firebase auth usage with:
- *   requireAuth
- *
- * Ensure this middleware validates:
- *   - JWT access token
- *   - user session
- *   - attaches req.user
+ * Responsibilities:
+ * - Register versioned API routes
+ * - Reuse central requireAuth middleware
+ * - Keep boot logic deterministic
+ * - Preserve backward compatibility with existing imports
  */
 
-// Import your auth middleware (adjust path if needed)
+const express = require('express');
 const { requireAuth } = require('./middleware/auth.middleware');
 
-// --- EXISTING ROUTES ---
-// app.use('/api/v1/onboarding', requireAuth, onboardingRoutes);
-// ... other existing routes ...
+// Route modules
+const usersRoutes = require('./routes/users.routes');
+const studentOnboardingRoutes = require('./routes/student-onboarding.routes');
+const careerOnboardingRoutes = require('./routes/career-onboarding.routes');
+const onboardingRoutes = require('./routes/onboarding.routes');
 
-// --- UPDATED USERS ROUTE ---
-app.use('/api/v1/users', requireAuth, require('./routes/users.routes'));
+/**
+ * Register all application routes.
+ *
+ * @param {import('express').Application} app
+ */
+function registerRoutes(app) {
+  if (!app || typeof app.use !== 'function') {
+    throw new TypeError('A valid Express app instance is required');
+  }
 
-// --- NEW: Dual Onboarding System ---
-app.use('/api/v1/student-onboarding', requireAuth, require('./routes/student-onboarding.routes'));
-app.use('/api/v1/career-onboarding', requireAuth, require('./routes/career-onboarding.routes'));
+  const apiV1Router = express.Router();
+
+  // ─────────────────────────────────────────────────────────────
+  // AUTHENTICATED ROUTES
+  // ─────────────────────────────────────────────────────────────
+
+  apiV1Router.use('/users', requireAuth, usersRoutes);
+
+  apiV1Router.use('/onboarding', requireAuth, onboardingRoutes);
+
+  // Dual onboarding system
+  apiV1Router.use(
+    '/student-onboarding',
+    requireAuth,
+    studentOnboardingRoutes
+  );
+
+  apiV1Router.use(
+    '/career-onboarding',
+    requireAuth,
+    careerOnboardingRoutes
+  );
+
+  // Mount API v1
+  app.use('/api/v1', apiV1Router);
+}
+
+module.exports = {
+  registerRoutes,
+};

@@ -181,7 +181,7 @@ function createCmsDatasetModule(config) {
   // ── Controller ────────────────────────────────────────────────────────────
   const controller = {
     create: asyncHandler(async (req, res) => {
-      const result = await service.create(req.body, req.user.uid, req.user?.agency);
+      const result = await service.create(req.body, req.user.id, req.user?.agency);
       res.status(201).json({ success: true, data: result });
     }),
     list: asyncHandler(async (req, res) => {
@@ -195,11 +195,11 @@ function createCmsDatasetModule(config) {
       res.json({ success: true, data: item });
     }),
     update: asyncHandler(async (req, res) => {
-      const result = await service.update(req.params.id, req.body, req.user.uid);
+      const result = await service.update(req.params.id, req.body, req.user.id);
       res.json({ success: true, data: result });
     }),
     delete: asyncHandler(async (req, res) => {
-      await service.softDelete(req.params.id, req.user.uid);
+      await service.softDelete(req.params.id, req.user.id);
       res.json({ success: true, message: `${datasetType} deleted` });
     }),
   };

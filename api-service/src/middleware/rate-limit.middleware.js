@@ -1,25 +1,40 @@
-import { supabase } from '../../../config/supabaseClient.js';
+'use strict';
+
+import { supabaseAdmin } from '../../../config/supabaseClient.js';
 import { logger } from '../../../shared/logger/index.js';
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Configuration
-// ─────────────────────────────────────────────────────────────────────────────
-
 const LIMITS = Object.freeze({
-  requestsPerMinute:   20,
-  maxPendingJobs:      5,
-  dailyResumeSubmits:  10,
+  requestsPerMinute: 20,
+  maxPendingJobs: 5,
+  dailyResumeSubmits: 10,
   dailySalaryRequests: 20,
   dailyCareerRequests: 20,
 });
 
 const VALID_WINDOWS = new Set(['minute', 'day']);
+const RATE_LIMIT_TIMEOUT_MS = 1000;
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Rate Limit Middleware Factory
-// ─────────────────────────────────────────────────────────────────────────────
+function getTimestamp() {
+  return new Date().toISOString();
+}
+
+function sendRateLimitResponse(res, payload, requestId) {
+  return res.status(429).json({
+    ...payload,
+    requestId,
+    timestamp: getTimestamp(),
+  });
+}
 
 export function rateLimit({ counterKey, limit, window = 'minute' }) {
+  if (!counterKey || typeof counterKey !== 'string') {
+    throw new Error('counterKey must be a non-empty string');
+  }
+
+  if (!Number.isInteger(limit) || limit <= 0) {
+    throw new Error('limit must be a positive integer');
+  }
+
   if (!VALID_WINDOWS.has(window)) {
     throw new Error(`Invalid rate limit window: ${window}`);
   }
@@ -30,11 +45,11 @@ export function rateLimit({ counterKey, limit, window = 'minute' }) {
 
     try {
       const windowKey = getWindowKey(window);
-      const docId     = `${userId}_${counterKey}_${windowKey}`;
+      const counterId = `${userId}:${counterKey}:${windowKey}`;
 
       const allowed = await withTimeout(
-        checkAndIncrement(docId, limit, window),
-        1000
+        checkAndIncrement(counterId, limit, window),
+        RATE_LIMIT_TIMEOUT_MS
       );
 
       if (!allowed) {
@@ -46,38 +61,39 @@ export function rateLimit({ counterKey, limit, window = 'minute' }) {
           requestId: req.requestId,
         });
 
-        return res.status(429).json({
-          error:      'RATE_LIMIT_EXCEEDED',
-          message:    `Too many requests. Limit: ${limit} per ${window}.`,
-          retryAfter: getRetryAfter(window),
-          requestId:  req.requestId,
-          timestamp:  new Date().toISOString(),
-        });
+        return sendRateLimitResponse(
+          res,
+          {
+            error: 'RATE_LIMIT_EXCEEDED',
+            message: `Too many requests. Limit: ${limit} per ${window}.`,
+            retryAfter: getRetryAfter(window),
+          },
+          req.requestId
+        );
       }
 
-      next();
-    } catch (err) {
-      logger.error('Rate limit check failed — fail-safe applied', {
-        error: err.message,
+      return next();
+    } catch (error) {
+      logger.error('Rate limit check failed — fail-open applied', {
+        error: error.message,
         userId,
         counterKey,
         requestId: req.requestId,
       });
 
-      // ⚠️ Safer fallback: allow but mark degraded
-      next();
+      return next();
     }
   };
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Pending Job Limit
-// ─────────────────────────────────────────────────────────────────────────────
-
 export async function checkPendingJobLimit(userId) {
-  const { count, error } = await supabase
+  if (!userId) {
+    return { allowed: true, count: 0 };
+  }
+
+  const { count, error } = await supabaseAdmin
     .from('jobs')
-    .select('id', { count: 'exact', head: true })
+    .select('*', { count: 'exact', head: true })
     .eq('user_id', userId)
     .in('status', ['pending', 'processing'])
     .is('deleted_at', null);
@@ -86,11 +102,13 @@ export async function checkPendingJobLimit(userId) {
     logger.error('checkPendingJobLimit query failed', {
       userId,
       error: error.message,
+      code: error.code,
     });
-    return { allowed: true, count: 0 };
+
+    return { allowed: true, count: 0, degraded: true };
   }
 
-  const jobCount = count ?? 0;
+  const jobCount = Number(count ?? 0);
 
   if (jobCount >= LIMITS.maxPendingJobs) {
     return {
@@ -103,10 +121,6 @@ export async function checkPendingJobLimit(userId) {
 
   return { allowed: true, count: jobCount };
 }
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Middleware Presets
-// ─────────────────────────────────────────────────────────────────────────────
 
 export const resumeSubmitRateLimit = rateLimit({
   counterKey: 'resume_submit',
@@ -132,97 +146,87 @@ export const globalRequestRateLimit = rateLimit({
   window: 'minute',
 });
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Pending Job Middleware
-// ─────────────────────────────────────────────────────────────────────────────
-
 export async function pendingJobLimitMiddleware(req, res, next) {
   const userId = req.user?.uid;
   if (!userId) return next();
 
   try {
-    const { allowed, count, limit, message } =
-      await checkPendingJobLimit(userId);
+    const result = await checkPendingJobLimit(userId);
 
-    if (!allowed) {
+    if (!result.allowed) {
       logger.warn('Pending job limit exceeded', {
         userId,
-        count,
-        limit,
+        count: result.count,
+        limit: result.limit,
         requestId: req.requestId,
       });
 
-      return res.status(429).json({
-        error:       'PENDING_JOB_LIMIT_EXCEEDED',
-        message,
-        pendingJobs: count,
-        limit,
-        requestId:   req.requestId,
-        timestamp:   new Date().toISOString(),
-      });
+      return sendRateLimitResponse(
+        res,
+        {
+          error: 'PENDING_JOB_LIMIT_EXCEEDED',
+          message: result.message,
+          pendingJobs: result.count,
+          limit: result.limit,
+        },
+        req.requestId
+      );
     }
 
-    next();
-  } catch (err) {
+    return next();
+  } catch (error) {
     logger.error('Pending job check failed — allowing request', {
-      error: err.message,
+      error: error.message,
       userId,
       requestId: req.requestId,
     });
 
-    next();
+    return next();
   }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Atomic Counter (RPC-based)
-// ─────────────────────────────────────────────────────────────────────────────
-
-async function checkAndIncrement(docId, limit, window) {
+async function checkAndIncrement(counterId, limit, window) {
   const expiresAt = getWindowExpiry(window).toISOString();
 
-  const { data, error } = await supabase.rpc('increment_rate_limit', {
-    p_id: docId,
+  const { data, error } = await supabaseAdmin.rpc('increment_rate_limit', {
+    p_id: counterId,
     p_limit: limit,
     p_expires_at: expiresAt,
   });
 
   if (error) {
     logger.error('[rateLimit] RPC failed', {
-      docId,
+      counterId,
+      limit,
+      window,
       error: error.message,
+      code: error.code,
     });
+
     return true;
   }
 
-  return data;
+  return Boolean(data);
 }
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Helpers
-// ─────────────────────────────────────────────────────────────────────────────
 
 function getWindowKey(window) {
   const now = new Date();
-
-  if (window === 'minute') {
-    return now.toISOString().slice(0, 16);
-  }
-
-  return now.toISOString().slice(0, 10);
+  return window === 'minute'
+    ? now.toISOString().slice(0, 16)
+    : now.toISOString().slice(0, 10);
 }
 
 function getWindowExpiry(window) {
   const now = new Date();
 
   if (window === 'minute') {
-    now.setSeconds(0, 0);
-    now.setMinutes(now.getMinutes() + 2);
-  } else {
-    now.setHours(0, 0, 0, 0);
-    now.setDate(now.getDate() + 2);
+    now.setUTCSeconds(0, 0);
+    now.setUTCMinutes(now.getUTCMinutes() + 2);
+    return now;
   }
 
+  now.setUTCHours(0, 0, 0, 0);
+  now.setUTCDate(now.getUTCDate() + 2);
   return now;
 }
 
@@ -230,12 +234,16 @@ function getRetryAfter(window) {
   return window === 'minute' ? 60 : 86400;
 }
 
-// Timeout wrapper
 function withTimeout(promise, ms) {
-  return Promise.race([
-    promise,
-    new Promise((_, reject) =>
-      setTimeout(() => reject(new Error('Rate limit timeout')), ms)
-    ),
-  ]);
+  let timeoutId;
+
+  const timeoutPromise = new Promise((_, reject) => {
+    timeoutId = setTimeout(() => {
+      reject(new Error('Rate limit timeout'));
+    }, ms);
+  });
+
+  return Promise.race([promise, timeoutPromise]).finally(() => {
+    clearTimeout(timeoutId);
+  });
 }

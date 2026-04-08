@@ -1,36 +1,55 @@
 'use strict';
 
 /**
- * validators.js — HARDENED VERSION
+ * shared/validation/validators.js
  *
- * ✅ Firebase naming removed
- * ✅ Strong sanitization
- * ✅ Type safety
- * ✅ Length limits
- * ✅ Consistent error format
+ * Validation layer — production hardened
+ *
+ * ✅ Zero Firebase legacy
+ * ✅ Better whitespace validation
+ * ✅ Stronger sanitization
+ * ✅ Numeric normalization
+ * ✅ Safer MIME validation
+ * ✅ Better API compatibility
+ * ✅ Predictable error contracts
  */
+
+function buildError(message, code = 'VALIDATION_ERROR', field = null) {
+  const err = new Error(message);
+  err.code = code;
+  err.field = field;
+
+  return {
+    valid: false,
+    error: err,
+  };
+}
 
 // ─────────────────────────────────────────────
 // Helpers
 // ─────────────────────────────────────────────
-
-function error(message, code = 'VALIDATION_ERROR') {
-  const err = new Error(message);
-  err.code = code;
-  return { valid: false, error: err };
-}
-
-function validateRequired(obj, fields) {
+function validateRequired(obj, fields = []) {
   if (!obj || typeof obj !== 'object' || Array.isArray(obj)) {
-    return error('Invalid request body');
+    return buildError('Invalid request body');
   }
 
-  const missing = fields.filter(
-    (f) => obj[f] === undefined || obj[f] === null || obj[f] === ''
-  );
+  const missing = fields.filter((field) => {
+    const value = obj[field];
+
+    if (value === undefined || value === null) return true;
+
+    if (typeof value === 'string' && value.trim().length === 0) {
+      return true;
+    }
+
+    return false;
+  });
 
   if (missing.length > 0) {
-    return error(`Missing required fields: ${missing.join(', ')}`);
+    return buildError(
+      `Missing required fields: ${missing.join(', ')}`,
+      'VALIDATION_ERROR'
+    );
   }
 
   return { valid: true };
@@ -39,77 +58,95 @@ function validateRequired(obj, fields) {
 // ─────────────────────────────────────────────
 // Sanitization
 // ─────────────────────────────────────────────
-
 function sanitizeString(value, maxLength = 1000) {
   if (typeof value !== 'string') return null;
 
   const cleaned = value
+    .replace(/[\x00-\x1F\x7F]/g, '')
     .trim()
-    .slice(0, maxLength)
-    .replace(/[\x00-\x1F\x7F]/g, '');
+    .slice(0, maxLength);
 
-  return cleaned.length ? cleaned : null;
+  return cleaned.length > 0 ? cleaned : null;
 }
 
-function sanitizeObject(obj, allowedKeys) {
-  if (!obj || typeof obj !== 'object' || Array.isArray(obj)) return {};
+function sanitizeObject(obj, allowedKeys = []) {
+  if (!obj || typeof obj !== 'object' || Array.isArray(obj)) {
+    return {};
+  }
 
   const result = {};
 
   for (const key of allowedKeys) {
-    if (obj[key] !== undefined) {
-      result[key] =
-        typeof obj[key] === 'string'
-          ? sanitizeString(obj[key])
-          : obj[key];
-    }
+    if (!(key in obj)) continue;
+
+    const value = obj[key];
+
+    result[key] =
+      typeof value === 'string' ? sanitizeString(value) : value;
   }
 
   return result;
 }
 
-// ─────────────────────────────────────────────
-// Generic ID Validator (FIXED)
-// ─────────────────────────────────────────────
+function parseSafeNumber(value) {
+  if (typeof value === 'number') {
+    return Number.isFinite(value) ? value : null;
+  }
 
+  if (typeof value === 'string' && value.trim()) {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : null;
+  }
+
+  return null;
+}
+
+// ─────────────────────────────────────────────
+// Generic ID Validator
+// ─────────────────────────────────────────────
 function isValidId(id) {
   if (typeof id !== 'string') return false;
-  if (id.length === 0 || id.length > 128) return false;
-  return /^[a-zA-Z0-9_\-]+$/.test(id);
+
+  const trimmed = id.trim();
+
+  if (!trimmed || trimmed.length > 128) return false;
+
+  return /^[a-zA-Z0-9_-]+$/.test(trimmed);
 }
 
 // ─────────────────────────────────────────────
 // Resume Submission
 // ─────────────────────────────────────────────
-
 function validateResumeSubmission(body) {
-  const ALLOWED_MIME = [
+  const ALLOWED_MIME = new Set([
     'application/pdf',
     'text/plain',
     'application/msword',
     'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
-  ];
+  ]);
 
   const required = validateRequired(body, [
     'resumeStoragePath',
     'fileName',
     'mimeType',
   ]);
+
   if (!required.valid) return required;
 
   const resumeStoragePath = sanitizeString(body.resumeStoragePath, 1024);
   const fileName = sanitizeString(body.fileName, 255);
+  const mimeType = sanitizeString(body.mimeType, 200)?.toLowerCase();
 
   if (!resumeStoragePath) {
-    return error('Invalid resumeStoragePath');
+    return buildError('Invalid resumeStoragePath', 'VALIDATION_ERROR', 'resumeStoragePath');
   }
 
   if (!fileName) {
-    return error('Invalid fileName');
+    return buildError('Invalid fileName', 'VALIDATION_ERROR', 'fileName');
   }
 
-  if (!ALLOWED_MIME.includes(body.mimeType)) {
-    return error(`Unsupported mimeType: ${body.mimeType}`);
+  if (!mimeType || !ALLOWED_MIME.has(mimeType)) {
+    return buildError(`Unsupported mimeType: ${body.mimeType}`, 'VALIDATION_ERROR', 'mimeType');
   }
 
   return {
@@ -117,7 +154,7 @@ function validateResumeSubmission(body) {
     data: {
       resumeStoragePath,
       fileName,
-      mimeType: body.mimeType,
+      mimeType,
     },
   };
 }
@@ -125,28 +162,37 @@ function validateResumeSubmission(body) {
 // ─────────────────────────────────────────────
 // Salary Request
 // ─────────────────────────────────────────────
-
 function validateSalaryRequest(body) {
   const required = validateRequired(body, [
     'jobTitle',
     'location',
     'yearsExperience',
   ]);
+
   if (!required.valid) return required;
 
   const jobTitle = sanitizeString(body.jobTitle, 200);
   const location = sanitizeString(body.location, 200);
+  const yearsExperience = parseSafeNumber(body.yearsExperience);
 
-  if (!jobTitle || !location) {
-    return error('Invalid jobTitle or location');
+  if (!jobTitle) {
+    return buildError('Invalid jobTitle', 'VALIDATION_ERROR', 'jobTitle');
+  }
+
+  if (!location) {
+    return buildError('Invalid location', 'VALIDATION_ERROR', 'location');
   }
 
   if (
-    typeof body.yearsExperience !== 'number' ||
-    body.yearsExperience < 0 ||
-    body.yearsExperience > 60
+    yearsExperience === null ||
+    yearsExperience < 0 ||
+    yearsExperience > 60
   ) {
-    return error('yearsExperience must be between 0 and 60');
+    return buildError(
+      'yearsExperience must be between 0 and 60',
+      'VALIDATION_ERROR',
+      'yearsExperience'
+    );
   }
 
   return {
@@ -154,7 +200,7 @@ function validateSalaryRequest(body) {
     data: {
       jobTitle,
       location,
-      yearsExperience: body.yearsExperience,
+      yearsExperience,
     },
   };
 }
@@ -162,24 +208,29 @@ function validateSalaryRequest(body) {
 // ─────────────────────────────────────────────
 // Career Path
 // ─────────────────────────────────────────────
-
 function validateCareerPathRequest(body) {
   const required = validateRequired(body, [
     'currentTitle',
     'targetTitle',
     'userId',
   ]);
+
   if (!required.valid) return required;
 
   const currentTitle = sanitizeString(body.currentTitle, 200);
   const targetTitle = sanitizeString(body.targetTitle, 200);
+  const userId = sanitizeString(body.userId, 128);
 
-  if (!currentTitle || !targetTitle) {
-    return error('Invalid titles');
+  if (!currentTitle) {
+    return buildError('Invalid currentTitle', 'VALIDATION_ERROR', 'currentTitle');
   }
 
-  if (!isValidId(body.userId)) {
-    return error('Invalid userId');
+  if (!targetTitle) {
+    return buildError('Invalid targetTitle', 'VALIDATION_ERROR', 'targetTitle');
+  }
+
+  if (!isValidId(userId)) {
+    return buildError('Invalid userId', 'VALIDATION_ERROR', 'userId');
   }
 
   return {
@@ -187,19 +238,16 @@ function validateCareerPathRequest(body) {
     data: {
       currentTitle,
       targetTitle,
-      userId: body.userId,
+      userId,
     },
   };
 }
-
-// ─────────────────────────────────────────────
-// Exports
-// ─────────────────────────────────────────────
 
 module.exports = {
   validateRequired,
   sanitizeString,
   sanitizeObject,
+  parseSafeNumber,
   isValidId,
   validateResumeSubmission,
   validateSalaryRequest,

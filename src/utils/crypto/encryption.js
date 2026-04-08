@@ -3,21 +3,25 @@
 /**
  * encryption.js — AES-256-GCM Secrets Encryption Utility
  *
+ * Production-ready database-agnostic encryption helper for secure secret storage.
+ *
+ * Designed for Supabase/Postgres row storage:
+ *   encrypted_value TEXT
+ *   iv TEXT
+ *   auth_tag TEXT
+ *   hmac TEXT
+ *
  * Security design:
- *   - Algorithm : AES-256-GCM  (authenticated encryption — detects tampering)
- *   - Key source: MASTER_ENCRYPTION_KEY env var (must be exactly 32 bytes)
- *   - IV        : 16 random bytes generated fresh per encryption call
- *   - Auth tag  : 16-byte GCM tag stored separately for integrity verification
- *   - HMAC      : SHA-256 HMAC over (name + iv + ciphertext) for tamper detection
- *   - Storage   : { encryptedValue, iv, authTag, hmac } — all hex-encoded
+ *   - Algorithm : AES-256-GCM
+ *   - Key source: MASTER_ENCRYPTION_KEY
+ *   - IV        : 16 random bytes per encryption
+ *   - Auth tag  : 16 bytes
+ *   - HMAC      : SHA-256 over (secretName + iv + ciphertext)
  *
- * The MASTER_ENCRYPTION_KEY must be stored as a secure environment variable
- * and NEVER committed to source control. Rotate via key-rotation script only.
- *
- * Separation from apiKeyCrypto.js:
- *   apiKeyCrypto  — uses API_KEY_ENCRYPTION_SECRET, single-string format
- *   encryption.js — uses MASTER_ENCRYPTION_KEY, structured Firestore fields,
- *                   adds HMAC tamper-protection and secret-name binding
+ * Supported MASTER_ENCRYPTION_KEY formats:
+ *   - 32-byte raw UTF-8 string
+ *   - 64-char hex string
+ *   - base64-encoded 32-byte key
  *
  * @module utils/crypto/encryption
  */
@@ -25,84 +29,104 @@
 const crypto = require('crypto');
 const logger = require('../logger');
 
-const ALGORITHM    = 'aes-256-gcm';
-const IV_LENGTH    = 16;   // bytes
-const TAG_LENGTH   = 16;   // bytes (GCM auth tag)
-const KEY_LENGTH   = 32;   // bytes (256 bits)
-const HMAC_ALG     = 'sha256';
-
-// ─── Key management ──────────────────────────────────────────────────────────
+const ALGORITHM = 'aes-256-gcm';
+const IV_LENGTH = 16;
+const TAG_LENGTH = 16;
+const KEY_LENGTH = 32;
+const HMAC_ALGORITHM = 'sha256';
 
 /**
- * Validate and return the master encryption key buffer.
- * Key is loaded fresh each call so env var hot-rotation is supported.
- *
- * @returns {Buffer} 32-byte key
- * @throws  {Error}  if key is missing or wrong length
+ * @typedef {Object} EncryptedSecret
+ * @property {string} encryptedValue
+ * @property {string} iv
+ * @property {string} authTag
+ * @property {string} hmac
  */
-function getMasterKey() {
+
+// ─────────────────────────────────────────────
+// Key Management
+// ─────────────────────────────────────────────
+
+/**
+ * Safely parse MASTER_ENCRYPTION_KEY from supported formats.
+ *
+ * @returns {Buffer}
+ */
+function parseMasterKey() {
   const raw = process.env.MASTER_ENCRYPTION_KEY;
 
   if (!raw) {
     throw new Error(
-      '[Encryption] MASTER_ENCRYPTION_KEY is not set. ' +
-      'Set it in your environment. Must be exactly 32 ASCII characters (256 bits).'
+      '[Encryption] MASTER_ENCRYPTION_KEY is missing from environment.'
     );
   }
 
-  const buf = Buffer.from(raw, 'utf8');
-
-  if (buf.length !== KEY_LENGTH) {
-    throw new Error(
-      `[Encryption] MASTER_ENCRYPTION_KEY must be exactly ${KEY_LENGTH} bytes. ` +
-      `Got ${buf.length}. Pad or trim to exactly 32 ASCII characters.`
-    );
+  // HEX: 64 chars → 32 bytes
+  if (/^[a-fA-F0-9]{64}$/.test(raw)) {
+    return Buffer.from(raw, 'hex');
   }
 
-  return buf;
+  // BASE64 → 32 bytes
+  try {
+    const base64Buf = Buffer.from(raw, 'base64');
+    if (base64Buf.length === KEY_LENGTH) {
+      return base64Buf;
+    }
+  } catch (_) {
+    // ignore parse attempt
+  }
+
+  // UTF-8 raw
+  const utf8Buf = Buffer.from(raw, 'utf8');
+  if (utf8Buf.length === KEY_LENGTH) {
+    return utf8Buf;
+  }
+
+  throw new Error(
+    `[Encryption] MASTER_ENCRYPTION_KEY must decode to exactly ${KEY_LENGTH} bytes.`
+  );
 }
 
 /**
- * Derive a separate HMAC key from the master key to prevent key reuse
- * across different cryptographic operations (domain separation).
+ * Domain-separated HMAC key derivation.
  *
- * @returns {Buffer} 32-byte HMAC key
+ * @returns {Buffer}
  */
 function getHmacKey() {
-  const masterKey = getMasterKey();
-  // HKDF-like derivation: HMAC(masterKey, "hmac-key-v1")
-  return crypto.createHmac(HMAC_ALG, masterKey)
-    .update('hmac-key-v1')
+  const masterKey = parseMasterKey();
+
+  return crypto
+    .createHmac(HMAC_ALGORITHM, masterKey)
+    .update('hmac-key-v2')
     .digest();
 }
 
-// ─── Core encrypt / decrypt ──────────────────────────────────────────────────
+// ─────────────────────────────────────────────
+// Core Encryption
+// ─────────────────────────────────────────────
 
 /**
- * Encrypt a secret value.
- * The secret name is bound into the HMAC to prevent substitution attacks
- * (an encrypted value for "STRIPE_KEY" cannot be swapped to "ANTHROPIC_KEY").
+ * Encrypt a plaintext secret.
  *
- * @param {string} plaintext  — raw secret value
- * @param {string} secretName — logical name of the secret (for HMAC binding)
- * @returns {{
- *   encryptedValue: string,  // hex
- *   iv:             string,  // hex
- *   authTag:        string,  // hex
- *   hmac:           string,  // hex  (tamper-detection signature)
- * }}
+ * @param {string} plaintext
+ * @param {string} secretName
+ * @returns {EncryptedSecret}
  */
 function encryptSecret(plaintext, secretName) {
-  if (!plaintext || typeof plaintext !== 'string') {
+  if (typeof plaintext !== 'string' || plaintext.length === 0) {
     throw new Error('[Encryption] plaintext must be a non-empty string');
   }
-  if (!secretName || typeof secretName !== 'string') {
-    throw new Error('[Encryption] secretName is required for HMAC binding');
+
+  if (typeof secretName !== 'string' || secretName.length === 0) {
+    throw new Error('[Encryption] secretName is required');
   }
 
-  const key    = getMasterKey();
-  const iv     = crypto.randomBytes(IV_LENGTH);
-  const cipher = crypto.createCipheriv(ALGORITHM, key, iv, { authTagLength: TAG_LENGTH });
+  const key = parseMasterKey();
+  const iv = crypto.randomBytes(IV_LENGTH);
+
+  const cipher = crypto.createCipheriv(ALGORITHM, key, iv, {
+    authTagLength: TAG_LENGTH,
+  });
 
   const encrypted = Buffer.concat([
     cipher.update(plaintext, 'utf8'),
@@ -111,119 +135,127 @@ function encryptSecret(plaintext, secretName) {
 
   const authTag = cipher.getAuthTag();
 
-  // HMAC over: secretName + ':' + iv + ciphertext  (name-bound tamper seal)
-  const hmacKey  = getHmacKey();
-  const hmacData = Buffer.concat([
+  const hmacPayload = Buffer.concat([
     Buffer.from(secretName.toLowerCase(), 'utf8'),
     Buffer.from(':'),
     iv,
     encrypted,
   ]);
-  const hmac = crypto.createHmac(HMAC_ALG, hmacKey).update(hmacData).digest();
+
+  const hmac = crypto
+    .createHmac(HMAC_ALGORITHM, getHmacKey())
+    .update(hmacPayload)
+    .digest();
 
   return {
     encryptedValue: encrypted.toString('hex'),
-    iv:             iv.toString('hex'),
-    authTag:        authTag.toString('hex'),
-    hmac:           hmac.toString('hex'),
+    iv: iv.toString('hex'),
+    authTag: authTag.toString('hex'),
+    hmac: hmac.toString('hex'),
   };
 }
 
 /**
- * Decrypt a secret value.
- * Verifies HMAC tamper-seal before decryption.
+ * Decrypt a stored secret payload.
  *
- * @param {{
- *   encryptedValue: string,
- *   iv:             string,
- *   authTag:        string,
- *   hmac:           string,
- * }} stored        — fields from Firestore document
- * @param {string} secretName — must match the name used during encryption
- * @returns {string} plaintext secret value
- * @throws  {Error}  on tamper detection, wrong key, or malformed input
+ * @param {EncryptedSecret} stored
+ * @param {string} secretName
+ * @returns {string}
  */
 function decryptSecret(stored, secretName) {
-  const { encryptedValue, iv: ivHex, authTag: authTagHex, hmac: storedHmac } = stored;
-
-  if (!encryptedValue || !ivHex || !authTagHex || !storedHmac) {
-    throw new Error('[Encryption] Stored secret is missing required fields (encryptedValue, iv, authTag, hmac)');
+  if (!stored || typeof stored !== 'object') {
+    throw new Error('[Encryption] stored payload is required');
   }
+
+  const { encryptedValue, iv, authTag, hmac } = stored;
+
+  if (!encryptedValue || !iv || !authTag || !hmac) {
+    throw new Error(
+      '[Encryption] Stored payload missing encryptedValue, iv, authTag, or hmac'
+    );
+  }
+
   if (!secretName) {
-    throw new Error('[Encryption] secretName is required to verify HMAC');
+    throw new Error('[Encryption] secretName is required');
   }
 
-  const encrypted = Buffer.from(encryptedValue, 'hex');
-  const iv        = Buffer.from(ivHex,           'hex');
-  const authTag   = Buffer.from(authTagHex,       'hex');
+  const encryptedBuffer = Buffer.from(encryptedValue, 'hex');
+  const ivBuffer = Buffer.from(iv, 'hex');
+  const authTagBuffer = Buffer.from(authTag, 'hex');
+  const storedHmacBuffer = Buffer.from(hmac, 'hex');
 
-  // ── Step 1: Verify HMAC before attempting decryption ────────────────────
-  const hmacKey  = getHmacKey();
-  const hmacData = Buffer.concat([
+  const hmacPayload = Buffer.concat([
     Buffer.from(secretName.toLowerCase(), 'utf8'),
     Buffer.from(':'),
-    iv,
-    encrypted,
+    ivBuffer,
+    encryptedBuffer,
   ]);
-  const expectedHmac = crypto.createHmac(HMAC_ALG, hmacKey).update(hmacData).digest();
-  const storedHmacBuf = Buffer.from(storedHmac, 'hex');
 
-  if (!crypto.timingSafeEqual(expectedHmac, storedHmacBuf)) {
-    logger.error('[Encryption] HMAC verification failed — secret may have been tampered with', {
-      secretName,
-    });
-    throw new Error('[Encryption] Tamper detection: HMAC mismatch. Secret integrity compromised.');
+  const expectedHmac = crypto
+    .createHmac(HMAC_ALGORITHM, getHmacKey())
+    .update(hmacPayload)
+    .digest();
+
+  // timingSafeEqual requires equal length
+  if (storedHmacBuffer.length !== expectedHmac.length) {
+    throw new Error('[Encryption] Tamper detection failed');
   }
 
-  // ── Step 2: Decrypt ────────────────────────────────────────────────────
-  const key      = getMasterKey();
-  const decipher = crypto.createDecipheriv(ALGORITHM, key, iv);
-  decipher.setAuthTag(authTag);
+  if (!crypto.timingSafeEqual(expectedHmac, storedHmacBuffer)) {
+    logger.error('[Encryption] HMAC verification failed', { secretName });
+    throw new Error('[Encryption] Tamper detection failed');
+  }
 
   try {
+    const decipher = crypto.createDecipheriv(
+      ALGORITHM,
+      parseMasterKey(),
+      ivBuffer
+    );
+
+    decipher.setAuthTag(authTagBuffer);
+
     const plaintext = Buffer.concat([
-      decipher.update(encrypted),
+      decipher.update(encryptedBuffer),
       decipher.final(),
     ]);
+
     return plaintext.toString('utf8');
-  } catch (err) {
-    // GCM auth tag failure — wrong key or corrupted ciphertext
-    logger.error('[Encryption] AES-GCM authentication failed — wrong key or corrupted data', {
+  } catch (error) {
+    logger.error('[Encryption] AES-GCM authentication failed', {
       secretName,
-      error: err.message,
+      error: error.message,
     });
-    throw new Error('[Encryption] Decryption failed: authentication tag mismatch.');
+
+    throw new Error('[Encryption] Decryption failed');
   }
 }
 
-// ─── Display helpers ─────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────
+// Helpers
+// ─────────────────────────────────────────────
 
 /**
- * Generate a masked preview of a plaintext secret for safe UI display.
- * Only the first 4 characters are revealed; the rest are masked.
+ * Generate a safe masked preview.
  *
- * Examples:
- *   "sk_live_abc123xyz"   → "sk_l************"
- *   "AIzaSy..."           → "AIza************"
- *   "short"               → "****"
- *
- * @param {string} plaintext — decrypted secret value
- * @returns {string} masked preview
+ * @param {string} plaintext
+ * @returns {string}
  */
 function maskSecret(plaintext) {
-  if (!plaintext || typeof plaintext !== 'string') return '****';
-  const show = Math.min(4, Math.floor(plaintext.length / 4));
-  return `${plaintext.substring(0, show)}${'*'.repeat(12)}`;
+  if (typeof plaintext !== 'string' || plaintext.length === 0) {
+    return '****';
+  }
+
+  const visibleChars = Math.min(4, Math.max(1, Math.floor(plaintext.length / 4)));
+
+  return `${plaintext.slice(0, visibleChars)}${'*'.repeat(12)}`;
 }
 
 /**
- * Validate that MASTER_ENCRYPTION_KEY is set and well-formed.
- * Call at server startup to fail fast before any request is served.
- *
- * @throws {Error} if key is absent or malformed
+ * Validate encryption key at startup.
  */
 function validateEncryptionKeyPresent() {
-  getMasterKey(); // throws if missing or wrong length
+  parseMasterKey();
 }
 
 module.exports = {
@@ -232,11 +264,3 @@ module.exports = {
   maskSecret,
   validateEncryptionKeyPresent,
 };
-
-
-
-
-
-
-
-

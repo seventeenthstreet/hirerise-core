@@ -1,62 +1,124 @@
 'use strict';
 
+/**
+ * shared/repositories/domain.repository.js
+ *
+ * Resume + Score repositories
+ * Fully production-hardened for Supabase
+ *
+ * ✅ Zero Firebase legacy
+ * ✅ Safe transition verification
+ * ✅ Timeout protected
+ * ✅ Better score ID sanitization
+ * ✅ Structured logging
+ * ✅ Reusable query execution
+ * ✅ Strong null safety
+ * ✅ Better race-condition handling
+ */
+
 const { supabase } = require('../config/supabase');
 const logger = require('../logger');
+
+const DEFAULT_TIMEOUT_MS = 10000;
 
 function nowISO() {
   return new Date().toISOString();
 }
 
+function sanitizeVersion(version) {
+  return String(version).replace(/[^a-zA-Z0-9_-]/g, '_');
+}
+
+function normalizeDbError(error, context = {}) {
+  const err = new Error(error?.message || 'Database operation failed');
+  err.code = error?.code || 'DB_ERROR';
+  err.details = error?.details;
+  err.context = context;
+  return err;
+}
+
 // ─────────────────────────────────────────────
 // Safe Execute Wrapper
 // ─────────────────────────────────────────────
-async function execute(query, context) {
-  const { data, error } = await query;
+async function execute(query, context = {}) {
+  let timeoutId;
 
-  if (error) {
-    logger.error('DB error', { error, ...context });
+  try {
+    const timeoutPromise = new Promise((_, reject) => {
+      timeoutId = setTimeout(() => {
+        const err = new Error('Database query timeout');
+        err.code = 'DB_TIMEOUT';
+        reject(err);
+      }, DEFAULT_TIMEOUT_MS);
+    });
 
-    const err = new Error(error.message);
-    err.code = 'DB_ERROR';
-    throw err;
+    const result = await Promise.race([query, timeoutPromise]);
+    clearTimeout(timeoutId);
+
+    const { data, error } = result;
+
+    if (error) {
+      const normalized = normalizeDbError(error, context);
+
+      logger.error('Supabase repository error', {
+        ...context,
+        code: normalized.code,
+        message: normalized.message,
+        details: normalized.details,
+      });
+
+      throw normalized;
+    }
+
+    return data;
+  } catch (error) {
+    clearTimeout(timeoutId);
+
+    logger.error('Repository execution failure', {
+      ...context,
+      code: error.code,
+      message: error.message,
+    });
+
+    throw error;
   }
-
-  return data;
 }
 
 // ─────────────────────────────────────────────
 // Resume Repository
 // ─────────────────────────────────────────────
-
 class ResumeRepository {
   constructor() {
     this.table = 'resumes';
   }
 
-  // ── Get recent resumes ──
-  async findByUserId(userId) {
-    if (!userId) return [];
-
-    return (
-      await execute(
-        supabase
-          .from(this.table)
-          .select('id, user_id, created_at, processing_status')
-          .eq('user_id', userId)
-          .order('created_at', { ascending: false })
-          .limit(10),
-        { method: 'findByUserId', userId }
-      )
-    ) ?? [];
+  query() {
+    return supabase.from(this.table);
   }
 
-  // ── Get latest active resume ──
+  async findByUserId(userId, limit = 10) {
+    if (!userId) return [];
+
+    const rows = await execute(
+      this.query()
+        .select('id, user_id, created_at, processing_status')
+        .eq('user_id', userId)
+        .order('created_at', { ascending: false })
+        .limit(limit),
+      {
+        method: 'findByUserId',
+        userId,
+      }
+    );
+
+    return rows ?? [];
+  }
+
   async findLatestByUserId(userId) {
     if (!userId) return null;
 
-    return await execute(
-      supabase
-        .from(this.table)
+    return execute(
+      this.query()
         .select('*')
         .eq('user_id', userId)
         .eq('soft_deleted', false)
@@ -64,62 +126,81 @@ class ResumeRepository {
         .order('created_at', { ascending: false })
         .limit(1)
         .maybeSingle(),
-      { method: 'findLatestByUserId', userId }
+      {
+        method: 'findLatestByUserId',
+        userId,
+      }
     );
   }
 
-  // ── Safe state transitions (FIXED) ──
-
   async markProcessing(resumeId) {
-    if (!resumeId) return;
+    if (!resumeId) return null;
 
-    return await execute(
-      supabase
-        .from(this.table)
+    const timestamp = nowISO();
+
+    return execute(
+      this.query()
         .update({
           processing_status: 'processing',
-          processing_started_at: nowISO(),
-          updated_at: nowISO(),
+          processing_started_at: timestamp,
+          updated_at: timestamp,
         })
         .eq('id', resumeId)
-        .in('processing_status', ['pending', 'failed']), // ✅ prevent overwrite
-      { method: 'markProcessing', resumeId }
+        .in('processing_status', ['pending', 'failed'])
+        .select('id, processing_status')
+        .maybeSingle(),
+      {
+        method: 'markProcessing',
+        resumeId,
+      }
     );
   }
 
   async markComplete(resumeId, engineVersion) {
-    if (!resumeId) return;
+    if (!resumeId) return null;
 
-    return await execute(
-      supabase
-        .from(this.table)
+    const timestamp = nowISO();
+
+    return execute(
+      this.query()
         .update({
           processing_status: 'complete',
-          processed_at: nowISO(),
+          processed_at: timestamp,
           last_engine_version: engineVersion,
-          updated_at: nowISO(),
+          updated_at: timestamp,
         })
         .eq('id', resumeId)
-        .eq('processing_status', 'processing'), // ✅ strict transition
-      { method: 'markComplete', resumeId }
+        .eq('processing_status', 'processing')
+        .select('id, processing_status, processed_at')
+        .maybeSingle(),
+      {
+        method: 'markComplete',
+        resumeId,
+      }
     );
   }
 
   async markFailed(resumeId, errorCode) {
-    if (!resumeId) return;
+    if (!resumeId) return null;
 
-    return await execute(
-      supabase
-        .from(this.table)
+    const timestamp = nowISO();
+
+    return execute(
+      this.query()
         .update({
           processing_status: 'failed',
-          failed_at: nowISO(),
+          failed_at: timestamp,
           last_error_code: errorCode,
-          updated_at: nowISO(),
+          updated_at: timestamp,
         })
         .eq('id', resumeId)
-        .neq('processing_status', 'complete'), // ✅ don't override success
-      { method: 'markFailed', resumeId }
+        .neq('processing_status', 'complete')
+        .select('id, processing_status, failed_at')
+        .maybeSingle(),
+      {
+        method: 'markFailed',
+        resumeId,
+      }
     );
   }
 }
@@ -127,14 +208,17 @@ class ResumeRepository {
 // ─────────────────────────────────────────────
 // Score Repository
 // ─────────────────────────────────────────────
-
 class ScoreRepository {
   constructor() {
     this.table = 'resume_scores';
   }
 
+  query() {
+    return supabase.from(this.table);
+  }
+
   buildScoreId(userId, resumeId, engineVersion) {
-    return `${userId}_${resumeId}_${engineVersion.replace(/\./g, '_')}`;
+    return `${userId}_${resumeId}_${sanitizeVersion(engineVersion)}`;
   }
 
   async upsertScore(userId, resumeId, engineVersion, scoreData = {}) {
@@ -142,6 +226,7 @@ class ScoreRepository {
       throw new Error('Missing required fields for scoring');
     }
 
+    const timestamp = nowISO();
     const id = this.buildScoreId(userId, resumeId, engineVersion);
 
     const payload = {
@@ -150,14 +235,17 @@ class ScoreRepository {
       resume_id: resumeId,
       engine_version: engineVersion,
       ...scoreData,
-      scored_at: nowISO(),
+      scored_at: timestamp,
     };
 
     await execute(
-      supabase
-        .from(this.table)
-        .upsert(payload, { onConflict: 'id' }), // ✅ optimized
-      { method: 'upsertScore', id }
+      this.query().upsert(payload, {
+        onConflict: 'id',
+      }),
+      {
+        method: 'upsertScore',
+        id,
+      }
     );
 
     return id;
@@ -166,33 +254,38 @@ class ScoreRepository {
   async getLatestScore(userId, resumeId) {
     if (!userId || !resumeId) return null;
 
-    return await execute(
-      supabase
-        .from(this.table)
+    return execute(
+      this.query()
         .select('*')
         .eq('user_id', userId)
         .eq('resume_id', resumeId)
         .order('scored_at', { ascending: false })
         .limit(1)
         .maybeSingle(),
-      { method: 'getLatestScore', userId, resumeId }
+      {
+        method: 'getLatestScore',
+        userId,
+        resumeId,
+      }
     );
   }
 
-  async getScoreHistory(userId) {
+  async getScoreHistory(userId, limit = 50) {
     if (!userId) return [];
 
-    return (
-      await execute(
-        supabase
-          .from(this.table)
-          .select('*')
-          .eq('user_id', userId)
-          .order('scored_at', { ascending: false })
-          .limit(50),
-        { method: 'getScoreHistory', userId }
-      )
-    ) ?? [];
+    const rows = await execute(
+      this.query()
+        .select('*')
+        .eq('user_id', userId)
+        .order('scored_at', { ascending: false })
+        .limit(limit),
+      {
+        method: 'getScoreHistory',
+        userId,
+      }
+    );
+
+    return rows ?? [];
   }
 }
 

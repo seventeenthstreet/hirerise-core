@@ -1,24 +1,55 @@
+'use strict';
+
 import { Router } from 'express';
 import { supabase } from '../../../config/supabaseClient.js';
+import { logger } from '../../../shared/logger/index.js';
 
 export const healthRouter = Router();
 
+const SERVICE_NAME = 'api-service';
+const READINESS_TIMEOUT_MS = 1000;
 const startedAt = new Date().toISOString();
+
+// ─────────────────────────────────────────────────────────────────────────────
+// HELPERS
+// ─────────────────────────────────────────────────────────────────────────────
+
+function createHealthPayload(req, extra = {}) {
+  return {
+    ...extra,
+    timestamp: new Date().toISOString(),
+    requestId: req?.requestId ?? null,
+  };
+}
+
+function withTimeout(promise, ms) {
+  let timeoutId;
+
+  const timeoutPromise = new Promise((_, reject) => {
+    timeoutId = setTimeout(() => {
+      reject(new Error('Health check timeout'));
+    }, ms);
+  });
+
+  return Promise.race([promise, timeoutPromise]).finally(() => {
+    clearTimeout(timeoutId);
+  });
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // GET /health — Basic status
 // ─────────────────────────────────────────────────────────────────────────────
 
 healthRouter.get('/', (req, res) => {
-  res.json({
-    status: 'ok',
-    service: 'api-service',
-    environment: process.env.NODE_ENV || 'unknown',
-    startedAt,
-    uptime: Math.floor(process.uptime()),
-    timestamp: new Date().toISOString(),
-    requestId: req.requestId,
-  });
+  return res.json(
+    createHealthPayload(req, {
+      status: 'ok',
+      service: SERVICE_NAME,
+      environment: process.env.NODE_ENV ?? 'unknown',
+      startedAt,
+      uptime: Math.floor(process.uptime()),
+    }),
+  );
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -27,35 +58,44 @@ healthRouter.get('/', (req, res) => {
 
 healthRouter.get('/ready', async (req, res) => {
   try {
-    // Check Supabase connectivity (lightweight query)
-    const { error } = await withTimeout(
-      supabase.from('jobs').select('id').limit(1),
-      1000
+    const { data, error } = await withTimeout(
+      supabase.rpc('health_check'),
+      READINESS_TIMEOUT_MS,
     );
 
-    if (error) {
-      return res.status(503).json({
+    if (error || data !== true) {
+      logger.warn('Health readiness failed', {
+        error: error?.message ?? 'Unexpected RPC response',
+        requestId: req.requestId,
+      });
+
+      return res.status(503).json(
+        createHealthPayload(req, {
+          status: 'not_ready',
+          dependency: 'database',
+          error: error?.message ?? 'Health RPC failed',
+        }),
+      );
+    }
+
+    return res.json(
+      createHealthPayload(req, {
+        status: 'ready',
+      }),
+    );
+  } catch (error) {
+    logger.error('Health readiness exception', {
+      error: error.message,
+      requestId: req.requestId,
+    });
+
+    return res.status(503).json(
+      createHealthPayload(req, {
         status: 'not_ready',
         dependency: 'database',
         error: error.message,
-        timestamp: new Date().toISOString(),
-        requestId: req.requestId,
-      });
-    }
-
-    return res.json({
-      status: 'ready',
-      timestamp: new Date().toISOString(),
-      requestId: req.requestId,
-    });
-
-  } catch (err) {
-    return res.status(503).json({
-      status: 'not_ready',
-      error: 'Dependency check failed',
-      timestamp: new Date().toISOString(),
-      requestId: req.requestId,
-    });
+      }),
+    );
   }
 });
 
@@ -63,19 +103,11 @@ healthRouter.get('/ready', async (req, res) => {
 // GET /health/live — Liveness check
 // ─────────────────────────────────────────────────────────────────────────────
 
-healthRouter.get('/live', (_req, res) => {
-  res.json({ status: 'live' });
+healthRouter.get('/live', (req, res) => {
+  return res.json(
+    createHealthPayload(req, {
+      status: 'live',
+      service: SERVICE_NAME,
+    }),
+  );
 });
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Timeout Helper
-// ─────────────────────────────────────────────────────────────────────────────
-
-function withTimeout(promise, ms) {
-  return Promise.race([
-    promise,
-    new Promise((_, reject) =>
-      setTimeout(() => reject(new Error('Timeout')), ms)
-    ),
-  ]);
-}

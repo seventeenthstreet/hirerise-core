@@ -22,7 +22,7 @@ const alertsService = require('../services/alerts.service');
 /**
  * Resolve authenticated user ID safely across:
  * - Supabase middleware: req.user.id
- * - Legacy transitional middleware: req.user.uid
+ * - Legacy transitional middleware: req.user.id
  * - Alternate auth wrappers: req.auth.userId
  *
  * Keeps migration backward compatible.

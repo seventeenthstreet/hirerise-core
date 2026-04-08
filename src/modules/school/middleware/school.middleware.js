@@ -14,7 +14,7 @@
  *
  * Supabase migration notes:
  * - Fully removes Firebase auth payload assumptions
- * - Supports temporary backward compatibility with req.user.uid
+ * - Supports temporary backward compatibility with req.user.id
  * - Optimized for minimal DB round trips
  */
 

@@ -1,16 +1,25 @@
-process.env.NODE_ENV = "test";
-require("dotenv").config();
+'use strict';
 
-const careerService = require("../services/careerIntelligence.service");
+/**
+ * @file test/careerIntelligence.simulation.js
+ * @description
+ * Enterprise simulation harness for career intelligence service.
+ * Supabase-era, CI-safe, and import-safe.
+ */
+
+process.env.NODE_ENV = 'test';
+require('dotenv').config({ path: '.env.test' });
+
+const careerService = require('../services/careerIntelligence.service');
 
 function generateMockResume() {
   return {
-    roleFit: "software_engineer",
+    roleFit: 'software_engineer',
     overallScore: 72,
     skillOverlap: 70,
     experienceMatch: 65,
     marketDemand: 80,
-    skillVelocity: 60
+    skillVelocity: 60,
   };
 }
 
@@ -19,16 +28,16 @@ function generateMockSalary() {
     currentEstimatedSalaryBand: {
       minSalaryINR: 1200000,
       maxSalaryINR: 1800000,
-      currency: "INR"
+      currency: 'INR',
     },
     max5YearPotentialINR: 5000000,
-    bandProgressionCAGR: 0.09
+    bandProgressionCAGR: 0.09,
   };
 }
 
 function generateMockCareerGraph() {
   return {
-    nextRoles: ["senior_software_engineer", "tech_lead"]
+    nextRoles: ['senior_software_engineer', 'tech_lead'],
   };
 }
 
@@ -39,106 +48,106 @@ function generateMockLLMResponse() {
     marketCompetitiveness: {},
     growthProjection: {
       projection: {
-        "1Year": {
+        '1Year': {
           probability: 75,
           projectedSalaryRange: {
             minSalaryINR: 1500000,
             maxSalaryINR: 2200000,
-            currency: "INR"
-          }
+            currency: 'INR',
+          },
         },
-        "3Year": {
+        '3Year': {
           probability: 60,
           projectedSalaryRange: {
             minSalaryINR: 2200000,
             maxSalaryINR: 3200000,
-            currency: "INR"
-          }
+            currency: 'INR',
+          },
         },
-        "5Year": {
+        '5Year': {
           probability: 45,
           projectedSalaryRange: {
             minSalaryINR: 3200000,
             maxSalaryINR: 5000000,
-            currency: "INR"
-          }
-        }
-      }
-    },
-    salaryForecast: {
-      currentEstimatedSalaryBand: {
-        minSalaryINR: 1200000,
-        maxSalaryINR: 1800000,
-        currency: "INR"
+            currency: 'INR',
+          },
+        },
       },
-      max5YearPotentialINR: 5000000,
-      bandProgressionCAGR: 0.09
     },
+    salaryForecast: generateMockSalary(),
     accelerationPlan: {
       prioritySkills: [
         {
           roiScore: 85,
-          roiScale: "0-100 relative acceleration index",
-          impactModelRef: "salary_engine::skill_premium_model_v2"
-        }
-      ]
+          roiScale: '0-100 relative acceleration index',
+          impactModelRef:
+            'salary_engine::skill_premium_model_v2',
+        },
+      ],
     },
     careerRiskAssessment: {
       careerRiskScore: 30,
-      riskLevel: "Low",
-      riskScaleDefinition: {
-        low: "0-35",
-        medium: "36-65",
-        high: "66-100"
-      }
-    }
+      riskLevel: 'Low',
+    },
   };
 }
 
-async function runSimulation() {
-  console.log("🚀 Running Enterprise Simulation...\n");
+async function runSimulation(iterations = 5) {
+  console.log('🚀 Running Enterprise Simulation...\n');
 
   let success = 0;
   let failed = 0;
 
-  for (let i = 1; i <= 5; i++) {
-    try {
-      const result = await careerService.generateCareerIntelligence({
-        user_id: `test-user-${i}`,
-        advancedMode: false,
-        overrides: {
-          resumeScore: generateMockResume(),
-          salaryBand: generateMockSalary(),
-          careerGraph: generateMockCareerGraph(),
-          mockLLMResponse: generateMockLLMResponse()
-        }
-      });
+  for (let i = 1; i <= iterations; i++) {
+    const userId = `test-user-${i}`;
 
-      if (result.success) {
-        console.log(`✅ test-user-${i} passed`);
+    try {
+      const result =
+        await careerService.generateCareerIntelligence({
+          userId,
+          advancedMode: false,
+          overrides: {
+            resumeScore: generateMockResume(),
+            salaryBand: generateMockSalary(),
+            careerGraph: generateMockCareerGraph(),
+            mockLLMResponse: generateMockLLMResponse(),
+          },
+        });
+
+      if (result?.success) {
+        console.log(`✅ ${userId} passed`);
         success++;
       } else {
-        console.log(`❌ test-user-${i} failed`);
+        console.log(`❌ ${userId} failed`);
         failed++;
       }
-
-    } catch (err) {
-      console.error(`❌ test-user-${i} crashed:`, err.message);
+    } catch (error) {
+      console.error(`❌ ${userId} crashed:`, error.message);
       failed++;
     }
   }
 
-  console.log("\n📊 Simulation Results:");
+  console.log('\n📊 Simulation Results:');
   console.log({ success, failed });
+
+  return { success, failed };
 }
 
-runSimulation();
+if (require.main === module) {
+  runSimulation()
+    .then(({ failed }) => {
+      process.exitCode = failed > 0 ? 1 : 0;
+    })
+    .catch((error) => {
+      console.error('Simulation harness failed:', error);
+      process.exitCode = 1;
+    });
+}
 
-
-
-
-
-
-
-
-
+module.exports = {
+  runSimulation,
+  generateMockResume,
+  generateMockSalary,
+  generateMockCareerGraph,
+  generateMockLLMResponse,
+};

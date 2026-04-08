@@ -106,7 +106,7 @@ router.post(
   '/',
   validate(createApiValidation),
   asyncHandler(async (req, res) => {
-    const adminId = req.user.uid;
+    const adminId = req.user.id;
 
     const created = await externalApiRepo.create(
       {
@@ -164,7 +164,7 @@ router.patch(
   '/:id',
   validate(patchApiValidation),
   asyncHandler(async (req, res) => {
-    const adminId = req.user.uid;
+    const adminId = req.user.id;
     const updates = {};
 
     if (req.body.providerName !== undefined) {
@@ -219,7 +219,7 @@ router.delete(
   '/:id',
   validate(idValidation),
   asyncHandler(async (req, res) => {
-    const adminId = req.user.uid;
+    const adminId = req.user.id;
 
     await externalApiRepo.softDelete(req.params.id, adminId);
 

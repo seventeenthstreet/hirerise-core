@@ -38,7 +38,7 @@ const MAX_SKILL_LENGTH = 100;
  * Supports:
  * - Supabase JWT middleware → req.user.id
  * - normalized auth middleware → req.auth.userId
- * - legacy compatibility → req.user.uid
+ * - legacy compatibility → req.user.id
  *
  * This safely removes Firebase-specific assumptions while
  * preserving backward compatibility during rollout.

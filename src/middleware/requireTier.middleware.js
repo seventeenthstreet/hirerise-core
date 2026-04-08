@@ -79,7 +79,7 @@ function requireTier(allowedTiers) {
       });
     }
 
-    const userId = req.user.uid;
+    const userId = req.user.id;
     const tier = normalizeTier(req.user.plan);
 
     // Attach normalized tier for downstream usage

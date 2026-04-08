@@ -1,73 +1,91 @@
 'use strict';
 
 /**
- * duplicate.error.js — Domain Error for Duplicate Dataset Records
+ * @file src/shared/errors/duplicate.error.js
+ * @description
+ * Domain error for duplicate dataset records.
  *
- * Extends the existing AppError pattern used throughout HireRise.
- * Produces the canonical error envelope:
- *
- *   {
- *     "success": false,
- *     "error": {
- *       "code": "DUPLICATE_RECORD",
- *       "message": "A skill with this name already exists."
- *     },
- *     "details": {
- *       "field": "name",
- *       "value": "JavaScript",
- *       "normalizedValue": "javascript",
- *       "existingId": "skill_abc123",
- *       "datasetType": "skills"
- *     }
- *   }
- *
- * Usage:
- *   const { DuplicateError } = require('../../shared/errors/duplicate.error');
- *   throw new DuplicateError('skills', 'JavaScript', 'skill_abc123');
+ * Datastore-agnostic and optimized for Supabase/Postgres-era services.
+ * Produces a canonical API error envelope compatible with AppError.
  */
 
 const { AppError } = require('../../middleware/errorHandler');
 
-// ── Error code constant ────────────────────────────────────────────────────────
 const DUPLICATE_RECORD = 'DUPLICATE_RECORD';
 
 /**
- * DuplicateError — thrown when a dataset entry already exists.
+ * Builds a readable singular dataset label.
  *
- * @param {string} datasetType  — 'skills' | 'roles' | 'jobFamilies' | 'educationLevels' | 'salaryBenchmarks'
- * @param {string} value        — The original (non-normalized) value that conflicted
- * @param {string} existingId   — Firestore document ID of the existing record
- * @param {object} [extra]      — Optional extra context (e.g. { field: 'normalizedName' })
+ * @param {string} datasetType
+ * @returns {string}
+ */
+function formatDatasetLabel(datasetType) {
+  if (!datasetType || typeof datasetType !== 'string') {
+    return 'record';
+  }
+
+  return datasetType
+    .replace(/([A-Z])/g, ' $1')
+    .replace(/[_-]/g, ' ')
+    .toLowerCase()
+    .trim()
+    .replace(/s$/, '');
+}
+
+/**
+ * DuplicateError
+ *
+ * Thrown when a unique dataset entry already exists.
+ *
+ * @param {string} datasetType
+ * @param {string} value
+ * @param {string|null} existingId
+ * @param {object} [extra]
  */
 class DuplicateError extends AppError {
-  constructor(datasetType, value, existingId, extra = {}) {
-    const message = `A ${datasetType.replace(/([A-Z])/g, ' $1').toLowerCase().trim()} with this name already exists.`;
+  constructor(datasetType, value, existingId = null, extra = {}) {
+    const safeDatasetType =
+      typeof datasetType === 'string' && datasetType.trim()
+        ? datasetType.trim()
+        : 'records';
+
+    const safeValue =
+      value === undefined || value === null
+        ? ''
+        : String(value).trim();
+
+    const safeExtra =
+      extra && typeof extra === 'object' && !Array.isArray(extra)
+        ? extra
+        : {};
+
+    const label = formatDatasetLabel(safeDatasetType);
 
     super(
-      message,
-      409,                  // HTTP 409 Conflict
+      `A ${label} with this name already exists.`,
+      409,
       {
-        datasetType,
-        value,
+        datasetType: safeDatasetType,
+        value: safeValue,
         existingId,
-        ...extra,
+        ...safeExtra,
       },
-      DUPLICATE_RECORD,     // machine-readable error code
-      `"${value}" already exists in the ${datasetType} dataset.`
+      DUPLICATE_RECORD,
+      safeValue
+        ? `"${safeValue}" already exists in the ${safeDatasetType} dataset.`
+        : `A duplicate ${label} already exists.`
     );
 
-    this.name        = 'DuplicateError';
-    this.datasetType = datasetType;
-    this.existingId  = existingId;
+    this.name = 'DuplicateError';
+    this.datasetType = safeDatasetType;
+    this.value = safeValue;
+    this.existingId = existingId;
+
+    Error.captureStackTrace?.(this, DuplicateError);
   }
 }
 
-module.exports = { DuplicateError, DUPLICATE_RECORD };
-
-
-
-
-
-
-
-
+module.exports = Object.freeze({
+  DuplicateError,
+  DUPLICATE_RECORD,
+});

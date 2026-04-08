@@ -19,7 +19,7 @@ const observabilityRepo = require('../../repositories/ai-observability.repositor
  *   // ... AI call ...
  *   await AILogger.log({
  *     feature: 'resume_scoring',
- *     userId: req.user.uid,
+ *     userId: req.user.id,
  *     model: 'gpt-4o',
  *     modelVersion: '2024-11-20',
  *     inputHash: AILogger.hashInput(resumeText),

@@ -12,7 +12,7 @@
  * - requireEmployerAdmin  → employer_admin only
  *
  * Supabase migration:
- * - removed Firebase req.user.uid dependency
+ * - removed Firebase req.user.id dependency
  * - standardized authenticated user extraction
  * - improved async error flow
  * - added structured logging
@@ -37,7 +37,7 @@ function fail(res, statusCode, message, code = 'EMPLOYER_FORBIDDEN') {
  *
  * Supports:
  * - req.user.id  → Supabase standard
- * - req.user.uid → legacy Firebase compatibility during migration
+ * - req.user.id → legacy Firebase compatibility during migration
  */
 function getAuthenticatedUserId(req) {
   return req?.user?.id || req?.user?.uid || null;

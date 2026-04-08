@@ -31,7 +31,7 @@ router.post(
   creditGuard('fullAnalysis'),
   async (req, res, next) => {
     try {
-      const userId = req.user.uid;
+      const userId = req.user.id;
       const tier = req.user.normalizedTier ?? normalizeTier(req.user.plan);
       const { resumeId, operationType } = req.body;
 

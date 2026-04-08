@@ -4,20 +4,74 @@ import { logger } from '../../../shared/logger/index.js';
 import { resolveEngine } from '../../../shared/engine-versions/index.js';
 import { SalaryBenchmarkEngineV1 } from '../engines/salary-benchmark-v1.engine.js';
 
-const ENGINE_MAP = {
-  'salary_bench_v1.1': SalaryBenchmarkEngineV1,
-};
+const ENGINE_MAP = Object.freeze({
+  'salary_bench_v1.2': SalaryBenchmarkEngineV1,
+  'salary_bench_v1.1': SalaryBenchmarkEngineV1, // backward-safe alias
+});
 
 const ENGINE_VERSION =
-  process.env.SALARY_ENGINE_VERSION ?? 'salary_bench_v1.1';
+  process.env.SALARY_ENGINE_VERSION ?? 'salary_bench_v1.2';
 
-export async function handleSalaryBenchmarkRequested(envelope, message = {}) {
+function createEngine(version) {
+  const resolved = resolveEngine(version, ENGINE_MAP);
 
-  // ─────────────────────────────────────────────
-  // Safe payload extraction
-  // ─────────────────────────────────────────────
+  if (!resolved) {
+    const error = new Error(`Unknown salary engine version: ${version}`);
+    error.code = 'ENGINE_NOT_FOUND';
+    throw error;
+  }
 
+  const engine =
+    typeof resolved === 'function' ? new resolved() : resolved;
+
+  if (typeof engine?.benchmark !== 'function') {
+    const error = new Error(
+      `Invalid salary engine: ${version} missing benchmark()`,
+    );
+    error.code = 'INVALID_ENGINE';
+    throw error;
+  }
+
+  return engine;
+}
+
+async function publishSalaryReadyEvent({
+  userId,
+  jobId,
+  median,
+  childLogger,
+}) {
+  try {
+    await publishEvent(
+      process.env.PUBSUB_NOTIFICATION_TOPIC,
+      EventTypes.NOTIFICATION_REQUESTED,
+      {
+        userId,
+        notificationType: 'SALARY_READY',
+        data: {
+          jobId,
+          salaryMedian: median,
+        },
+      },
+    );
+  } catch (err) {
+    childLogger.error('Salary notification publish failed', {
+      jobId,
+      message: err?.message,
+      code: err?.code,
+      stack: err?.stack,
+    });
+
+    // intentionally do not fail completed job
+  }
+}
+
+export async function handleSalaryBenchmarkRequested(
+  envelope,
+  message = {},
+) {
   const payload = envelope?.payload ?? {};
+
   const {
     userId,
     jobId,
@@ -29,44 +83,40 @@ export async function handleSalaryBenchmarkRequested(envelope, message = {}) {
 
   const childLogger = logger.child({
     handler: 'handleSalaryBenchmarkRequested',
-    userId,
-    jobId,
+    userId: userId ?? null,
+    jobId: jobId ?? null,
     engineVersion: ENGINE_VERSION,
     deliveryAttempt: message?.deliveryAttempt ?? 1,
+    service: process.env.SERVICE_NAME ?? 'salary-worker',
   });
-
-  // ─────────────────────────────────────────────
-  // Basic validation (lightweight)
-  // ─────────────────────────────────────────────
 
   if (!userId || !jobId) {
     childLogger.error('Invalid payload — missing required fields', {
-      payload,
+      hasUserId: Boolean(userId),
+      hasJobId: Boolean(jobId),
     });
     return;
   }
 
-  // ─────────────────────────────────────────────
-  // Claim Job
-  // ─────────────────────────────────────────────
+  const serviceName =
+    process.env.SERVICE_NAME ?? 'salary-worker';
 
-  const { claimed, status } =
-    await jobRepo.claimJob(jobId, process.env.SERVICE_NAME);
+  const { claimed, status } = await jobRepo.claimJob(
+    jobId,
+    serviceName,
+  );
 
   if (!claimed) {
-    childLogger.info('Job already processed or claimed', { status });
+    childLogger.info('Job already processed or claimed', {
+      status,
+    });
     return;
   }
 
   childLogger.info('Processing salary benchmark');
 
   try {
-
-    // ─────────────────────────────────────────
-    // Run Engine
-    // ─────────────────────────────────────────
-
-    const engine = resolveEngine(ENGINE_VERSION, ENGINE_MAP);
+    const engine = createEngine(ENGINE_VERSION);
 
     const result = await engine.benchmark({
       jobTitle,
@@ -75,36 +125,21 @@ export async function handleSalaryBenchmarkRequested(envelope, message = {}) {
       industry,
     });
 
-    // ─────────────────────────────────────────
-    // Persist Result
-    // ─────────────────────────────────────────
-
     await jobRepo.completeJob(jobId, result);
 
-    // ─────────────────────────────────────────
-    // Emit Notification
-    // ─────────────────────────────────────────
-
-    await publishEvent(
-      process.env.PUBSUB_NOTIFICATION_TOPIC,
-      EventTypes.NOTIFICATION_REQUESTED,
-      {
-        userId,
-        notificationType: 'SALARY_READY',
-        data: {
-          jobId,
-          salaryMedian: result.median,
-        },
-      },
-    );
+    await publishSalaryReadyEvent({
+      userId,
+      jobId,
+      median: result.median,
+      childLogger,
+    });
 
     childLogger.info('Salary benchmark complete', {
       median: result.median,
+      currency: result.currency,
+      engineVersion: result.engineVersion,
     });
-
   } catch (err) {
-
-    // ✅ Proper error logging (FIXED)
     childLogger.error('Salary benchmark failed', {
       message: err?.message,
       code: err?.code,
@@ -117,6 +152,6 @@ export async function handleSalaryBenchmarkRequested(envelope, message = {}) {
       err?.message ?? 'Unknown error',
     );
 
-    throw err; // allow retry / DLQ
+    throw err;
   }
 }

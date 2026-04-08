@@ -28,7 +28,7 @@ const router = express.Router();
 router.post(
   '/trigger',
   asyncHandler(async (req, res) => {
-    const adminId = req.user.uid;
+    const adminId = req.user.id;
 
     logger.info('[MasterSync] Manual sync triggered', {
       adminId,

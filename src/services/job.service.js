@@ -14,6 +14,10 @@
  * - Added +1 pagination fetch strategy for efficient hasMore
  * - Added centralized Supabase error normalization
  * - Preserved API response contract
+ *
+ * Schema fix applied:
+ * - toPublicJob: id falls back to role_id for rows where
+ *   the new id column was not explicitly set on insert
  */
 
 const { supabase } = require('../config/supabase');
@@ -31,6 +35,7 @@ const JOB_FAMILIES_MAX = 200;
 /**
  * Public projection for roles.
  * Only safe API fields are exposed.
+ * All columns exist on the live schema after migration.
  */
 const ROLE_PUBLIC_COLUMNS = `
   id,
@@ -53,31 +58,35 @@ const FAMILY_PUBLIC_COLUMNS = `
 `;
 
 /**
- * Normalize Supabase DB row -> public API role payload
+ * Normalize Supabase DB row -> public API role payload.
  * Preserves existing API contract (camelCase).
+ *
+ * FIX: id falls back to role_id — the new id column is nullable
+ * for rows inserted before the migration backfill. role_id is
+ * always populated and serves as the safe fallback.
  */
 const toPublicJob = (row = {}) => ({
-  id: row.id ?? null,
-  title: row.title ?? null,
-  level: row.level ?? null,
-  track: row.track ?? null,
+  id:          row.id ?? row.role_id ?? null,
+  title:       row.title ?? null,
+  level:       row.level ?? null,
+  track:       row.track ?? null,
   jobFamilyId: row.job_family_id ?? null,
   description: row.description ?? null,
-  skills: Array.isArray(row.skills) ? row.skills : [],
+  skills:      Array.isArray(row.skills) ? row.skills : [],
 });
 
 /**
- * Normalize Supabase DB row -> public API family payload
+ * Normalize Supabase DB row -> public API family payload.
  */
 const toPublicFamily = (row = {}) => ({
-  id: row.id ?? null,
-  name: row.name ?? null,
+  id:          row.id ?? null,
+  name:        row.name ?? null,
   description: row.description ?? null,
-  trackCount: row.track_count ?? 0,
+  trackCount:  row.track_count ?? 0,
 });
 
 /**
- * Centralized Supabase error wrapper
+ * Centralized Supabase error wrapper.
  */
 const throwDbError = (error, operation, meta = {}) => {
   throw new AppError(
@@ -85,16 +94,16 @@ const throwDbError = (error, operation, meta = {}) => {
     500,
     {
       ...meta,
-      code: error.code,
+      code:    error.code,
       details: error.details,
-      hint: error.hint,
+      hint:    error.hint,
     },
     ErrorCodes.INTERNAL_ERROR
   );
 };
 
 /**
- * Safe integer normalization
+ * Safe integer normalization.
  */
 const normalizePositiveInt = (value, fallback) => {
   const parsed = Number.parseInt(value, 10);
@@ -102,12 +111,13 @@ const normalizePositiveInt = (value, fallback) => {
 };
 
 /**
- * List all job families
+ * List all job families.
  */
 const listJobFamilies = async () => {
   const { data, error } = await supabase
     .from(TABLES.JOB_FAMILIES)
     .select(FAMILY_PUBLIC_COLUMNS)
+    .eq('soft_deleted', false)
     .order('name', { ascending: true })
     .limit(JOB_FAMILIES_MAX);
 
@@ -119,7 +129,7 @@ const listJobFamilies = async () => {
 };
 
 /**
- * List roles with proper SQL pagination
+ * List roles with proper SQL pagination.
  */
 const listRoles = async ({
   familyId,
@@ -167,26 +177,26 @@ const listRoles = async ({
       familyId,
       level,
       track,
-      page: parsedPage,
+      page:  parsedPage,
       limit: parsedLimit,
     });
   }
 
-  const rows = data ?? [];
-  const hasMore = rows.length > parsedLimit;
-  const roles = rows.slice(0, parsedLimit).map(toPublicJob);
+  const rows     = data ?? [];
+  const hasMore  = rows.length > parsedLimit;
+  const roles    = rows.slice(0, parsedLimit).map(toPublicJob);
 
   return {
     roles,
-    page: parsedPage,
-    limit: parsedLimit,
-    count: roles.length,
+    page:   parsedPage,
+    limit:  parsedLimit,
+    count:  roles.length,
     hasMore,
   };
 };
 
 /**
- * Get single role by ID
+ * Get single role by ID.
  */
 const getRoleById = async (roleId) => {
   if (!roleId) {

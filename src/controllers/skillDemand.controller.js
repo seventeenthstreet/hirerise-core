@@ -41,7 +41,7 @@ class SkillDemandController {
 
   analyzeSkills = asyncHandler(async (req, res) => {
     const { role, skills } = req.body;
-    const userId = req.user.uid;
+    const userId = req.user.id;
 
     if (!role) {
       throw new AppError('role is required', 400, {}, ErrorCodes.VALIDATION_ERROR);
@@ -139,7 +139,7 @@ class SkillDemandController {
   });
 
   getUserHistory = asyncHandler(async (req, res) => {
-    const userId = req.user.uid;
+    const userId = req.user.id;
 
     let page  = Math.max(parseInt(req.query.page || '1', 10), 1);
     let limit = Math.min(parseInt(req.query.limit || '10', 10), 50);

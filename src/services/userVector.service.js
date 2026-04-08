@@ -11,82 +11,115 @@ const { supabase } = require('../config/supabase');
 const logger = require('../utils/logger');
 const semanticSkillEngine = require('../engines/semanticSkill.engine');
 
-// ─────────────────────────────────────────────
-// UPDATE USER VECTOR
-// ─────────────────────────────────────────────
+const VECTOR_TABLE = 'user_vectors';
+const VECTOR_COLUMN = 'embedding_vector';
+const VECTOR_DIMENSIONS = 1536;
 
+function isValidVector(vector) {
+  return (
+    Array.isArray(vector) &&
+    vector.length === VECTOR_DIMENSIONS &&
+    vector.every((value) => typeof value === 'number' && Number.isFinite(value))
+  );
+}
+
+/**
+ * Generate + persist user vector
+ */
 async function updateUserVector(userId, skills = []) {
   if (!userId || !Array.isArray(skills) || skills.length === 0) {
-    throw new Error('updateUserVector: userId and skills required');
+    throw new Error('updateUserVector: userId and non-empty skills array required');
   }
 
   try {
-    // Generate vector
     const vector = await semanticSkillEngine.getUserSkillVector(skills);
 
-    // Upsert into DB
-    const { error } = await supabase
-      .from('user_vectors')
-      .upsert({
-        user_id: userId,
-        embedding_vector: vector,
-        updated_at: new Date().toISOString()
-      }, { onConflict: 'user_id' });
+    if (!isValidVector(vector)) {
+      throw new Error(
+        `updateUserVector: invalid embedding vector shape (expected ${VECTOR_DIMENSIONS})`
+      );
+    }
 
-    if (error) throw error;
+    const payload = {
+      user_id: userId,
+      [VECTOR_COLUMN]: vector,
+      updated_at: new Date().toISOString(),
+    };
+
+    const { error } = await supabase
+      .from(VECTOR_TABLE)
+      .upsert(payload, {
+        onConflict: 'user_id',
+      });
+
+    if (error) {
+      throw error;
+    }
+
+    logger.info('[UserVector] vector updated', {
+      userId,
+      dimensions: vector.length,
+      skillCount: skills.length,
+    });
 
     return vector;
-
-  } catch (err) {
+  } catch (error) {
     logger.error('[UserVector] update failed', {
       userId,
-      err: err.message
+      skillCount: skills.length,
+      error: error.message,
     });
-    throw err;
+
+    throw error;
   }
 }
 
-// ─────────────────────────────────────────────
-// GET USER VECTOR (WITH FALLBACK)
-// ─────────────────────────────────────────────
-
+/**
+ * Fetch cached vector or generate fallback
+ */
 async function getUserVector(userId, skills = []) {
-  if (!userId) throw new Error('userId required');
+  if (!userId) {
+    throw new Error('getUserVector: userId required');
+  }
 
   try {
-    // Try DB first
-    const { data } = await supabase
-      .from('user_vectors')
-      .select('embedding_vector')
+    const { data, error } = await supabase
+      .from(VECTOR_TABLE)
+      .select(VECTOR_COLUMN)
       .eq('user_id', userId)
       .maybeSingle();
 
-    if (data?.embedding_vector) {
-      return data.embedding_vector;
+    if (error) {
+      throw error;
     }
 
-    // Fallback → generate + store
-    if (skills.length > 0) {
-      return await updateUserVector(userId, skills);
+    const vector = data?.[VECTOR_COLUMN];
+
+    if (isValidVector(vector)) {
+      return vector;
+    }
+
+    if (Array.isArray(skills) && skills.length > 0) {
+      logger.info('[UserVector] cache miss → regenerating vector', {
+        userId,
+        skillCount: skills.length,
+      });
+
+      return updateUserVector(userId, skills);
     }
 
     return null;
-
-  } catch (err) {
+  } catch (error) {
     logger.warn('[UserVector] fetch failed', {
       userId,
-      err: err.message
+      error: error.message,
     });
 
     return null;
   }
 }
 
-// ─────────────────────────────────────────────
-// EXPORTS
-// ─────────────────────────────────────────────
-
 module.exports = {
   updateUserVector,
-  getUserVector
+  getUserVector,
 };

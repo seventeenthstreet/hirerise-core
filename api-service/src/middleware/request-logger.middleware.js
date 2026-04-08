@@ -1,50 +1,63 @@
+'use strict';
+
 import { randomUUID } from 'crypto';
 import { logger } from '../../../shared/logger/index.js';
+
+const MAX_REQUEST_ID_LENGTH = 100;
+
+function normalizeRequestId(headerValue) {
+  if (typeof headerValue !== 'string') {
+    return randomUUID();
+  }
+
+  const trimmed = headerValue.trim();
+
+  if (!trimmed || trimmed.length > MAX_REQUEST_ID_LENGTH) {
+    return randomUUID();
+  }
+
+  return trimmed;
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // REQUEST LOGGER
 // ─────────────────────────────────────────────────────────────────────────────
 
 export function requestLogger(req, res, next) {
-  // Sanitize incoming request ID
-  let requestId = req.headers['x-request-id'];
-
-  if (!requestId || typeof requestId !== 'string' || requestId.length > 100) {
-    requestId = randomUUID();
-  }
-
-  const startMs = Date.now();
+  const requestId = normalizeRequestId(req.headers['x-request-id']);
+  const startHrTime = process.hrtime.bigint();
 
   req.requestId = requestId;
   res.setHeader('X-Request-ID', requestId);
 
-  // Handle normal completion
-  res.on('finish', () => {
-    logRequest(req, res, startMs);
+  let completed = false;
+
+  res.once('finish', () => {
+    completed = true;
+    logRequest(req, res, startHrTime);
   });
 
-  // Handle aborted requests
-  res.on('close', () => {
-    if (!res.writableEnded) {
+  res.once('close', () => {
+    if (!completed) {
       logger.warn('HTTP request aborted', {
         requestId,
         method: req.method,
-        path: req.path,
+        path: req.originalUrl || req.path,
         userId: req.user?.uid ?? null,
         ip: req.ip,
       });
     }
   });
 
-  next();
+  return next();
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // HELPERS
 // ─────────────────────────────────────────────────────────────────────────────
 
-function logRequest(req, res, startMs) {
-  const durationMs = Date.now() - startMs;
+function logRequest(req, res, startHrTime) {
+  const durationMs = Number(process.hrtime.bigint() - startHrTime) / 1e6;
 
   const level =
     res.statusCode >= 500
@@ -56,12 +69,12 @@ function logRequest(req, res, startMs) {
   logger[level]('HTTP request completed', {
     requestId: req.requestId,
     method: req.method,
-    path: req.path,
+    path: req.originalUrl || req.path,
     statusCode: res.statusCode,
-    durationMs,
-    contentLength: res.getHeader('content-length') ?? 0,
-    requestSize: req.headers['content-length'] ?? 0,
-    userAgent: req.headers['user-agent'],
+    durationMs: Number(durationMs.toFixed(2)),
+    contentLength: Number(res.getHeader('content-length') ?? 0),
+    requestSize: Number(req.headers['content-length'] ?? 0),
+    userAgent: req.headers['user-agent'] ?? null,
     userId: req.user?.uid ?? null,
     ip: req.ip,
   });

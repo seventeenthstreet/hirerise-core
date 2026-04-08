@@ -36,7 +36,7 @@ function fail(res, statusCode, message, code = 'UNIVERSITY_ERROR', details = nul
 
 // ─────────────────────────────────────────────────────────────
 // Auth Helper (Supabase-safe)
-// Removes Firebase `req.user.uid` legacy assumption
+// Removes Firebase `req.user.id` legacy assumption
 // ─────────────────────────────────────────────────────────────
 
 function getAuthenticatedUserId(req) {

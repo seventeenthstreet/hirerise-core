@@ -1,101 +1,196 @@
 'use strict';
 
 /**
- * BaseRepository — PRODUCTION HARDENED (SUPABASE)
+ * shared/repositories/base.repository.js
  *
- * ✅ Select optimization
- * ✅ Pagination support
- * ✅ Error normalization
- * ✅ Timeout protection
- * ✅ Bulk operations added
+ * BaseRepository — Production Hardened for Supabase
+ *
+ * ✅ Zero Firebase legacy assumptions
+ * ✅ Centralized query execution
+ * ✅ Better timeout safety
+ * ✅ Strong null safety
+ * ✅ Query operator map
+ * ✅ Soft-delete aware
+ * ✅ Bulk insert / upsert optimized
+ * ✅ Consistent timestamps
+ * ✅ Predictable return behavior
+ * ✅ Improved maintainability
  */
 
 const { supabase } = require('../config/supabaseClient');
 const logger = require('../logger');
 
-const DEFAULT_TIMEOUT = 10000;
+const DEFAULT_TIMEOUT_MS = 10000;
+const DEFAULT_LIMIT = 50;
+const DEFAULT_COLUMNS = '*';
 
-// ─────────────────────────────────────────────
-// Helper: Safe Query Execution
-// ─────────────────────────────────────────────
-async function execute(queryPromise, context) {
+const OPERATOR_MAP = {
+  '==': 'eq',
+  '!=': 'neq',
+  '>': 'gt',
+  '>=': 'gte',
+  '<': 'lt',
+  '<=': 'lte',
+  in: 'in',
+  like: 'like',
+  ilike: 'ilike',
+};
+
+function nowIso() {
+  return new Date().toISOString();
+}
+
+function normalizeDbError(error, context = {}) {
+  const err = new Error(error?.message || 'Database operation failed');
+  err.code = error?.code || 'DB_ERROR';
+  err.details = error?.details;
+  err.hint = error?.hint;
+  err.context = context;
+  return err;
+}
+
+async function execute(query, context = {}) {
+  let timeoutId;
+
   try {
-    const timeout = new Promise((_, reject) =>
-      setTimeout(() => reject(new Error('DB_TIMEOUT')), DEFAULT_TIMEOUT)
-    );
+    const timeoutPromise = new Promise((_, reject) => {
+      timeoutId = setTimeout(() => {
+        const err = new Error('Database query timeout');
+        err.code = 'DB_TIMEOUT';
+        reject(err);
+      }, DEFAULT_TIMEOUT_MS);
+    });
 
-    const { data, error } = await Promise.race([queryPromise, timeout]);
+    const result = await Promise.race([query, timeoutPromise]);
+
+    clearTimeout(timeoutId);
+
+    const { data, error } = result;
 
     if (error) {
-      logger.error('Database error', { error, ...context });
+      const normalized = normalizeDbError(error, context);
 
-      const err = new Error(error.message);
-      err.code = 'DB_ERROR';
-      throw err;
+      logger.error('Supabase query failed', {
+        ...context,
+        code: normalized.code,
+        message: normalized.message,
+        details: normalized.details,
+      });
+
+      throw normalized;
     }
 
     return data;
-  } catch (err) {
-    logger.error('Database failure', { err, ...context });
-    throw err;
+  } catch (error) {
+    clearTimeout(timeoutId);
+
+    logger.error('Repository execution failure', {
+      ...context,
+      code: error.code,
+      message: error.message,
+    });
+
+    throw error;
   }
 }
 
-// ─────────────────────────────────────────────
-// Repository
-// ─────────────────────────────────────────────
-
 class BaseRepository {
   constructor(tableName) {
-    if (!tableName) throw new Error('BaseRepository requires a table name');
+    if (!tableName || typeof tableName !== 'string') {
+      throw new Error('BaseRepository requires a valid table name');
+    }
+
     this.table = tableName;
+  }
+
+  baseSelect(columns = DEFAULT_COLUMNS) {
+    return supabase
+      .from(this.table)
+      .select(columns)
+      .is('deleted_at', null);
+  }
+
+  applyConditions(query, conditions = []) {
+    if (!Array.isArray(conditions) || conditions.length === 0) {
+      return query;
+    }
+
+    for (const condition of conditions) {
+      if (!Array.isArray(condition) || condition.length !== 3) continue;
+
+      const [field, operator, value] = condition;
+
+      if (!field || value === undefined) continue;
+
+      const method = OPERATOR_MAP[operator];
+
+      if (!method || typeof query[method] !== 'function') {
+        logger.warn('Unsupported query operator skipped', {
+          table: this.table,
+          field,
+          operator,
+        });
+        continue;
+      }
+
+      query = query[method](field, value);
+    }
+
+    return query;
   }
 
   // ─────────────────────────────────────────────
   // READ
   // ─────────────────────────────────────────────
 
-  async findById(id, columns = '*') {
-    const query = supabase
-      .from(this.table)
-      .select(columns)
+  async findById(id, columns = DEFAULT_COLUMNS) {
+    if (!id) return null;
+
+    const query = this.baseSelect(columns)
       .eq('id', id)
-      .is('deleted_at', null)
       .maybeSingle();
 
-    return await execute(query, { method: 'findById', table: this.table });
+    return execute(query, {
+      method: 'findById',
+      table: this.table,
+      id,
+    });
   }
 
   async findWhere(
     conditions = [],
     {
-      limit = 50,
+      limit = DEFAULT_LIMIT,
       offset = 0,
       orderBy = null,
-      columns = '*',
+      columns = DEFAULT_COLUMNS,
     } = {}
   ) {
-    let query = supabase
-      .from(this.table)
-      .select(columns)
-      .range(offset, offset + limit - 1);
+    let query = this.baseSelect(columns);
 
-    for (const [field, op, value] of conditions) {
-      if (op === '==') query = query.eq(field, value);
-      else if (op === '!=') query = query.neq(field, value);
-      else if (op === '>') query = query.gt(field, value);
-      else if (op === '<') query = query.lt(field, value);
-    }
+    query = this.applyConditions(query, conditions);
 
-    query = query.is('deleted_at', null);
-
-    if (orderBy) {
+    if (orderBy?.field) {
       query = query.order(orderBy.field, {
         ascending: orderBy.direction !== 'desc',
       });
     }
 
-    return (await execute(query, { method: 'findWhere' })) || [];
+    query = query.range(offset, offset + limit - 1);
+
+    const rows = await execute(query, {
+      method: 'findWhere',
+      table: this.table,
+    });
+
+    return rows || [];
+  }
+
+  async exists(id) {
+    if (!id) return false;
+
+    const row = await this.findById(id, 'id');
+    return !!row;
   }
 
   // ─────────────────────────────────────────────
@@ -103,10 +198,16 @@ class BaseRepository {
   // ─────────────────────────────────────────────
 
   async create(data, { returning = 'minimal' } = {}) {
+    if (!data || typeof data !== 'object') {
+      throw new Error('create() requires a valid payload object');
+    }
+
+    const timestamp = nowIso();
+
     const payload = {
       ...data,
-      created_at: new Date().toISOString(),
-      updated_at: new Date().toISOString(),
+      created_at: data.created_at || timestamp,
+      updated_at: timestamp,
       deleted_at: null,
     };
 
@@ -116,61 +217,98 @@ class BaseRepository {
       query = query.select().maybeSingle();
     }
 
-    const result = await execute(query, { method: 'create' });
+    const result = await execute(query, {
+      method: 'create',
+      table: this.table,
+    });
 
-    return returning === 'full' ? result : payload.id;
+    return returning === 'full' ? result : payload.id ?? null;
   }
 
-  // ─────────────────────────────────────────────
-  // BULK INSERT (NEW)
-  // ─────────────────────────────────────────────
+  async bulkInsert(records = [], { returning = 'minimal' } = {}) {
+    if (!Array.isArray(records) || records.length === 0) {
+      return [];
+    }
 
-  async bulkInsert(records = []) {
-    if (!records.length) return [];
+    const timestamp = nowIso();
 
-    const payload = records.map((r) => ({
-      ...r,
-      created_at: new Date().toISOString(),
-      updated_at: new Date().toISOString(),
+    const payload = records.map((record) => ({
+      ...record,
+      created_at: record.created_at || timestamp,
+      updated_at: timestamp,
       deleted_at: null,
     }));
 
-    return await execute(
-      supabase.from(this.table).insert(payload),
-      { method: 'bulkInsert' }
-    );
+    let query = supabase.from(this.table).insert(payload);
+
+    if (returning === 'full') {
+      query = query.select();
+    }
+
+    const result = await execute(query, {
+      method: 'bulkInsert',
+      table: this.table,
+      count: records.length,
+    });
+
+    return returning === 'full' ? result : [];
   }
 
   // ─────────────────────────────────────────────
   // UPDATE
   // ─────────────────────────────────────────────
 
-  async update(id, data) {
-    return await execute(
-      supabase
-        .from(this.table)
-        .update({
-          ...data,
-          updated_at: new Date().toISOString(),
-        })
-        .eq('id', id)
-        .is('deleted_at', null),
-      { method: 'update', id }
-    );
+  async update(id, data, { returning = 'minimal' } = {}) {
+    if (!id || !data || typeof data !== 'object') {
+      throw new Error('update() requires id and payload');
+    }
+
+    let query = supabase
+      .from(this.table)
+      .update({
+        ...data,
+        updated_at: nowIso(),
+      })
+      .eq('id', id)
+      .is('deleted_at', null);
+
+    if (returning === 'full') {
+      query = query.select().maybeSingle();
+    }
+
+    return execute(query, {
+      method: 'update',
+      table: this.table,
+      id,
+    });
   }
 
-  async upsert(id, data) {
-    const payload = {
-      id,
-      ...data,
-      updated_at: new Date().toISOString(),
-      deleted_at: null,
-    };
+  async upsert(id, data, { returning = 'minimal' } = {}) {
+    if (!id || !data || typeof data !== 'object') {
+      throw new Error('upsert() requires id and payload');
+    }
 
-    return await execute(
-      supabase.from(this.table).upsert(payload, { onConflict: 'id' }),
-      { method: 'upsert', id }
+    let query = supabase.from(this.table).upsert(
+      {
+        id,
+        ...data,
+        updated_at: nowIso(),
+        deleted_at: null,
+      },
+      {
+        onConflict: 'id',
+      }
     );
+
+    if (returning === 'full') {
+      query = query.select().maybeSingle();
+    }
+
+    return execute(query, {
+      method: 'upsert',
+      table: this.table,
+      id,
+    });
   }
 
   // ─────────────────────────────────────────────
@@ -178,31 +316,26 @@ class BaseRepository {
   // ─────────────────────────────────────────────
 
   async softDelete(id, deletedBy = null) {
-    return await execute(
+    if (!id) {
+      throw new Error('softDelete() requires id');
+    }
+
+    return execute(
       supabase
         .from(this.table)
         .update({
-          deleted_at: new Date().toISOString(),
+          deleted_at: nowIso(),
           deleted_by: deletedBy,
-          updated_at: new Date().toISOString(),
+          updated_at: nowIso(),
         })
-        .eq('id', id),
-      { method: 'softDelete', id }
-    );
-  }
-
-  async exists(id) {
-    const data = await execute(
-      supabase
-        .from(this.table)
-        .select('id')
         .eq('id', id)
-        .is('deleted_at', null)
-        .maybeSingle(),
-      { method: 'exists', id }
+        .is('deleted_at', null),
+      {
+        method: 'softDelete',
+        table: this.table,
+        id,
+      }
     );
-
-    return !!data;
   }
 }
 

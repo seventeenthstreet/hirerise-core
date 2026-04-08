@@ -1,20 +1,32 @@
 'use strict';
 
 import { createClient } from '@supabase/supabase-js';
-import { publishEvent, EventTypes } from '../../../shared/pubsub/index.js';
 import { logger } from '../../../shared/logger/index.js';
 import { safeValidateEnvelope } from '../../../shared/validators/envelope.validator.js';
-import { claimEvent, releaseEvent } from '../../../shared/deduplication/index.js';
-import { ErrorCodes } from '../../../shared/errors/index.js';
+import {
+  claimEvent,
+  releaseEvent,
+} from '../../../shared/deduplication/index.js';
+import { EventTypes } from '../../../shared/pubsub/index.js';
 
-// ─── Supabase Admin (RLS BYPASS) ───────────────────────
+const { SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY } = process.env;
+
+if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
+  throw new Error(
+    'Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY'
+  );
+}
 
 const supabaseAdmin = createClient(
-  process.env.SUPABASE_URL,
-  process.env.SUPABASE_SERVICE_ROLE_KEY
+  SUPABASE_URL,
+  SUPABASE_SERVICE_ROLE_KEY,
+  {
+    auth: {
+      persistSession: false,
+      autoRefreshToken: false,
+    },
+  }
 );
-
-// ─── Templates ─────────────────────────────────────────
 
 const NOTIFICATION_TEMPLATES = {
   RESUME_SCORED: (data) => ({
@@ -40,16 +52,20 @@ const NOTIFICATION_TEMPLATES = {
 
   ONBOARDING_DRAFT_REENGAGEMENT: (data) => ({
     title: 'Your career profile is waiting',
-    body: data.message || 'Complete your profile to unlock your Career Health Score.',
+    body:
+      data.message ||
+      'Complete your profile to unlock your Career Health Score.',
     actionUrl: data.actionUrl || '/onboarding',
     channels: ['in_app', 'push'],
   }),
 };
 
-// ─── Main Handler ─────────────────────────────────────
-
 export async function handleNotificationRequested(envelope, message) {
-  const validated = safeValidateEnvelope(envelope, EventTypes.NOTIFICATION_REQUESTED);
+  const validated = safeValidateEnvelope(
+    envelope,
+    EventTypes.NOTIFICATION_REQUESTED
+  );
+
   if (!validated) return;
 
   const { payload } = validated;
@@ -61,7 +77,7 @@ export async function handleNotificationRequested(envelope, message) {
     userId,
     notificationType,
     eventId,
-    deliveryAttempt: message.deliveryAttempt,
+    deliveryAttempt: message?.deliveryAttempt,
   });
 
   if (!userId) {
@@ -69,9 +85,10 @@ export async function handleNotificationRequested(envelope, message) {
     return;
   }
 
-  // ─── Dedup ─────────────────────────────────────────
-
-  const { claimed } = await claimEvent(eventId, { userId, notificationType });
+  const { claimed } = await claimEvent(eventId, {
+    userId,
+    notificationType,
+  });
 
   if (!claimed) {
     childLogger.info('Duplicate notification — skipped');
@@ -83,160 +100,160 @@ export async function handleNotificationRequested(envelope, message) {
 
     if (!templateFn) {
       childLogger.warn('No template for notification type');
+      await releaseEvent(eventId);
       return;
     }
 
     const template = templateFn(data);
     const notificationId = `${userId}_${eventId}`;
 
-    // ─── Insert Notification ─────────────────────────
-
     const { error: insertError } = await supabaseAdmin
       .from('notifications')
-      .insert({
-        id: notificationId,
-        user_id: userId,
-        notification_type: notificationType,
-        title: template.title,
-        body: template.body,
-        action_url: template.actionUrl,
-        data,
-        read: false,
-        channels: template.channels,
-        created_at: new Date().toISOString(),
-        expires_at: getExpiresAt(30),
-        delivery_status: {
-          in_app: 'delivered',
-          push: 'pending',
+      .upsert(
+        {
+          id: notificationId,
+          user_id: userId,
+          notification_type: notificationType,
+          title: template.title,
+          body: template.body,
+          action_url: template.actionUrl,
+          data,
+          read: false,
+          channels: template.channels,
+          created_at: new Date().toISOString(),
+          expires_at: getExpiresAt(30),
+          delivery_status: {
+            in_app: 'delivered',
+            push: template.channels.includes('push')
+              ? 'pending'
+              : 'not_applicable',
+          },
         },
-      })
-      .select();
+        {
+          onConflict: 'id',
+        }
+      );
 
     if (insertError) {
-      childLogger.error('Notification insert failed', insertError);
       throw insertError;
     }
 
     childLogger.info('Notification saved');
 
-    // ─── Push Delivery ───────────────────────────────
-
     if (template.channels.includes('push')) {
-      await deliverPushNotification(userId, template, notificationId, childLogger);
+      await deliverPushNotification(
+        userId,
+        notificationId,
+        childLogger
+      );
     }
-
   } catch (err) {
-    childLogger.error('Notification processing failed', { err });
+    childLogger.error('Notification processing failed', {
+      error: err?.message,
+    });
 
-    await releaseEvent(eventId); // allow retry
+    await releaseEvent(eventId);
     throw err;
   }
 }
 
-// ─────────────────────────────────────────────
-// Push Delivery
-// ─────────────────────────────────────────────
+async function deliverPushNotification(
+  userId,
+  notificationId,
+  log
+) {
+  const deliveryId = `${notificationId}_push`;
 
-async function deliverPushNotification(userId, template, notificationId, logger) {
-
-  // Check existing delivery status
   const { data: existing, error: fetchError } = await supabaseAdmin
     .from('notification_delivery')
-    .select('*')
-    .eq('id', `${notificationId}_push`)
+    .select('status')
+    .eq('id', deliveryId)
     .maybeSingle();
 
-  if (fetchError) {
-    logger.error('Delivery fetch error', fetchError);
-    throw fetchError;
-  }
+  if (fetchError) throw fetchError;
 
   if (existing?.status === 'sent') {
-    logger.info('Push already sent — skipping');
+    log.info('Push already sent — skipping');
     return;
   }
 
-  try {
-    // Fetch FCM token
-    const { data: tokenRow, error: tokenError } = await supabaseAdmin
-      .from('user_fcm_tokens')
-      .select('token')
-      .eq('user_id', userId)
-      .limit(1)
-      .maybeSingle();
+  const { data: tokenRow, error: tokenError } = await supabaseAdmin
+    .from('user_fcm_tokens')
+    .select('token')
+    .eq('user_id', userId)
+    .limit(1)
+    .maybeSingle();
 
-    if (tokenError) {
-      logger.error('Token fetch error', tokenError);
-      throw tokenError;
-    }
+  if (tokenError) throw tokenError;
 
-    const fcmToken = tokenRow?.token;
+  const pushToken = tokenRow?.token;
 
-    if (!fcmToken) {
-      logger.info('No FCM token — skipping push');
-
-      await supabaseAdmin
-        .from('notification_delivery')
-        .upsert({
-          id: `${notificationId}_push`,
-          status: 'no_token',
-          attempted_at: new Date().toISOString(),
-        });
-
-      return;
-    }
-
-    // Simulate push send
-    await simulateFcmSend(fcmToken);
-
-    // Mark push sent
+  if (!pushToken) {
     await supabaseAdmin
       .from('notification_delivery')
       .upsert({
-        id: `${notificationId}_push`,
-        status: 'sent',
-        sent_at: new Date().toISOString(),
+        id: deliveryId,
+        status: 'no_token',
+        attempted_at: new Date().toISOString(),
       });
 
-    // ─── FIX: Merge JSON instead of overwrite ─────────
-
-    const { data: existingNotif } = await supabaseAdmin
-      .from('notifications')
-      .select('delivery_status')
-      .eq('id', notificationId)
-      .single();
-
-    const updatedStatus = {
-      ...(existingNotif?.delivery_status || {}),
-      push: 'delivered',
-    };
-
-    await supabaseAdmin
-      .from('notifications')
-      .update({
-        delivery_status: updatedStatus,
-        push_delivered_at: new Date().toISOString(),
-      })
-      .eq('id', notificationId);
-
-    logger.info('Push delivered');
-
-  } catch (err) {
-    logger.error('Push failed', { err });
-    throw err;
+    return;
   }
+
+  await simulatePushSend(pushToken);
+
+  await supabaseAdmin
+    .from('notification_delivery')
+    .upsert({
+      id: deliveryId,
+      status: 'sent',
+      sent_at: new Date().toISOString(),
+    });
+
+  // FIX: replaced 3-step SELECT → JS merge → UPDATE with a single atomic
+  // database-level merge via merge_notification_delivery_status().
+  //
+  // BEFORE (race condition):
+  //   const { data: existingNotif } = await supabaseAdmin
+  //     .from('notifications').select('delivery_status').eq('id', notificationId).single();
+  //   const updatedStatus = { ...(existingNotif?.delivery_status || {}), push: 'delivered' };
+  //   await supabaseAdmin.from('notifications').update({ delivery_status: updatedStatus, ... })
+  //
+  // Two concurrent workers would both read the same delivery_status snapshot,
+  // both spread it, and the last writer would silently overwrite the first —
+  // dropping whichever channel the first worker had already merged in.
+  //
+  // AFTER: single UPDATE with COALESCE || jsonb_build_object inside Postgres.
+  // No read round-trip. Row-level lock guarantees no interleaving between workers.
+  const { error: mergeError } = await supabaseAdmin.rpc(
+    'merge_notification_delivery_status',
+    {
+      p_notification_id: notificationId,
+      p_channel:         'push',
+      p_status:          'delivered',
+    }
+  );
+
+  if (mergeError) throw mergeError;
+
+  // push_delivered_at is a separate scalar column — safe to update independently
+  // since it's not part of the JSONB merge and has no concurrent writers.
+  const { error: timestampError } = await supabaseAdmin
+    .from('notifications')
+    .update({ push_delivered_at: new Date().toISOString() })
+    .eq('id', notificationId);
+
+  if (timestampError) throw timestampError;
+
+  log.info('Push delivered');
 }
 
-// ─────────────────────────────────────────────
-// Helpers
-// ─────────────────────────────────────────────
-
-function simulateFcmSend() {
-  return new Promise(res => setTimeout(res, 10));
+function simulatePushSend() {
+  return new Promise((resolve) => setTimeout(resolve, 10));
 }
 
 function getExpiresAt(days) {
-  const d = new Date();
-  d.setDate(d.getDate() + days);
-  return d.toISOString();
+  const date = new Date();
+  date.setDate(date.getDate() + days);
+  return date.toISOString();
 }

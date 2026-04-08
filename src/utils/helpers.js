@@ -1,67 +1,106 @@
-/**
- * helpers.js — Async Wrappers & Response Utilities
- *
- * asyncHandler: Wraps async controller functions so unhandled promise
- * rejections are automatically forwarded to Express's error middleware.
- * Without this, an unhandled async error in a controller silently hangs
- * the request or crashes the process.
- *
- * Note: We apply this via server.js express error propagation, but having
- * it available as a named utility enables explicit wrapping in edge cases
- * and is useful in testing.
- */
-
 'use strict';
 
 /**
- * Wraps an async Express handler to forward any thrown error to next().
- * Usage: router.get('/path', asyncHandler(myAsyncController))
+ * helpers.js — Async Wrappers & Response Utilities
+ *
+ * Production-safe Express helpers:
+ * - asyncHandler
+ * - sendSuccess
+ * - sendPaginated
  */
-const asyncHandler = (fn) => (req, res, next) => {
-  Promise.resolve(fn(req, res, next)).catch(next);
+
+/**
+ * Wrap async Express handlers safely.
+ *
+ * Prevents unhandled promise rejections and ensures
+ * sync + async errors both flow to next().
+ *
+ * @param {Function} fn
+ * @returns {Function}
+ */
+const asyncHandler = (fn) => {
+  if (typeof fn !== 'function') {
+    throw new TypeError('[helpers] asyncHandler requires a function');
+  }
+
+  return function wrappedAsyncHandler(req, res, next) {
+    Promise.resolve()
+      .then(() => fn(req, res, next))
+      .catch(next);
+  };
 };
 
 /**
  * Standard success response formatter.
- * Ensures every success response has a consistent envelope.
+ *
+ * @param {import('express').Response} res
+ * @param {unknown} data
+ * @param {number} [statusCode=200]
+ * @param {object} [meta={}]
  */
 const sendSuccess = (res, data, statusCode = 200, meta = {}) => {
-  res.status(statusCode).json({
+  const safeMeta =
+    meta && typeof meta === 'object' && !Array.isArray(meta)
+      ? meta
+      : {};
+
+  return res.status(statusCode).json({
     success: true,
     data,
     meta: {
-      ...meta,
-      respondedAt: new Date().toISOString(),
+      ...safeMeta,
+      responded_at: new Date().toISOString(),
     },
   });
 };
 
 /**
- * Paginated response formatter.
- * Use when returning lists that support pagination.
+ * Standard paginated response formatter.
+ *
+ * @param {import('express').Response} res
+ * @param {Array} items
+ * @param {{
+ *   page?: number,
+ *   limit?: number,
+ *   total?: number,
+ *   meta?: object
+ * }} options
  */
-const sendPaginated = (res, items, { page, limit, total }) => {
-  res.status(200).json({
+const sendPaginated = (
+  res,
+  items,
+  {
+    page = 1,
+    limit = 10,
+    total = Array.isArray(items) ? items.length : 0,
+    meta = {},
+  } = {}
+) => {
+  const safePage = Math.max(1, Number(page) || 1);
+  const safeLimit = Math.max(1, Number(limit) || 10);
+  const safeTotal = Math.max(0, Number(total) || 0);
+  const totalPages = Math.ceil(safeTotal / safeLimit);
+
+  return res.status(200).json({
     success: true,
-    data:    items,
+    data: Array.isArray(items) ? items : [],
     pagination: {
-      page,
-      limit,
-      total,
-      totalPages: Math.ceil(total / limit),
-      hasNext:    page * limit < total,
-      hasPrev:    page > 1,
+      page: safePage,
+      limit: safeLimit,
+      total: safeTotal,
+      total_pages: totalPages,
+      has_next: safePage < totalPages,
+      has_prev: safePage > 1,
+    },
+    meta: {
+      ...(meta || {}),
+      responded_at: new Date().toISOString(),
     },
   });
 };
 
-module.exports = { asyncHandler, sendSuccess, sendPaginated };
-
-
-
-
-
-
-
-
-
+module.exports = {
+  asyncHandler,
+  sendSuccess,
+  sendPaginated,
+};

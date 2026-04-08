@@ -28,7 +28,7 @@ const {
  *
  * Supports:
  *   - Supabase: req.user.id
- *   - Legacy compatibility: req.user.uid
+ *   - Legacy compatibility: req.user.id
  *
  * @param {import('express').Request} req
  * @returns {string|null}

@@ -1,8 +1,27 @@
-import { randomUUID } from 'crypto';
+import { createHash, randomUUID } from 'crypto';
 import { publishEvent, EventTypes } from '../../../shared/pubsub/index.js';
 import { partitionedJobRepo as jobRepo } from '../../../shared/repositories/partitioned-jobs.repository.js';
-import { validateCareerPathRequest, sanitizeString } from '../../../shared/validation/index.js';
+import {
+  validateCareerPathRequest,
+  sanitizeString
+} from '../../../shared/validation/index.js';
 import { logger } from '../../../shared/logger/index.js';
+
+const MAX_SKILLS = 50;
+const MAX_TITLE_LENGTH = 200;
+const MAX_SKILL_LENGTH = 100;
+
+function buildIdempotencyKey(userId, currentTitle, targetTitle) {
+  const raw = `${userId}:${currentTitle}:${targetTitle}`;
+  return createHash('sha256').update(raw).digest('hex');
+}
+
+function responseMeta(req) {
+  return {
+    requestId: req.requestId,
+    timestamp: new Date().toISOString()
+  };
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Request Career Path Analysis
@@ -10,10 +29,18 @@ import { logger } from '../../../shared/logger/index.js';
 
 export async function requestCareerPath(req, res, next) {
   try {
-    const userId = req.user.uid;
+    const userId = req.user?.uid;
 
-    // Validate env early
-    if (!process.env.PUBSUB_CAREER_TOPIC) {
+    if (!userId) {
+      return res.status(401).json({
+        error: 'UNAUTHORIZED',
+        message: 'User authentication required',
+        ...responseMeta(req)
+      });
+    }
+
+    const topic = process.env.PUBSUB_CAREER_TOPIC;
+    if (!topic) {
       throw new Error('Missing PUBSUB_CAREER_TOPIC environment variable');
     }
 
@@ -22,26 +49,57 @@ export async function requestCareerPath(req, res, next) {
       return res.status(400).json({
         error: 'VALIDATION_ERROR',
         message: validation.error,
-        requestId: req.requestId,
-        timestamp: new Date().toISOString(),
+        ...responseMeta(req)
       });
     }
 
     const { currentTitle, targetTitle, currentSkills = [] } = req.body;
 
-    const jobId = randomUUID();
+    const sanitizedCurrentTitle = sanitizeString(
+      currentTitle,
+      MAX_TITLE_LENGTH
+    );
+    const sanitizedTargetTitle = sanitizeString(
+      targetTitle,
+      MAX_TITLE_LENGTH
+    );
 
-    // Sanitize inputs ONCE
-    const sanitizedCurrentTitle = sanitizeString(currentTitle, 200);
-    const sanitizedTargetTitle = sanitizeString(targetTitle, 200);
     const sanitizedSkills = Array.isArray(currentSkills)
-      ? currentSkills.slice(0, 50).map(s => sanitizeString(s, 100))
+      ? currentSkills
+          .slice(0, MAX_SKILLS)
+          .map(skill => sanitizeString(skill, MAX_SKILL_LENGTH))
+          .filter(Boolean)
       : [];
 
-    // Stronger idempotency key (short + hashed-like)
-    const idempotencyKey = `career_${userId}_${sanitizedCurrentTitle}_${sanitizedTargetTitle}`.slice(0, 200);
+    const idempotencyKey = buildIdempotencyKey(
+      userId,
+      sanitizedCurrentTitle,
+      sanitizedTargetTitle
+    );
 
-    // Create job
+    // Fast-path: reuse existing job if repository supports idempotent lookup
+    const existingJob = await jobRepo.findByIdempotencyKey?.(
+      userId,
+      idempotencyKey
+    );
+
+    if (existingJob) {
+      logger.info('Career path duplicate request reused', {
+        userId,
+        jobId: existingJob.id,
+        requestId: req.requestId
+      });
+
+      return res.status(202).json({
+        message: 'Career path analysis already queued',
+        jobId: existingJob.id,
+        statusUrl: `/v1/career/result/${existingJob.id}`,
+        ...responseMeta(req)
+      });
+    }
+
+    const jobId = randomUUID();
+
     await jobRepo.createJob(jobId, {
       type: 'CAREER_PATH',
       userId,
@@ -49,20 +107,19 @@ export async function requestCareerPath(req, res, next) {
       input: {
         currentTitle: sanitizedCurrentTitle,
         targetTitle: sanitizedTargetTitle,
-        currentSkills: sanitizedSkills,
-      },
+        currentSkills: sanitizedSkills
+      }
     });
 
-    // Publish event with sanitized payload
     await publishEvent(
-      process.env.PUBSUB_CAREER_TOPIC,
+      topic,
       EventTypes.CAREER_PATH_REQUESTED,
       {
         userId,
         jobId,
         currentTitle: sanitizedCurrentTitle,
         targetTitle: sanitizedTargetTitle,
-        currentSkills: sanitizedSkills,
+        currentSkills: sanitizedSkills
       },
       { userId, jobId }
     );
@@ -70,19 +127,17 @@ export async function requestCareerPath(req, res, next) {
     logger.info('Career path requested', {
       userId,
       jobId,
-      requestId: req.requestId,
+      requestId: req.requestId
     });
 
     return res.status(202).json({
       message: 'Career path analysis queued',
       jobId,
       statusUrl: `/v1/career/result/${jobId}`,
-      requestId: req.requestId,
-      timestamp: new Date().toISOString(),
+      ...responseMeta(req)
     });
-
-  } catch (err) {
-    next(err);
+  } catch (error) {
+    next(error);
   }
 }
 
@@ -92,8 +147,16 @@ export async function requestCareerPath(req, res, next) {
 
 export async function getCareerResult(req, res, next) {
   try {
-    const userId = req.user.uid;
+    const userId = req.user?.uid;
     const { jobId } = req.params;
+
+    if (!userId) {
+      return res.status(401).json({
+        error: 'UNAUTHORIZED',
+        message: 'User authentication required',
+        ...responseMeta(req)
+      });
+    }
 
     const job = await jobRepo.findById(jobId);
 
@@ -101,28 +164,35 @@ export async function getCareerResult(req, res, next) {
       return res.status(404).json({
         error: 'NOT_FOUND',
         message: 'Job not found',
-        requestId: req.requestId,
-        timestamp: new Date().toISOString(),
+        ...responseMeta(req)
+      });
+    }
+
+    if (job.status === 'failed') {
+      return res.status(200).json({
+        jobId,
+        status: 'failed',
+        error: job.error || 'Career analysis failed',
+        ...responseMeta(req)
       });
     }
 
     if (job.status !== 'complete') {
       return res.status(202).json({
+        jobId,
         status: job.status,
         message: 'Result not yet available',
-        requestId: req.requestId,
-        timestamp: new Date().toISOString(),
+        ...responseMeta(req)
       });
     }
 
-    return res.json({
+    return res.status(200).json({
       jobId,
+      status: 'complete',
       result: job.result,
-      requestId: req.requestId,
-      timestamp: new Date().toISOString(),
+      ...responseMeta(req)
     });
-
-  } catch (err) {
-    next(err);
+  } catch (error) {
+    next(error);
   }
 }

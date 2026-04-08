@@ -27,7 +27,7 @@ const router = express.Router();
  *
  * Supports:
  * - Supabase JWT middleware → req.user.id
- * - legacy Firebase middleware → req.user.uid
+ * - legacy Firebase middleware → req.user.id
  * - internal normalized auth → req.auth.userId
  */
 function resolveAuthenticatedUserId(req) {

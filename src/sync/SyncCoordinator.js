@@ -1,7 +1,15 @@
 'use strict';
 
 /**
- * path: src/sync/SyncCoordinator.js
+ * @file src/sync/SyncCoordinator.js
+ * @description
+ * Production-grade sync orchestration coordinator.
+ * Handles:
+ * - distributed locking
+ * - summary/failure logging
+ * - safe release semantics
+ * - result validation
+ * - duration tracking
  */
 
 const { SyncLockManager } = require('./SyncLockManager');
@@ -36,6 +44,12 @@ class SyncCoordinator {
   }
 
   async runWithLockAndLogging(asyncFn, context = {}) {
+    if (typeof asyncFn !== 'function') {
+      throw new TypeError(
+        'runWithLockAndLogging requires an async function'
+      );
+    }
+
     const { requestId, initiatedBy } = context;
     const startTime = Date.now();
 
@@ -45,13 +59,16 @@ class SyncCoordinator {
       sourceType: this.sourceType,
     });
 
+    let result = null;
+    let originalError = null;
+
     await this.lockManager.acquire({
       requestId,
       initiatedBy,
     });
 
     try {
-      const result = await asyncFn({
+      result = await asyncFn({
         requestId,
         initiatedBy,
         startTime,
@@ -62,6 +79,10 @@ class SyncCoordinator {
       await this.syncLogger.logSummary({
         successCount: result.successCount,
         failCount: result.failCount,
+        skippedCount: result.skippedCount || 0,
+        totalCount:
+          result.totalCount ??
+          result.successCount + result.failCount,
         startTime,
         requestId,
       });
@@ -71,46 +92,80 @@ class SyncCoordinator {
         ...result,
         durationMs: Date.now() - startTime,
       };
-    } catch (err) {
-      log.error({ err }, 'Coordinated sync failed');
+    } catch (error) {
+      originalError = error;
+
+      log.error(
+        {
+          error,
+          requestId,
+          sourceType: this.sourceType,
+        },
+        'Coordinated sync failed'
+      );
 
       await this.syncLogger.logFailure({
-        error: err,
+        error,
         startTime,
-        totalCount: 0,
+        totalCount:
+          result?.totalCount ??
+          result?.successCount ??
+          0,
         requestId,
       });
 
-      throw err;
+      throw error;
     } finally {
-      await this.lockManager.release({
-        requestId,
-        initiatedBy,
-      });
+      try {
+        await this.lockManager.release({
+          requestId,
+          initiatedBy,
+        });
+      } catch (releaseError) {
+        log.error(
+          {
+            releaseError,
+            requestId,
+          },
+          'Failed to release sync lock'
+        );
+
+        if (!originalError) {
+          throw releaseError;
+        }
+      }
     }
   }
 
   _assertFnResult(result) {
     if (!result || typeof result !== 'object') {
       throw new TypeError(
-        'asyncFn must return { successCount, failCount }'
+        'asyncFn must return an object with successCount and failCount'
       );
     }
 
-    if (typeof result.successCount !== 'number') {
-      throw new TypeError('Missing successCount');
+    const { successCount, failCount } = result;
+
+    if (!Number.isFinite(successCount) || successCount < 0) {
+      throw new TypeError(
+        'successCount must be a non-negative finite number'
+      );
     }
 
-    if (typeof result.failCount !== 'number') {
-      throw new TypeError('Missing failCount');
+    if (!Number.isFinite(failCount) || failCount < 0) {
+      throw new TypeError(
+        'failCount must be a non-negative finite number'
+      );
     }
   }
 
   _childLogger(bindings) {
-    return this.logger.child
+    return typeof this.logger.child === 'function'
       ? this.logger.child(bindings)
       : this.logger;
   }
 }
 
-module.exports = { SyncCoordinator };
+module.exports = Object.freeze({
+  SyncCoordinator,
+});

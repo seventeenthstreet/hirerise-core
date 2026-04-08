@@ -1,5 +1,6 @@
 /**
- * Resume Score Engine — v1.0 (Cleaned & Safe)
+ * Resume Score Engine — v1.1
+ * Production-ready, Firebase-free, deterministic scoring engine
  */
 
 const WEIGHTS = Object.freeze({
@@ -10,34 +11,72 @@ const WEIGHTS = Object.freeze({
   formatting: 0.10,
 });
 
+const REQUIRED_SECTIONS = Object.freeze([
+  'experience',
+  'skills',
+  'contact',
+]);
+
+const OPTIONAL_SECTIONS = Object.freeze([
+  'education',
+  'summary',
+  'certifications',
+  'projects',
+]);
+
 const SENIOR_SIGNALS = new Set([
-  'led', 'managed', 'architected', 'founded', 'director', 'principal',
-  'staff', 'vp', 'head of', 'senior', 'lead',
+  'led',
+  'managed',
+  'architected',
+  'founded',
+  'director',
+  'principal',
+  'staff',
+  'vp',
+  'head of',
+  'senior',
+  'lead',
 ]);
 
 const HIGH_VALUE_SKILLS = new Set([
-  'python', 'typescript', 'kubernetes', 'terraform', 'react', 'node.js',
-  'aws', 'gcp', 'azure', 'machine learning', 'system design', 'sql',
-  'docker', 'graphql', 'rust', 'go',
+  'python',
+  'typescript',
+  'kubernetes',
+  'terraform',
+  'react',
+  'node.js',
+  'aws',
+  'gcp',
+  'azure',
+  'machine learning',
+  'system design',
+  'sql',
+  'docker',
+  'graphql',
+  'rust',
+  'go',
 ]);
 
 export class ResumeScoreEngineV1 {
   get version() {
-    return 'resume_score_v1.0';
+    return 'resume_score_v1.1';
   }
 
   score(parsed = {}) {
+    const safeParsed = this.#normalizeParsed(parsed);
+
     const breakdown = {
-      completeness: this.#scoreCompleteness(parsed),
-      skills: this.#scoreSkills(parsed),
-      experience: this.#scoreExperience(parsed),
-      education: this.#scoreEducation(parsed),
-      formatting: this.#scoreFormatting(parsed),
+      completeness: this.#scoreCompleteness(safeParsed),
+      skills: this.#scoreSkills(safeParsed),
+      experience: this.#scoreExperience(safeParsed),
+      education: this.#scoreEducation(safeParsed),
+      formatting: this.#scoreFormatting(safeParsed),
     };
 
     const overallScore = Math.round(
       Object.entries(breakdown).reduce(
-        (sum, [dim, score]) => sum + score * (WEIGHTS[dim] || 0),
+        (sum, [dimension, score]) =>
+          sum + score * (WEIGHTS[dimension] ?? 0),
         0
       )
     );
@@ -46,75 +85,103 @@ export class ResumeScoreEngineV1 {
       overallScore,
       tier: this.#mapTier(overallScore),
       breakdown,
-      extractedSkills: parsed.skills ?? [],
-      recommendations: this.#generateRecommendations(breakdown, parsed),
-      rawData: { weightMap: WEIGHTS },
+      extractedSkills: [...safeParsed.skills],
+      recommendations: this.#generateRecommendations(
+        breakdown,
+        safeParsed
+      ),
+      rawData: {
+        weightMap: WEIGHTS,
+        version: this.version,
+      },
+    };
+  }
+
+  #normalizeParsed(parsed) {
+    return {
+      ...parsed,
+      skills: Array.isArray(parsed.skills) ? parsed.skills : [],
+      sections:
+        parsed.sections && typeof parsed.sections === 'object'
+          ? parsed.sections
+          : {},
+      metadata:
+        parsed.metadata && typeof parsed.metadata === 'object'
+          ? parsed.metadata
+          : {},
     };
   }
 
   #scoreCompleteness(parsed) {
-    const sections = parsed.sections ?? {};
-
-    const REQUIRED = ['experience', 'skills', 'contact'];
-    const OPTIONAL = ['education', 'summary', 'certifications', 'projects'];
+    const { sections } = parsed;
 
     const requiredScore =
-      REQUIRED.filter((s) => (sections[s] ?? []).length > 0).length /
-      REQUIRED.length;
+      REQUIRED_SECTIONS.filter(
+        (section) => (sections[section] ?? []).length > 0
+      ).length / REQUIRED_SECTIONS.length;
 
     const optionalScore =
-      OPTIONAL.filter((s) => (sections[s] ?? []).length > 0).length /
-      OPTIONAL.length;
+      OPTIONAL_SECTIONS.filter(
+        (section) => (sections[section] ?? []).length > 0
+      ).length / OPTIONAL_SECTIONS.length;
 
     return Math.round((requiredScore * 0.8 + optionalScore * 0.2) * 100);
   }
 
   #scoreSkills(parsed) {
-    const skills = parsed.skills ?? [];
-    if (!skills.length) return 0;
+    const { skills } = parsed;
+    if (skills.length === 0) return 0;
 
-    const normalized = skills.map((s) => s.toLowerCase().trim());
+    const normalized = skills
+      .filter(Boolean)
+      .map((skill) => String(skill).toLowerCase().trim());
 
-    const highValueCount = normalized.filter((s) =>
-      HIGH_VALUE_SKILLS.has(s)
+    const uniqueSkills = new Set(normalized);
+    const highValueCount = normalized.filter((skill) =>
+      HIGH_VALUE_SKILLS.has(skill)
     ).length;
 
-    const uniqueCount = new Set(normalized).size;
-
-    const countScore = Math.min(uniqueCount / 20, 1);
+    const countScore = Math.min(uniqueSkills.size / 20, 1);
     const qualityScore = Math.min(highValueCount / 5, 1);
 
     return Math.round((countScore * 0.4 + qualityScore * 0.6) * 100);
   }
 
   #scoreExperience(parsed) {
-    const experiences = parsed.sections?.experience ?? [];
-    if (!experiences.length) return 10;
+    const experiences = parsed.sections.experience ?? [];
+    if (experiences.length === 0) return 10;
 
     const totalYears =
-      parsed.metadata?.totalYearsExperience ??
+      Number(parsed.metadata.totalYearsExperience) ||
       experiences.length * 1.5;
 
     const yearsScore = Math.min(totalYears / 10, 1);
 
-    const seniorityScore = experiences.some((exp) =>
-      SENIOR_SIGNALS.has((exp.title ?? '').toLowerCase())
-    )
+    const seniorityScore = experiences.some((experience) => {
+      const title = String(experience?.title ?? '')
+        .toLowerCase()
+        .trim();
+
+      return [...SENIOR_SIGNALS].some((signal) =>
+        title.includes(signal)
+      );
+    })
       ? 1
       : 0.5;
 
     const diversityScore = Math.min(experiences.length / 4, 1);
 
     return Math.round(
-      yearsScore * 0.5 +
-      seniorityScore * 0.3 +
-      diversityScore * 0.2
+      (yearsScore * 0.5 +
+        seniorityScore * 0.3 +
+        diversityScore * 0.2) *
+        100
     );
   }
 
   #scoreEducation(parsed) {
-    const education = parsed.sections?.education ?? [];
-    if (!education.length) return 30;
+    const education = parsed.sections.education ?? [];
+    if (education.length === 0) return 30;
 
     const degreePoints = {
       phd: 100,
@@ -126,11 +193,13 @@ export class ResumeScoreEngineV1 {
 
     let highest = 0;
 
-    for (const edu of education) {
-      const level = (edu.degree ?? '').toLowerCase();
+    for (const item of education) {
+      const level = String(item?.degree ?? '')
+        .toLowerCase()
+        .trim();
 
-      for (const [key, points] of Object.entries(degreePoints)) {
-        if (level.includes(key)) {
+      for (const [degree, points] of Object.entries(degreePoints)) {
+        if (level.includes(degree)) {
           highest = Math.max(highest, points);
         }
       }
@@ -140,7 +209,7 @@ export class ResumeScoreEngineV1 {
   }
 
   #scoreFormatting(parsed) {
-    const wordCount = parsed.metadata?.wordCount ?? 0;
+    const wordCount = Number(parsed.metadata.wordCount) || 0;
 
     const lengthScore =
       wordCount >= 300 && wordCount <= 1200
@@ -150,7 +219,7 @@ export class ResumeScoreEngineV1 {
         : 70;
 
     const structureScore =
-      Object.keys(parsed.sections ?? {}).length >= 4 ? 100 : 60;
+      Object.keys(parsed.sections).length >= 4 ? 100 : 60;
 
     return Math.round(lengthScore * 0.6 + structureScore * 0.4);
   }
@@ -163,10 +232,10 @@ export class ResumeScoreEngineV1 {
   }
 
   #generateRecommendations(breakdown, parsed) {
-    const recs = [];
+    const recommendations = [];
 
     if (breakdown.completeness < 60) {
-      recs.push({
+      recommendations.push({
         priority: 'high',
         dimension: 'completeness',
         message: 'Add summary and contact information',
@@ -174,7 +243,7 @@ export class ResumeScoreEngineV1 {
     }
 
     if (breakdown.skills < 60) {
-      recs.push({
+      recommendations.push({
         priority: 'high',
         dimension: 'skills',
         message: 'Add in-demand technical skills',
@@ -182,7 +251,7 @@ export class ResumeScoreEngineV1 {
     }
 
     if (breakdown.experience < 60) {
-      recs.push({
+      recommendations.push({
         priority: 'medium',
         dimension: 'experience',
         message: 'Quantify achievements with numbers',
@@ -191,9 +260,9 @@ export class ResumeScoreEngineV1 {
 
     if (
       breakdown.education < 50 &&
-      !(parsed.sections?.education ?? []).length
+      (parsed.sections.education ?? []).length === 0
     ) {
-      recs.push({
+      recommendations.push({
         priority: 'low',
         dimension: 'education',
         message: 'Add certifications or courses',
@@ -201,13 +270,13 @@ export class ResumeScoreEngineV1 {
     }
 
     if (breakdown.formatting < 60) {
-      recs.push({
+      recommendations.push({
         priority: 'medium',
         dimension: 'formatting',
         message: 'Keep resume between 400–800 words',
       });
     }
 
-    return recs;
+    return recommendations;
   }
 }

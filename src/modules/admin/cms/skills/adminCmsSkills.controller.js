@@ -4,7 +4,7 @@
  * adminCmsSkills.controller.js — HTTP handlers for Admin CMS Skills
  *
  * Security contract:
- *   - adminId is ALWAYS req.user.uid — never req.body.adminId
+ *   - adminId is ALWAYS req.user.id — never req.body.adminId
  *   - agency is ALWAYS req.user.agency — never req.body.agency
  *   - Middleware chain enforced in routes: authenticate → requireAdmin → handler
  *
@@ -24,7 +24,7 @@ const logger           = require('../../../../utils/logger');
 
 const createSkill = asyncHandler(async (req, res) => {
   // ⚠ SECURITY: adminId and agency come from the JWT — never from req.body
-  const adminId = req.user.uid;
+  const adminId = req.user.id;
   const agency  = req.user.agency ?? null;
 
   const { name, category, aliases, description, demandScore } = req.body;
@@ -49,7 +49,7 @@ const createSkill = asyncHandler(async (req, res) => {
 // ── PATCH /api/v1/admin/cms/skills/:skillId ──────────────────────────────────
 
 const updateSkill = asyncHandler(async (req, res) => {
-  const adminId  = req.user.uid;
+  const adminId  = req.user.id;
   const skillId  = req.params.skillId;
 
   // Strip any injected identity fields from the update payload

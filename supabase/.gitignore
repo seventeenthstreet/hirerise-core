@@ -1,8 +1,53 @@
-# Supabase
+# ============================================================================
+# Supabase local/dev artifacts
+# ============================================================================
+.supabase/
 .branches
 .temp
 
-# dotenvx
-.env.keys
+# Supabase generated types / local snapshots (optional)
+supabase/.branches
+supabase/.temp
+
+# ============================================================================
+# dotenvx / environment secrets
+# ============================================================================
+.env
 .env.local
 .env.*.local
+.env.keys
+.env.*.keys
+
+# dotenv variants
+.env.development
+.env.production
+.env.staging
+.env.test
+
+# ============================================================================
+# Node / build artifacts
+# ============================================================================
+node_modules/
+dist/
+build/
+coverage/
+.next/
+.nuxt/
+.cache/
+
+# ============================================================================
+# Logs
+# ============================================================================
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+pnpm-debug.log*
+
+# ============================================================================
+# OS / editor junk
+# ============================================================================
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

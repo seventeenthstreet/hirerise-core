@@ -7,18 +7,59 @@ import { handleNotificationRequested } from './handlers/notification-requested.h
 
 process.env.SERVICE_NAME = 'notification-worker';
 
-// ─── Bootstrap ───────────────────────────────────────
+let subscription = null;
+let isShuttingDown = false;
+
+// ─────────────────────────────────────────────────────────────
+// GRACEFUL SHUTDOWN
+// ─────────────────────────────────────────────────────────────
+
+async function shutdown(signal) {
+  if (isShuttingDown) {
+    logger.warn('Shutdown already in progress', { signal });
+    return;
+  }
+
+  isShuttingDown = true;
+
+  logger.info('Shutdown signal received', {
+    signal,
+    service: process.env.SERVICE_NAME,
+  });
+
+  try {
+    if (subscription?.close) {
+      await subscription.close();
+      logger.info('Subscription closed successfully');
+    }
+
+    process.exit(0);
+  } catch (err) {
+    logger.error('Error during shutdown', {
+      signal,
+      error: err?.message,
+      stack: err?.stack,
+    });
+
+    process.exit(1);
+  }
+}
+
+// ─────────────────────────────────────────────────────────────
+// STARTUP
+// ─────────────────────────────────────────────────────────────
 
 async function start() {
   try {
     const config = loadConfig('notification-worker');
 
     logger.info('Notification worker starting', {
+      service: process.env.SERVICE_NAME,
       subscription: config.pubsub.notificationSubscription,
       env: process.env.NODE_ENV,
     });
 
-    const subscription = createSubscriber(
+    subscription = createSubscriber(
       config.pubsub.notificationSubscription,
       handleNotificationRequested,
       {
@@ -27,53 +68,54 @@ async function start() {
       }
     );
 
-    logger.info('Notification worker started successfully');
+    process.once('SIGTERM', () => shutdown('SIGTERM'));
+    process.once('SIGINT', () => shutdown('SIGINT'));
 
-    // ─── Graceful Shutdown ───────────────────────────
-
-    const shutdown = async (signal) => {
-      logger.info(`${signal} received — shutting down`);
-
-      try {
-        await subscription.close();
-        logger.info('Subscription closed successfully');
-        process.exit(0);
-      } catch (err) {
-        logger.error('Error during shutdown', err);
-        process.exit(1);
-      }
-    };
-
-    process.on('SIGTERM', shutdown);
-    process.on('SIGINT', shutdown);
-
+    logger.info('Notification worker started successfully', {
+      service: process.env.SERVICE_NAME,
+    });
   } catch (err) {
     logger.error('Worker failed to start', {
-      error: err.message,
-      stack: err.stack,
+      service: process.env.SERVICE_NAME,
+      error: err?.message,
+      stack: err?.stack,
     });
+
     process.exit(1);
   }
 }
 
-// ─── Global Error Handlers (CRITICAL) ─────────────────
+// ─────────────────────────────────────────────────────────────
+// GLOBAL ERROR HANDLERS
+// ─────────────────────────────────────────────────────────────
 
-process.on('unhandledRejection', (reason) => {
-  logger.error('Unhandled Rejection', {
-    reason,
+process.on('unhandledRejection', async (reason) => {
+  logger.error('Unhandled rejection', {
+    service: process.env.SERVICE_NAME,
+    reason:
+      reason instanceof Error
+        ? {
+            message: reason.message,
+            stack: reason.stack,
+          }
+        : reason,
   });
+
+  await shutdown('unhandledRejection');
 });
 
-process.on('uncaughtException', (err) => {
-  logger.error('Uncaught Exception', {
-    message: err.message,
-    stack: err.stack,
+process.on('uncaughtException', async (err) => {
+  logger.error('Uncaught exception', {
+    service: process.env.SERVICE_NAME,
+    message: err?.message,
+    stack: err?.stack,
   });
 
-  // Crash intentionally — safer for workers
-  process.exit(1);
+  await shutdown('uncaughtException');
 });
 
-// ─── Start Worker ────────────────────────────────────
+// ─────────────────────────────────────────────────────────────
+// START
+// ─────────────────────────────────────────────────────────────
 
 start();

@@ -14,7 +14,7 @@
  * - structured error logging
  *
  * Supabase migration notes:
- * - removed Firebase-style req.user.uid assumption
+ * - removed Firebase-style req.user.id assumption
  * - now supports Supabase req.user.id as primary identity
  * - backward-safe fallback for legacy middleware during rollout
  */
@@ -51,7 +51,7 @@ function fail(res, statusCode, message, code = 'EMPLOYER_ERROR') {
  *
  * Supports:
  * - req.user.id     → Supabase standard
- * - req.user.uid    → legacy Firebase compatibility during migration
+ * - req.user.id    → legacy Firebase compatibility during migration
  */
 function getAuthenticatedUserId(req) {
   return req?.user?.id || req?.user?.uid || null;

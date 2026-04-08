@@ -53,7 +53,7 @@ function buildSalaryFilters(query = {}) {
  * Extract authenticated user ID in a provider-agnostic way.
  * Supports:
  * - Supabase auth middleware → req.user.id
- * - Legacy Firebase middleware → req.user.uid
+ * - Legacy Firebase middleware → req.user.id
  *
  * @param {object} user
  * @returns {string|null}

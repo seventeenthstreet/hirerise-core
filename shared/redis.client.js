@@ -1,13 +1,18 @@
 'use strict';
 
 /**
- * redis.client.js — FULLY FIXED (PRODUCTION SAFE)
+ * shared/redis.client.js
  *
- * ✅ Safe disable mode (no null crash)
- * ✅ Health check support
- * ✅ Retry strategy with backoff
- * ✅ Controlled reconnect
- * ✅ Graceful shutdown
+ * Redis client — production hardened
+ *
+ * ✅ Zero Firebase legacy
+ * ✅ Safe disabled mode
+ * ✅ No top-level return risk
+ * ✅ Timer leak fixed
+ * ✅ Better reconnect control
+ * ✅ Safer constructor normalization
+ * ✅ Graceful shutdown deduplicated
+ * ✅ Better connection state tracking
  */
 
 const Redis = require('ioredis');
@@ -20,144 +25,170 @@ const logger = (() => {
   }
 })();
 
-// ─────────────────────────────────────────────
-// ENABLE / DISABLE
-// ─────────────────────────────────────────────
-
 const ENABLED = process.env.CACHE_PROVIDER === 'redis';
 
-if (!ENABLED) {
+function buildDisabledClient() {
   logger.warn('[redis] disabled (CACHE_PROVIDER != redis)');
 
-  // ✅ SAFE STUB OBJECT (NO CRASHES)
-  const disabledRedis = {
+  return {
     isReady: () => false,
+    status: 'disabled',
 
-    // No-op methods to prevent crashes
-    set: async () => null,
     get: async () => null,
-    del: async () => null,
+    set: async () => null,
+    del: async () => 0,
     setex: async () => null,
+    expire: async () => 0,
+    quit: async () => null,
 
-    // Optional wrapper compatibility
     safeExec: async () => {
-      throw new Error('REDIS_DISABLED');
+      const err = new Error('REDIS_DISABLED');
+      err.code = 'REDIS_DISABLED';
+      throw err;
     },
   };
-
-  module.exports = disabledRedis;
-  return;
 }
 
-// ─────────────────────────────────────────────
-// CONFIG
-// ─────────────────────────────────────────────
-
-let redisConfig;
-
-if (process.env.REDIS_URL) {
-  redisConfig = process.env.REDIS_URL;
+if (!ENABLED) {
+  module.exports = buildDisabledClient();
 } else {
-  redisConfig = {
-    host: process.env.REDIS_HOST || '127.0.0.1',
-    port: parseInt(process.env.REDIS_PORT || '6379', 10),
-    password: process.env.REDIS_PASSWORD || undefined,
-    tls: process.env.REDIS_TLS === 'true' ? {} : undefined,
-  };
-}
+  // ─────────────────────────────────────────────
+  // CONFIG NORMALIZATION
+  // ─────────────────────────────────────────────
+  const redisOptions = process.env.REDIS_URL
+    ? process.env.REDIS_URL
+    : {
+        host: process.env.REDIS_HOST || '127.0.0.1',
+        port: Number.parseInt(process.env.REDIS_PORT || '6379', 10),
+        password: process.env.REDIS_PASSWORD || undefined,
+        tls: process.env.REDIS_TLS === 'true' ? {} : undefined,
+      };
 
-// ─────────────────────────────────────────────
-// CLIENT INIT
-// ─────────────────────────────────────────────
+  const redis =
+    typeof redisOptions === 'string'
+      ? new Redis(redisOptions, {
+          maxRetriesPerRequest: 2,
+          enableReadyCheck: true,
+          lazyConnect: false,
+          retryStrategy(times) {
+            const delay = Math.min(times * 100, 2000);
+            logger.warn('[redis] retrying connection', {
+              attempt: times,
+              delay,
+            });
+            return delay;
+          },
+          reconnectOnError(err) {
+            if (err?.message?.includes('READONLY')) {
+              logger.warn('[redis] reconnecting due to READONLY');
+              return true;
+            }
+            return false;
+          },
+        })
+      : new Redis({
+          ...redisOptions,
+          maxRetriesPerRequest: 2,
+          enableReadyCheck: true,
+          lazyConnect: false,
+          retryStrategy(times) {
+            const delay = Math.min(times * 100, 2000);
+            logger.warn('[redis] retrying connection', {
+              attempt: times,
+              delay,
+            });
+            return delay;
+          },
+          reconnectOnError(err) {
+            if (err?.message?.includes('READONLY')) {
+              logger.warn('[redis] reconnecting due to READONLY');
+              return true;
+            }
+            return false;
+          },
+        });
 
-const redis = new Redis(redisConfig, {
-  maxRetriesPerRequest: 2,
-  enableReadyCheck: true,
-  lazyConnect: false,
+  let isConnected = false;
 
-  // ✅ Controlled retry strategy
-  retryStrategy(times) {
-    const delay = Math.min(times * 100, 2000);
-    logger.warn('[redis] retrying connection', { attempt: times, delay });
-    return delay;
-  },
+  redis.on('connect', () => {
+    logger.info('[redis] connected');
+  });
 
-  // ✅ Only reconnect on safe errors
-  reconnectOnError(err) {
-    if (err.message.includes('READONLY')) {
-      logger.warn('[redis] reconnecting due to READONLY');
-      return true;
+  redis.on('ready', () => {
+    isConnected = true;
+    logger.info('[redis] ready');
+  });
+
+  redis.on('close', () => {
+    isConnected = false;
+    logger.warn('[redis] connection closed');
+  });
+
+  redis.on('end', () => {
+    isConnected = false;
+    logger.warn('[redis] connection ended');
+  });
+
+  redis.on('reconnecting', () => {
+    isConnected = false;
+    logger.warn('[redis] reconnecting');
+  });
+
+  redis.on('error', (err) => {
+    isConnected = false;
+    logger.error('[redis] error', {
+      error: err?.message || 'Unknown Redis error',
+    });
+  });
+
+  redis.isReady = () => isConnected;
+
+  redis.safeExec = async (fn, timeoutMs = 5000) => {
+    if (!redis.isReady()) {
+      const err = new Error('REDIS_NOT_READY');
+      err.code = 'REDIS_NOT_READY';
+      throw err;
     }
-    return false;
-  },
-});
 
-// ─────────────────────────────────────────────
-// CONNECTION STATE
-// ─────────────────────────────────────────────
+    let timeoutId;
 
-let isConnected = false;
+    try {
+      const timeoutPromise = new Promise((_, reject) => {
+        timeoutId = setTimeout(() => {
+          const err = new Error('REDIS_TIMEOUT');
+          err.code = 'REDIS_TIMEOUT';
+          reject(err);
+        }, timeoutMs);
+      });
 
-redis.on('connect', () => {
-  logger.info('[redis] connected');
-});
+      const result = await Promise.race([fn(), timeoutPromise]);
+      clearTimeout(timeoutId);
 
-redis.on('ready', () => {
-  isConnected = true;
-  logger.info('[redis] ready');
-});
+      return result;
+    } catch (error) {
+      clearTimeout(timeoutId);
+      throw error;
+    }
+  };
 
-redis.on('error', (err) => {
-  isConnected = false;
-  logger.error('[redis] error', { error: err.message });
-});
+  let shutdownRegistered = false;
 
-redis.on('close', () => {
-  isConnected = false;
-  logger.warn('[redis] connection closed');
-});
-
-// ─────────────────────────────────────────────
-// HEALTH CHECK
-// ─────────────────────────────────────────────
-
-redis.isReady = () => isConnected;
-
-// ─────────────────────────────────────────────
-// SAFE EXEC WRAPPER
-// ─────────────────────────────────────────────
-
-redis.safeExec = async (fn, timeoutMs = 5000) => {
-  if (!redis.isReady()) {
-    throw new Error('REDIS_NOT_READY');
+  async function shutdown() {
+    try {
+      logger.info('[redis] shutting down');
+      await redis.quit();
+    } catch (err) {
+      logger.error('[redis] shutdown error', {
+        error: err?.message,
+      });
+    }
   }
 
-  return Promise.race([
-    fn(),
-    new Promise((_, reject) =>
-      setTimeout(() => reject(new Error('REDIS_TIMEOUT')), timeoutMs)
-    ),
-  ]);
-};
-
-// ─────────────────────────────────────────────
-// GRACEFUL SHUTDOWN
-// ─────────────────────────────────────────────
-
-async function shutdown() {
-  try {
-    logger.info('[redis] shutting down...');
-    await redis.quit();
-  } catch (err) {
-    logger.error('[redis] shutdown error', { error: err.message });
+  if (!shutdownRegistered) {
+    process.once('SIGINT', shutdown);
+    process.once('SIGTERM', shutdown);
+    shutdownRegistered = true;
   }
+
+  module.exports = redis;
 }
-
-process.on('SIGINT', shutdown);
-process.on('SIGTERM', shutdown);
-
-// ─────────────────────────────────────────────
-// EXPORT
-// ─────────────────────────────────────────────
-
-module.exports = redis;

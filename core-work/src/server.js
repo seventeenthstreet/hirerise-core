@@ -241,7 +241,7 @@ if (process.env.FEATURE_CAREER_READINESS === 'true') {
  *   2. Supabase unique constraint on normalizedName / normalizedCompositeKey
  *
  * Security contract:
- *   - Admin identity (createdByAdminId) always sourced from req.user.uid (JWT)
+ *   - Admin identity (createdByAdminId) always sourced from req.user.id (JWT)
  *   - No admin identity is accepted from any request body — blocked by validators
  *   - All routes inherit authenticate + requireAdmin from this mount point
  *

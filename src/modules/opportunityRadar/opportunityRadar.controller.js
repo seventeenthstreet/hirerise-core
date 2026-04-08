@@ -74,7 +74,7 @@ function getAuthenticatedUserId(req) {
    * Supabase auth payload compatibility:
    * - req.user.id       → preferred standard
    * - req.user.sub      → JWT subject fallback
-   * - req.user.uid      → legacy compatibility kept for drop-in safety
+   * - req.user.id      → legacy compatibility kept for drop-in safety
    */
   return req.user?.id || req.user?.sub || req.user?.uid || null;
 }

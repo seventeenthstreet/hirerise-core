@@ -1,119 +1,150 @@
 'use strict';
 
 /**
- * tier.filter.js — PHASE 1 UPDATE
+ * tier.filter.js
  *
- * CHANGE: Added skillGaps, demandMetrics, salaryBenchmark to the free tier.
- * These three fields are required by SkillGapCard, MarketDemandCard, and
- * SalaryBenchmarkCard on the dashboard. They were previously missing from
- * all tier outputs, causing every dashboard card to show empty states.
+ * Product access control filter for dashboard snapshots.
  *
- * skillGaps[]     → free tier (core feature — users need to know what to fix)
- * demandMetrics[] → free tier (market signals — drives engagement)
- * salaryBenchmark → pro tier only (salary data is a premium upsell)
- *
- * ADDING A NEW FIELD:
- *   1. Add it to the appropriate tier block below.
- *   2. That's it. Controller and service are untouched.
+ * Goals:
+ * - prevent premium data leaks
+ * - stable free/pro/premium contracts
+ * - future enterprise tier extensibility
  */
 
-const PLAN_HIERARCHY = ['free', 'pro', 'premium'];
+const PLAN_HIERARCHY = Object.freeze(['free', 'pro', 'premium']);
 
-function meetsOrExceeds(userPlan, required) {
-  const userLevel     = PLAN_HIERARCHY.indexOf(userPlan  ?? 'free');
-  const requiredLevel = PLAN_HIERARCHY.indexOf(required);
-  return userLevel >= requiredLevel && userLevel !== -1;
+/**
+ * Normalize plan safely.
+ *
+ * @param {string} plan
+ * @returns {'free'|'pro'|'premium'}
+ */
+function normalizePlan(plan) {
+  return PLAN_HIERARCHY.includes(plan) ? plan : 'free';
 }
 
-function applyTierFilter(snapshot, plan) {
-  if (!snapshot || typeof snapshot !== 'object') return {};
+/**
+ * Check plan hierarchy access.
+ *
+ * @param {string} userPlan
+ * @param {string} required
+ * @returns {boolean}
+ */
+function meetsOrExceeds(userPlan, required) {
+  const normalizedUserPlan = normalizePlan(userPlan);
+  const userLevel = PLAN_HIERARCHY.indexOf(normalizedUserPlan);
+  const requiredLevel = PLAN_HIERARCHY.indexOf(required);
 
-  const can = (tier) => meetsOrExceeds(plan, tier);
+  return userLevel >= requiredLevel;
+}
 
-  // ── Always-present metadata ───────────────────────────────────────────────
-  const base = {
-    snapshotId:     snapshot.snapshotId,
-    user_id:         snapshot.userId,
-    resumeId:       snapshot.resumeId,
-    generatedAt:    snapshot.generatedAt,
-    isReady:        snapshot.isReady        ?? false,
-    lastCalculated: snapshot.lastCalculated ?? null,
-    analysisSource: snapshot.analysisSource ?? null,
-  };
+/**
+ * Safely expose trend object by tier.
+ *
+ * @param {object|null} trend
+ * @param {string} plan
+ * @returns {object|null}
+ */
+function filterTrend(trend, plan) {
+  if (!trend || typeof trend !== 'object') {
+    return null;
+  }
 
-  // ── Free tier ─────────────────────────────────────────────────────────────
-  const free = {
-    chiScore:       snapshot.chiScore,
-    dimensions:     snapshot.dimensions,
-    topStrength:    snapshot.topStrength,
-
-    // PHASE 1 FIX: skill gaps and demand metrics are now free-tier features.
-    // Users need to see what they're missing — this drives resume upload + upgrade.
-    skillGaps:      snapshot.skillGaps     ?? [],
-    demandMetrics:  snapshot.demandMetrics ?? [],
-
-    // Partial trend — direction only. Delta and previousScore are pro.
-    trend: snapshot.trend
-      ? { direction: snapshot.trend.direction }
-      : null,
-  };
-
-  // ── Pro tier ──────────────────────────────────────────────────────────────
-  const pro = can('pro') ? {
-    criticalGap:     snapshot.criticalGap,
-    marketPosition:  snapshot.marketPosition,
-    peerComparison:  snapshot.peerComparison,
-
-    // PHASE 1 FIX: salary benchmark is a pro upsell — shows earning potential
-    salaryBenchmark: snapshot.salaryBenchmark ?? null,
-
-    // Upgrade trend to full object
-    trend: snapshot.trend ?? null,
-  } : {
-    salaryBenchmark: null, // explicitly null for free — no partial data
-  };
-
-  // ── Premium tier ──────────────────────────────────────────────────────────
-  const premium = can('premium') ? {
-    projectedLevelUpMonths:      snapshot.projectedLevelUpMonths,
-    currentEstimatedSalaryLPA:   snapshot.currentEstimatedSalaryLPA,
-    nextLevelEstimatedSalaryLPA: snapshot.nextLevelEstimatedSalaryLPA,
-  } : {};
+  if (meetsOrExceeds(plan, 'pro')) {
+    return trend;
+  }
 
   return {
-    ...base,
-    ...free,
-    ...pro,
-    ...premium,
-    _plan: plan ?? 'free',
+    direction: trend.direction ?? null,
   };
 }
 
+/**
+ * Apply snapshot tier filtering.
+ *
+ * @param {object} snapshot
+ * @param {string} plan
+ * @returns {object}
+ */
+function applyTierFilter(snapshot, plan) {
+  if (!snapshot || typeof snapshot !== 'object') {
+    return {};
+  }
+
+  const safePlan = normalizePlan(plan);
+
+  const response = {
+    snapshotId: snapshot.snapshotId ?? null,
+    user_id: snapshot.userId ?? null,
+    resumeId: snapshot.resumeId ?? null,
+    generatedAt: snapshot.generatedAt ?? null,
+    isReady: snapshot.isReady ?? false,
+    lastCalculated: snapshot.lastCalculated ?? null,
+    analysisSource: snapshot.analysisSource ?? null,
+
+    // Free tier
+    chiScore: snapshot.chiScore ?? null,
+    dimensions: snapshot.dimensions ?? [],
+    topStrength: snapshot.topStrength ?? null,
+    skillGaps: snapshot.skillGaps ?? [],
+    demandMetrics: snapshot.demandMetrics ?? [],
+    trend: filterTrend(snapshot.trend, safePlan),
+
+    _plan: safePlan,
+  };
+
+  if (meetsOrExceeds(safePlan, 'pro')) {
+    response.criticalGap = snapshot.criticalGap ?? null;
+    response.marketPosition = snapshot.marketPosition ?? null;
+    response.peerComparison = snapshot.peerComparison ?? null;
+    response.salaryBenchmark = snapshot.salaryBenchmark ?? null;
+  } else {
+    response.salaryBenchmark = null;
+  }
+
+  if (meetsOrExceeds(safePlan, 'premium')) {
+    response.projectedLevelUpMonths =
+      snapshot.projectedLevelUpMonths ?? null;
+
+    response.currentEstimatedSalaryLPA =
+      snapshot.currentEstimatedSalaryLPA ?? null;
+
+    response.nextLevelEstimatedSalaryLPA =
+      snapshot.nextLevelEstimatedSalaryLPA ?? null;
+  }
+
+  return response;
+}
+
+/**
+ * Apply historical snapshot tier filtering.
+ *
+ * @param {object} entry
+ * @param {string} plan
+ * @returns {object}
+ */
 function applyHistoryTierFilter(entry, plan) {
-  if (!entry || typeof entry !== 'object') return {};
+  if (!entry || typeof entry !== 'object') {
+    return {};
+  }
 
-  const base = {
-    snapshotId:  entry.snapshotId,
-    chiScore:    entry.chiScore,
-    generatedAt: entry.generatedAt,
+  const safePlan = normalizePlan(plan);
+
+  const response = {
+    snapshotId: entry.snapshotId ?? null,
+    chiScore: entry.chiScore ?? null,
+    generatedAt: entry.generatedAt ?? null,
+    trend: filterTrend(entry.trend, safePlan),
   };
 
-  const proFields = meetsOrExceeds(plan, 'pro') ? {
-    marketPosition: entry.marketPosition,
-    trend:          entry.trend ?? null,
-  } : {
-    trend: entry.trend ? { direction: entry.trend.direction } : null,
-  };
+  if (meetsOrExceeds(safePlan, 'pro')) {
+    response.marketPosition = entry.marketPosition ?? null;
+  }
 
-  return { ...base, ...proFields };
+  return response;
 }
 
-module.exports = { applyTierFilter, applyHistoryTierFilter };
-
-
-
-
-
-
-
-
+module.exports = {
+  applyTierFilter,
+  applyHistoryTierFilter,
+};

@@ -50,7 +50,7 @@ async function requirePaidPlan(req, res, next) {
     });
   }
 
-  const userId = req.user.uid;
+  const userId = req.user.id;
 
   // ── Admin bypass ───────────────────────────────────────
   if (isAdmin(req.user)) return next();

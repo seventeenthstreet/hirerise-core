@@ -1,99 +1,115 @@
 'use strict';
 
 /**
- * Engine Version Registry
+ * shared/engines/registry.js
  *
- * ✅ CJS compatible
- * ✅ Env-safe resolution
- * ✅ Better error handling
+ * Production-safe engine version registry + constructor resolver
+ * ✅ Firebase legacy string-instantiation bug fixed
+ * ✅ Supabase worker safe
+ * ✅ Constructor-based resolution
+ * ✅ Strong validation
  * ✅ Dependency injection ready
+ * ✅ Backward-compatible version constants
  */
 
-const RESUME_ENGINES = Object.freeze({
-  V1_0: 'resume_score_v1.0',
-  V1_1: 'resume_score_v1.1',
-  V2_0: 'resume_score_v2.0',
+/**
+ * Stable persisted engine version identifiers
+ * These values are safe for DB storage, analytics, and event payloads.
+ */
+const ENGINE_VERSIONS = Object.freeze({
+  RESUME: Object.freeze({
+    V1_0: 'resume_score_v1.0',
+    V1_1: 'resume_score_v1.1',
+    V2_0: 'resume_score_v2.0',
+  }),
+
+  SALARY: Object.freeze({
+    V1_0: 'salary_bench_v1.0',
+    V1_1: 'salary_bench_v1.1',
+  }),
+
+  CAREER: Object.freeze({
+    V1_0: 'career_path_v1.0',
+  }),
 });
 
-const SALARY_ENGINES = Object.freeze({
-  V1_0: 'salary_bench_v1.0',
-  V1_1: 'salary_bench_v1.1',
+const CURRENT_ENGINES = Object.freeze({
+  resume: ENGINE_VERSIONS.RESUME.V1_0,
+  salary: ENGINE_VERSIONS.SALARY.V1_0,
+  career: ENGINE_VERSIONS.CAREER.V1_0,
 });
 
-const CAREER_ENGINES = Object.freeze({
-  V1_0: 'career_path_v1.0',
-});
-
-const CURRENT_RESUME_ENGINE = RESUME_ENGINES.V1_0;
-const CURRENT_SALARY_ENGINE = SALARY_ENGINES.V1_0;
-const CURRENT_CAREER_ENGINE = CAREER_ENGINES.V1_0;
-
-// ─── Helpers ────────────────────────────────────────────────────────────────
-
-function validateVersion(version, engineMap, type) {
+/**
+ * Validate version exists in constructor registry
+ */
+function validateVersion(version, registry, type = 'engine') {
   if (!version || typeof version !== 'string') {
-    throw new Error(`[EngineRegistry] Invalid ${type} engine version: ${version}`);
+    throw new Error(
+      `[EngineRegistry] Invalid ${type} version: ${String(version)}`
+    );
   }
 
-  if (!engineMap[version]) {
+  if (!registry || typeof registry !== 'object') {
     throw new Error(
-      `[EngineRegistry] Unknown ${type} engine version: ${version}. Available: ${Object.keys(engineMap).join(', ')}`
+      `[EngineRegistry] Invalid ${type} registry supplied`
+    );
+  }
+
+  if (!(version in registry)) {
+    throw new Error(
+      `[EngineRegistry] Unknown ${type} version "${version}". Available: ${Object.keys(registry).join(', ')}`
     );
   }
 }
 
-// ─── resolveEngine ──────────────────────────────────────────────────────────
-
 /**
- * Resolves and instantiates an engine
+ * Resolve engine instance from constructor registry
  *
  * @param {string} version
- * @param {Object} engineMap
- * @param {Object} [options] - dependencies/config injection
+ * @param {Object<string, Function>} registry
+ * @param {Object} [options]
  */
-function resolveEngine(version, engineMap, options = {}) {
-  validateVersion(version, engineMap, 'generic');
+function resolveEngine(version, registry, options = {}) {
+  validateVersion(version, registry);
 
-  const Engine = engineMap[version];
+  const EngineConstructor = registry[version];
+
+  if (typeof EngineConstructor !== 'function') {
+    throw new Error(
+      `[EngineRegistry] Registry entry for "${version}" is not a constructor`
+    );
+  }
 
   try {
-    return new Engine(options); // ✅ supports DI
-  } catch (err) {
+    return new EngineConstructor(options);
+  } catch (error) {
     throw new Error(
-      `[EngineRegistry] Failed to instantiate engine ${version}: ${err.message}`
+      `[EngineRegistry] Failed to instantiate "${version}": ${error.message}`
     );
   }
 }
 
-// ─── resolveFromEnv (NEW - IMPORTANT) ───────────────────────────────────────
-
 /**
- * Safely resolves engine from environment variable
+ * Resolve engine version from environment, then instantiate
  *
  * @param {string} envVar
- * @param {Object} engineMap
- * @param {string} fallback
+ * @param {Object<string, Function>} registry
+ * @param {string} fallbackVersion
  * @param {Object} [options]
  */
-function resolveFromEnv(envVar, engineMap, fallback, options = {}) {
-  const version = process.env[envVar] || fallback;
+function resolveFromEnv(envVar, registry, fallbackVersion, options = {}) {
+  const raw = process.env[envVar];
+  const version =
+    typeof raw === 'string' && raw.trim()
+      ? raw.trim()
+      : fallbackVersion;
 
-  validateVersion(version, engineMap, envVar);
-
-  return resolveEngine(version, engineMap, options);
+  return resolveEngine(version, registry, options);
 }
 
-// ─── Exports ────────────────────────────────────────────────────────────────
-
 module.exports = {
-  RESUME_ENGINES,
-  SALARY_ENGINES,
-  CAREER_ENGINES,
-
-  CURRENT_RESUME_ENGINE,
-  CURRENT_SALARY_ENGINE,
-  CURRENT_CAREER_ENGINE,
-
+  ENGINE_VERSIONS,
+  CURRENT_ENGINES,
   resolveEngine,
   resolveFromEnv,
 };

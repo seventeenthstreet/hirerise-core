@@ -2,91 +2,96 @@
 
 /**
  * route-registration.snippet.js
- * ==============================
+ * =============================
  *
- * Add these three lines to your main app.js / server.js file
- * where you mount all /api/v1/* routes.
+ * PURPOSE
+ * -------
+ * Central route registration snippet for the dual onboarding system.
  *
- * FIND the block that looks like:
+ * This Supabase-first version removes all Firebase / Firestore legacy
+ * references and standardizes route protection using the project's
+ * JWT middleware.
  *
- *   app.use('/api/v1/users',      require('./routes/users.routes'));
- *   app.use('/api/v1/onboarding', require('./modules/onboarding/onboarding.routes'));
- *   // ... other routes ...
+ * ------------------------------------------------------------------
+ * USAGE: Add inside app.js / server.js route registration block
+ * ------------------------------------------------------------------
  *
- * ADD the two new onboarding routes next to the existing ones:
+ * Replace old users route:
  *
- *   app.use('/api/v1/student-onboarding', verifyFirebaseToken, require('./routes/student-onboarding.routes'));
- *   app.use('/api/v1/career-onboarding',  verifyFirebaseToken, require('./routes/career-onboarding.routes'));
+ *   app.use('/api/v1/users', verifySupabaseToken, require('./routes/users.routes'));
  *
- * REPLACE the users route with the updated version:
+ * Add new onboarding routes:
  *
- *   app.use('/api/v1/users', verifyFirebaseToken, require('./routes/users.routes'));
+ *   app.use('/api/v1/student-onboarding', verifySupabaseToken, require('./routes/student-onboarding.routes'));
+ *   app.use('/api/v1/career-onboarding', verifySupabaseToken, require('./routes/career-onboarding.routes'));
  *
- * ─── Complete mount block (copy-paste ready) ─────────────────────────────────
+ * ------------------------------------------------------------------
+ * COMPLETE MOUNT BLOCK (DROP-IN READY)
+ * ------------------------------------------------------------------
  */
 
-// In your app.js / server.js, inside the route registration block:
-
-// --- existing routes (no changes needed) ---
-// app.use('/api/v1/onboarding', verifyFirebaseToken, onboardingRoutes);
+// Existing protected routes
+// app.use('/api/v1/onboarding', verifySupabaseToken, onboardingRoutes);
 // ... other existing routes ...
 
-// --- UPDATED (replace existing users route) ---
-app.use('/api/v1/users', verifyFirebaseToken, require('./routes/users.routes'));
+// Updated users route
+app.use(
+  '/api/v1/users',
+  verifySupabaseToken,
+  require('./routes/users.routes')
+);
 
-// --- NEW: Dual Onboarding System ---
-app.use('/api/v1/student-onboarding', verifyFirebaseToken, require('./routes/student-onboarding.routes'));
-app.use('/api/v1/career-onboarding',  verifyFirebaseToken, require('./routes/career-onboarding.routes'));
+// New dual onboarding routes
+app.use(
+  '/api/v1/student-onboarding',
+  verifySupabaseToken,
+  require('./routes/student-onboarding.routes')
+);
+
+app.use(
+  '/api/v1/career-onboarding',
+  verifySupabaseToken,
+  require('./routes/career-onboarding.routes')
+);
 
 /**
- * ─── Firestore rules additions ────────────────────────────────────────────────
+ * ------------------------------------------------------------------
+ * SUPABASE DATABASE SCHEMA SUMMARY
+ * ------------------------------------------------------------------
  *
- * Add these collection rules to your firestore.rules:
+ * public.users
+ *   └─ id (uuid PK)
+ *   └─ auth_user_id (uuid UNIQUE) ← references auth.users(id)
+ *   └─ email
+ *   └─ display_name
+ *   └─ photo_url
+ *   └─ tier
+ *   └─ plan_amount
+ *   └─ ai_credits_remaining
+ *   └─ onboarding_completed
+ *   └─ resume_uploaded
+ *   └─ chi_score
+ *   └─ subscription_status
+ *   └─ subscription_provider
+ *   └─ subscription_id
+ *   └─ NEW: user_type ('student' | 'professional' | null)
+ *   └─ NEW: student_onboarding_complete boolean default false
+ *   └─ NEW: professional_onboarding_complete boolean default false
+ *   └─ created_at timestamptz
+ *   └─ updated_at timestamptz
  *
- *   // Student onboarding drafts — user can read/write own draft
- *   match /studentOnboardingDrafts/{uid} {
- *     allow read, write: if request.auth.uid == uid;
- *   }
+ * public.student_onboarding_drafts
+ *   └─ auth_user_id uuid PK
+ *   └─ draft_data jsonb
+ *   └─ updated_at timestamptz
  *
- *   // Student career profiles — readable by user and backend service
- *   match /studentCareerProfiles/{uid} {
- *     allow read: if request.auth.uid == uid;
- *     allow write: if false; // backend service account only
- *   }
+ * public.student_career_profiles
+ *   └─ auth_user_id uuid PK
+ *   └─ profile_data jsonb
+ *   └─ created_at timestamptz
  *
- *   // Professional career profiles — readable by user and backend service
- *   match /professionalCareerProfiles/{uid} {
- *     allow read: if request.auth.uid == uid;
- *     allow write: if false; // backend service account only
- *   }
- *
- * Also add to the existing /users/{uid} update rule's hasOnly([...]) list:
- *   'user_type',
- *   'student_onboarding_complete',
- *   'professional_onboarding_complete',
- *
- * ─── Database schema summary ──────────────────────────────────────────────────
- *
- * users/{uid}
- *   └─ uid, email, displayName, photoURL
- *   └─ tier, planAmount, aiCreditsRemaining
- *   └─ onboardingCompleted, resumeUploaded, chiScore
- *   └─ subscriptionStatus, subscriptionProvider, subscriptionId
- *   └─ NEW: user_type                        ('student' | 'professional' | null)
- *   └─ NEW: student_onboarding_complete      (boolean, default false)
- *   └─ NEW: professional_onboarding_complete (boolean, default false)
- *   └─ createdAt, updatedAt
- *
- * studentOnboardingDrafts/{uid}       — partial wizard state, auto-saved
- * studentCareerProfiles/{uid}         — completed student profile
- * professionalCareerProfiles/{uid}    — completed professional profile
+ * public.professional_career_profiles
+ *   └─ auth_user_id uuid PK
+ *   └─ profile_data jsonb
+ *   └─ created_at timestamptz
  */
-
-
-
-
-
-
-
-
-

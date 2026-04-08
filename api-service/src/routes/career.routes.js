@@ -1,3 +1,5 @@
+'use strict';
+
 import { Router } from 'express';
 import { authenticate } from '../middleware/auth.middleware.js';
 import {
@@ -13,11 +15,24 @@ import {
 
 export const careerRouter = Router();
 
-// All career routes require authentication
+// ─────────────────────────────────────────────────────────────────────────────
+// CONSTANTS
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Strict RFC4122 UUID v4 validation
+const UUID_V4_REGEX =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GLOBAL AUTH
+// ─────────────────────────────────────────────────────────────────────────────
+
+// All career routes require authenticated Supabase user context
 careerRouter.use(authenticate);
 
 // ─────────────────────────────────────────────────────────────────────────────
 // POST /v1/career/path
+// Creates async career analysis job
 // ─────────────────────────────────────────────────────────────────────────────
 
 careerRouter.post(
@@ -29,35 +44,31 @@ careerRouter.post(
 
 // ─────────────────────────────────────────────────────────────────────────────
 // GET /v1/career/:jobId/result
+// Fetch completed async career analysis result
 // ─────────────────────────────────────────────────────────────────────────────
 
 careerRouter.get(
   '/:jobId/result',
-  globalRequestRateLimit, // Prevent polling abuse
+  globalRequestRateLimit, // protects against polling abuse
   validateJobIdParam,
   getCareerResult,
 );
 
 // ─────────────────────────────────────────────────────────────────────────────
-// PARAM VALIDATION
+// PARAM VALIDATION MIDDLEWARE
 // ─────────────────────────────────────────────────────────────────────────────
 
-function validateJobIdParam(req, res, next) {
-  const { jobId } = req.params;
+export function validateJobIdParam(req, res, next) {
+  const jobId = req.params?.jobId;
 
-  // Basic UUID v4 check
-  const isValid =
-    typeof jobId === 'string' &&
-    /^[0-9a-fA-F-]{36}$/.test(jobId);
-
-  if (!isValid) {
+  if (typeof jobId !== 'string' || !UUID_V4_REGEX.test(jobId)) {
     return res.status(400).json({
       error: 'VALIDATION_ERROR',
       message: 'Invalid jobId format',
-      requestId: req.requestId,
+      requestId: req.requestId ?? null,
       timestamp: new Date().toISOString(),
     });
   }
 
-  next();
+  return next();
 }

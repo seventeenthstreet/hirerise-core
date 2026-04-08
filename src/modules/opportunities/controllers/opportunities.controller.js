@@ -54,7 +54,7 @@ function fail(
  * Normalize authenticated user id across legacy + Supabase middleware.
  *
  * Supports:
- * - Firebase legacy: req.user.uid
+ * - Firebase legacy: req.user.id
  * - Supabase JWT: req.user.id
  * - JWT standard: req.user.sub
  */

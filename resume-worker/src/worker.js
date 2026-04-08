@@ -5,38 +5,85 @@ import { handleResumeSubmitted } from './handlers/resume-submitted.handler.js';
 
 process.env.SERVICE_NAME = 'resume-worker';
 
-const config = loadConfig('resume-worker');
+let subscription = null;
+let isShuttingDown = false;
 
-// ❌ Firebase removed — no initializeApp()
-
-logger.info('Resume worker starting', {
-  subscription: config.pubsub.resumeSubscription,
-  engineVersion: config.engines.resumeVersion,
-});
-
-const subscription = createSubscriber(
-  config.pubsub.resumeSubscription,
-  handleResumeSubmitted,
-  {
-    maxMessages: 5,
-    ackDeadlineSeconds: config.pubsub.ackDeadlineSeconds,
-  }
-);
-
-// Graceful shutdown
-const shutdown = async (signal) => {
-  logger.info(`${signal} received, closing subscription`);
-
+async function bootstrap() {
   try {
-    await subscription.close();
-    logger.info('Subscription closed, exiting');
-    process.exit(0);
+    const config = loadConfig('resume-worker');
+
+    logger.info('Resume worker starting', {
+      service: process.env.SERVICE_NAME,
+      subscription: config.pubsub.resumeSubscription,
+      engineVersion: config.engines.resumeVersion,
+      ackDeadlineSeconds: config.pubsub.ackDeadlineSeconds,
+    });
+
+    subscription = createSubscriber(
+      config.pubsub.resumeSubscription,
+      handleResumeSubmitted,
+      {
+        maxMessages: 5,
+        ackDeadlineSeconds:
+          config.pubsub.ackDeadlineSeconds,
+      }
+    );
+
+    logger.info('Resume worker started successfully');
   } catch (err) {
-    logger.error('Error during shutdown', { error: err.message });
+    logger.error('Worker bootstrap failed', {
+      service: process.env.SERVICE_NAME,
+      error: err?.message ?? 'Unknown bootstrap error',
+      stack: err?.stack,
+    });
+
     process.exit(1);
   }
-};
+}
 
-// Signals
+async function shutdown(signal) {
+  if (isShuttingDown) return;
+  isShuttingDown = true;
+
+  logger.info(`${signal} received, shutting down worker`);
+
+  try {
+    if (subscription?.close) {
+      await subscription.close();
+    }
+
+    logger.info('Worker shutdown complete');
+    process.exit(0);
+  } catch (err) {
+    logger.error('Error during shutdown', {
+      error: err?.message ?? 'Unknown shutdown error',
+    });
+
+    process.exit(1);
+  }
+}
+
 process.on('SIGTERM', () => shutdown('SIGTERM'));
 process.on('SIGINT', () => shutdown('SIGINT'));
+
+process.on('unhandledRejection', (reason) => {
+  logger.error('Unhandled promise rejection', {
+    error:
+      reason instanceof Error
+        ? reason.message
+        : String(reason),
+  });
+
+  shutdown('unhandledRejection');
+});
+
+process.on('uncaughtException', (err) => {
+  logger.error('Uncaught exception', {
+    error: err?.message ?? 'Unknown exception',
+    stack: err?.stack,
+  });
+
+  shutdown('uncaughtException');
+});
+
+await bootstrap();

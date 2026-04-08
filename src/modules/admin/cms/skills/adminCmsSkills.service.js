@@ -15,7 +15,7 @@
  *   (Firestore composite index on normalizedName is the final DB-level guard)
  *
  * Contributor identity:
- *   - adminId is ALWAYS taken from req.user.uid
+ *   - adminId is ALWAYS taken from req.user.id
  *   - agency is ALWAYS taken from req.user.agency
  *   - Neither may come from request body — enforced here and in the controller
  *
@@ -37,7 +37,7 @@ const logger = require('../../../../utils/logger');
  * Create a new skill with full duplicate detection.
  *
  * @param {object} payload   — Validated request body (from controller)
- * @param {string} adminId   — req.user.uid — NEVER from request body
+ * @param {string} adminId   — req.user.id — NEVER from request body
  * @param {string} [agency]  — req.user.agency — NEVER from request body
  * @returns {Promise<object>} — Created skill document
  * @throws {DuplicateError}  — HTTP 409 if skill already exists
@@ -95,7 +95,7 @@ async function createSkill(payload, adminId, agency = null) {
  *
  * @param {string} skillId
  * @param {object} updates   — Validated partial update object
- * @param {string} adminId   — req.user.uid
+ * @param {string} adminId   — req.user.id
  * @returns {Promise<object>}
  */
 async function updateSkill(skillId, updates, adminId) {

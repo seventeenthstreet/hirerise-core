@@ -1,99 +1,154 @@
 'use strict';
 
-const supabase   = require('../config/supabase');
+const supabase = require('../config/supabase');
 const BaseWorker = require('./shared/BaseWorker');
-const logger     = require('../utils/logger');
+const logger = require('../utils/logger');
+
+const WORKER_NAME = 'admin-metrics';
+const SNAPSHOT_TABLE = 'metrics_daily_snapshots';
+const USAGE_LOGS_TABLE = 'usage_logs';
+const USERS_TABLE = 'users';
 
 class AdminMetricsAggregator extends BaseWorker {
   constructor() {
-    super('admin-metrics');
+    super(WORKER_NAME);
   }
 
   async process({ targetDate }) {
-    const jobStart = Date.now();
+    const startedAt = Date.now();
     logger.info('[AdminMetricsAggregator] Start', { targetDate });
 
-    const startISO = `${targetDate}T00:00:00.000Z`;
-    const endISO   = `${targetDate}T23:59:59.999Z`;
+    const { startISO, endISO } = this._buildUtcDayRange(targetDate);
 
-    // ── Fetch usage logs (SAFE) ────────────────────────────────────────
-    let logRows = [];
+    const [usageRows, totalUsers] = await Promise.all([
+      this._fetchUsageLogs(startISO, endISO, targetDate),
+      this._fetchTotalUsers()
+    ]);
 
+    if (usageRows.length === 0) {
+      logger.warn('[AdminMetricsAggregator] No usage data found', {
+        targetDate
+      });
+
+      return {
+        date: targetDate,
+        docCount: 0,
+        durationMs: Date.now() - startedAt
+      };
+    }
+
+    const aggregate = this._buildAggregateSnapshot(
+      usageRows,
+      totalUsers,
+      targetDate
+    );
+
+    await this._upsertSnapshot(aggregate, targetDate);
+
+    const durationMs = Date.now() - startedAt;
+
+    logger.info('[AdminMetricsAggregator] Done', {
+      targetDate,
+      rows: usageRows.length,
+      durationMs
+    });
+
+    return {
+      date: targetDate,
+      docCount: usageRows.length,
+      durationMs
+    };
+  }
+
+  async runJob(dateStr) {
+    const targetDate = dateStr ?? this._yesterdayUTC();
+
+    const idempotencyKey = BaseWorker.buildIdempotencyKey('system', {
+      job: WORKER_NAME,
+      date: targetDate
+    });
+
+    const { result } = await this.run({ targetDate }, idempotencyKey);
+    return result;
+  }
+
+  async _fetchUsageLogs(startISO, endISO, targetDate) {
     try {
       const { data, error } = await supabase
-        .from('usage_logs')
+        .from(USAGE_LOGS_TABLE)
         .select(`
           user_id,
           feature,
           tier,
-          model,
-          input_tokens,
-          output_tokens,
           total_tokens,
           cost_usd,
           revenue_usd
         `)
         .gte('created_at', startISO)
-        .lte('created_at', endISO);
+        .lt('created_at', endISO);
 
       if (error) throw error;
 
-      logRows = data || [];
-    } catch (err) {
+      return Array.isArray(data) ? data : [];
+    } catch (error) {
       logger.error('[AdminMetricsAggregator] usage_logs query failed', {
-        err: err?.message,
-        targetDate
+        targetDate,
+        error: error?.message
       });
-      throw err;
+      throw error;
     }
+  }
 
-    // ── Map rows ───────────────────────────────────────────────────────
-    const rows = logRows.map(d => ({
-      userId: d.user_id || '',
-      feature: d.feature || 'unknown',
-      tier: d.tier || 'free',
-      model: d.model || 'unknown',
-      inputTokens: d.input_tokens || 0,
-      outputTokens: d.output_tokens || 0,
-      totalTokens: d.total_tokens || 0,
-      costUSD: d.cost_usd || 0,
-      revenueUSD: d.revenue_usd || 0,
-    }));
+  async _fetchTotalUsers() {
+    try {
+      const { count, error } = await supabase
+        .from(USERS_TABLE)
+        .select('id', { count: 'exact', head: true });
 
-    if (rows.length === 0) {
-      logger.warn('[AdminMetricsAggregator] No data', { targetDate });
-      return {
-        date: targetDate,
-        docCount: 0,
-        durationMs: Date.now() - jobStart
-      };
+      if (error) throw error;
+
+      return Number(count) || 0;
+    } catch (error) {
+      logger.error('[AdminMetricsAggregator] user count failed', {
+        error: error?.message
+      });
+
+      return 0;
     }
+  }
 
-    // ── Aggregation ────────────────────────────────────────────────────
+  _buildAggregateSnapshot(rows, totalUsers, targetDate) {
     let totalTokens = 0;
     let totalCostUSD = 0;
     let totalRevenueUSD = 0;
     let freeTierCostUSD = 0;
     let paidTierCostUSD = 0;
 
-    const featureCounts = {};
+    const featureCounts = Object.create(null);
     const paidUserIds = new Set();
-    const allUserIds = new Set();
+    const activeUserIds = new Set();
 
     for (const row of rows) {
-      totalTokens += row.totalTokens;
-      totalCostUSD += row.costUSD;
-      totalRevenueUSD += row.revenueUSD;
+      const userId = row.user_id ?? '';
+      const feature = row.feature ?? 'unknown';
+      const tier = row.tier ?? 'free';
+      const totalTokensRow = Number(row.total_tokens) || 0;
+      const costUSD = Number(row.cost_usd) || 0;
+      const revenueUSD = Number(row.revenue_usd) || 0;
 
-      if (row.userId) allUserIds.add(row.userId);
+      totalTokens += totalTokensRow;
+      totalCostUSD += costUSD;
+      totalRevenueUSD += revenueUSD;
 
-      featureCounts[row.feature] = (featureCounts[row.feature] || 0) + 1;
+      if (userId) activeUserIds.add(userId);
 
-      if (row.tier === 'free') {
-        freeTierCostUSD += row.costUSD;
+      featureCounts[feature] = (featureCounts[feature] || 0) + 1;
+
+      if (tier === 'free') {
+        freeTierCostUSD += costUSD;
       } else {
-        paidTierCostUSD += row.costUSD;
-        if (row.userId) paidUserIds.add(row.userId);
+        paidTierCostUSD += costUSD;
+        if (userId) paidUserIds.add(userId);
       }
     }
 
@@ -103,106 +158,81 @@ class AdminMetricsAggregator extends BaseWorker {
         ? (grossMarginUSD / totalRevenueUSD) * 100
         : 0;
 
-    // ── Total users (SAFE) ─────────────────────────────────────────────
-    let totalUsers = 0;
-
-    try {
-      const { count, error } = await supabase
-        .from('users')
-        .select('*', { count: 'exact', head: true });
-
-      if (error) throw error;
-
-      totalUsers = count || 0;
-    } catch (err) {
-      logger.error('[AdminMetricsAggregator] user count failed', {
-        err: err?.message
-      });
-    }
-
-    // ── Snapshot ───────────────────────────────────────────────────────
-    const aggregate = {
-      date: targetDate,
-      total_users: totalUsers,
-      active_users: allUserIds.size,
-      total_requests: rows.length,
-      total_tokens: totalTokens,
-      total_cost_usd: +totalCostUSD.toFixed(6),
-      total_revenue_usd: +totalRevenueUSD.toFixed(4),
-      gross_margin_usd: +grossMarginUSD.toFixed(6),
-      gross_margin_percent: +grossMarginPercent.toFixed(2),
-      free_tier_cost_usd: +freeTierCostUSD.toFixed(6),
-      paid_tier_cost_usd: +paidTierCostUSD.toFixed(6),
-      paid_user_count: paidUserIds.size,
-      feature_counts: featureCounts,
-      updated_at: new Date().toISOString(),
-    };
-
-    // ── Upsert ─────────────────────────────────────────────────────────
-    try {
-      const { error } = await supabase
-        .from('metrics_daily_snapshots')
-        .upsert(aggregate, { onConflict: 'date' });
-
-      if (error) throw error;
-    } catch (err) {
-      logger.error('[AdminMetricsAggregator] snapshot upsert failed', {
-        err: err?.message,
-        targetDate
-      });
-      throw err;
-    }
-
-    const durationMs = Date.now() - jobStart;
-
-    logger.info('[AdminMetricsAggregator] Done', {
-      targetDate,
-      rows: rows.length,
-      durationMs
-    });
-
     return {
       date: targetDate,
-      docCount: rows.length,
-      durationMs,
+      total_users: totalUsers,
+      active_users: activeUserIds.size,
+      total_requests: rows.length,
+      total_tokens: totalTokens,
+      total_cost_usd: Number(totalCostUSD.toFixed(6)),
+      total_revenue_usd: Number(totalRevenueUSD.toFixed(6)),
+      gross_margin_usd: Number(grossMarginUSD.toFixed(6)),
+      gross_margin_percent: Number(grossMarginPercent.toFixed(2)),
+      free_tier_cost_usd: Number(freeTierCostUSD.toFixed(6)),
+      paid_tier_cost_usd: Number(paidTierCostUSD.toFixed(6)),
+      paid_user_count: paidUserIds.size,
+      feature_counts: featureCounts,
+      updated_at: new Date().toISOString()
     };
   }
 
-  // ── Runner ──────────────────────────────────────────────────────────
+  async _upsertSnapshot(snapshot, targetDate) {
+    try {
+      const { error } = await supabase
+        .from(SNAPSHOT_TABLE)
+        .upsert(snapshot, {
+          onConflict: 'date',
+          ignoreDuplicates: false
+        });
 
-  async runJob(dateStr) {
-    const targetDate = dateStr ?? this._yesterdayUTC();
+      if (error) throw error;
+    } catch (error) {
+      logger.error('[AdminMetricsAggregator] snapshot upsert failed', {
+        targetDate,
+        error: error?.message
+      });
+      throw error;
+    }
+  }
 
-    const idempotencyKey = BaseWorker.buildIdempotencyKey('system', {
-      job: 'admin-metrics',
-      date: targetDate,
-    });
+  _buildUtcDayRange(date) {
+    const startISO = `${date}T00:00:00.000Z`;
 
-    const { result } = await this.run({ targetDate }, idempotencyKey);
-    return result;
+    const nextDay = new Date(`${date}T00:00:00.000Z`);
+    nextDay.setUTCDate(nextDay.getUTCDate() + 1);
+
+    return {
+      startISO,
+      endISO: nextDay.toISOString()
+    };
   }
 
   _yesterdayUTC() {
-    const d = new Date();
-    d.setUTCDate(d.getUTCDate() - 1);
-    return d.toISOString().split('T')[0];
+    const date = new Date();
+    date.setUTCDate(date.getUTCDate() - 1);
+    return date.toISOString().slice(0, 10);
   }
 }
 
 const adminMetricsAggregator = new AdminMetricsAggregator();
-module.exports = { adminMetricsAggregator };
 
-// CLI
+module.exports = {
+  adminMetricsAggregator
+};
+
 if (require.main === module) {
   const dateArg = process.argv[2];
 
-  adminMetricsAggregator.runJob(dateArg)
-    .then(r => {
-      console.log('Done:', r);
+  adminMetricsAggregator
+    .runJob(dateArg)
+    .then(result => {
+      logger.info('[AdminMetricsAggregator] CLI success', result);
       process.exit(0);
     })
-    .catch(e => {
-      console.error('Failed:', e);
+    .catch(error => {
+      logger.error('[AdminMetricsAggregator] CLI failed', {
+        error: error?.message
+      });
       process.exit(1);
     });
 }

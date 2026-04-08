@@ -1,6 +1,6 @@
 /**
- * metrics.types.ts
- *
+ * @file src/shared/types/metrics.types.ts
+ * @description
  * Central type definitions for:
  * - AI pricing
  * - token usage
@@ -8,34 +8,40 @@
  * - cost tracking
  */
 
-// ─────────────────────────────────────────────
-// MODEL PRICING
-// ─────────────────────────────────────────────
+export type ISODateString = string;
 
-export type ModelPricing = {
-  input: number;   // USD per unit (per million or per 1k — depends on config)
+export type AIProvider =
+  | 'openai'
+  | 'openrouter'
+  | 'grok'
+  | 'anthropic'
+  | 'internal'
+  | 'unknown';
+
+/* ========================= MODEL PRICING ========================= */
+
+export type ModelPricing = Readonly<{
+  input: number;
   output: number;
-};
+}>;
 
-export type ModelPricingMap = Record<string, ModelPricing>;
+export type ModelPricingMap = Readonly<
+  Record<string, ModelPricing>
+>;
 
-// ─────────────────────────────────────────────
-// TOKEN USAGE
-// ─────────────────────────────────────────────
+/* ========================= TOKEN USAGE ========================= */
 
-export type TokenUsage = {
+export type TokenUsage = Readonly<{
   inputTokens: number;
   outputTokens: number;
   totalTokens?: number;
-};
+}>;
 
-// ─────────────────────────────────────────────
-// AI CALL METRICS
-// ─────────────────────────────────────────────
+/* ========================= AI CALL METRICS ========================= */
 
-export type AICallMetrics = {
+export type AICallMetrics = Readonly<{
   model: string;
-  provider?: string;
+  provider?: AIProvider;
 
   latencyMs: number;
 
@@ -46,54 +52,47 @@ export type AICallMetrics = {
   success: boolean;
   error?: string;
 
-  timestamp?: string;
-};
+  timestamp?: ISODateString;
+}>;
 
-// ─────────────────────────────────────────────
-// AGGREGATED METRICS
-// ─────────────────────────────────────────────
+/* ========================= AGGREGATED METRICS ========================= */
 
-export type AggregatedMetrics = {
+export type AggregatedMetrics = Readonly<{
   totalCalls: number;
   successRate: number;
   errorRate: number;
 
   avgLatencyMs: number;
+  p50LatencyMs?: number;
   p95LatencyMs?: number;
+  p99LatencyMs?: number;
 
   totalTokens: number;
   totalCostUSD: number;
-};
+}>;
 
-// ─────────────────────────────────────────────
-// DRIFT METRICS
-// ─────────────────────────────────────────────
+/* ========================= DRIFT METRICS ========================= */
 
-export type DriftMetric = {
+export type DriftMetric = Readonly<{
   feature: string;
 
   baselineValue: number;
   currentValue: number;
 
-  deviation: number; // percentage (0–1)
-
+  deviation: number; // 0–1 normalized %
   triggered: boolean;
-};
+}>;
 
-// ─────────────────────────────────────────────
-// BUDGET TRACKING
-// ─────────────────────────────────────────────
+/* ========================= BUDGET TRACKING ========================= */
 
-export type BudgetUsage = {
+export type BudgetUsage = Readonly<{
   totalCostUSD: number;
   perUserCostUSD?: number;
   perFeatureCostUSD?: number;
 
   thresholdExceeded?: boolean;
-};
+}>;
 
-// ─────────────────────────────────────────────
-// PLAN / REVENUE
-// ─────────────────────────────────────────────
+/* ========================= PLAN / REVENUE ========================= */
 
-export type PlanRevenueMap = Record<number, number>; // INR → USD mapping
+export type PlanRevenueMap = Readonly<Record<number, number>>;
