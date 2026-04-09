@@ -243,12 +243,14 @@ async function uploadResume(userId, file, options = {}) {
   );
 
   return {
-    jobId: resumeId,
-    resumeId,
-    fileName: file.originalname,
-    status: 'pending',
-    createdAt: now
-  };
+  jobId: resumeId,
+  resumeId,
+  fileName: file.originalname,
+  fileUrl: contentMeta.fileUrl,
+  resumeText: resumeText.trim(),
+  status: 'pending',
+  createdAt: now
+};
 }
 
 async function scoreResume(userId, resumeId) {
