@@ -5,6 +5,7 @@
  *
  * BaseRepository — Production Hardened for Supabase
  *
+ * ✅ Correct Supabase import path
  * ✅ Zero Firebase legacy assumptions
  * ✅ Centralized query execution
  * ✅ Better timeout safety
@@ -17,7 +18,7 @@
  * ✅ Improved maintainability
  */
 
-const { supabase } = require('../config/supabaseClient');
+const { supabase } = require('../../src/config/supabase');
 const logger = require('../logger');
 
 const DEFAULT_TIMEOUT_MS = 10000;
@@ -61,7 +62,10 @@ async function execute(query, context = {}) {
       }, DEFAULT_TIMEOUT_MS);
     });
 
-    const result = await Promise.race([query, timeoutPromise]);
+    const result = await Promise.race([
+      Promise.resolve(query),
+      timeoutPromise,
+    ]);
 
     clearTimeout(timeoutId);
 
