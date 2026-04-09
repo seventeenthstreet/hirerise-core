@@ -4,6 +4,7 @@
  * shared/pubsub/index.js
  *
  * Supabase-native transport layer
+ * ✅ Correct Supabase import path
  * ✅ Google Pub/Sub fully removed
  * ✅ Firebase legacy transport removed
  * ✅ Postgres outbox pattern
@@ -12,7 +13,7 @@
  * ✅ SKIP LOCKED concurrency
  */
 
-const { supabase } = require('../supabase');
+const { supabase } = require('../../src/config/supabase');
 const logger = require('../logger');
 const {
   buildEnvelope,
@@ -142,7 +143,6 @@ function createSubscriber(route, handler, options = {}) {
 
           await markProcessed(row.id, 'processed');
           childLogger.info('Message acknowledged');
-
         } catch (err) {
           const retryable =
             !err.code || err.code !== 'PERMANENT_ERROR';
