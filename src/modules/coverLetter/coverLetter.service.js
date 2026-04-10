@@ -1,17 +1,9 @@
 'use strict';
 
 /**
- * coverLetter.service.js
+ * src/modules/coverLetter/coverLetter.service.js
  *
- * Production-grade Supabase orchestration layer.
- *
- * Responsibilities:
- * - tier safety enforcement
- * - atomic credit deduction via consume_ai_credits RPC
- * - Claude engine orchestration
- * - atomic credit refund via refund_ai_credits RPC on engine failure
- * - non-fatal persistence
- * - async usage logging
+ * Wave 1 drift-safe AI credit transaction hardening
  */
 
 const { supabase } = require('../../config/supabase');
@@ -28,24 +20,44 @@ const FEATURE_ID = 'cover_letter';
 const CREDIT_COST = 2;
 const FREE_TIERS = new Set(['free']);
 
-// ─────────────────────────────────────────────────────────────────────────────
-// USAGE LOGGER (SUPABASE-NATIVE, NON-BLOCKING)
-// ─────────────────────────────────────────────────────────────────────────────
+/**
+ * Normalize scalar/object/array RPC responses
+ */
+function normalizeCreditResult(data) {
+  if (data == null) {
+    return 0;
+  }
 
+  if (typeof data === 'number') {
+    return data;
+  }
+
+  const row = Array.isArray(data) ? data[0] : data;
+
+  return Number(
+    row?.remaining ??
+    row?.remaining_credits ??
+    row?.balance ??
+    data ??
+    0
+  );
+}
+
+/**
+ * Non-blocking usage logger
+ */
 async function logUsageAsync(payload) {
   try {
-    await supabase
-      .from('usage_logs')
-      .insert({
-        user_id: payload.userId,
-        feature: payload.feature,
-        tier: payload.tier,
-        model: payload.model,
-        input_tokens: payload.inputTokens,
-        output_tokens: payload.outputTokens,
-        plan_amount: payload.planAmount,
-        created_at: new Date().toISOString(),
-      });
+    await supabase.from('usage_logs').insert({
+      user_id: payload.userId,
+      feature: payload.feature,
+      tier: payload.tier,
+      model: payload.model,
+      input_tokens: payload.inputTokens,
+      output_tokens: payload.outputTokens,
+      plan_amount: payload.planAmount,
+      created_at: new Date().toISOString(),
+    });
   } catch (error) {
     logger.warn('[CoverLetterService] Usage log failed (non-fatal)', {
       userId: payload.userId,
@@ -54,22 +66,37 @@ async function logUsageAsync(payload) {
   }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// ATOMIC CREDIT HELPERS
-// ─────────────────────────────────────────────────────────────────────────────
-
+/**
+ * Atomic deduct
+ */
 async function deductCredits(userId, amount) {
+  const cost = Math.trunc(Number(amount));
+
+  if (!Number.isFinite(cost) || cost <= 0) {
+    throw new AppError(
+      'Invalid credit cost configuration.',
+      500,
+      { amount },
+      ErrorCodes.INTERNAL_SERVER_ERROR
+    );
+  }
+
   const { data, error } = await supabase.rpc('consume_ai_credits', {
     p_user_id: userId,
-    p_amount: amount,
+    p_cost: cost,
   });
 
   if (error) {
-    if (error.message?.includes('INSUFFICIENT_CREDITS')) {
+    const message = String(error.message || '');
+
+    if (
+      message.includes('INSUFFICIENT_CREDITS') ||
+      error.code === 'P0001'
+    ) {
       throw new AppError(
         'Insufficient AI credits. Please purchase a new plan.',
         402,
-        { creditsRequired: amount },
+        { creditsRequired: cost },
         ErrorCodes.PAYMENT_REQUIRED
       );
     }
@@ -77,33 +104,49 @@ async function deductCredits(userId, amount) {
     throw new AppError(
       'Failed to deduct credits.',
       500,
-      { error: error.message },
+      {
+        rpc: 'consume_ai_credits',
+        error: error.message,
+      },
       ErrorCodes.DB_ERROR
     );
   }
 
+  const creditsRemaining = normalizeCreditResult(data);
+
   logger.debug('[CoverLetterService] Credits deducted', {
     userId,
-    amount,
-    creditsRemaining: data,
+    cost,
+    creditsRemaining,
   });
 
-  return { creditsRemaining: data };
+  return { creditsRemaining };
 }
 
-async function refundCredits(userId, amount) {
+/**
+ * Atomic refund (retry-safe per invocation)
+ */
+async function refundCredits(userId, amount, refundState) {
+  if (refundState.refunded) {
+    return;
+  }
+
+  refundState.refunded = true;
+
   try {
+    const cost = Math.trunc(Number(amount));
+
     const { data, error } = await supabase.rpc('refund_ai_credits', {
       p_user_id: userId,
-      p_amount: amount,
+      p_cost: cost,
     });
 
     if (error) throw error;
 
     logger.debug('[CoverLetterService] Credits refunded', {
       userId,
-      amount,
-      creditsRemaining: data,
+      cost,
+      creditsRemaining: normalizeCreditResult(data),
     });
   } catch (error) {
     logger.error(
@@ -117,10 +160,9 @@ async function refundCredits(userId, amount) {
   }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// SAVE RESULT (NON-FATAL)
-// ─────────────────────────────────────────────────────────────────────────────
-
+/**
+ * Non-fatal persistence
+ */
 async function saveCoverLetter(userId, payload, content) {
   try {
     const { data, error } = await supabase
@@ -139,11 +181,6 @@ async function saveCoverLetter(userId, payload, content) {
 
     if (error) throw error;
 
-    logger.debug('[CoverLetterService] Saved', {
-      userId,
-      coverLetterId: data?.id,
-    });
-
     return data?.id ?? null;
   } catch (error) {
     logger.warn('[CoverLetterService] Save failed (non-fatal)', {
@@ -155,10 +192,9 @@ async function saveCoverLetter(userId, payload, content) {
   }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// MAIN ORCHESTRATOR
-// ─────────────────────────────────────────────────────────────────────────────
-
+/**
+ * Main orchestrator
+ */
 async function generateCoverLetterForUser({
   userId,
   tier,
@@ -188,13 +224,12 @@ async function generateCoverLetterForUser({
     tone,
   });
 
-  let creditsRemaining;
-  let engineResult;
-  let creditsDeducted = false;
+  let creditsRemaining = null;
+  let engineResult = null;
+  const refundState = { refunded: false };
 
   try {
     ({ creditsRemaining } = await deductCredits(userId, CREDIT_COST));
-    creditsDeducted = true;
 
     engineResult = await generateCoverLetter({
       userId,
@@ -204,10 +239,7 @@ async function generateCoverLetterForUser({
       tone,
     });
   } catch (error) {
-    if (creditsDeducted) {
-      await refundCredits(userId, CREDIT_COST);
-    }
-
+    await refundCredits(userId, CREDIT_COST, refundState);
     throw error;
   }
 

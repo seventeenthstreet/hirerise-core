@@ -60,6 +60,30 @@ const NOTIFICATION_TEMPLATES = {
   }),
 };
 
+function normalizeMergeResult(data) {
+  if (data == null) return { success: false };
+
+  if (typeof data === 'boolean') {
+    return { success: data };
+  }
+
+  if (typeof data === 'number') {
+    return { success: data > 0 };
+  }
+
+  const row = Array.isArray(data) ? data[0] : data;
+
+  return {
+    success: Boolean(
+      row?.success ??
+      row?.updated ??
+      row?.merged ??
+      true
+    ),
+    payload: row,
+  };
+}
+
 export async function handleNotificationRequested(envelope, message) {
   const validated = safeValidateEnvelope(
     envelope,
@@ -129,14 +153,10 @@ export async function handleNotificationRequested(envelope, message) {
               : 'not_applicable',
           },
         },
-        {
-          onConflict: 'id',
-        }
+        { onConflict: 'id' }
       );
 
-    if (insertError) {
-      throw insertError;
-    }
+    if (insertError) throw insertError;
 
     childLogger.info('Notification saved');
 
@@ -164,92 +184,113 @@ async function deliverPushNotification(
 ) {
   const deliveryId = `${notificationId}_push`;
 
-  const { data: existing, error: fetchError } = await supabaseAdmin
-    .from('notification_delivery')
-    .select('status')
-    .eq('id', deliveryId)
-    .maybeSingle();
+  // atomic pre-send claim
+  const { data: deliveryRow, error: claimError } =
+    await supabaseAdmin
+      .from('notification_delivery')
+      .upsert(
+        {
+          id: deliveryId,
+          status: 'sending',
+          attempted_at: new Date().toISOString(),
+        },
+        { onConflict: 'id' }
+      )
+      .select('status')
+      .maybeSingle();
 
-  if (fetchError) throw fetchError;
+  if (claimError) throw claimError;
 
-  if (existing?.status === 'sent') {
+  if (deliveryRow?.status === 'sent') {
     log.info('Push already sent — skipping');
     return;
   }
 
-  const { data: tokenRow, error: tokenError } = await supabaseAdmin
-    .from('user_fcm_tokens')
-    .select('token')
-    .eq('user_id', userId)
-    .limit(1)
-    .maybeSingle();
+  const { data: tokenRow, error: tokenError } =
+    await supabaseAdmin
+      .from('user_fcm_tokens')
+      .select('token')
+      .eq('user_id', userId)
+      .limit(1)
+      .maybeSingle();
 
   if (tokenError) throw tokenError;
 
   const pushToken = tokenRow?.token;
 
   if (!pushToken) {
-    await supabaseAdmin
-      .from('notification_delivery')
-      .upsert({
-        id: deliveryId,
-        status: 'no_token',
-        attempted_at: new Date().toISOString(),
-      });
+    await supabaseAdmin.from('notification_delivery').upsert({
+      id: deliveryId,
+      status: 'no_token',
+      attempted_at: new Date().toISOString(),
+    });
 
     return;
   }
 
   await simulatePushSend(pushToken);
 
-  await supabaseAdmin
-    .from('notification_delivery')
-    .upsert({
-      id: deliveryId,
-      status: 'sent',
-      sent_at: new Date().toISOString(),
-    });
+  await supabaseAdmin.from('notification_delivery').upsert({
+    id: deliveryId,
+    status: 'sent',
+    sent_at: new Date().toISOString(),
+  });
 
-  // FIX: replaced 3-step SELECT → JS merge → UPDATE with a single atomic
-  // database-level merge via merge_notification_delivery_status().
-  //
-  // BEFORE (race condition):
-  //   const { data: existingNotif } = await supabaseAdmin
-  //     .from('notifications').select('delivery_status').eq('id', notificationId).single();
-  //   const updatedStatus = { ...(existingNotif?.delivery_status || {}), push: 'delivered' };
-  //   await supabaseAdmin.from('notifications').update({ delivery_status: updatedStatus, ... })
-  //
-  // Two concurrent workers would both read the same delivery_status snapshot,
-  // both spread it, and the last writer would silently overwrite the first —
-  // dropping whichever channel the first worker had already merged in.
-  //
-  // AFTER: single UPDATE with COALESCE || jsonb_build_object inside Postgres.
-  // No read round-trip. Row-level lock guarantees no interleaving between workers.
-  const { error: mergeError } = await supabaseAdmin.rpc(
+  const { data, error } = await supabaseAdmin.rpc(
     'merge_notification_delivery_status',
     {
       p_notification_id: notificationId,
-      p_channel:         'push',
-      p_status:          'delivered',
+      p_channel: 'push',
+      p_status: 'delivered',
     }
   );
 
-  if (mergeError) throw mergeError;
+  if (error) {
+    log.error('merge_notification_delivery_status failed', {
+      rpc: 'merge_notification_delivery_status',
+      notificationId,
+      code: error.code,
+      details: error.details,
+      error: error.message,
+    });
 
-  // push_delivered_at is a separate scalar column — safe to update independently
-  // since it's not part of the JSONB merge and has no concurrent writers.
+    throw error;
+  }
+
+  const mergeResult = normalizeMergeResult(data);
+
+  if (!mergeResult.success) {
+    log.error('Invalid merge RPC result', {
+      notificationId,
+      mergeResult,
+    });
+
+    throw new Error(
+      'merge_notification_delivery_status returned invalid result'
+    );
+  }
+
   const { error: timestampError } = await supabaseAdmin
     .from('notifications')
-    .update({ push_delivered_at: new Date().toISOString() })
+    .update({
+      push_delivered_at: new Date().toISOString(),
+    })
     .eq('id', notificationId);
 
-  if (timestampError) throw timestampError;
+  if (timestampError) {
+    log.error('push_delivered_at update failed', {
+      notificationId,
+      error: timestampError.message,
+    });
+
+    throw timestampError;
+  }
 
   log.info('Push delivered');
 }
 
 function simulatePushSend() {
-  return new Promise((resolve) => setTimeout(resolve, 10));
+  return new Promise(resolve => setTimeout(resolve, 10));
 }
 
 function getExpiresAt(days) {

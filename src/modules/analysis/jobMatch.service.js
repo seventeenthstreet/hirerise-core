@@ -1,5 +1,18 @@
 'use strict';
 
+/**
+ * @file src/modules/analysis/jobMatch.service.js
+ * @description
+ * Wave 3 Priority #2 — Supabase RPC consolidation.
+ *
+ * Production hardening:
+ * - centralized RPC execution
+ * - deterministic credit deduction/refund
+ * - normalized Supabase error handling
+ * - safer premium rollback
+ * - reduced write drift
+ */
+
 const { supabase } = require('../../config/supabase');
 const {
   AppError,
@@ -15,6 +28,8 @@ const {
   runFullAnalysis,
 } = require('./jobMatchPremiumEngine');
 
+const chiSnapshotsRepository = require('./repositories/chiSnapshots.repository');
+
 const {
   CREDIT_COSTS,
 } = require('./analysis.constants');
@@ -24,6 +39,47 @@ const VALID_OPERATIONS = new Set([
   'jobSpecificCV',
 ]);
 
+const RPC = Object.freeze({
+  DEDUCT_CREDITS: 'deduct_credits',
+  REFUND_CREDITS: 'refund_credits',
+});
+
+// ─────────────────────────────────────────────────────────────
+// Shared RPC executor
+// ─────────────────────────────────────────────────────────────
+async function executeRpc(fn, params = {}, { allowFallback = false } = {}) {
+  const startedAt = Date.now();
+
+  try {
+    const { data, error } = await supabase.rpc(fn, params);
+
+    if (error) {
+      error.rpc = fn;
+      throw error;
+    }
+
+    logger.debug('[JobMatchService][RPC] success', {
+      rpc: fn,
+      latency_ms: Date.now() - startedAt,
+    });
+
+    return data;
+  } catch (error) {
+    logger.warn('[JobMatchService][RPC] failed', {
+      rpc: fn,
+      latency_ms: Date.now() - startedAt,
+      error: error?.message || 'Unknown RPC error',
+      fallback_enabled: allowFallback,
+    });
+
+    if (!allowFallback) throw error;
+    return null;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────
+// Data fetchers
+// ─────────────────────────────────────────────────────────────
 async function fetchResume(userId, resumeId) {
   const { data, error } = await supabase
     .from('resumes')
@@ -106,6 +162,9 @@ async function fetchCareerContext(userId) {
   }
 }
 
+// ─────────────────────────────────────────────────────────────
+// Persistence helpers
+// ─────────────────────────────────────────────────────────────
 async function saveJobMatchResult(
   userId,
   resumeId,
@@ -113,36 +172,55 @@ async function saveJobMatchResult(
   result
 ) {
   try {
-    const payload = {
-      user_id: userId,
-      resume_id: resumeId,
-      operation_type: operationType,
-      match_score:
+    const analysisHash = [
+      userId,
+      resumeId,
+      operationType,
+      result.matchScore ?? result.score ?? 'na',
+    ].join(':');
+
+    await chiSnapshotsRepository.createSnapshot({
+      resumeId,
+      userId,
+      engine: result.engine || 'premium',
+      analysisHash,
+      score: result.matchScore ?? result.score ?? null,
+      tier: result.tier ?? null,
+      summary: result.summary ?? null,
+      breakdown: result.breakdown ?? {
+        matchScore: result.matchScore ?? null,
+        recommendations: result.recommendations ?? [],
+      },
+      strengths: result.strengths ?? [],
+      improvements: result.improvements ?? [],
+      topSkills: result.keywordsMatched ?? [],
+      chiScore:
+        result.chiScore ??
         result.matchScore ??
         result.score ??
         null,
-      job_title:
-        result.jobTitle ??
-        result.targetRole ??
-        null,
-      strengths: result.strengths ?? [],
-      improvements: result.improvements ?? [],
-      keywords_matched:
-        result.keywordsMatched ?? [],
-      recommendations:
-        result.recommendations ?? [],
-      analysis_payload: result,
-      analyzed_at: new Date().toISOString(),
-    };
-
-    const { error } = await supabase
-      .from('job_match_analyses')
-      .insert(payload);
-
-    if (error) throw error;
+      dimensions: result.dimensions ?? null,
+      marketPosition: result.marketPosition ?? null,
+      peerComparison: result.peerComparison ?? null,
+      growthInsights: result.growthInsights ?? null,
+      salaryEstimate: result.salaryEstimate ?? null,
+      roadmap:
+        result.roadmap ??
+        result.recommendations ??
+        [],
+      weightedCareerContext:
+        result.weightedCareerContext ?? null,
+      latencyMs: result.latencyMs ?? null,
+      tokenInputCount:
+        result.totalInputTokens ?? null,
+      tokenOutputCount:
+        result.totalOutputTokens ?? null,
+      aiCostUsd: result.costUSD ?? null,
+      operationType,
+    });
   } catch (error) {
     logger.error(
-      '[JobMatchService] saveJobMatchResult failed',
+      '[JobMatchService] CHI snapshot save failed',
       {
         userId,
         resumeId,
@@ -169,11 +247,9 @@ async function logUsage(
       total_tokens:
         result.totalTokens ?? 0,
       cost_usd:
-        result.costUSD ??
-        0,
+        result.costUSD ?? 0,
       revenue_usd:
-        result.revenueUSD ??
-        0,
+        result.revenueUSD ?? 0,
       created_at: new Date().toISOString(),
     });
   } catch (error) {
@@ -187,6 +263,9 @@ async function logUsage(
   }
 }
 
+// ─────────────────────────────────────────────────────────────
+// Main execution
+// ─────────────────────────────────────────────────────────────
 async function runJobMatch({
   userId,
   resumeId,
@@ -239,23 +318,13 @@ async function runJobMatch({
       );
     }
 
-    const { error: deductError } =
-      await supabase.rpc(
-        'deduct_credits',
-        {
-          user_id: userId,
-          amount: cost,
-        }
-      );
-
-    if (deductError) {
-      throw new AppError(
-        'Credit deduction failed',
-        500,
-        {},
-        ErrorCodes.INTERNAL_ERROR
-      );
-    }
+    await executeRpc(
+      RPC.DEDUCT_CREDITS,
+      {
+        user_id: userId,
+        amount: cost,
+      }
+    );
 
     creditsRemaining -= cost;
 
@@ -269,19 +338,29 @@ async function runJobMatch({
         weightedCareerContext: context,
       });
     } catch (engineErr) {
-      await supabase.rpc(
-        'refund_credits',
-        {
-          user_id: userId,
-          amount: cost,
-        }
-      );
+      try {
+        await executeRpc(
+          RPC.REFUND_CREDITS,
+          {
+            user_id: userId,
+            amount: cost,
+          }
+        );
+      } catch (refundErr) {
+        logger.error(
+          '[JobMatchService] refund failed after engine error',
+          {
+            userId,
+            refund_error: refundErr.message,
+          }
+        );
+      }
 
       throw engineErr;
     }
   }
 
-  await Promise.all([
+  await Promise.allSettled([
     saveJobMatchResult(
       userId,
       resumeId,

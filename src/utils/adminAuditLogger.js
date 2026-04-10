@@ -3,19 +3,19 @@
 /**
  * adminAuditLogger.js — Admin Action Audit Trail
  *
- * Supabase production-ready audit logger.
- *
- * Design goals:
- * - Never breaks request flow
- * - Safe in test / missing-env environments
- * - Structured snake_case Postgres payloads
+ * Production-hardened:
+ * - never breaks request flow
  * - JSONB-safe metadata
- * - Non-blocking async writes
- * - Reusable singleton Supabase client
+ * - reusable singleton Supabase client
+ * - centralized schema constants
  */
 
 const { supabase } = require('../config/supabase');
 const logger = require('./logger');
+
+const TABLES = Object.freeze({
+  ADMIN_LOGS: 'admin_logs',
+});
 
 /**
  * Safely normalize metadata into JSONB-safe object.
@@ -66,8 +66,7 @@ function buildAuditPayload({
  * Write an audit log entry.
  *
  * Never throws.
- * Safe for fire-and-forget usage:
- *   void logAdminAction(...)
+ * Safe for fire-and-forget usage.
  *
  * @param {{
  *   adminId?: string,
@@ -88,19 +87,22 @@ async function logAdminAction(params = {}) {
     const payload = buildAuditPayload(params);
 
     const { error } = await supabase
-      .from('admin_logs')
+      .from(TABLES.ADMIN_LOGS)
       .insert(payload);
 
     if (error) {
       throw error;
     }
   } catch (error) {
-    logger.error('[AdminAuditLogger] Failed to write audit log', {
-      admin_id: params?.adminId || 'unknown',
-      action: params?.action || 'UNKNOWN_ACTION',
-      entity_type: params?.entityType || 'unknown',
-      error: error.message,
-    });
+    logger.error(
+      '[AdminAuditLogger] Failed to write audit log',
+      {
+        admin_id: params?.adminId || 'unknown',
+        action: params?.action || 'UNKNOWN_ACTION',
+        entity_type: params?.entityType || 'unknown',
+        error: error.message,
+      }
+    );
   }
 }
 

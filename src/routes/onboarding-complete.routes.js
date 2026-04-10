@@ -2,11 +2,8 @@
 
 /**
  * src/routes/onboarding-complete.routes.js
- * Unified onboarding completion + progress autosave routes
  *
- * POST  /complete  — atomic resume onboarding completion via RPC
- * PATCH /progress  — autosave onboarding step + resume_data
- * GET   /resume    — fetch current resume state
+ * Wave 1 hardened onboarding completion + progress autosave
  */
 
 const express = require('express');
@@ -17,10 +14,8 @@ const { supabase } = require('../config/supabase');
 const logger = require('../utils/logger');
 
 const router = express.Router();
+const MAX_RESUME_JSON_SIZE = 500_000; // 500 KB soft cap
 
-// ─────────────────────────────────────────────────────────────
-// Helpers
-// ─────────────────────────────────────────────────────────────
 function resolveUserId(req) {
   return (
     req?.user?.id ||
@@ -29,6 +24,29 @@ function resolveUserId(req) {
     req?.user?.user_id ||
     null
   );
+}
+
+function normalizeRpcResult(data) {
+  if (!data) {
+    return {
+      updated: false,
+      already_complete: false,
+    };
+  }
+
+  const row = Array.isArray(data) ? data[0] : data;
+
+  if (typeof row === 'boolean') {
+    return {
+      updated: row,
+      already_complete: false,
+    };
+  }
+
+  return {
+    updated: Boolean(row?.updated),
+    already_complete: Boolean(row?.already_complete),
+  };
 }
 
 function validateResumeData(data) {
@@ -59,10 +77,7 @@ function validateResumeData(data) {
     missing.push('At least one experience or education entry');
   }
 
-  if (
-    !Array.isArray(data?.skills) ||
-    data.skills.length < 3
-  ) {
+  if (!Array.isArray(data?.skills) || data.skills.length < 3) {
     improvements.push('Add at least 3 skills');
   }
 
@@ -73,7 +88,7 @@ function validateResumeData(data) {
   if (
     hasExp &&
     data.experience.some(
-      (item) => (item?.description ?? '').trim().length < 30
+      item => (item?.description ?? '').trim().length < 30
     )
   ) {
     improvements.push('Expand experience descriptions');
@@ -89,9 +104,9 @@ function validateResumeData(data) {
 function calcProfileStrength(data) {
   let score = 0;
 
-  if (data?.personal_info?.name?.trim())     score += 5;
-  if (data?.personal_info?.email?.trim())    score += 5;
-  if (data?.personal_info?.phone?.trim())    score += 5;
+  if (data?.personal_info?.name?.trim()) score += 5;
+  if (data?.personal_info?.email?.trim()) score += 5;
+  if (data?.personal_info?.phone?.trim()) score += 5;
   if (data?.personal_info?.location?.trim()) score += 5;
 
   const hasExp =
@@ -108,37 +123,17 @@ function calcProfileStrength(data) {
   }
 
   if (hasEdu) score += 15;
-
   if (Array.isArray(data?.skills) && data.skills.length >= 3) score += 10;
   if (Array.isArray(data?.skills) && data.skills.length >= 6) score += 5;
-
   if ((data?.summary ?? '').trim().length > 50) score += 10;
-
   if (Array.isArray(data?.projects) && data.projects.length > 0) score += 5;
-
-  if (
-    Array.isArray(data?.certifications) &&
-    data.certifications.length > 0
-  ) {
+  if (Array.isArray(data?.certifications) && data.certifications.length > 0) {
     score += 5;
   }
 
   return Math.min(100, score);
 }
 
-// ─────────────────────────────────────────────────────────────
-// POST /complete
-//
-// Atomically completes onboarding via complete_resume_onboarding
-// RPC — eliminates the previous SELECT → check → UPDATE race
-// condition under parallel duplicate requests.
-//
-// RPC behaviour:
-//   - Locks the user row with FOR UPDATE
-//   - Returns { already_complete: true,  updated: false } if done
-//   - Returns { already_complete: false, updated: true  } on success
-//   - Raises exception if user not found
-// ─────────────────────────────────────────────────────────────
 router.post(
   '/complete',
   validate([
@@ -152,76 +147,102 @@ router.post(
 
       if (!userId) {
         return res.status(401).json({
-          success:   false,
+          success: false,
           errorCode: 'UNAUTHORIZED',
-          message:   'Authentication required.',
+          message: 'Authentication required.',
         });
       }
 
       const resumeData = req.body.resume_data;
+      const jsonSize = Buffer.byteLength(
+        JSON.stringify(resumeData),
+        'utf8'
+      );
+
+      if (jsonSize > MAX_RESUME_JSON_SIZE) {
+        return res.status(413).json({
+          success: false,
+          errorCode: 'RESUME_TOO_LARGE',
+          message: 'Resume data exceeds maximum allowed size.',
+        });
+      }
+
       const { valid, missing } = validateResumeData(resumeData);
 
       if (!valid) {
         return res.status(422).json({
-          success:   false,
+          success: false,
           errorCode: 'VALIDATION_FAILED',
-          message:   'Resume data does not meet completion requirements.',
+          message: 'Resume data does not meet completion requirements.',
           missing,
         });
       }
 
       const profileStrength = calcProfileStrength(resumeData);
 
-      // ── Atomic RPC — single transaction, no race condition ────────
-      const { data: rpcResult, error: rpcError } =
-        await supabase.rpc('complete_resume_onboarding', {
-          p_user_id:          userId,
-          p_resume_data:      resumeData,
+      const { data, error } = await supabase.rpc(
+        'complete_resume_onboarding',
+        {
+          p_user_id: userId,
+          p_resume_data: resumeData,
           p_profile_strength: profileStrength,
+        }
+      );
+
+      if (error) {
+        logger.error('[OnboardingComplete] RPC failed', {
+          rpc: 'complete_resume_onboarding',
+          userId,
+          code: error.code,
+          details: error.details,
+          error: error.message,
+          payloadSize: jsonSize,
         });
 
-      if (rpcError) {
-        logger.error('[OnboardingComplete] RPC error', {
-          userId,
-          error: rpcError.message,
-        });
-        return next(rpcError);
+        return next(error);
       }
 
-      // ── Already complete — idempotent response ────────────────────
-      if (rpcResult?.already_complete) {
+      const rpcResult = normalizeRpcResult(data);
+
+      if (!rpcResult.updated && !rpcResult.already_complete) {
+        logger.error('[OnboardingComplete] Invalid RPC result', {
+          userId,
+          rpcResult,
+        });
+
+        return res.status(500).json({
+          success: false,
+          errorCode: 'ONBOARDING_COMPLETION_FAILED',
+          message: 'Onboarding completion returned invalid result.',
+        });
+      }
+
+      if (rpcResult.already_complete) {
         return res.json({
-          success:         true,
+          success: true,
           alreadyComplete: true,
           profileStrength: null,
-          message:         'Onboarding already complete.',
+          message: 'Onboarding already complete.',
         });
       }
 
-      logger.info('[OnboardingComplete] Onboarding marked complete', {
+      logger.info('[OnboardingComplete] Completed', {
         userId,
         profileStrength,
       });
 
       return res.json({
-        success:         true,
+        success: true,
         alreadyComplete: false,
         profileStrength,
-        message:         'Onboarding complete.',
+        message: 'Onboarding complete.',
       });
-
     } catch (error) {
       return next(error);
     }
   }
 );
 
-// ─────────────────────────────────────────────────────────────
-// PATCH /progress
-// Autosave onboarding step and/or resume_data draft.
-// Direct update is safe here — no completion state involved,
-// no race condition risk, no RPC needed.
-// ─────────────────────────────────────────────────────────────
 router.patch(
   '/progress',
   validate([
@@ -245,10 +266,9 @@ router.patch(
         updated_at: new Date().toISOString(),
       };
 
-      if (step)        patch.onboarding_step = step;
-      if (resume_data) patch.resume_data     = resume_data;
+      if (step) patch.onboarding_step = step;
+      if (resume_data) patch.resume_data = resume_data;
 
-      // Nothing meaningful to patch
       if (Object.keys(patch).length === 1) {
         return res.json({
           success: true,
@@ -267,18 +287,12 @@ router.patch(
         success: true,
         message: 'Progress saved.',
       });
-
     } catch (error) {
       return next(error);
     }
   }
 );
 
-// ─────────────────────────────────────────────────────────────
-// GET /resume
-// Fetch current resume state for the authenticated user.
-// Read-only — no RPC needed.
-// ─────────────────────────────────────────────────────────────
 router.get('/resume', async (req, res, next) => {
   try {
     const userId = resolveUserId(req);
@@ -303,13 +317,12 @@ router.get('/resume', async (req, res, next) => {
     return res.json({
       success: true,
       data: {
-        resume_data:          data?.resume_data          ?? null,
-        onboarding_step:      data?.onboarding_step      ?? null,
+        resume_data: data?.resume_data ?? null,
+        onboarding_step: data?.onboarding_step ?? null,
         onboarding_completed: data?.onboarding_completed ?? false,
-        profile_strength:     data?.profile_strength     ?? 0,
+        profile_strength: data?.profile_strength ?? 0,
       },
     });
-
   } catch (error) {
     return next(error);
   }

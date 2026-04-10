@@ -3,10 +3,13 @@
 /**
  * @file src/shared/pubsub/index.js
  * @description
- * Production-grade Pub/Sub abstraction for async domain events.
- * Firebase-free, datastore-agnostic, and optimized for Supabase-era services.
- * Uses lazy singleton initialization, safe envelope validation,
- * structured logging, and graceful local-dev degradation.
+ * Production-grade Pub/Sub abstraction.
+ *
+ * Wave 3 Priority #3 hardening:
+ * - lazy singleton
+ * - poison-message protection
+ * - publish timeout safety
+ * - local-dev graceful fallback
  */
 
 const { randomUUID } = require('crypto');
@@ -37,6 +40,9 @@ const SchemaVersions = Object.freeze({
   [EventTypes.JOB_DEAD]: '1.0',
 });
 
+const MAX_DELIVERY_ATTEMPTS = 5;
+const PUBLISH_TIMEOUT_MS = 8000;
+
 function buildEnvelope(eventType, payload, source) {
   return {
     eventId: randomUUID(),
@@ -54,11 +60,27 @@ async function getClient() {
   if (!clientPromise) {
     clientPromise = (async () => {
       let PubSub;
+
       try {
         ({ PubSub } = require('@google-cloud/pubsub'));
       } catch (error) {
+        if (process.env.NODE_ENV !== 'production') {
+          logger.warn(
+            '[PubSub] dependency missing, using noop local fallback'
+          );
+
+          return {
+            topic: () => ({
+              publishMessage: async () => 'local-noop-message-id',
+            }),
+            subscription: () => ({
+              on: () => {},
+            }),
+          };
+        }
+
         const wrapped = new Error(
-          '@google-cloud/pubsub dependency missing. Install with: npm install @google-cloud/pubsub'
+          '@google-cloud/pubsub dependency missing'
         );
         wrapped.code = 'PUBSUB_DEPENDENCY_MISSING';
         wrapped.cause = error;
@@ -74,13 +96,32 @@ async function getClient() {
   return clientPromise;
 }
 
+function withTimeout(promise, timeoutMs, label) {
+  return Promise.race([
+    promise,
+    new Promise((_, reject) =>
+      setTimeout(
+        () =>
+          reject(
+            new Error(`${label} timed out after ${timeoutMs}ms`)
+          ),
+        timeoutMs
+      )
+    ),
+  ]);
+}
+
 async function publishEvent(topicName, eventType, payload, attributes = {}) {
   if (!topicName) {
     throw new Error('publishEvent requires topicName');
   }
 
   const client = await getClient();
-  const envelope = buildEnvelope(eventType, payload, process.env.SERVICE_NAME);
+  const envelope = buildEnvelope(
+    eventType,
+    payload,
+    process.env.SERVICE_NAME
+  );
 
   const data = Buffer.from(JSON.stringify(envelope));
 
@@ -92,9 +133,13 @@ async function publishEvent(topicName, eventType, payload, attributes = {}) {
   };
 
   try {
-    const pubsubMessageId = await client
-      .topic(topicName)
-      .publishMessage({ data, attributes: msgAttributes });
+    const pubsubMessageId = await withTimeout(
+      client
+        .topic(topicName)
+        .publishMessage({ data, attributes: msgAttributes }),
+      PUBLISH_TIMEOUT_MS,
+      'PubSub publish'
+    );
 
     logger.info('Event published', {
       topicName,
@@ -111,7 +156,7 @@ async function publishEvent(topicName, eventType, payload, attributes = {}) {
     logger.error('Failed to publish event', {
       topicName,
       eventType,
-      error,
+      error: error.message,
     });
 
     const wrapped = new Error(
@@ -125,7 +170,7 @@ async function publishEvent(topicName, eventType, payload, attributes = {}) {
 
 async function createSubscriber(subscriptionName, handler, options = {}) {
   if (typeof handler !== 'function') {
-    throw new TypeError('createSubscriber requires a valid handler function');
+    throw new TypeError('createSubscriber requires handler');
   }
 
   const client = await getClient();
@@ -146,18 +191,19 @@ async function createSubscriber(subscriptionName, handler, options = {}) {
       logger.error('Invalid Pub/Sub JSON payload', {
         subscriptionName,
         pubsubMessageId: message.id,
-        error,
       });
       message.ack();
       return;
     }
+
+    const attempt = message.deliveryAttempt || 1;
 
     const childLogger = logger.child({
       subscriptionName,
       pubsubMessageId: message.id,
       eventId: envelope?.eventId || null,
       eventType: envelope?.eventType || null,
-      deliveryAttempt: message.deliveryAttempt || 1,
+      deliveryAttempt: attempt,
     });
 
     try {
@@ -166,17 +212,25 @@ async function createSubscriber(subscriptionName, handler, options = {}) {
       message.ack();
       childLogger.info('Message acknowledged');
     } catch (error) {
-      childLogger.error('Message handler failed, nacking', {
-        error,
+      childLogger.error('Message handler failed', {
+        error: error.message,
       });
-      message.nack();
+
+      if (attempt >= MAX_DELIVERY_ATTEMPTS) {
+        childLogger.error(
+          'Poison message threshold reached, acking permanently'
+        );
+        message.ack();
+      } else {
+        message.nack();
+      }
     }
   });
 
   subscription.on('error', (error) => {
     logger.error('Subscription error', {
       subscriptionName,
-      error,
+      error: error.message,
     });
   });
 

@@ -3,42 +3,63 @@
 /**
  * src/modules/user/user.registration.service.js
  *
- * Production-safe Supabase-native user registration sync.
- * Delegates atomic seeding to the seed_user_and_profile SQL RPC so that
- * both tables are written in a single server-side transaction.
+ * Wave 1 hardened identity bootstrap RPC layer
  */
 
 const { supabase } = require('../../config/supabase');
 const logger = require('../../utils/logger');
 
-// ─────────────────────────────────────────────
-// Helpers
-// ─────────────────────────────────────────────
-
+/**
+ * Normalize auth payloads from:
+ * - Supabase auth
+ * - OAuth providers
+ * - legacy JWT payloads
+ */
 function normalizeAuthUser(authUser = {}) {
+  const meta = authUser.user_metadata || {};
+
   return {
-    email: authUser.email || '',
-    display_name: authUser.name || authUser.display_name || null,
-    photo_url: authUser.picture || authUser.photo_url || null,
+    email: String(
+      authUser.email ||
+      meta.email ||
+      ''
+    ).trim(),
+    display_name:
+      authUser.name ||
+      authUser.display_name ||
+      authUser.full_name ||
+      meta.full_name ||
+      meta.name ||
+      null,
+    photo_url:
+      authUser.picture ||
+      authUser.photo_url ||
+      authUser.avatar_url ||
+      meta.avatar_url ||
+      meta.picture ||
+      null,
   };
 }
 
-// ─────────────────────────────────────────────
-// ENSURE USER SEEDED  (via atomic RPC)
-// ─────────────────────────────────────────────
+/**
+ * Normalize RPC object/array/null payloads
+ */
+function normalizeRpcObject(data) {
+  if (!data) return {};
+
+  if (Array.isArray(data)) {
+    return data[0] || {};
+  }
+
+  if (typeof data !== 'object') {
+    return {};
+  }
+
+  return data;
+}
 
 /**
- * Seeds `users` and `user_profiles` atomically using the
- * `seed_user_and_profile` PostgreSQL RPC.
- *
- * Behavior:
- *  - Both rows are inserted in a single SQL transaction.
- *  - ON CONFLICT DO NOTHING — existing rows are never overwritten.
- *  - If the database raises any error the entire transaction rolls back.
- *
- * @param {string} userId  - UUID from Supabase Auth
- * @param {object} authUser - Raw auth payload (email, name/display_name, picture/photo_url)
- * @returns {{ created: boolean, created_user: boolean, created_profile: boolean }}
+ * Atomic seed
  */
 async function ensureUserSeeded(userId, authUser = {}) {
   if (!userId) {
@@ -47,26 +68,47 @@ async function ensureUserSeeded(userId, authUser = {}) {
 
   const identity = normalizeAuthUser(authUser);
 
+  if (identity.email.length > 320) {
+    throw new Error('[UserRegistration] email exceeds max length');
+  }
+
+  if (identity.display_name && identity.display_name.length > 160) {
+    identity.display_name = identity.display_name.slice(0, 160);
+  }
+
+  if (identity.photo_url && identity.photo_url.length > 500) {
+    identity.photo_url = identity.photo_url.slice(0, 500);
+  }
+
   const { data, error } = await supabase.rpc('seed_user_and_profile', {
-    p_user_id:      userId,
-    p_email:        identity.email,
+    p_user_id: userId,
+    p_email: identity.email,
     p_display_name: identity.display_name,
-    p_photo_url:    identity.photo_url,
+    p_photo_url: identity.photo_url,
   });
 
   if (error) {
     logger.error('[UserRegistration] seed_user_and_profile RPC failed', {
+      rpc: 'seed_user_and_profile',
       userId,
+      code: error.code,
+      details: error.details,
       error: error.message,
     });
     throw error;
   }
 
-  const { created_user, created_profile } = data;
+  const payload = normalizeRpcObject(data);
+
+  const created_user = Boolean(payload.created_user);
+  const created_profile = Boolean(payload.created_profile);
   const created = created_user || created_profile;
 
   if (!created) {
-    logger.debug('[UserRegistration] User already seeded — skipping', { userId });
+    logger.debug(
+      '[UserRegistration] User already seeded — skipping',
+      { userId }
+    );
   } else {
     logger.info('[UserRegistration] User seeded via RPC', {
       userId,
@@ -78,60 +120,65 @@ async function ensureUserSeeded(userId, authUser = {}) {
   return { created, created_user, created_profile };
 }
 
-// ─────────────────────────────────────────────
-// SYNC DISPLAY FIELDS  (unchanged — fine as-is)
-// ─────────────────────────────────────────────
-
 /**
- * Syncs display_name / photo_url to both tables atomically using the
- * `sync_user_display_fields` PostgreSQL RPC.
- *
- * Behavior:
- *  - users        → display_name only (no photo_url column on that table)
- *  - user_profiles → display_name + photo_url
- *  - Both updates run in a single SQL transaction — any failure rolls back both.
- *  - Short-circuits early if values are unchanged (avoids unnecessary DB round-trip).
- *
- * @param {string} userId        - UUID from Supabase Auth
- * @param {object} authUser      - Raw auth payload
- * @param {object} existingFields - Current { display_name, photo_url } from DB
- * @returns {{ users_updated: boolean, profile_updated: boolean } | false}
+ * Atomic display sync
  */
-async function syncProfileDisplayFields(userId, authUser = {}, existingFields = {}) {
+async function syncProfileDisplayFields(
+  userId,
+  authUser = {},
+  existingFields = {}
+) {
   if (!userId) return false;
 
   const identity = normalizeAuthUser(authUser);
 
-  // Short-circuit: nothing changed, skip the DB round-trip entirely
   if (
     identity.display_name === (existingFields.display_name ?? null) &&
-    identity.photo_url    === (existingFields.photo_url    ?? null)
+    identity.photo_url === (existingFields.photo_url ?? null)
   ) {
-    logger.debug('[UserRegistration] Display fields unchanged — skipping sync', { userId });
+    logger.debug(
+      '[UserRegistration] Display fields unchanged — skipping sync',
+      { userId }
+    );
     return false;
   }
 
-  const { data, error } = await supabase.rpc('sync_user_display_fields', {
-    p_user_id:      userId,
-    p_display_name: identity.display_name,
-    p_photo_url:    identity.photo_url,
-  });
+  const { data, error } = await supabase.rpc(
+    'sync_user_display_fields',
+    {
+      p_user_id: userId,
+      p_display_name: identity.display_name,
+      p_photo_url: identity.photo_url,
+    }
+  );
 
   if (error) {
-    logger.error('[UserRegistration] sync_user_display_fields RPC failed', {
-      userId,
-      error: error.message,
-    });
+    logger.error(
+      '[UserRegistration] sync_user_display_fields RPC failed',
+      {
+        rpc: 'sync_user_display_fields',
+        userId,
+        code: error.code,
+        details: error.details,
+        error: error.message,
+      }
+    );
     throw error;
   }
 
-  const { users_updated, profile_updated } = data;
+  const payload = normalizeRpcObject(data);
+
+  const users_updated = Boolean(payload.users_updated);
+  const profile_updated = Boolean(payload.profile_updated);
 
   logger.info('[UserRegistration] Display fields synced via RPC', {
     userId,
     users_updated,
     profile_updated,
-    to: { display_name: identity.display_name, photo_url: identity.photo_url },
+    to: {
+      display_name: identity.display_name,
+      photo_url: identity.photo_url,
+    },
   });
 
   return { users_updated, profile_updated };

@@ -7,12 +7,10 @@ const logger = require('../../utils/logger');
 
 const THRESHOLDS = Object.freeze({
   margin: Object.freeze({
-    // FIX #1: Both warn and critical thresholds are now used
     warnPercent: 60,
     criticalPercent: 40,
   }),
   freeBurn: Object.freeze({
-    // FIX #2: Renamed to reflect correct semantic ordering (warn < critical)
     warnPercent: 40,
     criticalPercent: 60,
   }),
@@ -34,16 +32,24 @@ function buildAlertKey(type, dateStr) {
   return `${type}:${dateStr}`;
 }
 
-// FIX #6: Extracted to a named, testable helper instead of an inline IIFE
 function getYesterdayUTC() {
   const d = new Date();
   d.setUTCDate(d.getUTCDate() - 1);
   return d.toISOString().split('T')[0];
 }
 
-// ───────────────── Fetch today's cost summary ─────────────────
+/**
+ * Production hardening:
+ * centralised UTC day window builder
+ * prepares Wave 4 index / partition migration
+ */
+function buildUTCDateWindow(dateStr) {
+  return {
+    startISO: new Date(`${dateStr}T00:00:00.000Z`).toISOString(),
+    endISO: new Date(`${dateStr}T23:59:59.999Z`).toISOString(),
+  };
+}
 
-// FIX #7: Always returns a consistent shape regardless of error or empty data
 function emptyDaySummary(dateStr) {
   return {
     dateStr,
@@ -56,14 +62,13 @@ function emptyDaySummary(dateStr) {
 }
 
 async function fetchDayCostSummary(dateStr) {
-  const start = new Date(`${dateStr}T00:00:00.000Z`);
-  const end = new Date(`${dateStr}T23:59:59.999Z`);
+  const { startISO, endISO } = buildUTCDateWindow(dateStr);
 
   const { data, error } = await supabase
     .from('usage_logs')
     .select(USAGE_SELECT_COLUMNS)
-    .gte('created_at', start.toISOString())
-    .lte('created_at', end.toISOString());
+    .gte('created_at', startISO)
+    .lte('created_at', endISO);
 
   if (error) {
     logger.error('[MarginMonitor] usage_logs fetch error', {
@@ -101,25 +106,21 @@ async function fetchDayCostSummary(dateStr) {
     dateStr,
     docCount: data?.length ?? 0,
     totalCostUSD: round(totalCostUSD, 6),
-    totalRevenueUSD: round(totalRevenueUSD, 6), // FIX #minor: unified to 6 d.p. for consistency
+    totalRevenueUSD: round(totalRevenueUSD, 6),
     freeTierCostUSD: round(freeTierCostUSD, 6),
     perUser,
   };
 }
 
-// ───────────────── Fetch 7-day average ─────────────────
-
 async function fetch7DayAvgCost(endDateStr) {
   const endDate = new Date(`${endDateStr}T23:59:59.000Z`);
   const start7 = new Date(endDate);
-  // FIX #3: Use 6 to get a true 7-day window inclusive of endDateStr
   start7.setUTCDate(start7.getUTCDate() - 6);
 
   const { data, error } = await supabase
     .from('metrics_daily_snapshots')
     .select('total_cost_usd,date')
     .gte('date', start7.toISOString().split('T')[0])
-    // FIX #3: Use .lte to include endDateStr in the 7-day window
     .lte('date', endDateStr);
 
   if (error) {
@@ -140,8 +141,6 @@ async function fetch7DayAvgCost(endDateStr) {
   return round(total / data.length, 6);
 }
 
-// ───────────────── Idempotent alert write ─────────────────
-
 async function writeAlert(alert) {
   const alertKey = buildAlertKey(
     alert.type,
@@ -156,13 +155,14 @@ async function writeAlert(alert) {
       .limit(1);
 
     if (existing?.length) {
-      logger.info('[MarginMonitor] Duplicate alert skipped', { alertKey });
+      logger.info('[MarginMonitor] Duplicate alert skipped', {
+        alertKey,
+      });
       return;
     }
 
     const now = new Date();
     const expires = new Date(now);
-    // FIX #4: Use setUTCDate for UTC consistency
     expires.setUTCDate(expires.getUTCDate() + 180);
 
     const { error } = await supabase.from('ai_alerts').insert({
@@ -189,8 +189,6 @@ async function writeAlert(alert) {
   }
 }
 
-// ───────────────── Checks ─────────────────
-
 async function checkMarginHealth(summary) {
   const { totalCostUSD, totalRevenueUSD, dateStr } = summary;
   if (!totalRevenueUSD) return;
@@ -198,7 +196,6 @@ async function checkMarginHealth(summary) {
   const grossMargin = totalRevenueUSD - totalCostUSD;
   const marginPercent = (grossMargin / totalRevenueUSD) * 100;
 
-  // FIX #1: Fire CRITICAL below criticalPercent, WARNING between critical and warn
   if (marginPercent < THRESHOLDS.margin.criticalPercent) {
     await writeAlert({
       type: 'MARGIN_CRITICAL',
@@ -224,7 +221,6 @@ async function checkFreeBurnRate(summary) {
 
   const freeBurnPercent = (freeTierCostUSD / totalCostUSD) * 100;
 
-  // FIX #2: Now uses both warn and critical thresholds in correct order
   if (freeBurnPercent >= THRESHOLDS.freeBurn.criticalPercent) {
     await writeAlert({
       type: 'FREE_BURN_CRITICAL',
@@ -253,7 +249,6 @@ async function checkUserAnomalies(summary) {
 
   if (!anomalies.length) return;
 
-  // FIX #5: Serialise Map entries to plain objects so JSON storage works correctly
   const serialisedAnomalies = anomalies.map(([userId, cost]) => ({
     userId,
     cost: round(cost, 6),
@@ -287,16 +282,12 @@ async function checkDailyCostSpike(summary) {
   }
 }
 
-// ───────────────── Main ─────────────────
-
 async function runDailyChecks(dateStr) {
-  // FIX #6: Use named helper instead of inline IIFE
   const targetDate = dateStr ?? getYesterdayUTC();
 
   const summary = await fetchDayCostSummary(targetDate);
 
   if (!summary.docCount) {
-    // FIX #6: Log a warning so data gaps are observable
     logger.warn('[MarginMonitor] No usage records found for date', {
       date: targetDate,
     });

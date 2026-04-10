@@ -14,6 +14,7 @@ const DEFAULT_LIMITS = Object.freeze({
 });
 
 const INSERT_CHUNK_SIZE = 500;
+const COST_RPC = 'upsert_ai_cost_tracking_atomic';
 
 class AIObservabilityRepository {
   constructor(db = supabase) {
@@ -37,24 +38,29 @@ class AIObservabilityRepository {
       .single();
 
     this.#throwIfError(error, 'writeLog');
-    return data.id;
+    return data?.id ?? null;
   }
 
   async batchWriteLogs(logEntries = []) {
-    if (!Array.isArray(logEntries) || logEntries.length === 0) return;
+    if (!Array.isArray(logEntries) || logEntries.length === 0) return 0;
 
     const retentionDays =
       OBSERVABILITY_CONFIG.retention.aiLogsRetentionDays;
 
+    let inserted = 0;
+
     for (let i = 0; i < logEntries.length; i += INSERT_CHUNK_SIZE) {
       const chunk = logEntries.slice(i, i + INSERT_CHUNK_SIZE);
-      const records = chunk.map(entry =>
+      const records = chunk.map((entry) =>
         this.#withAuditFields(entry, retentionDays)
       );
 
       const { error } = await this.db.from('ai_logs').insert(records);
       this.#throwIfError(error, 'batchWriteLogs');
+      inserted += records.length;
     }
+
+    return inserted;
   }
 
   async getLogsByFeature(feature, { limit = DEFAULT_LIMITS.logs } = {}) {
@@ -64,7 +70,7 @@ class AIObservabilityRepository {
       .eq('feature', feature)
       .eq('is_deleted', false)
       .order('created_at', { ascending: false })
-      .limit(limit);
+      .limit(this.#safeLimit(limit, DEFAULT_LIMITS.logs));
 
     this.#throwIfError(error, 'getLogsByFeature');
     return data ?? [];
@@ -104,7 +110,7 @@ class AIObservabilityRepository {
       .eq('feature', feature)
       .eq('is_deleted', false)
       .order('date', { ascending: false })
-      .limit(limit);
+      .limit(this.#safeLimit(limit, DEFAULT_LIMITS.metrics));
 
     this.#throwIfError(error, 'getDailyMetrics');
     return data ?? [];
@@ -118,7 +124,7 @@ class AIObservabilityRepository {
       .select('*')
       .eq('is_deleted', false)
       .order('updated_at', { ascending: false })
-      .limit(limit);
+      .limit(this.#safeLimit(limit, DEFAULT_LIMITS.summary));
 
     this.#throwIfError(error, 'getAggregatedMetricsSummary');
     return data ?? [];
@@ -141,7 +147,7 @@ class AIObservabilityRepository {
       .single();
 
     this.#throwIfError(error, 'writeDriftSnapshot');
-    return data.id;
+    return data?.id ?? null;
   }
 
   async getDriftSummary({ limit = DEFAULT_LIMITS.drift } = {}) {
@@ -150,43 +156,55 @@ class AIObservabilityRepository {
       .select('*')
       .eq('is_deleted', false)
       .order('created_at', { ascending: false })
-      .limit(limit);
+      .limit(this.#safeLimit(limit, DEFAULT_LIMITS.drift));
 
     this.#throwIfError(error, 'getDriftSummary');
     return data ?? [];
   }
 
   // ───────────────────────────────────────────────────────────────────────────
-  // COST TRACKING (ATOMIC SQL RPC)
+  // COST TRACKING (RPC-FIRST WITH TABLE FALLBACK)
   // ───────────────────────────────────────────────────────────────────────────
 
   async upsertCostEntry(userId, feature, dateStr, delta = {}) {
-    const { data, error } = await this.db.rpc(
-      'upsert_ai_cost_tracking_atomic',
-      {
-        p_user_id: userId,
-        p_feature: feature,
-        p_date: dateStr,
-        p_total_cost_usd: Number(delta.totalCostUSD ?? 0),
-        p_input_tokens: Number(delta.inputTokens ?? 0),
-        p_output_tokens: Number(delta.outputTokens ?? 0),
-        p_retention_days:
-          OBSERVABILITY_CONFIG.retention.costRetentionDays,
-      }
-    );
+    const rpcPayload = {
+      p_user_id: userId,
+      p_feature: feature,
+      p_date: dateStr,
+      p_total_cost_usd: this.#toNumber(delta.totalCostUSD),
+      p_input_tokens: this.#toNumber(delta.inputTokens),
+      p_output_tokens: this.#toNumber(delta.outputTokens),
+      p_retention_days:
+        OBSERVABILITY_CONFIG.retention.costRetentionDays,
+    };
+
+    const { data, error } = await this.db.rpc(COST_RPC, rpcPayload);
+
+    // Wave 1 drift hardening:
+    // fallback safely if RPC signature/table deployment lags behind code rollout.
+    if (error && this.#isRpcDrift(error)) {
+      logger.warn('AIObservabilityRepository.upsertCostEntry rpc drift fallback', {
+        rpc: COST_RPC,
+        code: error.code,
+        message: error.message,
+      });
+
+      return this.#fallbackCostUpsert(userId, feature, dateStr, delta);
+    }
 
     this.#throwIfError(error, 'upsertCostEntry');
     return data;
   }
 
-  async getCostByDateRange(from, to) {
+  async getCostByDateRange(from, to, { limit = DEFAULT_LIMITS.cost } = {}) {
     const { data, error } = await this.db
       .from('ai_cost_tracking')
       .select('*')
       .gte('date', from)
       .lte('date', to)
       .eq('is_deleted', false)
-      .limit(DEFAULT_LIMITS.cost);
+      .order('date', { ascending: false })
+      .limit(this.#safeLimit(limit, DEFAULT_LIMITS.cost));
 
     this.#throwIfError(error, 'getCostByDateRange');
     return data ?? [];
@@ -212,7 +230,7 @@ class AIObservabilityRepository {
       .single();
 
     this.#throwIfError(error, 'writeAlert');
-    return data.id;
+    return data?.id ?? null;
   }
 
   async getActiveAlerts({ limit = DEFAULT_LIMITS.alerts } = {}) {
@@ -222,7 +240,7 @@ class AIObservabilityRepository {
       .eq('resolved', false)
       .eq('is_deleted', false)
       .order('created_at', { ascending: false })
-      .limit(limit);
+      .limit(this.#safeLimit(limit, DEFAULT_LIMITS.alerts));
 
     this.#throwIfError(error, 'getActiveAlerts');
     return data ?? [];
@@ -236,22 +254,73 @@ class AIObservabilityRepository {
         resolved_at: this.#now(),
         resolved_by: resolvedBy,
       })
-      .eq('id', alertId);
+      .eq('id', alertId)
+      .eq('resolved', false);
 
     this.#throwIfError(error, 'resolveAlert');
+    return true;
   }
 
   // ───────────────────────────────────────────────────────────────────────────
   // INTERNAL HELPERS
   // ───────────────────────────────────────────────────────────────────────────
 
-  #withAuditFields(record, retentionDays) {
-    return {
-      ...record,
-      created_at: this.#now(),
-      expires_at: this.#ttlDate(retentionDays),
+  async #fallbackCostUpsert(userId, feature, dateStr, delta = {}) {
+    const id = `${userId}_${feature}_${dateStr}`;
+
+    const record = {
+      id,
+      user_id: userId,
+      feature,
+      date: dateStr,
+      total_cost_usd: this.#toNumber(delta.totalCostUSD),
+      input_tokens: this.#toNumber(delta.inputTokens),
+      output_tokens: this.#toNumber(delta.outputTokens),
+      updated_at: this.#now(),
+      expires_at: this.#ttlDate(
+        OBSERVABILITY_CONFIG.retention.costRetentionDays
+      ),
       is_deleted: false,
     };
+
+    const { error } = await this.db
+      .from('ai_cost_tracking')
+      .upsert(record, { onConflict: 'id' });
+
+    this.#throwIfError(error, 'fallbackCostUpsert');
+    return id;
+  }
+
+  #withAuditFields(record = {}, retentionDays) {
+    return {
+      ...record,
+      created_at: record.created_at ?? this.#now(),
+      expires_at:
+        record.expires_at ?? this.#ttlDate(retentionDays),
+      is_deleted: Boolean(record.is_deleted ?? false),
+    };
+  }
+
+  #safeLimit(limit, fallback) {
+    const value = Number(limit);
+    if (!Number.isFinite(value) || value <= 0) return fallback;
+    return Math.floor(value);
+  }
+
+  #toNumber(value) {
+    const parsed = Number(value ?? 0);
+    return Number.isFinite(parsed) ? parsed : 0;
+  }
+
+  #isRpcDrift(error) {
+    const msg = String(error?.message || '').toLowerCase();
+    return (
+      error?.code === '42883' ||
+      msg.includes('function') ||
+      msg.includes('rpc') ||
+      msg.includes('does not exist') ||
+      msg.includes('schema cache')
+    );
   }
 
   #now() {

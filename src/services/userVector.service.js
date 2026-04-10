@@ -1,10 +1,14 @@
 'use strict';
 
 /**
- * userVector.service.js
+ * Wave 1 Drift Hardened userVector.service.js
  *
- * Handles user embedding vector generation + storage
- * Used across AI engines
+ * Hardening:
+ *  - vector dimension drift tolerance
+ *  - column/table rollout fallback
+ *  - malformed persisted vector recovery
+ *  - safe regeneration path
+ *  - cross-engine contract stabilization
  */
 
 const { supabase } = require('../config/supabase');
@@ -13,30 +17,59 @@ const semanticSkillEngine = require('../engines/semanticSkill.engine');
 
 const VECTOR_TABLE = 'user_vectors';
 const VECTOR_COLUMN = 'embedding_vector';
+const FALLBACK_VECTOR_COLUMN = 'embedding';
 const VECTOR_DIMENSIONS = 1536;
 
-function isValidVector(vector) {
+function isValidVector(vector, expectedDimensions = VECTOR_DIMENSIONS) {
   return (
     Array.isArray(vector) &&
-    vector.length === VECTOR_DIMENSIONS &&
-    vector.every((value) => typeof value === 'number' && Number.isFinite(value))
+    vector.length === expectedDimensions &&
+    vector.every(
+      (value) => typeof value === 'number' && Number.isFinite(value)
+    )
   );
 }
 
-/**
- * Generate + persist user vector
- */
+function normalizeVector(vector) {
+  if (!Array.isArray(vector)) return null;
+
+  const normalized = vector
+    .map((v) => Number(v))
+    .filter((v) => Number.isFinite(v));
+
+  // strict preferred path
+  if (normalized.length === VECTOR_DIMENSIONS) {
+    return normalized;
+  }
+
+  // drift-tolerant path for staged model upgrades
+  if (normalized.length > 0 && normalized.length >= 512) {
+    logger.warn('[UserVector] dimension drift tolerated', {
+      receivedDimensions: normalized.length,
+      expectedDimensions: VECTOR_DIMENSIONS,
+    });
+    return normalized;
+  }
+
+  return null;
+}
+
 async function updateUserVector(userId, skills = []) {
   if (!userId || !Array.isArray(skills) || skills.length === 0) {
-    throw new Error('updateUserVector: userId and non-empty skills array required');
+    throw new Error(
+      'updateUserVector: userId and non-empty skills array required'
+    );
   }
 
   try {
-    const vector = await semanticSkillEngine.getUserSkillVector(skills);
+    const rawVector =
+      await semanticSkillEngine.getUserSkillVector(skills);
 
-    if (!isValidVector(vector)) {
+    const vector = normalizeVector(rawVector);
+
+    if (!vector) {
       throw new Error(
-        `updateUserVector: invalid embedding vector shape (expected ${VECTOR_DIMENSIONS})`
+        `updateUserVector: invalid embedding vector shape (expected ~${VECTOR_DIMENSIONS})`
       );
     }
 
@@ -46,15 +79,34 @@ async function updateUserVector(userId, skills = []) {
       updated_at: new Date().toISOString(),
     };
 
-    const { error } = await supabase
+    let { error } = await supabase
       .from(VECTOR_TABLE)
       .upsert(payload, {
         onConflict: 'user_id',
       });
 
-    if (error) {
-      throw error;
+    // rollout fallback if column renamed during vector migration
+    if (error && isColumnDrift(error)) {
+      logger.warn('[UserVector] column drift fallback write', {
+        userId,
+        column: VECTOR_COLUMN,
+        error: error.message,
+      });
+
+      const fallbackPayload = {
+        user_id: userId,
+        [FALLBACK_VECTOR_COLUMN]: vector,
+        updated_at: new Date().toISOString(),
+      };
+
+      ({ error } = await supabase
+        .from(VECTOR_TABLE)
+        .upsert(fallbackPayload, {
+          onConflict: 'user_id',
+        }));
     }
+
+    if (error) throw error;
 
     logger.info('[UserVector] vector updated', {
       userId,
@@ -74,28 +126,39 @@ async function updateUserVector(userId, skills = []) {
   }
 }
 
-/**
- * Fetch cached vector or generate fallback
- */
 async function getUserVector(userId, skills = []) {
   if (!userId) {
     throw new Error('getUserVector: userId required');
   }
 
   try {
-    const { data, error } = await supabase
+    let { data, error } = await supabase
       .from(VECTOR_TABLE)
-      .select(VECTOR_COLUMN)
+      .select(`${VECTOR_COLUMN}, ${FALLBACK_VECTOR_COLUMN}`)
       .eq('user_id', userId)
       .maybeSingle();
 
-    if (error) {
-      throw error;
+    // tolerate staged column rollout where one column may not exist
+    if (error && isColumnDrift(error)) {
+      logger.warn('[UserVector] column drift fallback read', {
+        userId,
+        error: error.message,
+      });
+
+      ({ data, error } = await supabase
+        .from(VECTOR_TABLE)
+        .select(VECTOR_COLUMN)
+        .eq('user_id', userId)
+        .maybeSingle());
     }
 
-    const vector = data?.[VECTOR_COLUMN];
+    if (error) throw error;
 
-    if (isValidVector(vector)) {
+    const vector = normalizeVector(
+      data?.[VECTOR_COLUMN] ?? data?.[FALLBACK_VECTOR_COLUMN]
+    );
+
+    if (vector) {
       return vector;
     }
 
@@ -119,7 +182,18 @@ async function getUserVector(userId, skills = []) {
   }
 }
 
+function isColumnDrift(error) {
+  const msg = String(error?.message || '').toLowerCase();
+  return (
+    error?.code === '42703' ||
+    msg.includes('column') ||
+    msg.includes('does not exist') ||
+    msg.includes('schema cache')
+  );
+}
+
 module.exports = {
   updateUserVector,
   getUserVector,
+  isValidVector,
 };

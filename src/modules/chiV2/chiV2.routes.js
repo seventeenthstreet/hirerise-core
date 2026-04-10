@@ -12,12 +12,14 @@
  * POST /career-path
  * POST /opportunities
  * POST /full-intelligence
+ * GET  /benchmark
  */
 
 const express = require('express');
 const { body } = require('express-validator');
 const { validate } = require('../../middleware/requestValidator');
 const ctrl = require('./chiV2.controller');
+const benchmarkCtrl = require('./chiBenchmark.controller');
 
 const router = express.Router();
 
@@ -30,7 +32,8 @@ const ROUTES = Object.freeze({
   SKILL_GAP: '/skill-gap',
   CAREER_PATH: '/career-path',
   OPPORTUNITIES: '/opportunities',
-  FULL_INTELLIGENCE: '/full-intelligence'
+  FULL_INTELLIGENCE: '/full-intelligence',
+  BENCHMARK: '/benchmark',
 });
 
 const VALID_EDUCATION = Object.freeze([
@@ -140,5 +143,10 @@ router.post(
   validateProfile,
   ctrl.fullIntelligence
 );
+
+// GET /api/v1/chi-v2/benchmark
+// Returns the authenticated user's latest CHI cohort benchmark + trend history.
+// No body required — userId sourced from req.user.id (set by authenticate middleware).
+router.get(ROUTES.BENCHMARK, benchmarkCtrl.getUserBenchmarkAnalytics);
 
 module.exports = router;

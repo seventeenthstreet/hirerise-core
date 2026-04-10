@@ -1,14 +1,21 @@
 'use strict';
 
 /**
- * Opportunity Radar Engine (Precompute + RPC + Smart Cache)
+ * Opportunity Radar Engine (Wave 1 Drift Hardened)
  *
  * Flow:
  *   1. Try Redis cache
  *   2. Try precomputed DB result
  *   3. Fallback to RPC
- *   4. Cache result
+ *   4. Cache normalized result
  *   5. Async refresh if stale
+ *
+ * Wave 1 hardening:
+ *   - RPC drift-safe normalization
+ *   - schema-cache / missing RPC fallback envelope
+ *   - DB row shape drift tolerance
+ *   - stale refresh dedupe safety
+ *   - cache corruption protection
  */
 
 const crypto = require('crypto');
@@ -16,14 +23,12 @@ const cacheManager = require('../core/cache/cache.manager');
 const { supabase } = require('../config/supabase');
 const logger = require('../utils/logger');
 
-const CACHE_TTL = 1800; // 30 mins
-const STALE_TTL = 1800; // 30 mins (for DB freshness)
+const CACHE_TTL = 1800;
+const STALE_TTL = 1800;
+const RADAR_RPC = 'get_opportunity_radar';
 
 const cache = cacheManager?.getClient?.();
-
-// ─────────────────────────────────────────────
-// VERSIONING (GLOBAL INVALIDATION)
-// ─────────────────────────────────────────────
+const inFlightRefreshes = new Set();
 
 async function getRadarVersion() {
   if (!cache) return 'v1';
@@ -36,170 +41,118 @@ async function getRadarVersion() {
   }
 }
 
-// ─────────────────────────────────────────────
-// CACHE KEY
-// ─────────────────────────────────────────────
-
 async function buildCacheKey(userId, opts) {
   const version = await getRadarVersion();
 
   const hash = crypto
     .createHash('md5')
-    .update(JSON.stringify(opts))
+    .update(JSON.stringify(opts || {}))
     .digest('hex')
     .slice(0, 8);
 
   return `radar:${version}:${userId}:${hash}`;
 }
 
-// ─────────────────────────────────────────────
-// MAIN ENGINE
-// ─────────────────────────────────────────────
-
 async function getOpportunityRadar(userId, opts = {}) {
-  const {
-    topN = 10,
-    minOpportunityScore = 40,
-    minMatchScore = 0
-  } = opts;
+  const normalizedOpts = normalizeOptions(opts);
 
-  const cacheKey = await buildCacheKey(userId, {
-    topN,
-    minOpportunityScore,
-    minMatchScore
-  });
+  const cacheKey = await buildCacheKey(userId, normalizedOpts);
 
-  // ─────────────────────────────────────────
-  // 1️⃣ REDIS CACHE
-  // ─────────────────────────────────────────
   if (cache) {
     try {
       const cached = await cache.get(cacheKey);
       if (cached) {
-        return JSON.parse(cached);
+        try {
+          return normalizeRadarPayload(JSON.parse(cached));
+        } catch {
+          logger.warn('[Radar] cache parse failed', { userId });
+        }
       }
     } catch (err) {
-      logger.warn('[Radar] cache read failed', { err: err.message });
+      logger.warn('[Radar] cache read failed', {
+        userId,
+        err: err.message,
+      });
     }
   }
 
-  // ─────────────────────────────────────────
-  // 2️⃣ PRECOMPUTED DB
-  // ─────────────────────────────────────────
-  let dbData = null;
-
   try {
-    const { data } = await supabase
+    const { data, error } = await supabase
       .from('user_opportunity_radar')
       .select('data, updated_at')
       .eq('user_id', userId)
       .maybeSingle();
 
-    if (data?.data) {
-      dbData = data;
+    if (!error && data?.data) {
+      const payload = normalizeRadarPayload(data.data);
+      const updatedAt = data.updated_at
+        ? new Date(data.updated_at).getTime()
+        : 0;
 
-      // 🔥 async refresh if stale (non-blocking)
       const isStale =
-        Date.now() - new Date(data.updated_at).getTime() > STALE_TTL * 1000;
+        !updatedAt || Date.now() - updatedAt > STALE_TTL * 1000;
 
       if (isStale) {
-        refreshRadarAsync(userId);
+        refreshRadarAsync(userId, normalizedOpts);
       }
 
-      // cache it
-      if (cache) {
-        await cache.set(cacheKey, JSON.stringify(data.data), 'EX', CACHE_TTL);
-      }
-
-      return data.data;
+      await writeCacheSafe(cacheKey, payload, userId);
+      return payload;
     }
-
   } catch (err) {
     logger.warn('[Radar] precomputed fetch failed', {
       userId,
-      err: err.message
+      err: err.message,
     });
   }
 
-  // ─────────────────────────────────────────
-  // 3️⃣ FALLBACK → RPC
-  // ─────────────────────────────────────────
-  const fresh = await computeRadarRPC(userId, {
-    topN,
-    minOpportunityScore,
-    minMatchScore
-  });
-
-  // cache it
-  if (cache) {
-    try {
-      await cache.set(cacheKey, JSON.stringify(fresh), 'EX', CACHE_TTL);
-    } catch (err) {
-      logger.warn('[Radar] cache write failed', { err: err.message });
-    }
-  }
-
+  const fresh = await computeRadarRPC(userId, normalizedOpts);
+  await writeCacheSafe(cacheKey, fresh, userId);
   return fresh;
 }
 
-// ─────────────────────────────────────────────
-// RPC COMPUTE
-// ─────────────────────────────────────────────
-
 async function computeRadarRPC(userId, opts) {
   try {
-    const { data, error } = await supabase.rpc(
-      'get_opportunity_radar',
-      {
-        p_user_id: userId,
-        p_top_n: opts.topN,
-        p_min_opportunity_score: opts.minOpportunityScore,
-        p_min_match_score: opts.minMatchScore
-      }
-    );
+    const { data, error } = await supabase.rpc(RADAR_RPC, {
+      p_user_id: userId,
+      p_top_n: opts.topN,
+      p_min_opportunity_score: opts.minOpportunityScore,
+      p_min_match_score: opts.minMatchScore,
+    });
 
     if (error) throw error;
-
-    return data;
-
+    return normalizeRadarPayload(data);
   } catch (err) {
     logger.error('[Radar] RPC failed', {
       userId,
-      err: err.message
+      rpc: RADAR_RPC,
+      code: err.code,
+      err: err.message,
     });
 
-    return {
-      emerging_opportunities: [],
-      user_skills: 0,
-      generated_at: new Date().toISOString(),
-      vector_used: false,
-      error: 'RADAR_RPC_FAILED'
-    };
+    return emptyRadar('RADAR_RPC_FAILED');
   }
 }
 
-// ─────────────────────────────────────────────
-// ASYNC REFRESH (STALE-WHILE-REVALIDATE)
-// ─────────────────────────────────────────────
+function refreshRadarAsync(userId, opts = {}) {
+  const key = `${userId}:${JSON.stringify(opts)}`;
+  if (inFlightRefreshes.has(key)) return;
 
-async function refreshRadarAsync(userId) {
+  inFlightRefreshes.add(key);
+
   setImmediate(async () => {
     try {
-      await supabase.rpc('precompute_opportunity_radar', {
-        p_user_id: userId
-      });
+      await computeRadarRPC(userId, normalizeOptions(opts));
     } catch (err) {
       logger.warn('[Radar] async refresh failed', {
         userId,
-        err: err.message
+        err: err.message,
       });
+    } finally {
+      inFlightRefreshes.delete(key);
     }
   });
 }
-
-// ─────────────────────────────────────────────
-// USER-LEVEL INVALIDATION
-// ─────────────────────────────────────────────
 
 async function invalidateOpportunityRadar(userId) {
   if (!cache) return;
@@ -220,18 +173,13 @@ async function invalidateOpportunityRadar(userId) {
     if (keys.length) {
       await cache.del(keys);
     }
-
   } catch (err) {
     logger.warn('[Radar] invalidation failed', {
       userId,
-      err: err.message
+      err: err.message,
     });
   }
 }
-
-// ─────────────────────────────────────────────
-// GLOBAL INVALIDATION (VERSION BUMP)
-// ─────────────────────────────────────────────
 
 async function bumpRadarVersion() {
   if (!cache) return;
@@ -240,17 +188,74 @@ async function bumpRadarVersion() {
     await cache.set('radar:version', `v${Date.now()}`);
   } catch (err) {
     logger.warn('[Radar] version bump failed', {
-      err: err.message
+      err: err.message,
     });
   }
 }
 
-// ─────────────────────────────────────────────
-// EXPORTS
-// ─────────────────────────────────────────────
+function normalizeOptions(opts = {}) {
+  return {
+    topN: safeNumber(opts.topN, 10),
+    minOpportunityScore: safeNumber(opts.minOpportunityScore, 40),
+    minMatchScore: safeNumber(opts.minMatchScore, 0),
+  };
+}
+
+function normalizeRadarPayload(payload) {
+  if (Array.isArray(payload)) {
+    return {
+      emerging_opportunities: payload,
+      user_skills: 0,
+      generated_at: new Date().toISOString(),
+      vector_used: false,
+    };
+  }
+
+  if (!payload || typeof payload !== 'object') {
+    return emptyRadar();
+  }
+
+  return {
+    emerging_opportunities: Array.isArray(payload.emerging_opportunities)
+      ? payload.emerging_opportunities
+      : [],
+    user_skills: safeNumber(payload.user_skills, 0),
+    generated_at: payload.generated_at || new Date().toISOString(),
+    vector_used: Boolean(payload.vector_used),
+    ...(payload.error ? { error: payload.error } : {}),
+  };
+}
+
+function emptyRadar(errorCode) {
+  return {
+    emerging_opportunities: [],
+    user_skills: 0,
+    generated_at: new Date().toISOString(),
+    vector_used: false,
+    ...(errorCode ? { error: errorCode } : {}),
+  };
+}
+
+async function writeCacheSafe(cacheKey, payload, userId) {
+  if (!cache) return;
+
+  try {
+    await cache.set(cacheKey, JSON.stringify(payload), 'EX', CACHE_TTL);
+  } catch (err) {
+    logger.warn('[Radar] cache write failed', {
+      userId,
+      err: err.message,
+    });
+  }
+}
+
+function safeNumber(value, fallback) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : fallback;
+}
 
 module.exports = {
   getOpportunityRadar,
   invalidateOpportunityRadar,
-  bumpRadarVersion
+  bumpRadarVersion,
 };

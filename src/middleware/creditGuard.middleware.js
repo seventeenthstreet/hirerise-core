@@ -1,117 +1,198 @@
 'use strict';
 
 /**
- * creditGuard.middleware.js (Supabase Production Version)
+ * src/middleware/creditGuard.middleware.js
+ *
+ * Wave 1 hardened RPC drift-safe AI credit guard
  */
 
-const { supabase } = require('../config/supabase'); // ✅ REQUIRED
+const { supabase } = require('../config/supabase');
 const { AppError, ErrorCodes } = require('./errorHandler');
-const { CREDIT_COSTS, isValidOperation } = require('../modules/analysis/analysis.constants');
+const {
+  CREDIT_COSTS,
+  isValidOperation,
+} = require('../modules/analysis/analysis.constants');
 const { normalizeTier } = require('./requireTier.middleware');
 const logger = require('../utils/logger');
 
-// ─────────────────────────────────────────────────────────────────────────────
-// ATOMIC CREDIT CHECK + DEDUCT (RPC)
-// ─────────────────────────────────────────────────────────────────────────────
+/**
+ * Normalize RPC result shape across:
+ * - object row
+ * - array row
+ * - nullable payloads
+ */
+function normalizeCreditRpcResult(data) {
+  if (!data) {
+    return {
+      success: false,
+      remaining: 0,
+    };
+  }
 
-async function checkAndDeductCredits(userId, cost) {
-  const { data, error } = await supabase.rpc('consume_ai_credits', {
-    p_user_id: userId,
-    p_cost: cost,
-  });
+  const row = Array.isArray(data) ? data[0] : data;
 
-  if (error) throw error;
-
-  return data;
+  return {
+    success: Boolean(
+      row?.success ??
+      row?.allowed ??
+      row?.consumed
+    ),
+    remaining: Number(
+      row?.remaining ??
+      row?.remaining_credits ??
+      row?.balance ??
+      0
+    ),
+  };
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// MIDDLEWARE
-// ─────────────────────────────────────────────────────────────────────────────
+/**
+ * Atomic consume via SQL RPC
+ */
+async function checkAndDeductCredits(userId, cost) {
+  const normalizedCost = Number(cost);
 
+  if (!Number.isFinite(normalizedCost) || normalizedCost <= 0) {
+    throw new Error(`Invalid credit cost: ${cost}`);
+  }
+
+  const { data, error } = await supabase.rpc('consume_ai_credits', {
+    p_user_id: userId,
+    p_cost: Math.trunc(normalizedCost),
+  });
+
+  if (error) {
+    error.context = {
+      rpc: 'consume_ai_credits',
+      userId,
+      cost: normalizedCost,
+    };
+    throw error;
+  }
+
+  return normalizeCreditRpcResult(data);
+}
+
+/**
+ * Middleware factory
+ */
 function creditGuard(operationType) {
-  return async function (req, res, next) {
+  return async function creditGuardMiddleware(req, res, next) {
     try {
       const userId = req.user?.uid;
 
       if (!userId) {
-        return next(new AppError(
-          'Unauthorized',
-          401,
-          {},
-          ErrorCodes.UNAUTHORIZED
-        ));
+        return next(
+          new AppError(
+            'Unauthorized',
+            401,
+            {},
+            ErrorCodes.UNAUTHORIZED
+          )
+        );
       }
 
       if (!isValidOperation(operationType)) {
-        return next(new AppError(
-          `Unknown operation: ${operationType}`,
-          400,
-          {},
-          ErrorCodes.VALIDATION_ERROR
-        ));
+        return next(
+          new AppError(
+            `Unknown operation: ${operationType}`,
+            400,
+            { operationType },
+            ErrorCodes.VALIDATION_ERROR
+          )
+        );
       }
 
       const tier = req.user.normalizedTier ?? normalizeTier(req.user.plan);
 
-      // Free users handled elsewhere
-      if (tier === 'free') return next();
-
-      const cost = CREDIT_COSTS[operationType];
-
-      // 🔥 Atomic DB operation
-      const result = await checkAndDeductCredits(userId, cost);
-
-      if (!result?.success) {
-        return next(new AppError(
-          'Insufficient AI credits',
-          402,
-          {
-            creditsRequired: cost,
-            creditsAvailable: result?.remaining ?? 0,
-            operationType,
-          },
-          ErrorCodes.PAYMENT_REQUIRED
-        ));
+      // free users bypass paid credit enforcement
+      if (tier === 'free') {
+        return next();
       }
 
-      // Attach metadata
+      const rawCost = CREDIT_COSTS[operationType];
+      const cost = Math.trunc(Number(rawCost));
+
+      if (!Number.isFinite(cost) || cost <= 0) {
+        logger.error('[CreditGuard] Invalid configured cost', {
+          operationType,
+          rawCost,
+        });
+
+        return next(
+          new AppError(
+            'Credit configuration invalid',
+            500,
+            { operationType },
+            ErrorCodes.INTERNAL_SERVER_ERROR
+          )
+        );
+      }
+
+      const result = await checkAndDeductCredits(userId, cost);
+
+      if (!result.success) {
+        return next(
+          new AppError(
+            'Insufficient AI credits',
+            402,
+            {
+              creditsRequired: cost,
+              creditsAvailable: result.remaining,
+              operationType,
+            },
+            ErrorCodes.PAYMENT_REQUIRED
+          )
+        );
+      }
+
+      // attach deterministic downstream metadata
       req.creditCost = cost;
       req.creditsRemaining = result.remaining;
+      req.creditConsumption = {
+        userId,
+        operationType,
+        consumed: cost,
+        remaining: result.remaining,
+      };
 
       return next();
-
     } catch (err) {
-      logger.error('[CreditGuard] Failed', {
+      logger.error('[CreditGuard] RPC consume_ai_credits failed', {
         error: err.message,
+        code: err.code,
+        details: err.details,
         userId: req.user?.uid,
+        operationType,
       });
 
-      return next(new AppError(
-        'Credit validation failed',
-        500,
-        {},
-        ErrorCodes.INTERNAL_SERVER_ERROR
-      ));
+      return next(
+        new AppError(
+          'Credit validation failed',
+          500,
+          {
+            operationType,
+          },
+          ErrorCodes.INTERNAL_SERVER_ERROR
+        )
+      );
     }
   };
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// NO-OP (for compatibility with your existing flow)
-// ─────────────────────────────────────────────────────────────────────────────
-
+/**
+ * Compatibility no-op
+ */
 async function confirmCreditReservation() {
-  // No-op (handled atomically in DB)
+  return true;
 }
 
+/**
+ * Compatibility no-op
+ */
 async function releaseCreditReservationFromReq() {
-  // No-op (no reservation system anymore)
+  return true;
 }
-
-// ─────────────────────────────────────────────────────────────────────────────
-// EXPORTS
-// ─────────────────────────────────────────────────────────────────────────────
 
 module.exports = {
   creditGuard,

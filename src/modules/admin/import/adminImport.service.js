@@ -17,7 +17,7 @@ const ENTITY_TO_TABLE = {
   'skill-clusters': 'skill_clusters',
   skills: 'skills',
   roles: 'roles',
-  'education-levels': 'education_levels',
+  'education-levels': 'cms_education_levels',
   'salary-benchmarks': 'salary_benchmarks',
   'skill-demand': 'skill_demand',
   'role-skills': 'role_skills',

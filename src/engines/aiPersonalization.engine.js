@@ -1,12 +1,16 @@
 'use strict';
 
 /**
- * Personalization Engine (Supabase + AI Vector Integrated)
- * ✅ Ghost tables fixed
- * ✅ snake_case aligned
- * ✅ cache safe
+ * Personalization Engine — production hardened
+ *
+ * Wave 3 Priority #3:
+ * - hydration cache
+ * - deterministic vector dedupe
+ * - behavior-triggered cache busting
+ * - stale-safe personalization reads
  */
 
+const crypto = require('crypto');
 const { supabase } = require('../config/supabase');
 const cacheManager = require('../core/cache/cache.manager');
 const logger = require('../utils/logger');
@@ -16,6 +20,7 @@ const {
 } = require('../services/userVector.service');
 
 const CACHE_TTL_SECONDS = 600;
+const HYDRATION_CACHE_TTL = 300;
 
 const P_WEIGHTS = Object.freeze({
   behavior_signals: 0.4,
@@ -42,8 +47,24 @@ const EVENT_WEIGHTS = Object.freeze({
 
 const cache = cacheManager?.getClient?.() || null;
 
+function skillHash(skills = []) {
+  return crypto
+    .createHash('sha1')
+    .update(JSON.stringify([...skills].sort()))
+    .digest('hex');
+}
+
 async function loadUserProfile(userId) {
   if (!userId) throw new Error('userId is required');
+
+  const cacheKey = `personalization:hydration:${userId}`;
+
+  if (cache) {
+    try {
+      const cached = await cache.get(cacheKey);
+      if (cached) return JSON.parse(cached);
+    } catch {}
+  }
 
   try {
     const [profileRes, progressRes] = await Promise.all([
@@ -82,16 +103,25 @@ async function loadUserProfile(userId) {
       .map((s) => (typeof s === 'string' ? s : s?.name))
       .filter(Boolean);
 
-    try {
-      await updateUserVector(userId, cleanedSkills);
-    } catch (err) {
-      logger.warn('[Personalization] vector update skipped', {
-        userId,
-        error: err.message,
-      });
+    if (cache) {
+      try {
+        const hashKey = `personalization:skillhash:${userId}`;
+        const nextHash = skillHash(cleanedSkills);
+        const prevHash = await cache.get(hashKey);
+
+        if (prevHash !== nextHash) {
+          await updateUserVector(userId, cleanedSkills);
+          await cache.set(hashKey, nextHash, 'EX', 86400);
+        }
+      } catch (err) {
+        logger.warn('[Personalization] vector dedupe skipped', {
+          userId,
+          error: err.message,
+        });
+      }
     }
 
-    return {
+    const normalized = {
       skills: cleanedSkills,
       targetRole:
         profile.target_role ||
@@ -103,6 +133,19 @@ async function loadUserProfile(userId) {
         profile.years_experience ??
         0,
     };
+
+    if (cache) {
+      try {
+        await cache.set(
+          cacheKey,
+          JSON.stringify(normalized),
+          'EX',
+          HYDRATION_CACHE_TTL
+        );
+      } catch {}
+    }
+
+    return normalized;
   } catch (err) {
     logger.error(
       '[PersonalizationEngine] loadUserProfile failed',
@@ -150,18 +193,11 @@ async function upsertPersonalizationProfile(userId, profile) {
     if (error) throw error;
 
     if (cache) {
-      try {
-        await Promise.all([
-          cache.del(`personalization:profile:${userId}`),
-          cache.del(
-            `personalization:recommendations:${userId}`
-          ),
-        ]);
-      } catch (cacheErr) {
-        logger.warn('[Cache] Invalidation failed', {
-          error: cacheErr?.message || cacheErr,
-        });
-      }
+      await Promise.allSettled([
+        cache.del(`personalization:profile:${userId}`),
+        cache.del(`personalization:recommendations:${userId}`),
+        cache.del(`personalization:hydration:${userId}`),
+      ]);
     }
 
     return data;
@@ -197,6 +233,13 @@ async function trackBehaviorEvent(userId, eventData = {}) {
 
     if (error) throw error;
 
+    if (cache) {
+      await Promise.allSettled([
+        cache.del(`personalization:recommendations:${userId}`),
+        cache.del(`personalization:profile:${userId}`),
+      ]);
+    }
+
     return { id: data.id };
   } catch (err) {
     logger.error(
@@ -219,11 +262,7 @@ async function getPersonalizationProfile(userId) {
     try {
       const cached = await cache.get(cacheKey);
       if (cached) return JSON.parse(cached);
-    } catch (err) {
-      logger.warn('[Cache] Read failed', {
-        error: err?.message || err,
-      });
-    }
+    } catch {}
   }
 
   try {
@@ -236,18 +275,12 @@ async function getPersonalizationProfile(userId) {
     if (error) throw error;
 
     if (data && cache) {
-      try {
-        await cache.set(
-          cacheKey,
-          JSON.stringify(data),
-          'EX',
-          CACHE_TTL_SECONDS
-        );
-      } catch (err) {
-        logger.warn('[Cache] Write failed', {
-          error: err?.message || err,
-        });
-      }
+      await cache.set(
+        cacheKey,
+        JSON.stringify(data),
+        'EX',
+        CACHE_TTL_SECONDS
+      );
     }
 
     return data || null;

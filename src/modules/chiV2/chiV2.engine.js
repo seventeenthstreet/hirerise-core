@@ -384,6 +384,49 @@ async function calculateCHI(profile) {
     ms: Date.now() - start
   });
 
+  // Persist score to chi_scores so chi_weekly_rollups_mv and
+  // chi_cohort_benchmark_mv materialised views have data to aggregate.
+  // Non-blocking — a save failure must never break the API response.
+  if (profile._userId) {
+    setImmediate(async () => {
+      try {
+        const { error: saveError } = await supabase
+          .from('chi_scores')
+          .upsert(
+            {
+              id: `${profile._userId}:${targetRoleId}`,
+              user_id: profile._userId,
+              role_id: targetRoleId,
+              skill_match: breakdown.skill_match,
+              experience_fit: breakdown.experience_score,
+              market_demand: breakdown.salary_score,
+              learning_progress: breakdown.skill_depth,
+              chi_score,
+              last_updated: new Date().toISOString(),
+            },
+            { onConflict: 'id' }
+          );
+
+        if (saveError) {
+          logger.warn('[CHIv2] Score persist failed', {
+            userId: profile._userId,
+            error: saveError.message,
+          });
+        } else {
+          logger.debug('[CHIv2] Score persisted', {
+            userId: profile._userId,
+            chi_score,
+          });
+        }
+      } catch (err) {
+        logger.warn('[CHIv2] Score persist exception', {
+          userId: profile._userId,
+          error: err.message,
+        });
+      }
+    });
+  }
+
   return {
     chi_score,
     breakdown,

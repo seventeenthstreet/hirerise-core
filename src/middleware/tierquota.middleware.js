@@ -1,27 +1,25 @@
 'use strict';
 
 /**
- * tierQuota.middleware.js (Production Optimized)
+ * src/middleware/tierQuota.middleware.js
+ *
+ * Wave 1 hardened quota enforcement middleware
  */
 
-const { supabase } = require('../config/supabase'); // ✅ KEEP
+const { supabase } = require('../config/supabase');
 const { AppError, ErrorCodes } = require('./errorHandler');
 const { normalizeTier } = require('./requireTier.middleware');
 const logger = require('../utils/logger');
 
-// ─────────────────────────────────────────────────────────────────────────────
-// CONFIG
-// ─────────────────────────────────────────────────────────────────────────────
-
 const TIER_MONTHLY_QUOTAS = Object.freeze({
   free: {
-    fullAnalysis:     3,
-    generateCV:       1,
+    fullAnalysis: 3,
+    generateCV: 1,
     jobMatchAnalysis: 5,
-    jobSpecificCV:    1,
-    careerReport:     1,
-    salaryBenchmark:  10,
-    default:          10,
+    jobSpecificCV: 1,
+    careerReport: 1,
+    salaryBenchmark: 10,
+    default: 10,
   },
   pro: { default: null },
   enterprise: { default: null },
@@ -30,21 +28,20 @@ const TIER_MONTHLY_QUOTAS = Object.freeze({
 
 const QUOTA_DOC_TTL_DAYS = 60;
 
-// ─────────────────────────────────────────────────────────────────────────────
-// HELPERS
-// ─────────────────────────────────────────────────────────────────────────────
-
 function getRequestId(req) {
   return (
     req.correlationId ||
     req.headers['x-correlation-id'] ||
-    req.headers['x-request-id']
+    req.headers['x-request-id'] ||
+    null
   );
 }
 
 function currentMonthKey() {
   const now = new Date();
-  return `${now.getUTCFullYear()}-${String(now.getUTCMonth() + 1).padStart(2, '0')}`;
+  return `${now.getUTCFullYear()}-${String(
+    now.getUTCMonth() + 1
+  ).padStart(2, '0')}`;
 }
 
 function getQuotaLimit(tier, feature) {
@@ -54,34 +51,62 @@ function getQuotaLimit(tier, feature) {
 
 function ttlISO(days) {
   const d = new Date();
-  d.setDate(d.getDate() + days);
+  d.setUTCDate(d.getUTCDate() + days);
   return d.toISOString();
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// MIDDLEWARE
-// ─────────────────────────────────────────────────────────────────────────────
+/**
+ * Drift-safe quota increment RPC
+ */
+async function incrementQuotaUsage({
+  userId,
+  monthKey,
+  feature,
+  increment = 1,
+}) {
+  const { data, error } = await supabase.rpc('increment_user_quota', {
+    p_user_id: userId,
+    p_month_key: monthKey,
+    p_feature: feature,
+    p_increment: increment,
+    p_expires_at: ttlISO(QUOTA_DOC_TTL_DAYS),
+  });
+
+  if (error) {
+    error.context = {
+      rpc: 'increment_user_quota',
+      userId,
+      monthKey,
+      feature,
+    };
+    throw error;
+  }
+
+  return data;
+}
 
 function tierQuota(feature) {
-  return async function (req, res, next) {
+  return async function tierQuotaMiddleware(req, res, next) {
     const requestId = getRequestId(req);
-
     const userId = req.user?.uid;
-    const tier   = normalizeTier(req.user?.plan);
+    const tier = normalizeTier(req.user?.plan);
 
     if (!userId) {
-      return next(new AppError(
-        'Authentication required',
-        401,
-        {},
-        ErrorCodes.UNAUTHORIZED
-      ));
+      return next(
+        new AppError(
+          'Authentication required',
+          401,
+          {},
+          ErrorCodes.UNAUTHORIZED
+        )
+      );
     }
 
     const limit = getQuotaLimit(tier, feature);
 
-    // Unlimited tiers
-    if (limit === null) return next();
+    if (limit === null) {
+      return next();
+    }
 
     const monthKey = currentMonthKey();
 
@@ -96,13 +121,11 @@ function tierQuota(feature) {
 
       if (error) throw error;
 
-      const current = data?.count ?? 0;
+      const current = Number(data?.count ?? 0);
 
-      // ── LIMIT CHECK ───────────────────────────────────
       if (current >= limit) {
         logger.warn('[Quota] Limit exceeded', {
           requestId,
-          correlationId: req.correlationId,
           userId,
           feature,
           tier,
@@ -121,30 +144,33 @@ function tierQuota(feature) {
         });
       }
 
-      // ── SAFE INCREMENT (POST-SUCCESS) ─────────────────
-      res.on('finish', async () => {
+      let incremented = false;
+
+      res.once('finish', async () => {
+        if (incremented) return;
+        incremented = true;
+
         if (res.statusCode >= 200 && res.statusCode < 300) {
           try {
-            await supabase.rpc('increment_user_quota', {
-              p_user_id: userId,
-              p_month_key: monthKey,
-              p_feature: feature,
-              p_increment: 1,
-              p_expires_at: ttlISO(QUOTA_DOC_TTL_DAYS),
+            await incrementQuotaUsage({
+              userId,
+              monthKey,
+              feature,
             });
           } catch (err) {
-            logger.error('[Quota] Increment failed', {
+            logger.error('[Quota] Increment RPC failed', {
               requestId,
               userId,
               feature,
               error: err.message,
+              code: err.code,
+              details: err.details,
             });
           }
         }
       });
 
       return next();
-
     } catch (err) {
       logger.error('[Quota] Check failed', {
         requestId,
@@ -165,10 +191,6 @@ function tierQuota(feature) {
   };
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// ADMIN HELPERS
-// ─────────────────────────────────────────────────────────────────────────────
-
 async function getUserQuotaUsage(userId) {
   const monthKey = currentMonthKey();
 
@@ -181,38 +203,39 @@ async function getUserQuotaUsage(userId) {
 
     if (error) throw error;
 
-    return (data || []).reduce((acc, r) => {
-      acc[r.feature] = r.count;
+    return (data || []).reduce((acc, row) => {
+      acc[row.feature] = Number(row.count ?? 0);
       return acc;
     }, {});
   } catch (err) {
-    logger.error('[Quota] Fetch failed', { userId, error: err.message });
+    logger.error('[Quota] Fetch failed', {
+      userId,
+      error: err.message,
+    });
     return {};
   }
 }
 
 async function getRemainingQuota(userId, tierRaw) {
   const tier = normalizeTier(tierRaw);
-
   const limit = getQuotaLimit(tier, 'default');
-  if (limit === null) return null;
+
+  if (limit === null) {
+    return null;
+  }
 
   const usage = await getUserQuotaUsage(userId);
   const conf = TIER_MONTHLY_QUOTAS[tier] ?? TIER_MONTHLY_QUOTAS.free;
 
   const result = {};
 
-  for (const [feat, max] of Object.entries(conf)) {
-    if (feat === 'default' || max === null) continue;
-    result[feat] = Math.max(0, max - (usage[feat] ?? 0));
+  for (const [feature, max] of Object.entries(conf)) {
+    if (feature === 'default' || max == null) continue;
+    result[feature] = Math.max(0, max - (usage[feature] ?? 0));
   }
 
   return result;
 }
-
-// ─────────────────────────────────────────────────────────────────────────────
-// EXPORTS
-// ─────────────────────────────────────────────────────────────────────────────
 
 module.exports = {
   tierQuota,

@@ -2,7 +2,12 @@
 
 /**
  * src/services/admin/adminMetrics.service.js
- * Production-ready Supabase-native admin metrics service
+ * Production-hardened admin metrics service
+ *
+ * Wave 3 Priority #3:
+ * - final snake_case snapshot drift fix
+ * - safer revenue fallback
+ * - anomaly-safe margin analytics
  */
 
 const { supabase } = require('../../config/supabase');
@@ -20,10 +25,6 @@ const PERIOD_DAYS = Object.freeze({
 });
 
 const INR_TO_USD = 0.012;
-
-// ───────────────────────────────────────────────────────────
-// Helpers
-// ───────────────────────────────────────────────────────────
 
 function toNumber(value, precision = null) {
   const num = Number(value ?? 0);
@@ -119,16 +120,22 @@ function computeModelBreakdown(rows = []) {
     .sort((a, b) => b.totalCostUSD - a.totalCostUSD);
 }
 
-function computeHealthAlerts(grossMarginPercent, freeTierCostUSD, totalCostUSD) {
+function computeHealthAlerts(
+  grossMarginPercent,
+  freeTierCostUSD,
+  totalCostUSD
+) {
   let marginHealthStatus = 'HEALTHY';
   let marginWarning;
 
-  if (grossMarginPercent < MARGIN_THRESHOLDS.CRITICAL_PERCENT) {
+  const saneMargin = Math.max(-100, Math.min(1000, grossMarginPercent));
+
+  if (saneMargin < MARGIN_THRESHOLDS.CRITICAL_PERCENT) {
     marginHealthStatus = 'CRITICAL';
-    marginWarning = `CRITICAL: Gross margin ${grossMarginPercent.toFixed(1)}% is below ${MARGIN_THRESHOLDS.CRITICAL_PERCENT}% threshold.`;
-  } else if (grossMarginPercent < MARGIN_THRESHOLDS.HEALTHY_PERCENT) {
+    marginWarning = `CRITICAL: Gross margin ${saneMargin.toFixed(1)}% is below ${MARGIN_THRESHOLDS.CRITICAL_PERCENT}% threshold.`;
+  } else if (saneMargin < MARGIN_THRESHOLDS.HEALTHY_PERCENT) {
     marginHealthStatus = 'WARNING';
-    marginWarning = `WARNING: Gross margin ${grossMarginPercent.toFixed(1)}% is below healthy ${MARGIN_THRESHOLDS.HEALTHY_PERCENT}% target.`;
+    marginWarning = `WARNING: Gross margin ${saneMargin.toFixed(1)}% is below healthy ${MARGIN_THRESHOLDS.HEALTHY_PERCENT}% target.`;
   }
 
   const freeBurnPercent =
@@ -152,7 +159,7 @@ function computeHealthAlerts(grossMarginPercent, freeTierCostUSD, totalCostUSD) 
   };
 }
 
-async function estimateRevenueFromUsers() {
+async function estimateRevenueFromUsers(excludedPaidUsers = 0) {
   const { data, error } = await supabase
     .from('users')
     .select('plan_amount')
@@ -163,23 +170,20 @@ async function estimateRevenueFromUsers() {
     throw new Error(`Revenue estimation failed: ${error.message}`);
   }
 
-  let totalRevenueUSD = 0;
-  let paidUserCount = 0;
+  const paidRows = data ?? [];
+  const remainingRows = paidRows.slice(excludedPaidUsers);
 
-  for (const row of data ?? []) {
-    paidUserCount += 1;
+  let totalRevenueUSD = 0;
+
+  for (const row of remainingRows) {
     totalRevenueUSD += toNumber(row.plan_amount) * INR_TO_USD;
   }
 
   return {
     totalRevenueUSD: toNumber(totalRevenueUSD, 2),
-    paidUserCount
+    paidUserCount: remainingRows.length
   };
 }
-
-// ───────────────────────────────────────────────────────────
-// Service
-// ───────────────────────────────────────────────────────────
 
 class AdminMetricsService {
   async getMetrics(params = {}) {
@@ -200,7 +204,6 @@ class AdminMetricsService {
     let totalRevenueUSD = 0;
     let freeTierCostUSD = 0;
     let paidTierCostUSD = 0;
-
     const paidUserIds = new Set();
 
     for (const row of rows) {
@@ -216,14 +219,16 @@ class AdminMetricsService {
       }
     }
 
-    const hasRevenueData = rows.some((r) => toNumber(r.revenueUSD) > 0);
-    let paidUserCount = paidUserIds.size;
+    const estimated = await estimateRevenueFromUsers(
+      paidUserIds.size
+    );
 
-    if (!hasRevenueData) {
-      const estimated = await estimateRevenueFromUsers();
+    if (totalRevenueUSD === 0) {
       totalRevenueUSD = estimated.totalRevenueUSD;
-      paidUserCount = estimated.paidUserCount;
     }
+
+    const paidUserCount =
+      paidUserIds.size + estimated.paidUserCount;
 
     const grossMarginUSD = toNumber(
       totalRevenueUSD - totalCostUSD,
@@ -264,12 +269,14 @@ class AdminMetricsService {
         freeTierCostUSD,
         totalCostUSD
       ),
-      dataSource: docCount === 0 ? 'aggregated' : capped ? 'hybrid' : 'live',
+      dataSource:
+        docCount === 0
+          ? 'aggregated'
+          : capped
+          ? 'hybrid'
+          : 'live',
       generatedAt: new Date().toISOString(),
-      periodDays: period.days,
-      ...(capped && {
-        _warning: `Query returned ${docCount} docs (limit: 10,000). Use /admin/metrics/aggregated for large periods.`
-      })
+      periodDays: period.days
     };
   }
 
@@ -289,13 +296,15 @@ class AdminMetricsService {
       throw new Error(`Aggregated metrics fetch failed: ${error.message}`);
     }
 
-    if (!data?.length) {
+    const rows = data || [];
+
+    if (!rows.length) {
       return {
         period: period.label,
         startDate: startStr,
         endDate: endStr,
         totalUsers: 0,
-        _warning: 'No aggregated data found. Run the daily aggregation job first.'
+        _warning: 'No aggregated data found.'
       };
     }
 
@@ -308,17 +317,20 @@ class AdminMetricsService {
     let paidUserCount = 0;
     const featureCounts = new Map();
 
-    for (const row of data) {
-      totalRequests += toNumber(row.totalRequests);
-      totalTokens += toNumber(row.totalTokens);
-      totalCostUSD += toNumber(row.totalCostUSD);
-      totalRevenueUSD += toNumber(row.totalRevenueUSD);
-      freeTierCostUSD += toNumber(row.freeTierCostUSD);
-      paidTierCostUSD += toNumber(row.paidTierCostUSD);
-      paidUserCount += toNumber(row.paidUserCount);
+    for (const row of rows) {
+      totalRequests += toNumber(row.total_requests);
+      totalTokens += toNumber(row.total_tokens);
+      totalCostUSD += toNumber(row.total_cost_usd);
+      totalRevenueUSD += toNumber(row.total_revenue_usd);
+      freeTierCostUSD += toNumber(row.free_tier_cost_usd);
+      paidTierCostUSD += toNumber(row.paid_tier_cost_usd);
+      paidUserCount += toNumber(row.paid_user_count);
 
-      for (const [feature, count] of Object.entries(row.featureCounts || {})) {
-        featureCounts.set(feature, (featureCounts.get(feature) ?? 0) + count);
+      for (const [feature, count] of Object.entries(row.feature_counts || {})) {
+        featureCounts.set(
+          feature,
+          (featureCounts.get(feature) ?? 0) + count
+        );
       }
     }
 

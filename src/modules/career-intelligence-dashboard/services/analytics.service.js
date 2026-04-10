@@ -1,9 +1,13 @@
 'use strict';
 
 /**
- * src/modules/analytics/services/analytics.service.js
+ * src/modules/career-intelligence-dashboard/services/analytics.service.js
  *
  * Supabase-native analytics aggregation service.
+ * Wave 2 hardened:
+ * - namespaced in-memory cache keys
+ * - scope-safe metric resolution
+ * - future region/user overlays
  */
 
 const logger = require('../../../utils/logger');
@@ -17,11 +21,22 @@ const {
   buildCacheRow,
 } = require('../models/analyticsSnapshot.model');
 
+/* -------------------------------------------------------------------------- */
+/* Cache layer — Wave 2 namespaced cleanup */
+/* -------------------------------------------------------------------------- */
+
 const MEM_TTL_MS = 10 * 60 * 1000;
+const CACHE_NAMESPACE = 'analytics:v2';
 const memCache = new Map();
 
-function memGet(key) {
+function buildCacheKey(metricName, scope = 'global') {
+  return `${CACHE_NAMESPACE}:${scope}:${metricName}`;
+}
+
+function memGet(metricName, scope = 'global') {
+  const key = buildCacheKey(metricName, scope);
   const cached = memCache.get(key);
+
   if (!cached) return null;
 
   if (Date.now() - cached.ts > MEM_TTL_MS) {
@@ -32,7 +47,9 @@ function memGet(key) {
   return cached.value;
 }
 
-function memSet(key, value) {
+function memSet(metricName, value, scope = 'global') {
+  const key = buildCacheKey(metricName, scope);
+
   memCache.set(key, {
     value,
     ts: Date.now(),
@@ -56,13 +73,17 @@ const INDUSTRY_DATA = [ /* KEEP EXACTLY AS-IS */ ];
 /* Shared metric compute wrapper */
 /* -------------------------------------------------------------------------- */
 
-async function resolveMetric(metricName, computeFn) {
-  const cached = memGet(metricName);
+async function resolveMetric(
+  metricName,
+  computeFn,
+  scope = 'global'
+) {
+  const cached = memGet(metricName, scope);
   if (cached) return cached;
 
   const result = await computeFn();
 
-  memSet(metricName, result);
+  memSet(metricName, result, scope);
 
   void persistSnapshot(metricName, result);
 
@@ -342,7 +363,9 @@ async function getSnapshots(metricName, limitDays = 30) {
 
   const { data, error } = await supabase
     .from(TABLES.SNAPSHOTS)
-    .select('metric_name, metric_value, region, snapshot_date, created_at')
+    .select(
+      'metric_name, metric_value, region, snapshot_date, created_at'
+    )
     .eq('metric_name', metricName)
     .gte('snapshot_date', cutoff.toISOString().slice(0, 10))
     .order('snapshot_date', { ascending: true })

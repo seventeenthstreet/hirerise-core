@@ -74,7 +74,7 @@ export function rateLimit({ counterKey, limit, window = 'minute' }) {
 
       return next();
     } catch (error) {
-      logger.error('Rate limit check failed — fail-open applied', {
+      logger.warn('Rate limit check degraded — fail-open applied', {
         error: error.message,
         userId,
         counterKey,
@@ -175,7 +175,7 @@ export async function pendingJobLimitMiddleware(req, res, next) {
 
     return next();
   } catch (error) {
-    logger.error('Pending job check failed — allowing request', {
+    logger.warn('Pending job check degraded — allowing request', {
       error: error.message,
       userId,
       requestId: req.requestId,
@@ -186,17 +186,18 @@ export async function pendingJobLimitMiddleware(req, res, next) {
 }
 
 async function checkAndIncrement(counterId, limit, window) {
+  const normalizedCounterId = String(counterId).trim().toLowerCase();
   const expiresAt = getWindowExpiry(window).toISOString();
 
   const { data, error } = await supabaseAdmin.rpc('increment_rate_limit', {
-    p_id: counterId,
+    p_id: normalizedCounterId,
     p_limit: limit,
     p_expires_at: expiresAt,
   });
 
   if (error) {
-    logger.error('[rateLimit] RPC failed', {
-      counterId,
+    logger.warn('[rateLimit] RPC degraded — fail-open', {
+      counterId: normalizedCounterId,
       limit,
       window,
       error: error.message,
@@ -221,12 +222,12 @@ function getWindowExpiry(window) {
 
   if (window === 'minute') {
     now.setUTCSeconds(0, 0);
-    now.setUTCMinutes(now.getUTCMinutes() + 2);
+    now.setUTCMinutes(now.getUTCMinutes() + 1);
     return now;
   }
 
   now.setUTCHours(0, 0, 0, 0);
-  now.setUTCDate(now.getUTCDate() + 2);
+  now.setUTCDate(now.getUTCDate() + 1);
   return now;
 }
 

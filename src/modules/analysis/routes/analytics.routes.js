@@ -72,6 +72,19 @@ function resolveAnalysisRunner() {
 
 const router = express.Router();
 
+// ── Liveness probe ────────────────────────────────────────────────────────────
+// GET /api/v1/analytics/health
+// Auth-gated (authenticate runs at mount point in server.js).
+// Used to verify the analytics module is reachable with a valid token.
+router.get('/health', (_req, res) => {
+  res.status(200).json({
+    success: true,
+    status: 'healthy',
+    module: 'analytics',
+    ts: new Date().toISOString(),
+  });
+});
+
 router.post(
   '/',
   authenticate,

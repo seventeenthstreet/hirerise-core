@@ -4,16 +4,13 @@
  * src/modules/employer/services/employer.service.js
  *
  * Employer business logic service
- * -------------------------------
- * Supabase-native service orchestration layer
- * preserving anonymized talent analytics.
- *
- * Changes from previous version:
- * - createEmployer now calls the create_employer_with_admin RPC for atomic
- *   employer + admin membership creation. The previous two-step flow that
- *   could leave an orphan employer row without an admin has been removed.
- * - getTalentPipeline now caps concurrent matchingService calls via p-limit
- *   to prevent unbounded fan-out on employers with many active roles.
+ * --------------------------------
+ * Wave 1 hardened:
+ * - drift-safe create_employer_with_admin RPC
+ * - nullable payload normalization
+ * - unique violation normalization
+ * - input validation hardening
+ * - bounded talent pipeline concurrency
  */
 
 const logger = require('../../../utils/logger');
@@ -21,8 +18,6 @@ const empRepo = require('../repositories/employer.repository');
 const { supabase } = require('../../../config/supabase');
 const matchingService = require('../../opportunities/services/studentMatching.service');
 
-// Cap concurrent talent pipeline stat fetches per employer request.
-// Adjust based on matchingService throughput limits.
 const PIPELINE_CONCURRENCY_LIMIT = 5;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -44,10 +39,7 @@ function notFound(message, code = 'NOT_FOUND') {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Concurrency limiter (inline, no external dependency required)
-// Replace with p-limit if already in your dependency tree:
-//   const pLimit = require('p-limit');
-//   const limit = pLimit(PIPELINE_CONCURRENCY_LIMIT);
+// Concurrency limiter
 // ─────────────────────────────────────────────────────────────────────────────
 
 function makeLimit(concurrency) {
@@ -56,13 +48,18 @@ function makeLimit(concurrency) {
 
   function next() {
     if (active >= concurrency || queue.length === 0) return;
+
     active++;
     const { fn, resolve, reject } = queue.shift();
+
     Promise.resolve()
       .then(() => fn())
-      .then(result => { resolve(result); })
-      .catch(err => { reject(err); })
-      .finally(() => { active--; next(); });
+      .then(resolve)
+      .catch(reject)
+      .finally(() => {
+        active--;
+        next();
+      });
   }
 
   return function limit(fn) {
@@ -78,46 +75,116 @@ function makeLimit(concurrency) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /**
- * Atomically create an employer and assign the creator as employer_admin.
- *
- * Delegates to the create_employer_with_admin DB RPC, which runs both
- * INSERTs in a single transaction — no orphan employer row is possible.
- *
- * @param {string} userId
- * @param {object} fields - { company_name, industry?, website? }
- * @returns {{ employer: object }}
+ * Normalize RPC payloads:
+ * - object
+ * - array row
+ * - scalar UUID
  */
-async function createEmployer(userId, fields = {}) {
-  if (!fields.company_name?.trim()) {
-    throw badRequest('company_name is required.', 'MISSING_COMPANY_NAME');
+function normalizeEmployerRpcResult(data) {
+  if (!data) return null;
+
+  if (Array.isArray(data)) {
+    return data[0] ?? null;
   }
 
-  const { data, error } = await supabase.rpc('create_employer_with_admin', {
-    p_user_id:      userId,
-    p_company_name: fields.company_name.trim(),
-    p_industry:     fields.industry?.trim?.() || null,
-    p_website:      fields.website?.trim?.() || null,
-  });
-
-  if (error) {
-    // Surface DB-level validation (ERRCODE P0001) as a 400
-    if (error.code === 'P0001') {
-      throw badRequest(error.message, 'MISSING_COMPANY_NAME');
-    }
-    logger.error(
-      { userId, message: error.message },
-      '[EmployerService] create_employer_with_admin RPC failed'
-    );
-    throw error;
+  if (typeof data === 'string') {
+    return { id: data };
   }
 
-  return { employer: data };
+  return data;
 }
 
 /**
- * List all employers the requesting user is a member of.
- * @param {string} userId
- * @returns {{ employers: object[] }}
+ * Atomically create employer + admin membership
+ */
+async function createEmployer(userId, fields = {}) {
+  const companyName = String(fields.company_name || '').trim();
+  const industry = fields.industry?.trim?.() || null;
+  const website = fields.website?.trim?.() || null;
+
+  if (!companyName) {
+    throw badRequest(
+      'company_name is required.',
+      'MISSING_COMPANY_NAME'
+    );
+  }
+
+  if (companyName.length > 160) {
+    throw badRequest(
+      'company_name exceeds maximum length.',
+      'INVALID_COMPANY_NAME'
+    );
+  }
+
+  if (website && website.length > 300) {
+    throw badRequest(
+      'website exceeds maximum length.',
+      'INVALID_WEBSITE'
+    );
+  }
+
+  const { data, error } = await supabase.rpc(
+    'create_employer_with_admin',
+    {
+      p_user_id: userId,
+      p_company_name: companyName,
+      p_industry: industry,
+      p_website: website,
+    }
+  );
+
+  if (error) {
+    if (error.code === 'P0001') {
+      throw badRequest(
+        error.message,
+        'EMPLOYER_VALIDATION_FAILED'
+      );
+    }
+
+    if (error.code === '23505') {
+      throw badRequest(
+        'Employer already exists.',
+        'EMPLOYER_ALREADY_EXISTS'
+      );
+    }
+
+    logger.error(
+      {
+        rpc: 'create_employer_with_admin',
+        userId,
+        companyName,
+        code: error.code,
+        message: error.message,
+        details: error.details,
+      },
+      '[EmployerService] RPC failed'
+    );
+
+    throw error;
+  }
+
+  const employer = normalizeEmployerRpcResult(data);
+
+  if (!employer) {
+    logger.error(
+      {
+        rpc: 'create_employer_with_admin',
+        userId,
+        companyName,
+      },
+      '[EmployerService] RPC returned empty payload'
+    );
+
+    throw new Error(
+      'Employer creation transaction returned empty result.'
+    );
+  }
+
+  return { employer };
+}
+
+/**
+ * List all employers the requesting user is a member of
  */
 async function getMyEmployers(userId) {
   const employers = await empRepo.getMyEmployers(userId);
@@ -125,15 +192,16 @@ async function getMyEmployers(userId) {
 }
 
 /**
- * Fetch a single employer by ID.
- * @param {string} employerId
- * @returns {{ employer: object }}
+ * Fetch single employer
  */
 async function getEmployer(employerId) {
   const employer = await empRepo.getEmployer(employerId);
 
   if (!employer) {
-    throw notFound('Employer not found.', 'EMPLOYER_NOT_FOUND');
+    throw notFound(
+      'Employer not found.',
+      'EMPLOYER_NOT_FOUND'
+    );
   }
 
   return { employer };
@@ -143,49 +211,33 @@ async function getEmployer(employerId) {
 // Job Role CRUD
 // ─────────────────────────────────────────────────────────────────────────────
 
-/**
- * Create a new job role for an employer.
- * @param {string} employerId
- * @param {object} fields
- * @returns {{ role: object }}
- */
 async function createJobRole(employerId, fields = {}) {
   if (!fields.role_name?.trim()) {
-    throw badRequest('role_name is required.', 'MISSING_ROLE_NAME');
+    throw badRequest(
+      'role_name is required.',
+      'MISSING_ROLE_NAME'
+    );
   }
 
   const role = await empRepo.createJobRole(employerId, {
-    role_name:       fields.role_name.trim(),
+    role_name: fields.role_name.trim(),
     required_skills: fields.required_skills ?? [],
-    salary_min:      fields.salary_min,
-    salary_max:      fields.salary_max,
-    currency:        fields.currency || 'USD',
-    streams:         fields.streams ?? [],
-    exp_min:         fields.exp_min,
-    exp_max:         fields.exp_max,
+    salary_min: fields.salary_min,
+    salary_max: fields.salary_max,
+    currency: fields.currency || 'USD',
+    streams: fields.streams ?? [],
+    exp_min: fields.exp_min,
+    exp_max: fields.exp_max,
   });
 
   return { role };
 }
 
-/**
- * List all active job roles for an employer.
- * @param {string} employerId
- * @returns {{ roles: object[] }}
- */
 async function listJobRoles(employerId) {
   const roles = await empRepo.listJobRoles(employerId);
   return { roles };
 }
 
-/**
- * Update a job role, scoped to the owning employer.
- * Ownership is verified before the update is applied.
- * @param {string} employerId
- * @param {string} roleId
- * @param {object} fields
- * @returns {{ role: object }}
- */
 async function updateJobRole(employerId, roleId, fields = {}) {
   const role = await empRepo.getJobRole(roleId);
 
@@ -200,13 +252,6 @@ async function updateJobRole(employerId, roleId, fields = {}) {
   return { role: updated };
 }
 
-/**
- * Soft-delete a job role by setting active = false.
- * Ownership is verified before deactivation.
- * @param {string} employerId
- * @param {string} roleId
- * @returns {{ deactivated: true }}
- */
 async function deactivateJobRole(employerId, roleId) {
   const role = await empRepo.getJobRole(roleId);
 
@@ -225,27 +270,16 @@ async function deactivateJobRole(employerId, roleId) {
 // Talent Pipeline Analytics
 // ─────────────────────────────────────────────────────────────────────────────
 
-/**
- * Aggregate talent pipeline stats across all active roles for an employer.
- *
- * Concurrent matchingService calls are capped at PIPELINE_CONCURRENCY_LIMIT
- * to prevent unbounded fan-out. Individual role failures are caught and
- * return zero-filled fallback stats so a single bad role does not block
- * the entire pipeline response.
- *
- * @param {string} employerId
- * @returns {object} Aggregated pipeline report.
- */
 async function getTalentPipeline(employerId) {
   const { roles } = await listJobRoles(employerId);
 
   if (!roles.length) {
     return {
-      employer_id:  employerId,
-      total_roles:  0,
+      employer_id: employerId,
+      total_roles: 0,
       total_talent: 0,
       skill_trends: [],
-      roles:        [],
+      roles: [],
     };
   }
 
@@ -255,32 +289,36 @@ async function getTalentPipeline(employerId) {
     roles.map(role =>
       limit(async () => {
         try {
-          const stats = await matchingService.getMatchedStudentsForJobRole(role.id);
+          const stats =
+            await matchingService.getMatchedStudentsForJobRole(role.id);
 
           return {
-            role_id:             role.id,
-            role_name:           role.role_name,
-            required_skills:     role.required_skills ?? [],
-            salary_range:        role.salary_range ?? {},
-            pipeline_count:      stats?.total_pipeline ?? 0,
-            avg_match_score:     stats?.avg_match_score ?? 0,
-            skill_gap:           (stats?.skill_gap_analysis ?? []).slice(0, 5),
+            role_id: role.id,
+            role_name: role.role_name,
+            required_skills: role.required_skills ?? [],
+            salary_range: role.salary_range ?? {},
+            pipeline_count: stats?.total_pipeline ?? 0,
+            avg_match_score: stats?.avg_match_score ?? 0,
+            skill_gap: (stats?.skill_gap_analysis ?? []).slice(0, 5),
             stream_distribution: stats?.stream_distribution ?? [],
           };
         } catch (err) {
           logger.warn(
-            { roleId: role.id, message: err?.message },
+            {
+              roleId: role.id,
+              message: err?.message,
+            },
             '[EmployerService] talent pipeline role stats failed'
           );
 
           return {
-            role_id:             role.id,
-            role_name:           role.role_name,
-            required_skills:     role.required_skills ?? [],
-            salary_range:        role.salary_range ?? {},
-            pipeline_count:      0,
-            avg_match_score:     0,
-            skill_gap:           [],
+            role_id: role.id,
+            role_name: role.role_name,
+            required_skills: role.required_skills ?? [],
+            salary_range: role.salary_range ?? {},
+            pipeline_count: 0,
+            avg_match_score: 0,
+            skill_gap: [],
             stream_distribution: [],
           };
         }
@@ -289,34 +327,37 @@ async function getTalentPipeline(employerId) {
   );
 
   const totalTalent = roleStats.reduce(
-    (sum, r) => sum + r.pipeline_count,
+    (sum, role) => sum + role.pipeline_count,
     0
   );
 
   const skillFrequency = {};
-  for (const r of roleStats) {
-    for (const skill of r.required_skills) {
-      skillFrequency[skill] = (skillFrequency[skill] || 0) + 1;
+
+  for (const role of roleStats) {
+    for (const skill of role.required_skills) {
+      skillFrequency[skill] =
+        (skillFrequency[skill] || 0) + 1;
     }
   }
 
   const skillTrends = Object.entries(skillFrequency)
     .sort((a, b) => b[1] - a[1])
     .slice(0, 10)
-    .map(([skill, demand_count]) => ({ skill, demand_count }));
+    .map(([skill, demand_count]) => ({
+      skill,
+      demand_count,
+    }));
 
   return {
-    employer_id:  employerId,
-    total_roles:  roles.length,
+    employer_id: employerId,
+    total_roles: roles.length,
     total_talent: totalTalent,
     skill_trends: skillTrends,
-    roles:        roleStats.sort((a, b) => b.pipeline_count - a.pipeline_count),
+    roles: roleStats.sort(
+      (a, b) => b.pipeline_count - a.pipeline_count
+    ),
   };
 }
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Exports
-// ─────────────────────────────────────────────────────────────────────────────
 
 module.exports = {
   createEmployer,

@@ -18,43 +18,90 @@ const marketTrendService = require('../../labor-market-intelligence/services/mar
 
 const ENGINE_VERSION = '1.4.0';
 
-/**
- * Logs non-fatal persistence failures without breaking the orchestration pipeline.
- *
- * @param {string} fn
- * @param {string} studentId
- * @param {Error | null} error
- */
+const ALLOWED_REPLACE_RPCS = new Set([
+  'replace_career_predictions',
+  'replace_education_roi',
+  'replace_career_simulations',
+]);
+
+function normalizeInsertedCount(data) {
+  if (data == null) return 0;
+  if (typeof data === 'number') return data;
+
+  const row = Array.isArray(data) ? data[0] : data;
+
+  return Number(
+    row?.inserted ??
+    row?.count ??
+    row?.rows_affected ??
+    0
+  );
+}
+
 function logNonFatalWrite(fn, studentId, error) {
   if (!error) return;
 
   logger.warn(
-    { fn, studentId, err: error.message },
+    {
+      fn,
+      studentId,
+      code: error.code,
+      details: error.details,
+      err: error.message,
+    },
     '[EduOrchestrator] Non-fatal persistence failure'
   );
 }
 
 /**
- * Atomic row replacement using PostgreSQL SECURITY DEFINER RPC.
- * Guarantees DELETE + INSERT happens transactionally.
- *
- * @param {string} fn
- * @param {string} studentId
- * @param {Array<object>} rows
- * @returns {Promise<number>}
+ * Strict dynamic RPC atomic row replacement
  */
-async function atomicReplace(fn, studentId, rows) {
+async function atomicReplace(fn, studentId, rows, { strict = true } = {}) {
+  if (!ALLOWED_REPLACE_RPCS.has(fn)) {
+    throw new Error(
+      `[EduOrchestrator] Disallowed RPC function: ${fn}`
+    );
+  }
+
+  const safeRows = Array.isArray(rows) ? rows : [];
+
   const { data, error } = await supabase.rpc(fn, {
     p_student_id: studentId,
-    p_rows: rows || [],
+    p_rows: safeRows,
   });
 
-  logNonFatalWrite(fn, studentId, error);
+  if (error) {
+    logger.error(
+      {
+        fn,
+        studentId,
+        strict,
+        rowCount: safeRows.length,
+        code: error.code,
+        details: error.details,
+        err: error.message,
+      },
+      '[EduOrchestrator] Atomic replacement failed'
+    );
 
-  const inserted = data ?? 0;
+    if (strict) {
+      throw error;
+    }
+
+    logNonFatalWrite(fn, studentId, error);
+    return 0;
+  }
+
+  const inserted = normalizeInsertedCount(data);
 
   logger.info(
-    { fn, studentId, inserted },
+    {
+      fn,
+      studentId,
+      strict,
+      inserted,
+      rowCount: safeRows.length,
+    },
     '[EduOrchestrator] Atomic replacement complete'
   );
 
@@ -67,9 +114,6 @@ async function run(studentId) {
   logger.info({ studentId }, '[EduOrchestrator] Pipeline started');
 
   try {
-    // ───────────────────────────────────────────────────────────────────────
-    // 1) Load all student inputs in parallel
-    // ───────────────────────────────────────────────────────────────────────
     const [student, academics, activities, cognitive] = await Promise.all([
       repository.getStudent(studentId),
       repository.getAcademicRecords(studentId),
@@ -99,9 +143,6 @@ async function run(studentId) {
       cognitive,
     };
 
-    // ───────────────────────────────────────────────────────────────────────
-    // 2–10) Intelligence engines
-    // ───────────────────────────────────────────────────────────────────────
     const academicResult = await AcademicTrendEngine.analyze(context);
     const cognitiveResult = await CognitiveProfileEngine.analyze(context);
     const activityResult = await ActivityAnalyzerEngine.analyze(context);
@@ -152,14 +193,12 @@ async function run(studentId) {
     };
 
     try {
-      skillResult = await skillEvolutionService.generateRecommendations(
-        studentId,
-        {
+      skillResult =
+        await skillEvolutionService.generateRecommendations(studentId, {
           careerResult,
           streamResult,
           cognitiveResult,
-        }
-      );
+        });
     } catch (error) {
       logger.warn(
         { studentId, err: error.message },
@@ -167,9 +206,6 @@ async function run(studentId) {
       );
     }
 
-    // ───────────────────────────────────────────────────────────────────────
-    // 11) Persist outputs in parallel using atomic SQL RPC
-    // ───────────────────────────────────────────────────────────────────────
     const streamWritePromise = supabase
       .from(TABLES.STREAM_SCORES)
       .upsert(
@@ -190,12 +226,12 @@ async function run(studentId) {
         { onConflict: 'student_id' }
       );
 
-    const careerRows = (careerResult.top_careers || []).map((item) => ({
+    const careerRows = (careerResult.top_careers || []).map(item => ({
       career_name: item.career,
       success_probability: item.probability,
     }));
 
-    const roiRows = (roiResult.education_options || []).map((option) => ({
+    const roiRows = (roiResult.education_options || []).map(option => ({
       education_path: option.path,
       duration_years: option.duration_years,
       estimated_cost: option.estimated_cost,
@@ -205,7 +241,7 @@ async function run(studentId) {
       matched_careers: option.matched_careers,
     }));
 
-    const simulationRows = (twinResult.simulations || []).map((sim) => ({
+    const simulationRows = (twinResult.simulations || []).map(sim => ({
       career_name: sim.career,
       probability: sim.probability,
       entry_salary: sim.entry_salary,

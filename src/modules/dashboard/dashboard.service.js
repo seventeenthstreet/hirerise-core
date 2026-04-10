@@ -3,14 +3,20 @@
 /**
  * src/modules/dashboard/dashboard.service.js
  *
- * Production-safe Supabase dashboard service
- * ✅ No duplicate declarations
+ * Wave 3 Priority #4.1 — CHI canonical repository unification
+ *
+ * Production-safe dashboard service
+ * ✅ CHI reads via canonical repository
  * ✅ Redis cache safe
- * ✅ Supabase snake_case aligned
+ * ✅ zero direct chi_snapshots access
+ * ✅ partition-ready
  */
 
 const { supabase } = require('../../config/supabase');
 const logger = require('../../utils/logger');
+const chiSnapshotRepository = require(
+  '../careerHealthIndex/chiSnapshot.repository'
+);
 
 const {
   CREDIT_COSTS,
@@ -112,22 +118,9 @@ async function invalidateDashboardCache(userId) {
 
 async function fetchLatestCHI(userId) {
   try {
-    const { data, error } = await supabase
-      .from('chi_snapshots')
-      .select(`
-        chi_score,
-        critical_gap,
-        current_estimated_salary_lpa,
-        next_level_estimated_salary_lpa,
-        dimensions,
-        created_at
-      `)
-      .eq('user_id', userId)
-      .order('created_at', { ascending: false })
-      .limit(1)
-      .maybeSingle();
+    const data = await chiSnapshotRepository.getLatest(userId);
 
-    if (error || !data) return null;
+    if (!data) return null;
 
     const currentSalary =
       data.current_estimated_salary_lpa ?? null;
@@ -135,10 +128,15 @@ async function fetchLatestCHI(userId) {
       data.next_level_estimated_salary_lpa ?? null;
 
     return {
-      chiScore: data.chi_score ?? null,
+      chiScore: data.chi_score ?? data.chiScore ?? null,
       skillCoverage:
-        data.dimensions?.skillVelocity?.score ?? null,
-      growthSummary: data.critical_gap ?? null,
+        data.dimensions?.skillVelocity?.score ??
+        data.skillCoverage ??
+        null,
+      growthSummary:
+        data.critical_gap ??
+        data.growthSummary ??
+        null,
       salaryPreview: currentSalary
         ? {
             min: Math.round(currentSalary * 0.9),

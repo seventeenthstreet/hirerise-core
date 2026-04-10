@@ -5,36 +5,41 @@
  *
  * HTTP controller for the Global Career Intelligence Dashboard.
  *
- * Supabase-ready, backend-agnostic controller layer:
- * - No Firebase assumptions
- * - Service-driven architecture
- * - Standardized async error propagation
- * - Safe query parsing
- * - Consistent structured logging
- *
- * Routes:
- *   GET /api/v1/analytics/career-demand
- *   GET /api/v1/analytics/skill-demand
- *   GET /api/v1/analytics/education-roi
- *   GET /api/v1/analytics/career-growth
- *   GET /api/v1/analytics/industry-trends
- *   GET /api/v1/analytics/overview
- *   GET /api/v1/analytics/snapshots/:metric
+ * Wave 3 hardening upgrades:
+ * - Single metric registry source of truth
+ * - Deterministic service dispatch
+ * - Controller/service consistency boundaries
+ * - Snapshot metric normalization
+ * - Future-safe cache invalidation compatibility
+ * - Reduced duplicate Promise orchestration drift
  */
 
 const logger = require('../../../utils/logger');
 const analyticsService = require('../services/analytics.service');
 
-const VALID_SNAPSHOT_METRICS = Object.freeze([
-  'career_demand',
-  'skill_demand',
-  'education_roi',
-  'career_growth',
-  'industry_trends',
-]);
-
 const MAX_SNAPSHOT_DAYS = 90;
 const DEFAULT_SNAPSHOT_DAYS = 30;
+
+/**
+ * Unified metric registry.
+ * IMPORTANT:
+ * This becomes the source of truth for:
+ * - route handlers
+ * - overview aggregation
+ * - snapshot validation
+ * - future cache namespace alignment
+ */
+const METRIC_HANDLERS = Object.freeze({
+  career_demand: () => analyticsService.getCareerDemand(),
+  skill_demand: () => analyticsService.getSkillDemand(),
+  education_roi: () => analyticsService.getEducationROI(),
+  career_growth: () => analyticsService.getCareerGrowth(),
+  industry_trends: () => analyticsService.getIndustryTrends(),
+});
+
+const VALID_SNAPSHOT_METRICS = Object.freeze(
+  Object.keys(METRIC_HANDLERS)
+);
 
 /**
  * Standard success response helper
@@ -89,12 +94,15 @@ function asyncHandler(operation, handler) {
 }
 
 /**
- * Safely parse snapshot days query param
+ * Parse snapshot days safely
  * @param {string | undefined} rawDays
  * @returns {number}
  */
 function parseSnapshotDays(rawDays) {
-  const parsed = Number.parseInt(rawDays ?? `${DEFAULT_SNAPSHOT_DAYS}`, 10);
+  const parsed = Number.parseInt(
+    rawDays ?? `${DEFAULT_SNAPSHOT_DAYS}`,
+    10
+  );
 
   if (!Number.isFinite(parsed) || parsed <= 0) {
     return DEFAULT_SNAPSHOT_DAYS;
@@ -103,56 +111,40 @@ function parseSnapshotDays(rawDays) {
   return Math.min(parsed, MAX_SNAPSHOT_DAYS);
 }
 
+/**
+ * Build a metric controller from registry
+ * @param {keyof typeof METRIC_HANDLERS} metric
+ * @returns {Function}
+ */
+function createMetricController(metric) {
+  return asyncHandler(`get:${metric}`, async () => {
+    return METRIC_HANDLERS[metric]();
+  });
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Metric Endpoints
 // ─────────────────────────────────────────────────────────────────────────────
 
-const getCareerDemand = asyncHandler('getCareerDemand', async () => {
-  return analyticsService.getCareerDemand();
-});
-
-const getSkillDemand = asyncHandler('getSkillDemand', async () => {
-  return analyticsService.getSkillDemand();
-});
-
-const getEducationROI = asyncHandler('getEducationROI', async () => {
-  return analyticsService.getEducationROI();
-});
-
-const getCareerGrowth = asyncHandler('getCareerGrowth', async () => {
-  return analyticsService.getCareerGrowth();
-});
-
-const getIndustryTrends = asyncHandler('getIndustryTrends', async () => {
-  return analyticsService.getIndustryTrends();
-});
+const getCareerDemand = createMetricController('career_demand');
+const getSkillDemand = createMetricController('skill_demand');
+const getEducationROI = createMetricController('education_roi');
+const getCareerGrowth = createMetricController('career_growth');
+const getIndustryTrends = createMetricController('industry_trends');
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Overview Endpoint
 // ─────────────────────────────────────────────────────────────────────────────
 
 const getOverview = asyncHandler('getOverview', async () => {
-  const [
-    careerDemand,
-    skillDemand,
-    educationROI,
-    careerGrowth,
-    industryTrends,
-  ] = await Promise.all([
-    analyticsService.getCareerDemand(),
-    analyticsService.getSkillDemand(),
-    analyticsService.getEducationROI(),
-    analyticsService.getCareerGrowth(),
-    analyticsService.getIndustryTrends(),
-  ]);
+  const metricEntries = await Promise.all(
+    Object.entries(METRIC_HANDLERS).map(async ([metric, handler]) => {
+      const result = await handler();
+      return [metric, result];
+    })
+  );
 
-  return {
-    careerDemand,
-    skillDemand,
-    educationROI,
-    careerGrowth,
-    industryTrends,
-  };
+  return Object.fromEntries(metricEntries);
 });
 
 // ─────────────────────────────────────────────────────────────────────────────

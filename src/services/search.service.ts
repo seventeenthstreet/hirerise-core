@@ -10,7 +10,6 @@ type SearchRolesResult = {
   [key: string]: unknown;
 };
 
-// Raw shape returned inside data.roles[] by the RPC
 type RpcRoleRow = {
   role_id: string;
   role_name: string;
@@ -21,7 +20,6 @@ type RpcRoleRow = {
   [key: string]: unknown;
 };
 
-// Envelope returned by search_roles_hybrid (RETURNS jsonb)
 type RpcEnvelope = {
   success: boolean;
   error?: string;
@@ -35,12 +33,52 @@ type RpcEnvelope = {
 };
 
 const DEFAULT_LIMIT = 20;
+const DEFAULT_THRESHOLD = 0.15;
+
+const DEFAULT_WEIGHTS = {
+  semantic: 0.7,
+  keyword: 0.3,
+} as const;
+
+const RPCS = Object.freeze({
+  SEARCH_ROLES_HYBRID: 'search_roles_hybrid',
+});
+
+function normalizeEnvelope(data: unknown): RpcEnvelope {
+  if (!data) {
+    return {
+      success: false,
+      error: 'Empty RPC response',
+      code: 'EMPTY_RESPONSE',
+    };
+  }
+
+  if (typeof data === 'string') {
+    try {
+      return JSON.parse(data) as RpcEnvelope;
+    } catch {
+      return {
+        success: false,
+        error: 'Invalid JSON RPC response',
+        code: 'INVALID_JSON',
+      };
+    }
+  }
+
+  if (typeof data === 'object') {
+    return data as RpcEnvelope;
+  }
+
+  return {
+    success: false,
+    error: 'Unexpected RPC response type',
+    code: 'INVALID_RESPONSE_TYPE',
+  };
+}
 
 /**
  * Hybrid semantic + keyword role search.
- * Calls search_roles_hybrid RPC which returns a jsonb envelope:
- *   { success, data: { roles: [...], total, query, returned } }
- * Remaps raw RPC columns → SearchRolesResult shape.
+ * Stable against SQL signature drift + malformed jsonb envelopes.
  */
 export async function searchRoles(
   query: string,
@@ -65,11 +103,16 @@ export async function searchRoles(
   const supabase = getSupabaseClient();
 
   try {
-    const { data, error } = await supabase.rpc('search_roles_hybrid', {
-      p_query: normalizedQuery,
-      p_agency: normalizedAgency,
-      p_limit: safeLimit,
-    });
+    const { data, error } = await supabase.rpc(
+      RPCS.SEARCH_ROLES_HYBRID,
+      {
+        p_query: normalizedQuery,
+        p_agency: normalizedAgency,
+        p_limit: safeLimit,
+        p_threshold: DEFAULT_THRESHOLD,
+        p_weights: DEFAULT_WEIGHTS,
+      }
+    );
 
     if (error) {
       throw new Error(
@@ -77,38 +120,40 @@ export async function searchRoles(
       );
     }
 
-    // RPC returns a single jsonb envelope, not a row array
-    const envelope = data as RpcEnvelope;
+    const envelope = normalizeEnvelope(data);
 
-    if (!envelope?.success) {
+    if (!envelope.success) {
       throw new Error(
-        `searchRoles RPC error: ${envelope?.error ?? 'Unknown error'} (${envelope?.code ?? 'NO_CODE'})`
+        `searchRoles RPC error: ${
+          envelope.error ?? 'Unknown error'
+        } (${envelope.code ?? 'NO_CODE'})`
       );
     }
 
-    const roles = envelope?.data?.roles;
+    const roles = envelope.data?.roles;
 
-    if (!Array.isArray(roles)) {
+    if (!Array.isArray(roles) || roles.length === 0) {
       return [];
     }
 
-    // Remap RPC column names → stable SearchRolesResult shape
-    return roles.map((row: RpcRoleRow): SearchRolesResult => ({
-      id: row.role_id,
-      title: row.role_name,
-      level: row.seniority_level ?? null,
-      score: row.rank_score ?? null,
-      keyword_score: row.fts_score ?? null,
-      semantic_score: row.sim_score ?? null,
-      // Preserve extra fields for forward compatibility
-      ...row,
-    }));
+    return roles.map(
+      (row: RpcRoleRow): SearchRolesResult => ({
+        ...row,
+        id: row.role_id,
+        title: row.role_name,
+        level: row.seniority_level ?? null,
+        score: row.rank_score ?? null,
+        keyword_score: row.fts_score ?? null,
+        semantic_score: row.sim_score ?? null,
+      })
+    );
   } catch (error) {
     console.error('search.service.searchRoles failed', {
-      query: normalizedQuery,
-      agency: normalizedAgency,
       limit: safeLimit,
-      error,
+      message:
+        error instanceof Error
+          ? error.message
+          : String(error),
     });
 
     throw error;

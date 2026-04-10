@@ -3,13 +3,7 @@
 /**
  * src/modules/conversion/repositiories/conversionHook.middleware.js
  *
- * NOTE:
- * Path retained exactly as existing project structure for safe production drop-in.
- * This file is logically a repository despite the legacy filename.
- *
- * Fully aligned with live Supabase schema:
- * - table PK: id TEXT
- * - RPC: increment_conversion_aggregate(text, text, int, int)
+ * Wave 1 hardened conversion event ingestion repository
  */
 
 const { supabase } = require('../../../config/supabase');
@@ -19,15 +13,28 @@ const {
   SCORE_VERSION,
 } = require('../utils/eventWeights.config');
 
+function normalizeRpcRow(data) {
+  if (!data) return null;
+
+  const row = Array.isArray(data) ? data[0] : data;
+
+  if (row?.row) return row.row;
+  if (typeof row !== 'object') return null;
+
+  return row;
+}
+
+function safeScore(value) {
+  const num = Number(value);
+  if (!Number.isFinite(num) || num < 0) return 0;
+  return num;
+}
+
 class ConversionAggregateRepository {
   constructor() {
     this.table = 'conversion_aggregates';
     this.incrementRpc = 'increment_conversion_aggregate';
   }
-
-  // ---------------------------------------------------------------------------
-  // Reads
-  // ---------------------------------------------------------------------------
 
   async getAggregate(userId) {
     try {
@@ -42,7 +49,6 @@ class ConversionAggregateRepository {
         .maybeSingle();
 
       if (error) throw error;
-
       return data ?? null;
     } catch (error) {
       logger.error('ConversionAggregateRepository.getAggregate failed', {
@@ -52,10 +58,6 @@ class ConversionAggregateRepository {
       throw error;
     }
   }
-
-  // ---------------------------------------------------------------------------
-  // Atomic Increment + Score Recompute
-  // ---------------------------------------------------------------------------
 
   async incrementAndUpdate(userId, eventType, computeScoresFn) {
     try {
@@ -71,8 +73,7 @@ class ConversionAggregateRepository {
         throw new Error('computeScoresFn must be a function');
       }
 
-      // 1) Atomic SQL-side increment via RPC
-      const { data: updatedRow, error: rpcError } = await supabase.rpc(
+      const { data: rpcData, error: rpcError } = await supabase.rpc(
         this.incrementRpc,
         {
           p_user_id: userId,
@@ -82,37 +83,43 @@ class ConversionAggregateRepository {
         }
       );
 
-      if (rpcError) throw rpcError;
-      if (!updatedRow) {
-        throw new Error('RPC increment returned no row');
+      if (rpcError) {
+        logger.error('increment_conversion_aggregate RPC failed', {
+          rpc: this.incrementRpc,
+          userId,
+          eventType,
+          code: rpcError.code,
+          details: rpcError.details,
+          error: rpcError.message,
+        });
+        throw rpcError;
       }
 
-      // 2) Preserve existing business scoring logic
+      const updatedRow = normalizeRpcRow(rpcData);
+
+      if (!updatedRow) {
+        throw new Error('RPC increment returned invalid row');
+      }
+
       const eventCounts = updatedRow.event_counts || {};
 
-      const {
-        engagementScore,
-        monetizationScore,
-        totalIntentScore,
-        isEngagementEvent,
-        isMonetizationEvent,
-      } = computeScoresFn(updatedRow, eventCounts);
+      const scores = computeScoresFn(updatedRow, eventCounts);
 
       const now = new Date().toISOString();
 
       const payload = {
-        engagement_score: engagementScore,
-        monetization_score: monetizationScore,
-        total_intent_score: totalIntentScore,
+        engagement_score: safeScore(scores.engagementScore),
+        monetization_score: safeScore(scores.monetizationScore),
+        total_intent_score: safeScore(scores.totalIntentScore),
         score_version: SCORE_VERSION,
         last_updated_at: now,
       };
 
-      if (isEngagementEvent) {
+      if (scores.isEngagementEvent) {
         payload.last_engagement_event_at = now;
       }
 
-      if (isMonetizationEvent) {
+      if (scores.isMonetizationEvent) {
         payload.last_monetization_event_at = now;
       }
 
@@ -128,22 +135,22 @@ class ConversionAggregateRepository {
       logger.debug('Conversion aggregate incremented successfully', {
         userId,
         eventType,
+        eventCounts,
       });
 
       return data;
     } catch (error) {
-      logger.error('ConversionAggregateRepository.incrementAndUpdate failed', {
-        userId,
-        eventType,
-        error: error.message,
-      });
+      logger.error(
+        'ConversionAggregateRepository.incrementAndUpdate failed',
+        {
+          userId,
+          eventType,
+          error: error.message,
+        }
+      );
       throw error;
     }
   }
-
-  // ---------------------------------------------------------------------------
-  // Manual Upsert
-  // ---------------------------------------------------------------------------
 
   async upsertAggregate(userId, aggregateData) {
     try {
@@ -168,10 +175,13 @@ class ConversionAggregateRepository {
 
       return data;
     } catch (error) {
-      logger.error('ConversionAggregateRepository.upsertAggregate failed', {
-        userId,
-        error: error.message,
-      });
+      logger.error(
+        'ConversionAggregateRepository.upsertAggregate failed',
+        {
+          userId,
+          error: error.message,
+        }
+      );
       throw error;
     }
   }

@@ -3,29 +3,64 @@
 /**
  * @file src/services/careerMatching.service.js
  * @description
+ * Wave 3 Priority #2 — Supabase RPC consolidation.
+ *
  * Production-safe CHI scoring + role matching service.
  *
- * Optimized for:
- * - snake_case Supabase schema
- * - stronger null safety
- * - deterministic ordering
- * - safer upserts
- * - reusable normalization helpers
- * - lower overfetch
- *
- * Schema fixes applied:
- * - domain_id resolved via cms_job_families (not directly on cms_roles)
- * - removed camelCase fallbacks — schema is fully snake_case
- * - market_demand, required_skills, experience_min/max now exist on cms_roles
+ * Verified production DB contract:
+ * - cms_roles.domain_id = text
+ * - cms_roles.job_family_id = text
+ * - chi_scores.user_id = text
+ * - chi_scores.role_id = text
+ * - upsert_chi_score write path uses uuid params
+ * - get_chi_score read path uses text params
  */
 
 const logger = require('../utils/logger');
 const careerGraph = require('../modules/careerGraph/CareerGraph');
 const { supabase } = require('../config/supabase');
 
+const RPC = Object.freeze({
+  LEARNING_PROGRESS: 'compute_learning_progress',
+  DOMAIN_FAMILY_IDS: 'resolve_family_ids_for_domain',
+  MATCH_CAREER_ROLES: 'match_career_roles',
+  UPSERT_CHI_SCORE: 'upsert_chi_score',
+  GET_CHI_SCORE: 'get_chi_score',
+});
+
 // ─────────────────────────────────────────────────────────────
-// Helpers
+// Shared helpers
 // ─────────────────────────────────────────────────────────────
+async function executeRpc(fn, params = {}, { allowFallback = false } = {}) {
+  const startedAt = Date.now();
+
+  try {
+    const { data, error } = await supabase.rpc(fn, params);
+
+    if (error) {
+      error.rpc = fn;
+      throw error;
+    }
+
+    logger.debug('[CareerMatching][RPC] success', {
+      rpc: fn,
+      latency_ms: Date.now() - startedAt,
+    });
+
+    return data;
+  } catch (error) {
+    logger.warn('[CareerMatching][RPC] failed', {
+      rpc: fn,
+      latency_ms: Date.now() - startedAt,
+      error: error?.message || 'Unknown RPC error',
+      fallback_enabled: allowFallback,
+    });
+
+    if (!allowFallback) throw error;
+    return null;
+  }
+}
+
 function normalizeSkills(skills) {
   return new Set(
     (Array.isArray(skills) ? skills : [])
@@ -51,70 +86,43 @@ async function computeLearningProgress(userId) {
   if (!safeUserId) return 0;
 
   try {
+    const rpcResult = await executeRpc(
+      RPC.LEARNING_PROGRESS,
+      { p_user_id: safeUserId },
+      { allowFallback: true }
+    );
+
+    if (rpcResult !== null && rpcResult !== undefined) {
+      return clamp(safeNumber(rpcResult, 0), 0, 100);
+    }
+
     const thirtyDaysAgo = new Date(
       Date.now() - 30 * 86400000
     ).toISOString();
 
+    const { data, error } = await supabase
+      .from('activity_events')
+      .select('event_type')
+      .eq('user_id', safeUserId)
+      .gte('created_at', thirtyDaysAgo)
+      .in('event_type', ['skill_added', 'course_started']);
+
+    if (error) throw error;
+
     let skillsAdded = 0;
     let coursesStarted = 0;
 
-    let from = 0;
-    const pageSize = 500;
-
-    while (true) {
-      const { data, error } = await supabase
-        .from('activity_events')
-        .select('event_type')
-        .eq('user_id', safeUserId)
-        .gte('created_at', thirtyDaysAgo)
-        .in('event_type', ['skill_added', 'course_started'])
-        .order('created_at', { ascending: false })
-        .range(from, from + pageSize - 1);
-
-      if (error) throw error;
-      if (!data?.length) break;
-
-      for (const row of data) {
-        if (row.event_type === 'skill_added') skillsAdded += 1;
-        else if (row.event_type === 'course_started') coursesStarted += 1;
-      }
-
-      if (data.length < pageSize) break;
-      from += pageSize;
+    for (const row of data || []) {
+      if (row.event_type === 'skill_added') skillsAdded += 1;
+      if (row.event_type === 'course_started') coursesStarted += 1;
     }
 
-    try {
-      const { data, error } = await supabase
-        .from('ava_memory')
-        .select('skills_added')
-        .eq('user_id', safeUserId)
-        .limit(1)
-        .maybeSingle();
-
-      if (!error && data) {
-        const weekly = safeNumber(data.skills_added, 0);
-        const estimatedMonthly = Math.round(weekly * 2);
-        skillsAdded += Math.round(estimatedMonthly * 0.5);
-      }
-    } catch (_) {
-      // intentionally non-blocking
-    }
-
-    const skillComponent = clamp(skillsAdded / 5, 0, 1) * 50;
-    const courseComponent = clamp(coursesStarted / 3, 0, 1) * 50;
-
-    const result = Math.round(
-      clamp(skillComponent + courseComponent, 0, 100)
+    const score = Math.round(
+      clamp(skillsAdded / 5, 0, 1) * 50 +
+      clamp(coursesStarted / 3, 0, 1) * 50
     );
 
-    logger.debug('[CareerMatching] Learning progress computed', {
-      user_id: safeUserId,
-      skills_added: skillsAdded,
-      courses_started: coursesStarted,
-      learning_progress: result,
-    });
-
-    return result;
+    return clamp(score, 0, 100);
   } catch (err) {
     logger.warn('[CareerMatching] computeLearningProgress failed', {
       user_id: safeUserId,
@@ -131,22 +139,21 @@ async function computeLearningProgress(userId) {
 function calculateRoleScore(profile = {}, role = {}, learningProgress = 0) {
   const profileSkills = normalizeSkills(profile.skills);
 
-  // Schema is fully snake_case — no camelCase fallbacks needed
   const requiredSkills = (
-    Array.isArray(role.required_skills) ? role.required_skills : []
+    Array.isArray(role.required_skills)
+      ? role.required_skills
+      : []
   )
     .map((s) => String(s).toLowerCase().trim())
     .filter(Boolean);
 
-  let skillMatch = 0;
+  const matched = requiredSkills.filter((s) =>
+    profileSkills.has(s)
+  ).length;
 
-  if (requiredSkills.length > 0) {
-    const matched = requiredSkills.filter((s) =>
-      profileSkills.has(s)
-    ).length;
-
-    skillMatch = Math.round((matched / requiredSkills.length) * 100);
-  }
+  const skillMatch = requiredSkills.length
+    ? Math.round((matched / requiredSkills.length) * 100)
+    : 0;
 
   const years = safeNumber(profile.experience_years, 0);
   const expMin = safeNumber(role.experience_min, 0);
@@ -162,15 +169,19 @@ function calculateRoleScore(profile = {}, role = {}, learningProgress = 0) {
     experienceFit = clamp(100 - (years - expMax) * 10, 0, 100);
   }
 
-  const rawDemand = safeNumber(role.market_demand, 5);
-  const marketDemand = clamp(Math.round((rawDemand / 10) * 100), 0, 100);
+  const marketDemand = clamp(
+    Math.round((safeNumber(role.market_demand, 5) / 10) * 100),
+    0,
+    100
+  );
+
   const safeLearning = clamp(learningProgress, 0, 100);
 
   const chiScore = Math.round(
     skillMatch * 0.4 +
-      experienceFit * 0.3 +
-      marketDemand * 0.2 +
-      safeLearning * 0.1
+    experienceFit * 0.3 +
+    marketDemand * 0.2 +
+    safeLearning * 0.1
   );
 
   return {
@@ -180,23 +191,36 @@ function calculateRoleScore(profile = {}, role = {}, learningProgress = 0) {
     learningProgress: safeLearning,
     chiScore,
     insights: {
-      missingSkills: requiredSkills.filter((s) => !profileSkills.has(s)),
+      missingSkills: requiredSkills.filter(
+        (s) => !profileSkills.has(s)
+      ),
       experienceGap: years < expMin ? expMin - years : 0,
     },
   };
 }
 
 // ─────────────────────────────────────────────────────────────
-// Domain → job family ID resolution
-// cms_roles has no domain_id column directly —
-// domain maps via cms_roles.job_family_id → cms_job_families.domain_id
+// Domain family resolution
 // ─────────────────────────────────────────────────────────────
 async function resolveFamilyIdsForDomain(domainId) {
+  if (!domainId) return null;
+
+  const rpcResult = await executeRpc(
+    RPC.DOMAIN_FAMILY_IDS,
+    {
+      p_domain_id: String(domainId),
+    },
+    { allowFallback: true }
+  );
+
+  if (Array.isArray(rpcResult)) return rpcResult;
+
   const { data, error } = await supabase
-    .from('cms_job_families')
-    .select('id')
-    .eq('domain_id', domainId)
-    .eq('soft_deleted', false);
+    .from('cms_roles')
+    .select('job_family_id')
+    .eq('domain_id', String(domainId))
+    .eq('soft_deleted', false)
+    .not('job_family_id', 'is', null);
 
   if (error) {
     logger.error('[CareerMatching] resolveFamilyIdsForDomain failed', {
@@ -206,7 +230,7 @@ async function resolveFamilyIdsForDomain(domainId) {
     return null;
   }
 
-  return (data ?? []).map((f) => f.id);
+  return [...new Set((data || []).map((r) => r.job_family_id))];
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -220,50 +244,43 @@ async function matchCareerRoles(profile = {}, domainId, { limit = 10 } = {}) {
       ? await computeLearningProgress(profile.userId)
       : 0;
 
-    // Resolve domainId → job_family_ids
-    // domain_id does not exist on cms_roles — must join via cms_job_families
-    let familyIds = null;
-    if (domainId) {
-      familyIds = await resolveFamilyIdsForDomain(domainId);
+    const rpcRows = await executeRpc(
+      RPC.MATCH_CAREER_ROLES,
+      {
+        p_domain_id: domainId ? String(domainId) : null,
+        p_limit: safeLimit,
+      },
+      { allowFallback: true }
+    );
 
-      if (!familyIds) {
-        // Resolution errored — fail gracefully
-        return [];
+    let roles = Array.isArray(rpcRows) ? rpcRows : null;
+
+    if (!roles) {
+      let query = supabase
+        .from('cms_roles')
+        .select(`
+          id,
+          name,
+          required_skills,
+          experience_min,
+          experience_max,
+          market_demand
+        `)
+        .eq('soft_deleted', false)
+        .eq('status', 'active')
+        .order('market_demand', { ascending: false });
+
+      if (domainId) {
+        query = query.eq('domain_id', String(domainId));
       }
 
-      if (!familyIds.length) {
-        // Valid domain but no families assigned — nothing to match
-        logger.debug('[CareerMatching] No job families found for domain', {
-          domain_id: domainId,
-        });
-        return [];
-      }
+      const { data, error } = await query;
+      if (error) throw error;
+
+      roles = data || [];
     }
 
-    let query = supabase
-      .from('cms_roles')
-      .select(`
-        id,
-        name,
-        required_skills,
-        experience_min,
-        experience_max,
-        market_demand
-      `)
-      .eq('soft_deleted', false)
-      .eq('status', 'active')
-      .order('market_demand', { ascending: false });
-
-    if (familyIds) {
-      query = query.in('job_family_id', familyIds);
-    }
-
-    const { data, error } = await query;
-    if (error) throw error;
-
-    const roles = Array.isArray(data) ? data : [];
-
-    const scored = roles
+    return roles
       .map((role) => ({
         role,
         scores: calculateRoleScore(profile, role, learningProgress),
@@ -274,8 +291,6 @@ async function matchCareerRoles(profile = {}, domainId, { limit = 10 } = {}) {
         ...item,
         rank: idx + 1,
       }));
-
-    return scored;
   } catch (err) {
     logger.error('[CareerMatchingService] matchCareerRoles failed', {
       error: err?.message || 'Unknown matching error',
@@ -290,10 +305,26 @@ async function matchCareerRoles(profile = {}, domainId, { limit = 10 } = {}) {
 // ─────────────────────────────────────────────────────────────
 async function saveChiScore(userId, roleId, breakdown) {
   try {
+    const rpcResult = await executeRpc(
+      RPC.UPSERT_CHI_SCORE,
+      {
+        p_user_id: userId, // keep raw UUID
+        p_role_id: roleId, // keep raw UUID
+        p_skill_match: breakdown.skillMatch,
+        p_experience_fit: breakdown.experienceFit,
+        p_market_demand: breakdown.marketDemand,
+        p_learning_progress: breakdown.learningProgress,
+        p_chi_score: breakdown.chiScore,
+      },
+      { allowFallback: true }
+    );
+
+    if (rpcResult?.id) return rpcResult;
+
     const payload = {
       id: `${userId}_${roleId}`,
-      user_id: userId,
-      role_id: roleId,
+      user_id: String(userId),
+      role_id: String(roleId),
       skill_match: breakdown.skillMatch,
       experience_fit: breakdown.experienceFit,
       market_demand: breakdown.marketDemand,
@@ -319,24 +350,26 @@ async function saveChiScore(userId, roleId, breakdown) {
 
 async function getChiScore(userId, roleId) {
   try {
+    const rpcResult = await executeRpc(
+      RPC.GET_CHI_SCORE,
+      {
+        p_user_id: String(userId),
+        p_role_id: String(roleId),
+      },
+      { allowFallback: true }
+    );
+
+    if (rpcResult) return rpcResult;
+
     const { data, error } = await supabase
       .from('chi_scores')
-      .select(`
-        id,
-        user_id,
-        role_id,
-        skill_match,
-        experience_fit,
-        market_demand,
-        learning_progress,
-        chi_score,
-        last_updated
-      `)
+      .select('*')
       .eq('id', `${userId}_${roleId}`)
       .maybeSingle();
 
     if (error) throw error;
-    return data ?? null;
+
+    return data || null;
   } catch (err) {
     logger.error('[CareerMatchingService] getChiScore failed', {
       error: err?.message || 'Unknown fetch error',

@@ -300,6 +300,15 @@ app.use(`${API_PREFIX}/job-seeker`, authenticate, require('./modules/jobSeeker/j
  *   GET  /api/v1/career/advice            → AI career advisor (grounded)
  *   GET  /api/v1/skills/learning-path     → AI-generated learning paths
  */
+/**
+ * Semantic AI — Skill Intelligence + Job Matching (mounted on API_PREFIX directly)
+ *   GET  /api/v1/skills/similar                    → semantically similar skills (cosine sim)
+ *   POST /api/v1/skills/embed                      → generate/store skill embedding
+ *   GET  /api/v1/job-seeker/jobs/semantic-match    → vector-based job matching
+ *   GET  /api/v1/career/advice                     → AI career advisor (grounded)
+ *   GET  /api/v1/skills/learning-path              → AI-generated learning paths
+ * Controlled by FEATURE_SEMANTIC_MATCHING=true env flag.
+ */
 app.use(API_PREFIX, authenticate, require('./routes/semantic.routes'));
 
 /**
@@ -307,6 +316,12 @@ app.use(API_PREFIX, authenticate, require('./routes/semantic.routes'));
  *   GET  /api/v1/career/opportunity-radar         → personalised emerging opportunities
  *   GET  /api/v1/career/emerging-roles            → public catalogue of emerging roles
  *   POST /api/v1/career/opportunity-radar/refresh → admin: refresh signals from LMI
+ */
+/**
+ * AI Career Opportunity Radar (mounted on API_PREFIX directly)
+ *   GET  /api/v1/career/opportunity-radar          → personalised emerging opportunities
+ *   GET  /api/v1/career/emerging-roles             → public catalogue of emerging roles
+ *   POST /api/v1/career/opportunity-radar/refresh  → admin: refresh signals from LMI
  */
 app.use(API_PREFIX, authenticate, require('./modules/opportunityRadar/opportunityRadar.routes'));
 
@@ -341,6 +356,13 @@ if (process.env.FEATURE_EVENT_BUS === 'true') {
  *   GET  /api/v1/career/personalized-recommendations   → personalized career list
  *   GET  /api/v1/user/personalization-profile          → current signal profile
  *   POST /api/v1/user/update-behavior-profile          → manual profile refresh
+ */
+/**
+ * AI Personalization Engine (mounted on API_PREFIX directly)
+ *   POST /api/v1/user/behavior-event                  → track user interaction
+ *   GET  /api/v1/career/personalized-recommendations  → personalized career list
+ *   GET  /api/v1/user/personalization-profile         → current signal profile
+ *   POST /api/v1/user/update-behavior-profile         → manual profile refresh
  */
 app.use(API_PREFIX, authenticate, require('./modules/personalization/personalization.routes'));
 
@@ -396,6 +418,7 @@ app.use(`${API_PREFIX}/market`, authenticate, require('./modules/labor-market-in
 
 /**
  * Global Career Intelligence Dashboard (GCID)
+ *   GET /api/v1/analytics/health           → analytics service liveness probe (auth required)
  *   GET /api/v1/analytics/career-demand    → Career Demand Index (ranked)
  *   GET /api/v1/analytics/skill-demand     → Skill Demand Index (ranked)
  *   GET /api/v1/analytics/education-roi    → Education ROI Index (ranked)

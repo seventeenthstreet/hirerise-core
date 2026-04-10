@@ -79,7 +79,10 @@ function success(res, data) {
 const calculate = asyncHandler(async (req, res) => {
   requireField(req.body, 'target_role');
 
-  const profile = extractProfile(req.body);
+  const profile = {
+    ...extractProfile(req.body),
+    _userId: req.user?.id ?? null, // passed to engine for chi_scores persistence
+  };
 
   logger.info('[CHI V2] Calculate requested', {
     target_role: profile.target_role

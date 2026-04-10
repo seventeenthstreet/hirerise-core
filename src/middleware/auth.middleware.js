@@ -144,7 +144,7 @@ async function resolvePlan(user) {
 
   const { data, error } = await getSupabaseAdmin()
     .from('users')
-    .select('plan, tier')
+    .select('tier')
     .eq('id', user.id)
     .maybeSingle();
 
@@ -156,7 +156,7 @@ async function resolvePlan(user) {
     return 'free';
   }
 
-  return data?.tier ?? data?.plan ?? 'free';
+  return data?.tier ?? 'free';
 }
 
 /**

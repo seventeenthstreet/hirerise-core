@@ -1,27 +1,18 @@
 'use strict';
 
 /**
- * BaseRepository — Supabase-native generic repository
+ * BaseRepository — production-hardened generic Supabase repository
  *
- * Supports:
- *  - CRUD operations
- *  - Soft delete (optional)
- *  - Automatic timestamps (optional)
- *  - Batch operations
- *  - SQL-style condition mapping
- *  - snake_case → camelCase normalization
+ * Wave 3 Priority #3:
+ * - runtime drift elimination
+ * - deterministic batch failure visibility
+ * - consistent soft-delete handling
  */
 
 const { supabase } = require('../../config/supabase');
 const logger = require('../logger');
 
 class BaseRepository {
-  /**
-   * @param {string} tableName
-   * @param {object} [options={}]
-   * @param {boolean} [options.hasSoftDelete=false]
-   * @param {boolean} [options.hasTimestamps=true]
-   */
   constructor(tableName, options = {}) {
     if (!tableName) {
       throw new Error('BaseRepository requires a table name');
@@ -31,10 +22,6 @@ class BaseRepository {
     this.hasSoftDelete = options.hasSoftDelete ?? false;
     this.hasTimestamps = options.hasTimestamps ?? true;
   }
-
-  // ───────────────────────────────────────────────────────────
-  // Helpers
-  // ───────────────────────────────────────────────────────────
 
   get serverTimestamp() {
     return new Date().toISOString();
@@ -50,18 +37,12 @@ class BaseRepository {
     return query;
   }
 
-  // ───────────────────────────────────────────────────────────
-  // Read
-  // ───────────────────────────────────────────────────────────
-
   async findById(id) {
     if (!id) return null;
 
-    const { data, error } = await supabase
-      .from(this.table)
-      .select('*')
-      .eq('id', id)
-      .maybeSingle();
+    let query = this._baseQuery().eq('id', id);
+
+    const { data, error } = await query.maybeSingle();
 
     if (error) {
       logger.error(
@@ -71,10 +52,7 @@ class BaseRepository {
       throw new Error(`DB error in findById [${this.table}]`);
     }
 
-    if (!data) return null;
-    if (this.hasSoftDelete && data.deleted_at) return null;
-
-    return this._normalize(data);
+    return data ? this._normalize(data) : null;
   }
 
   async findOneWhere(conditions = []) {
@@ -124,10 +102,6 @@ class BaseRepository {
 
     return (data ?? []).map((row) => this._normalize(row));
   }
-
-  // ───────────────────────────────────────────────────────────
-  // Write
-  // ───────────────────────────────────────────────────────────
 
   async create(id, data) {
     const now = this.serverTimestamp;
@@ -246,35 +220,26 @@ class BaseRepository {
   }
 
   async exists(id) {
-    const { data, error } = await supabase
-      .from(this.table)
-      .select('id, deleted_at')
-      .eq('id', id)
-      .maybeSingle();
-
-    if (error || !data) return false;
-    if (this.hasSoftDelete && data.deleted_at) return false;
-
-    return true;
+    return Boolean(await this.findById(id));
   }
 
   async batchWrite(operations = []) {
     const chunks = this._chunk(operations, 100);
 
     for (const chunk of chunks) {
-      await Promise.all(
-        chunk.map((op) => {
+      const results = await Promise.allSettled(
+        chunk.map(async (op) => {
+          let response;
+
           if (op.type === 'set') {
-            return supabase
+            response = await supabase
               .from(this.table)
               .upsert(
                 { ...op.data, id: op.id },
                 { onConflict: 'id' }
               );
-          }
-
-          if (op.type === 'update') {
-            return supabase
+          } else if (op.type === 'update') {
+            response = await supabase
               .from(this.table)
               .update({
                 ...op.data,
@@ -283,32 +248,44 @@ class BaseRepository {
                 }),
               })
               .eq('id', op.id);
-          }
-
-          if (op.type === 'delete') {
+          } else if (op.type === 'delete') {
             if (!this.hasSoftDelete) {
               throw new Error(
                 `Soft delete not enabled for ${this.table}`
               );
             }
 
-            return supabase
+            response = await supabase
               .from(this.table)
               .update({
                 deleted_at: this.serverTimestamp,
               })
               .eq('id', op.id);
+          } else {
+            throw new Error(`Unknown batch op type: ${op.type}`);
           }
 
-          throw new Error(`Unknown batch op type: ${op.type}`);
+          if (response?.error) {
+            throw new Error(response.error.message);
+          }
         })
       );
+
+      const rejected = results.find(
+        (r) => r.status === 'rejected'
+      );
+
+      if (rejected) {
+        logger.error('[BaseRepository] batchWrite failed', {
+          table: this.table,
+          chunk_size: chunk.length,
+          error: rejected.reason?.message,
+        });
+
+        throw rejected.reason;
+      }
     }
   }
-
-  // ───────────────────────────────────────────────────────────
-  // Internal helpers
-  // ───────────────────────────────────────────────────────────
 
   _applyCondition(query, field, op, value) {
     switch (op) {

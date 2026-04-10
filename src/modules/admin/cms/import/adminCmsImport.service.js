@@ -1,16 +1,13 @@
 'use strict';
 
 /**
- * adminCmsImport.service.js (Supabase RPC - Production Grade)
- *
- * Uses:
- *   bulk_import_dataset RPC
- *
- * Features:
- *   - Correct parameter mapping
- *   - Structured response
- *   - Safe error handling
- *   - Clean logging
+ * File: src/modules/admin/cms/import/adminCmsImport.service.js
+ * Production Ready:
+ * - Supabase RPC bulk import
+ * - strict dataset validation
+ * - row sanitization
+ * - canonical + backward-compatible result normalization
+ * - safe structured logging
  */
 
 const { supabase } = require('../../../../config/supabase');
@@ -46,10 +43,6 @@ async function processImport({
   const startTime = Date.now();
 
   try {
-    // ───────────────────────────────────────────
-    // 🔐 VALIDATION
-    // ───────────────────────────────────────────
-
     if (!adminId) {
       throw new AppError(
         'Unauthorized',
@@ -79,6 +72,10 @@ async function processImport({
 
     if (rows.length === 0) {
       return {
+        rows_processed: 0,
+        rows_imported: 0,
+        rows_skipped: 0,
+        rows_failed: 0,
         total: 0,
         inserted: 0,
         skipped: 0,
@@ -96,10 +93,6 @@ async function processImport({
         ErrorCodes.VALIDATION_ERROR
       );
     }
-
-    // ───────────────────────────────────────────
-    // 🔒 SANITIZE INPUT
-    // ───────────────────────────────────────────
 
     const sanitizedRows = rows.map((row, index) => {
       if (!row || typeof row !== 'object') {
@@ -125,10 +118,6 @@ async function processImport({
       };
     });
 
-    // ───────────────────────────────────────────
-    // 🚀 RPC CALL
-    // ───────────────────────────────────────────
-
     const { data, error } = await supabase.rpc('bulk_import_dataset', {
       p_dataset: datasetType,
       p_rows: sanitizedRows,
@@ -151,36 +140,37 @@ async function processImport({
       );
     }
 
-    // ───────────────────────────────────────────
-    // 📊 NORMALIZE RESPONSE
-    // ───────────────────────────────────────────
+    const errors = data?.errors ?? [];
+    const duplicates = data?.duplicates ?? [];
 
     const result = {
-      total: data?.total || 0,
-      inserted: data?.inserted || 0,
-      skipped: data?.skipped || 0,
-      duplicates: data?.duplicates || [],
-      errors: data?.errors || [],
-      insertedIds: data?.insertedIds || [],
-    };
+      // canonical fields
+      rows_processed: data?.total ?? 0,
+      rows_imported: data?.inserted ?? 0,
+      rows_skipped: data?.skipped ?? 0,
+      rows_failed: Array.isArray(errors) ? errors.length : 0,
 
-    // ───────────────────────────────────────────
-    // 📈 LOGGING
-    // ───────────────────────────────────────────
+      // backward compatibility
+      total: data?.total ?? 0,
+      inserted: data?.inserted ?? 0,
+      skipped: data?.skipped ?? 0,
+      duplicates,
+      errors,
+      insertedIds: data?.insertedIds ?? [],
+    };
 
     logger.info('[IMPORT SUCCESS]', {
       requestId,
       datasetType,
-      total: result.total,
-      inserted: result.inserted,
-      skipped: result.skipped,
-      duplicateCount: result.duplicates.length,
-      errorCount: result.errors.length,
+      rows_processed: result.rows_processed,
+      rows_imported: result.rows_imported,
+      rows_skipped: result.rows_skipped,
+      rows_failed: result.rows_failed,
+      duplicateCount: duplicates.length,
       durationMs: Date.now() - startTime,
     });
 
     return result;
-
   } catch (err) {
     logger.error('[IMPORT FAILED]', {
       requestId,
@@ -205,9 +195,9 @@ async function importSkills(skills, adminId, agency = null) {
   });
 
   return {
-    insertedCount: result.inserted,
-    duplicateCount: result.skipped,
-    errorCount: result.errors.length,
+    insertedCount: result.rows_imported,
+    duplicateCount: result.rows_skipped,
+    errorCount: result.rows_failed,
     errors: result.errors,
   };
 }

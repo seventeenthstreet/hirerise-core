@@ -7,13 +7,12 @@ const {
   ensureUserSeeded,
   syncProfileDisplayFields,
 } = require('../user/user.registration.service');
+const chiSnapshotRepository = require(
+  '../careerHealthIndex/chiSnapshot.repository'
+);
 const logger = require('../../utils/logger');
 
 const router = express.Router();
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Cache Keys / TTL
-// ─────────────────────────────────────────────────────────────────────────────
 
 const CACHE_KEYS = Object.freeze({
   userProfile: userId => `profile:${userId}`,
@@ -24,10 +23,6 @@ const CACHE_TTL = Object.freeze({
   userProfile: 5 * 60,
   chiLatest: 10 * 60,
 });
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Internal helpers
-// ─────────────────────────────────────────────────────────────────────────────
 
 function getRedisClient() {
   try {
@@ -53,15 +48,13 @@ async function warmProfileCache(userId, redis) {
   try {
     const { data, error } = await supabase
       .from('user_profiles')
-      .select(
-        `
-          id,
-          display_name,
-          photo_url,
-          onboarding_completed,
-          updated_at
-        `
-      )
+      .select(`
+        id,
+        display_name,
+        photo_url,
+        onboarding_completed,
+        updated_at
+      `)
       .eq('id', userId)
       .maybeSingle();
 
@@ -83,8 +76,9 @@ async function warmProfileCache(userId, redis) {
 
 async function warmChiLatestCache(userId, redis) {
   try {
-    const chiRepo = require('../careerHealthIndex/chiSnapshot.repository');
-    const latest = await chiRepo.getLatest(userId);
+    const latest =
+      await chiSnapshotRepository.getLatest(userId);
+
     if (!latest) return;
 
     await redis.set(
@@ -104,15 +98,13 @@ async function warmChiLatestCache(userId, redis) {
 async function fetchUserProfile(userId) {
   const { data, error } = await supabase
     .from('user_profiles')
-    .select(
-      `
-        id,
-        display_name,
-        photo_url,
-        onboarding_completed,
-        onboardingCompleted
-      `
-    )
+    .select(`
+      id,
+      display_name,
+      photo_url,
+      onboarding_completed,
+      onboardingCompleted
+    `)
     .eq('id', userId)
     .maybeSingle();
 
@@ -126,10 +118,6 @@ async function fetchUserProfile(userId) {
 
   return data;
 }
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Route
-// ─────────────────────────────────────────────────────────────────────────────
 
 router.get('/', async (req, res, next) => {
   try {
@@ -145,7 +133,6 @@ router.get('/', async (req, res, next) => {
     const tier = normalizeTier(req.user?.plan);
     req.user.normalizedTier = tier;
 
-    // Safe seed for Supabase-only architecture
     try {
       await ensureUserSeeded(userId, req.user);
     } catch (err) {
@@ -165,12 +152,16 @@ router.get('/', async (req, res, next) => {
         profile.onboardingComplete === true ||
         profile.onboardingCompleted === true;
 
-      // Non-blocking profile sync
       Promise.resolve(
         syncProfileDisplayFields(userId, req.user, {
           displayName:
-            profile.display_name ?? profile.displayName ?? null,
-          photoURL: profile.photo_url ?? profile.photoURL ?? null,
+            profile.display_name ??
+            profile.displayName ??
+            null,
+          photoURL:
+            profile.photo_url ??
+            profile.photoURL ??
+            null,
         })
       ).catch(err => {
         logger.debug('[AppEntry] Display sync skipped', {
@@ -179,7 +170,6 @@ router.get('/', async (req, res, next) => {
         });
       });
 
-      // Non-blocking cache warm
       warmUserCache(userId).catch(() => {});
     } catch (err) {
       logger.warn('[AppEntry] Profile fetch failed', {

@@ -1,92 +1,200 @@
 'use strict';
 
-/**
- * dailyMetrics.job.js (PRODUCTION READY)
- *
- * - Uses DB-side aggregation (fast, scalable)
- * - Idempotent (safe to rerun)
- * - Minimal memory usage
- */
-
 const { supabase } = require('../config/supabase');
+const logger = require('../utils/logger');
 
-// ─────────────────────────────────────────────
-// 🔹 MAIN
-// ─────────────────────────────────────────────
+const AGGREGATE_RPC = 'aggregate_daily_metrics';
+const SNAPSHOT_TABLE = 'metrics_daily_snapshots';
+
+function normalizeAggregationResult(agg) {
+  if (!agg) return null;
+  if (Array.isArray(agg)) return normalizeAggregationResult(agg[0]);
+  if (typeof agg !== 'object') return null;
+
+  return {
+    active_users: safeNumber(agg.active_users, 0),
+    total_requests: safeNumber(agg.total_requests, 0),
+    total_tokens: safeNumber(agg.total_tokens, 0),
+    total_cost_usd: safeNumber(agg.total_cost_usd, 0),
+    total_revenue_usd: safeNumber(agg.total_revenue_usd, 0),
+    gross_margin_usd: safeNumber(agg.gross_margin_usd, 0),
+    gross_margin_percent: safeNumber(agg.gross_margin_percent, 0),
+    free_tier_cost_usd: safeNumber(agg.free_tier_cost_usd, 0),
+    paid_tier_cost_usd: safeNumber(agg.paid_tier_cost_usd, 0),
+    paid_user_count: safeNumber(agg.paid_user_count, 0),
+    feature_counts:
+      agg.feature_counts && typeof agg.feature_counts === 'object'
+        ? agg.feature_counts
+        : {},
+  };
+}
 
 async function runDailyAggregation(date = null) {
+  const targetDate = safeDate(date);
+
   try {
-    const targetDate = date || new Date();
-    const dateStr = targetDate.toISOString().split('T')[0];
+    const startDate = new Date(
+      Date.UTC(
+        targetDate.getUTCFullYear(),
+        targetDate.getUTCMonth(),
+        targetDate.getUTCDate(),
+        0,
+        0,
+        0,
+        0
+      )
+    );
 
-    const start = `${dateStr}T00:00:00.000Z`;
-    const end   = `${dateStr}T23:59:59.999Z`;
+    const endDate = new Date(startDate);
+    endDate.setUTCDate(endDate.getUTCDate() + 1);
 
-    console.log('[Aggregation] Running for:', dateStr);
+    const dateStr = startDate.toISOString().split('T')[0];
 
-    // ─────────────────────────────────────────
-    // 1. AGGREGATE (DB SIDE)
-    // ─────────────────────────────────────────
+    logger.info('[Aggregation] Running', { date: dateStr });
 
-    const { data: agg, error } = await supabase.rpc('aggregate_daily_metrics', {
-      start_date: start,
-      end_date: end
-    });
+    const result = await getAggregatedMetrics(startDate, endDate);
 
-    if (error) throw error;
-
-    if (!agg || agg.length === 0) {
-      console.log('[Aggregation] No data found:', dateStr);
-      return;
+    if (!result) {
+      logger.info('[Aggregation] No data found', { date: dateStr });
+      return {
+        date: dateStr,
+        updated: false,
+        reason: 'no_data',
+      };
     }
 
-    const result = agg[0];
-
-    // ─────────────────────────────────────────
-    // 2. TOTAL USERS
-    // ─────────────────────────────────────────
-
-    const { count: total_users, error: userErr } = await supabase
-      .from('users')
-      .select('*', { count: 'exact', head: true });
-
-    if (userErr) throw userErr;
-
-    // ─────────────────────────────────────────
-    // 3. UPSERT SNAPSHOT
-    // ─────────────────────────────────────────
+    const totalUsers = await getTotalUsersCount();
 
     const payload = {
       date: dateStr,
-      total_users: total_users || 0,
-      active_users: result.active_users || 0,
-      total_requests: result.total_requests || 0,
-      total_tokens: result.total_tokens || 0,
-      total_cost_usd: result.total_cost_usd || 0,
-      total_revenue_usd: result.total_revenue_usd || 0,
-      gross_margin_usd: result.gross_margin_usd || 0,
-      gross_margin_percent: result.gross_margin_percent || 0,
-      free_tier_cost_usd: result.free_tier_cost_usd || 0,
-      paid_tier_cost_usd: result.paid_tier_cost_usd || 0,
-      paid_user_count: result.paid_user_count || 0,
-      feature_counts: result.feature_counts || {},
-      updated_at: new Date().toISOString()
+      total_users: totalUsers,
+      ...result,
+      updated_at: new Date().toISOString(),
     };
 
     const { error: upsertError } = await supabase
-      .from('metrics_daily_snapshots')
+      .from(SNAPSHOT_TABLE)
       .upsert(payload, { onConflict: 'date' });
 
     if (upsertError) throw upsertError;
 
-    console.log('[Aggregation] Success:', dateStr);
+    logger.info('[Aggregation] Success', { date: dateStr });
 
+    return {
+      date: dateStr,
+      updated: true,
+      snapshot: payload,
+    };
   } catch (err) {
-    console.error('[Aggregation] FAILED:', err.message);
+    logger.error('[Aggregation] FAILED', {
+      rpc: AGGREGATE_RPC,
+      error: err.message,
+      code: err.code,
+    });
     throw err;
   }
 }
 
+async function getAggregatedMetrics(startDate, endDate) {
+  try {
+    const { data, error } = await supabase.rpc(AGGREGATE_RPC, {
+      start_date: startDate.toISOString(),
+      end_date: endDate.toISOString(),
+    });
+
+    if (error) throw error;
+    return normalizeAggregationResult(data);
+  } catch (err) {
+    if (isRpcDrift(err)) {
+      logger.warn('[Aggregation] RPC drift fallback', {
+        rpc: AGGREGATE_RPC,
+        code: err.code,
+        error: err.message,
+      });
+
+      return fallbackAggregateFromLogs(startDate, endDate);
+    }
+
+    throw err;
+  }
+}
+
+async function fallbackAggregateFromLogs(startDate, endDate) {
+  const { data, error } = await supabase
+    .from('ai_logs')
+    .select('user_id, total_tokens, total_cost_usd, feature')
+    .gte('created_at', startDate.toISOString())
+    .lt('created_at', endDate.toISOString())
+    .eq('is_deleted', false);
+
+  if (error) throw error;
+
+  const rows = data || [];
+  if (!rows.length) return null;
+
+  const activeUsers = new Set();
+  const featureCounts = {};
+
+  let totalRequests = 0;
+  let totalTokens = 0;
+  let totalCost = 0;
+
+  for (const row of rows) {
+    totalRequests += 1;
+    totalTokens += safeNumber(row.total_tokens, 0);
+    totalCost += safeNumber(row.total_cost_usd, 0);
+
+    if (row.user_id) activeUsers.add(row.user_id);
+    if (row.feature) {
+      featureCounts[row.feature] =
+        safeNumber(featureCounts[row.feature], 0) + 1;
+    }
+  }
+
+  return normalizeAggregationResult({
+    active_users: activeUsers.size,
+    total_requests: totalRequests,
+    total_tokens: totalTokens,
+    total_cost_usd: totalCost,
+    total_revenue_usd: 0,
+    gross_margin_usd: 0,
+    gross_margin_percent: 0,
+    free_tier_cost_usd: totalCost,
+    paid_tier_cost_usd: 0,
+    paid_user_count: 0,
+    feature_counts: featureCounts,
+  });
+}
+
+async function getTotalUsersCount() {
+  const { count, error } = await supabase
+    .from('users')
+    .select('*', { count: 'exact', head: true });
+
+  if (error) throw error;
+  return safeNumber(count, 0);
+}
+
+function safeNumber(value, fallback) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+function safeDate(value) {
+  const parsed = value ? new Date(value) : new Date();
+  return Number.isNaN(parsed.getTime()) ? new Date() : parsed;
+}
+
+function isRpcDrift(error) {
+  const msg = String(error?.message || '').toLowerCase();
+  return (
+    error?.code === '42883' ||
+    msg.includes('function') ||
+    msg.includes('does not exist') ||
+    msg.includes('schema cache')
+  );
+}
+
 module.exports = {
-  runDailyAggregation
+  runDailyAggregation,
 };

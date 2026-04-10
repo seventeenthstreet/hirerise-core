@@ -148,7 +148,16 @@ async function activateSubscription({
     throw error;
   }
 
-  const result = data?.[0];
+  const result = Array.isArray(data) ? data[0] : data;
+
+  if (!result?.out_user_id) {
+    throw new AppError(
+      'Subscription activation returned invalid payload',
+      500,
+      { userId, subscriptionId },
+      ErrorCodes.INTERNAL_ERROR
+    );
+  }
 
   return {
     skipped: false,

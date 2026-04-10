@@ -3,8 +3,13 @@
 /**
  * routes/skills-priority.routes.js
  *
+ * Wave 3 Priority #4.1 — CHI canonical repository unification
+ *
  * Skill Prioritization Intelligence API
- * Fully optimized for Supabase production workloads
+ * ✅ no direct chi_snapshots access
+ * ✅ canonical repository read path
+ * ✅ Supabase production optimized
+ * ✅ partition-ready
  */
 
 const express = require('express');
@@ -17,6 +22,9 @@ const supabase = require('../lib/supabaseClient');
 const cacheManager = require('../core/cache/cache.manager');
 const logger = require('../utils/logger');
 const engine = require('../modules/skill-prioritization');
+const chiSnapshotRepository = require(
+  '../modules/careerHealthIndex/chiSnapshot.repository'
+);
 
 const router = express.Router();
 
@@ -24,9 +32,6 @@ const cache = cacheManager.getClient();
 const CACHE_TTL_SECONDS = 1800;
 const DEFAULT_PROFICIENCY = 50;
 
-/**
- * Auth-provider agnostic user ID extraction
- */
 function getUserId(req) {
   const userId =
     req.user?.id ||
@@ -39,7 +44,7 @@ function getUserId(req) {
       'Unauthenticated',
       401,
       {},
-      ErrorCodes.UNAUTHORIZED,
+      ErrorCodes.UNAUTHORIZED
     );
   }
 
@@ -89,7 +94,8 @@ function buildMergedSkills(profileSkills, chiTopSkills) {
     merged.push({
       skillId: createSkillId(name),
       skillName: name,
-      proficiencyLevel: fromProfile?.proficiency || DEFAULT_PROFICIENCY,
+      proficiencyLevel:
+        fromProfile?.proficiency || DEFAULT_PROFICIENCY,
     });
 
     seen.add(key);
@@ -108,9 +114,17 @@ function buildMergedSkills(profileSkills, chiTopSkills) {
   return merged;
 }
 
-// ─────────────────────────────────────────────────────────────
-// GET /priority
-// ─────────────────────────────────────────────────────────────
+function normalizeChiData(snapshot) {
+  if (!snapshot) return {};
+
+  return (
+    snapshot.data ||
+    snapshot.breakdown ||
+    snapshot.dimensions ||
+    snapshot
+  );
+}
+
 router.get(
   '/priority',
   validate([
@@ -124,7 +138,6 @@ router.get(
     const forceRefresh = req.query.refresh === 'true';
     const cacheKey = `skill-priority:user:${userId}`;
 
-    // 1) Cache
     if (!forceRefresh) {
       try {
         const hit = await cache.get(cacheKey);
@@ -146,13 +159,12 @@ router.get(
       }
     }
 
-    // 2) Load only required columns (major Supabase perf win)
-    const [profileResult, progressResult, userResult, chiResult] =
+    const [profileResult, progressResult, userResult, chiSnapshot] =
       await Promise.all([
         supabase
           .from('user_profiles')
           .select(
-            'skills,target_role,current_job_title,current_role,experience_years,years_experience,resume_score,plan,is_premium',
+            'skills,target_role,current_job_title,current_role,experience_years,years_experience,resume_score,plan,is_premium'
           )
           .eq('user_id', userId)
           .maybeSingle(),
@@ -166,27 +178,18 @@ router.get(
         supabase
           .from('users')
           .select(
-            'skills,current_job_title,experience,experience_years',
+            'skills,current_job_title,experience,experience_years'
           )
           .eq('id', userId)
           .maybeSingle(),
 
-        supabase
-          .from('chi_snapshots')
-          .select(
-            'data,generated_at',
-          )
-          .eq('user_id', userId)
-          .eq('soft_deleted', false)
-          .order('generated_at', { ascending: false })
-          .limit(1)
-          .maybeSingle(),
+        chiSnapshotRepository.getLatest(userId),
       ]);
 
     const profile = profileResult.data || {};
     const progress = progressResult.data || {};
     const user = userResult.data || {};
-    const chiData = chiResult.data?.data || {};
+    const chiData = normalizeChiData(chiSnapshot);
 
     const rawProfileSkills =
       Array.isArray(profile.skills) && profile.skills.length
@@ -199,11 +202,13 @@ router.get(
 
     const chiTopSkills = Array.isArray(chiData.topSkills)
       ? chiData.topSkills
-      : [];
+      : Array.isArray(chiData.top_skills)
+        ? chiData.top_skills
+        : [];
 
     const mergedSkills = buildMergedSkills(
       rawProfileSkills,
-      chiTopSkills,
+      chiTopSkills
     );
 
     const targetRole =
@@ -212,6 +217,8 @@ router.get(
       progress.target_role ||
       chiData.detectedProfession ||
       chiData.currentJobTitle ||
+      chiData.detected_profession ||
+      chiData.current_job_title ||
       null;
 
     if (!targetRole) {
@@ -243,13 +250,15 @@ router.get(
         profile.experience_years ||
           profile.years_experience ||
           chiData.estimatedExperienceYears ||
-          0,
+          chiData.estimated_experience_years ||
+          0
       ),
       resumeScore: Number(
         profile.resume_score ||
           chiData.dimensions?.skillVelocity?.score ||
           chiData.chiScore ||
-          50,
+          chiData.chi_score ||
+          50
       ),
       skills: mergedSkills,
     };
@@ -266,12 +275,11 @@ router.get(
 
     const result = await engine.run(input, { isPremium });
 
-    // 3) Cache write
     try {
       await cache.set(
         cacheKey,
         JSON.stringify(result),
-        CACHE_TTL_SECONDS,
+        CACHE_TTL_SECONDS
       );
     } catch (error) {
       logger.warn('[SkillPriorityRoute] Cache write failed', {
@@ -291,7 +299,7 @@ router.get(
       data: result,
       cached: false,
     });
-  }),
+  })
 );
 
 module.exports = router;

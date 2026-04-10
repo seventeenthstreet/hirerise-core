@@ -1,5 +1,11 @@
 'use strict';
 
+/**
+ * src/modules/conversion/repositories/conversionAggregate.repository.js
+ *
+ * Wave 1 hardened analytics aggregate repository
+ */
+
 const { supabase } = require('../../../config/supabase');
 const logger = require('../utils/conversion.logger');
 const {
@@ -7,14 +13,32 @@ const {
   SCORE_VERSION,
 } = require('../utils/eventWeights.config');
 
+function normalizeCountSnapshot(data) {
+  if (!data) return {};
+
+  const row = Array.isArray(data) ? data[0] : data;
+
+  if (typeof row !== 'object') {
+    return {};
+  }
+
+  return row?.counts || row;
+}
+
+function safeScore(value) {
+  const num = Number(value);
+
+  if (!Number.isFinite(num) || num < 0) {
+    return 0;
+  }
+
+  return num;
+}
+
 class ConversionAggregateRepository {
   constructor() {
     this._table = 'conversion_aggregates';
   }
-
-  // ---------------------------------------------------------------------------
-  // Reads
-  // ---------------------------------------------------------------------------
 
   async getAggregate(userId) {
     try {
@@ -35,72 +59,73 @@ class ConversionAggregateRepository {
     }
   }
 
-  // ---------------------------------------------------------------------------
-  // Atomic Increment + Deterministic Score Update
-  // ---------------------------------------------------------------------------
-
   async incrementAndUpdate(userId, eventType, computeScoresFn) {
     try {
       if (!eventType) {
         throw new Error('Invalid eventType');
       }
 
-      // 1) Atomic increment in Postgres — row creation, locking, and hard-limit
-      //    enforcement all happen inside the RPC. No read-modify-write here.
-      const { data: updatedCounts, error: rpcError } = await supabase.rpc(
-        'increment_conversion_event_count',
-        {
-          p_id:          userId,
-          p_event_type:  eventType,
-          p_hard_limit:  HARD_COUNTER_LIMIT,
-        }
-      );
+      if (typeof computeScoresFn !== 'function') {
+        throw new Error('computeScoresFn must be a function');
+      }
+
+      const { data: rpcData, error: rpcError } =
+        await supabase.rpc(
+          'increment_conversion_event_count',
+          {
+            p_id: userId,
+            p_event_type: eventType,
+            p_hard_limit: HARD_COUNTER_LIMIT,
+          }
+        );
 
       if (rpcError) {
+        logger.error('increment RPC failed', {
+          rpc: 'increment_conversion_event_count',
+          userId,
+          eventType,
+          code: rpcError.code,
+          details: rpcError.details,
+          error: rpcError.message,
+        });
+
         throw new Error(
           `RPC increment_conversion_event_count failed: ${rpcError.message}`
         );
       }
 
-      // 2) Read latest aggregate after atomic increment (for score computation)
-      const { data: existingData, error: readError } = await supabase
-        .from(this._table)
-        .select('*')
-        .eq('id', userId)
-        .single();
+      const updatedCounts = normalizeCountSnapshot(rpcData);
+
+      const { data: existingData, error: readError } =
+        await supabase
+          .from(this._table)
+          .select('*')
+          .eq('id', userId)
+          .single();
 
       if (readError) throw readError;
 
-      // 3) Compute derived scores using the latest counts returned by the RPC
-      const {
-        engagementScore,
-        monetizationScore,
-        totalIntentScore,
-        isEngagementEvent,
-        isMonetizationEvent,
-      } = computeScoresFn(existingData, updatedCounts);
+      const scores = computeScoresFn(existingData, updatedCounts);
 
       const now = new Date().toISOString();
 
       const payload = {
-        engagement_score:    engagementScore,
-        monetization_score:  monetizationScore,
-        total_intent_score:  totalIntentScore,
-        score_version:       SCORE_VERSION,
-        last_updated_at:     now,
-        last_event_at:       now,
+        engagement_score: safeScore(scores.engagementScore),
+        monetization_score: safeScore(scores.monetizationScore),
+        total_intent_score: safeScore(scores.totalIntentScore),
+        score_version: SCORE_VERSION,
+        last_updated_at: now,
+        last_event_at: now,
       };
 
-      if (isEngagementEvent) {
+      if (scores.isEngagementEvent) {
         payload.last_engagement_event_at = now;
       }
 
-      if (isMonetizationEvent) {
+      if (scores.isMonetizationEvent) {
         payload.last_monetization_event_at = now;
       }
 
-      // 4) Deterministic score-only update (scores are derived, not counters —
-      //    a re-play with the same updatedCounts produces the same scores)
       const { data, error } = await supabase
         .from(this._table)
         .update(payload)
@@ -113,6 +138,7 @@ class ConversionAggregateRepository {
       logger.debug('incrementAndUpdate success', {
         userId,
         eventType,
+        updatedCounts,
       });
 
       return data;
@@ -126,16 +152,12 @@ class ConversionAggregateRepository {
     }
   }
 
-  // ---------------------------------------------------------------------------
-  // Manual Upsert
-  // ---------------------------------------------------------------------------
-
   async upsertAggregate(userId, data) {
     try {
       const payload = {
         ...data,
-        id:              userId,
-        score_version:   SCORE_VERSION,
+        id: userId,
+        score_version: SCORE_VERSION,
         last_updated_at: new Date().toISOString(),
       };
 

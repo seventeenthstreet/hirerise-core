@@ -1,12 +1,13 @@
 'use strict';
 
 /**
- * graphAdmin.controller.js
+ * File: src/modules/admin/graph/graphAdmin.controller.js
  * Production Ready:
  * - CSV import
  * - Redis cache invalidation
  * - cache warming
  * - circular dependency removed
+ * - import logs normalized to canonical Supabase schema
  */
 
 const { asyncHandler } = require('../../../utils/helpers');
@@ -61,10 +62,6 @@ const ALLOWED_MIMES = new Set([
 
 const MAX_FILE_SIZE = 5 * 1024 * 1024;
 
-// ─────────────────────────────────────────────────────────────
-// Helpers
-// ─────────────────────────────────────────────────────────────
-
 function requireCSV(req) {
   if (!req.file) {
     throw new AppError(
@@ -113,10 +110,6 @@ function getMode(body) {
     ? body.mode
     : 'append';
 }
-
-// ─────────────────────────────────────────────────────────────
-// Cache Helpers
-// ─────────────────────────────────────────────────────────────
 
 async function invalidateGraphCache(datasetType) {
   try {
@@ -205,10 +198,6 @@ async function warmGraphCache(keys) {
   }
 }
 
-// ─────────────────────────────────────────────────────────────
-// Controllers
-// ─────────────────────────────────────────────────────────────
-
 const importDataset = asyncHandler(async (req, res) => {
   const start = Date.now();
 
@@ -294,12 +283,35 @@ const validateGraph = asyncHandler(async (_req, res) => {
 });
 
 const importLogs = asyncHandler(async (req, res) => {
-  const limit = parseInt(req.query.limit || '50', 10);
-  const logs = await getImportLogs({ limit });
+  const rawLimit = Number.parseInt(req.query.limit ?? '50', 10);
+  const limit = Number.isFinite(rawLimit)
+    ? Math.min(Math.max(rawLimit, 1), 200)
+    : 50;
+
+  const rows = await getImportLogs({ limit });
+
+  const logs = (rows || []).map((row) => ({
+    id: row.id,
+    dataset_name: row.dataset_name ?? row.entity_type ?? null,
+    entity_type: row.entity_type ?? row.dataset_name ?? null,
+    admin_user_id: row.admin_user_id ?? row.admin_id ?? null,
+    imported_at: row.imported_at ?? row.import_time ?? null,
+    rows_processed: row.rows_processed ?? row.total_rows ?? 0,
+    rows_imported: row.rows_imported ?? row.created_count ?? 0,
+    rows_skipped: row.rows_skipped ?? row.skipped_count ?? 0,
+    rows_failed: row.rows_failed ?? row.failed_count ?? 0,
+    duplicate_errors: row.duplicate_errors ?? 0,
+    fk_errors: row.fk_errors ?? 0,
+    duration_ms: row.duration_ms ?? null,
+    import_mode: row.import_mode ?? 'append',
+  }));
 
   res.json({
     success: true,
-    data: { logs, count: logs.length },
+    data: {
+      logs,
+      count: logs.length,
+    },
   });
 });
 

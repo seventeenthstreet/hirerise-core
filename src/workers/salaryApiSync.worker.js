@@ -6,13 +6,13 @@ const cron = require('node-cron');
 const https = require('https');
 const http = require('http');
 
-const supabase = require('../config/supabase');
+const { supabase } = require('../config/supabase');
 const externalApiRepo = require('../modules/master/externalApi.repository');
 const salaryRepository = require('../modules/salary/salary.repository');
 const roleAliasRepository = require('../modules/roleAliases/roleAlias.repository');
 const {
   validateSalaryRecord,
-  logImport
+  logImport,
 } = require('../modules/salary/salary.service');
 const { logAdminAction } = require('../utils/adminAuditLogger');
 const logger = require('../utils/logger');
@@ -22,14 +22,18 @@ const WORKER_ID = 'salary-api-sync';
 const DEFAULT_TIMEOUT_MS = 15000;
 const MAX_CONCURRENT_APIS = 3;
 
+const TABLES = Object.freeze({
+  CMS_ROLES: 'cms_roles',
+});
+
 const httpAgent = new http.Agent({
   keepAlive: true,
-  maxSockets: 20
+  maxSockets: 20,
 });
 
 const httpsAgent = new https.Agent({
   keepAlive: true,
-  maxSockets: 20
+  maxSockets: 20,
 });
 
 function fetchJSON(url, apiKey) {
@@ -49,13 +53,13 @@ function fetchJSON(url, apiKey) {
         headers: {
           Accept: 'application/json',
           Authorization: `Bearer ${apiKey}`,
-          'X-Api-Key': apiKey
-        }
+          'X-Api-Key': apiKey,
+        },
       },
-      res => {
+      (res) => {
         let raw = '';
 
-        res.on('data', chunk => {
+        res.on('data', (chunk) => {
           raw += chunk;
         });
 
@@ -64,7 +68,7 @@ function fetchJSON(url, apiKey) {
             const body = raw ? JSON.parse(raw) : null;
             resolve({
               status: res.statusCode || 500,
-              body
+              body,
             });
           } catch (error) {
             reject(
@@ -95,7 +99,8 @@ async function normalizeRoleName(roleName, roleCache) {
   if (roleCache.has(normalized)) return roleCache.get(normalized);
 
   try {
-    const canonical = await roleAliasRepository.findCanonicalRole(normalized);
+    const canonical =
+      await roleAliasRepository.findCanonicalRole(normalized);
 
     if (canonical?.roleId) {
       roleCache.set(normalized, canonical.roleId);
@@ -103,7 +108,7 @@ async function normalizeRoleName(roleName, roleCache) {
     }
 
     const { data, error } = await supabase
-      .from('cms_roles')
+      .from(TABLES.CMS_ROLES)
       .select('id')
       .eq('normalized_name', normalized)
       .eq('soft_deleted', false)
@@ -113,7 +118,7 @@ async function normalizeRoleName(roleName, roleCache) {
     if (error) {
       logger.warn(`[${WORKER_ID}] cms_roles lookup failed`, {
         normalized,
-        error: error.message
+        error: error.message,
       });
 
       roleCache.set(normalized, null);
@@ -127,7 +132,7 @@ async function normalizeRoleName(roleName, roleCache) {
   } catch (error) {
     logger.warn(`[${WORKER_ID}] normalizeRoleName failed`, {
       normalized,
-      error: error.message
+      error: error.message,
     });
 
     roleCache.set(normalized, null);
@@ -140,7 +145,7 @@ async function processApiResponse(body, providerName, roleCache) {
 
   if (!Array.isArray(rawRecords)) {
     logger.warn(`[${WORKER_ID}] Unexpected response shape`, {
-      providerName
+      providerName,
     });
     return [];
   }
@@ -166,12 +171,15 @@ async function processApiResponse(body, providerName, roleCache) {
       industry: raw.industry || '',
       minSalary: Number(raw.minSalary ?? raw.min_salary ?? 0),
       medianSalary: Number(
-        raw.medianSalary ?? raw.median_salary ?? raw.avg_salary ?? 0
+        raw.medianSalary ??
+          raw.median_salary ??
+          raw.avg_salary ??
+          0
       ),
       maxSalary: Number(raw.maxSalary ?? raw.max_salary ?? 0),
       sourceType: 'API',
       sourceName: providerName,
-      confidenceScore: 0.9
+      confidenceScore: 0.9,
     };
 
     try {
@@ -183,7 +191,7 @@ async function processApiResponse(body, providerName, roleCache) {
       logger.warn(`[${WORKER_ID}] Invalid salary record skipped`, {
         providerName,
         roleId,
-        reason: error.message
+        reason: error.message,
       });
     }
   }
@@ -191,7 +199,7 @@ async function processApiResponse(body, providerName, roleCache) {
   if (skipped > 0) {
     logger.info(`[${WORKER_ID}] Provider skipped invalid rows`, {
       providerName,
-      skipped
+      skipped,
     });
   }
 
@@ -213,7 +221,7 @@ class SalaryApiSyncWorker extends BaseWorker {
       return {
         totalInserted: 0,
         totalDuplicates: 0,
-        apiCount: 0
+        apiCount: 0,
       };
     }
 
@@ -223,7 +231,7 @@ class SalaryApiSyncWorker extends BaseWorker {
 
     for (const api of apis.slice(0, MAX_CONCURRENT_APIS)) {
       logger.info(`[${WORKER_ID}] Syncing provider`, {
-        provider: api.providerName
+        provider: api.providerName,
       });
 
       try {
@@ -233,7 +241,7 @@ class SalaryApiSyncWorker extends BaseWorker {
         if (status < 200 || status >= 300) {
           logger.warn(`[${WORKER_ID}] Non-success response`, {
             provider: api.providerName,
-            status
+            status,
           });
           continue;
         }
@@ -246,7 +254,10 @@ class SalaryApiSyncWorker extends BaseWorker {
 
         if (records.length > 0) {
           const { inserted, duplicates } =
-            await salaryRepository.batchInsert(records, WORKER_ID);
+            await salaryRepository.batchInsert(
+              records,
+              WORKER_ID
+            );
 
           totalInserted += inserted;
           totalDuplicates += duplicates;
@@ -256,7 +267,7 @@ class SalaryApiSyncWorker extends BaseWorker {
       } catch (error) {
         logger.error(`[${WORKER_ID}] Provider sync failed`, {
           provider: api.providerName,
-          error: error.message
+          error: error.message,
         });
       }
     }
@@ -266,7 +277,7 @@ class SalaryApiSyncWorker extends BaseWorker {
         datasetType: 'salary-api-sync',
         processed: totalInserted + totalDuplicates,
         created: totalInserted,
-        failed: 0
+        failed: 0,
       }),
       logAdminAction({
         adminId: WORKER_ID,
@@ -275,33 +286,38 @@ class SalaryApiSyncWorker extends BaseWorker {
         metadata: {
           totalInserted,
           totalDuplicates,
-          apiCount: apis.length
-        }
-      })
+          apiCount: apis.length,
+        },
+      }),
     ]);
 
     logger.info(`[${WORKER_ID}] Sync complete`, {
       totalInserted,
       totalDuplicates,
-      apiCount: apis.length
+      apiCount: apis.length,
     });
 
     return {
       totalInserted,
       totalDuplicates,
-      apiCount: apis.length
+      apiCount: apis.length,
     };
   }
 
   async runSync() {
     const dateKey = new Date().toISOString().slice(0, 10);
 
-    const idempotencyKey = BaseWorker.buildIdempotencyKey('system', {
-      job: WORKER_ID,
-      date: dateKey
-    });
+    const idempotencyKey =
+      BaseWorker.buildIdempotencyKey('system', {
+        job: WORKER_ID,
+        date: dateKey,
+      });
 
-    const { result } = await this.run({ dateKey }, idempotencyKey);
+    const { result } = await this.run(
+      { dateKey },
+      idempotencyKey
+    );
+
     return result;
   }
 }
@@ -316,7 +332,7 @@ cron.schedule(
     } catch (error) {
       logger.error(`[${WORKER_ID}] Scheduled sync failed`, {
         error: error.message,
-        stack: error.stack
+        stack: error.stack,
       });
     }
   },
@@ -332,9 +348,9 @@ if (process.argv.includes('--run-now')) {
       logger.info(`[${WORKER_ID}] Manual run complete`);
       process.exit(0);
     })
-    .catch(error => {
+    .catch((error) => {
       logger.error(`[${WORKER_ID}] Manual run failed`, {
-        error: error.message
+        error: error.message,
       });
       process.exit(1);
     });
@@ -345,5 +361,5 @@ async function runSalarySync() {
 }
 
 module.exports = {
-  runSalarySync
+  runSalarySync,
 };

@@ -1,26 +1,16 @@
 'use strict';
 
-/**
- * partitioned-jobs.repository.js — HARDENED
- *
- * ✅ CJS aligned
- * ✅ Atomic fail handling
- * ✅ Attempt increment fixed
- * ✅ Status guards added
- * ✅ Error normalization
- */
-
 const { supabase } = require('../../src/config/supabaseClient');
 const logger = require('../logger');
 
-// ─────────────────────────────────────────────
-// Helper
-// ─────────────────────────────────────────────
 async function execute(query, context) {
   const { data, error } = await query;
 
   if (error) {
-    logger.error('DB error', { error, ...context });
+    logger.error('DB error', {
+      method: context?.method,
+      error: error.message,
+    });
 
     const err = new Error(error.message);
     err.code = 'DB_ERROR';
@@ -30,17 +20,23 @@ async function execute(query, context) {
   return data;
 }
 
-// ─────────────────────────────────────────────
-// Repository
-// ─────────────────────────────────────────────
+function normalizeId(value, field) {
+  const normalized = String(value || '').trim();
+
+  if (!normalized) {
+    throw new Error(`${field} is required`);
+  }
+
+  return normalized;
+}
 
 class PartitionedJobRepository {
-
-  // ── CREATE ──
   async createJob(jobId, jobData) {
+    const safeJobId = normalizeId(jobId, 'jobId');
+
     await execute(
       supabase.from('automation_jobs').insert({
-        id: jobId,
+        id: safeJobId,
         ...jobData,
         status: 'pending',
         attempts: 0,
@@ -49,30 +45,36 @@ class PartitionedJobRepository {
         updated_at: new Date().toISOString(),
         deleted_at: null,
       }),
-      { method: 'createJob', jobId }
+      { method: 'createJob' }
     );
 
-    return jobId;
+    return safeJobId;
   }
 
-  // ── CLAIM (RPC) ──
   async claimJob(jobId, workerId) {
+    const safeJobId = normalizeId(jobId, 'jobId');
+    const safeWorkerId = normalizeId(workerId, 'workerId');
+
     const { data, error } = await supabase.rpc('claim_job', {
-      p_job_id: jobId,
-      p_worker_id: workerId,
+      p_job_id: safeJobId,
+      p_worker_id: safeWorkerId,
     });
 
     if (error) {
-      logger.error('claimJob failed', { error, jobId, workerId });
+      logger.error('claimJob failed', {
+        jobId: safeJobId,
+        error: error.message,
+      });
       throw error;
     }
 
     return data;
   }
 
-  // ── COMPLETE ──
   async completeJob(jobId, result = {}) {
-    await execute(
+    const safeJobId = normalizeId(jobId, 'jobId');
+
+    const data = await execute(
       supabase
         .from('automation_jobs')
         .update({
@@ -81,63 +83,80 @@ class PartitionedJobRepository {
           completed_at: new Date().toISOString(),
           updated_at: new Date().toISOString(),
         })
-        .eq('id', jobId)
-        .eq('status', 'processing'), // ✅ guard
-      { method: 'completeJob', jobId }
+        .eq('id', safeJobId)
+        .eq('status', 'processing')
+        .select('id')
+        .maybeSingle(),
+      { method: 'completeJob' }
     );
+
+    if (!data?.id) {
+      const err = new Error('Job completion no-op: job not in processing state');
+      err.code = 'JOB_COMPLETE_NOOP';
+      throw err;
+    }
   }
 
-  // ── FAIL (FIXED ATOMICITY) ──
   async failJob(jobId, errorCode, errorMessage) {
+    const safeJobId = normalizeId(jobId, 'jobId');
+
     const { data, error } = await supabase.rpc('fail_job', {
-      p_job_id: jobId,
-      p_error_code: errorCode,
-      p_error_message: errorMessage?.slice(0, 500),
+      p_job_id: safeJobId,
+      p_error_code: String(errorCode || 'UNKNOWN'),
+      p_error_message: String(errorMessage || '')
+        .slice(0, 500),
     });
 
     if (error) {
-      logger.error('failJob failed', { error, jobId });
+      logger.error('failJob failed', {
+        jobId: safeJobId,
+        error: error.message,
+      });
       throw error;
     }
 
-    return data; // { status: 'failed' | 'dead' }
+    return data;
   }
 
-  // ── READ ──
-
   async findById(jobId) {
+    const safeJobId = normalizeId(jobId, 'jobId');
+
     return await execute(
       supabase
         .from('automation_jobs')
         .select('*')
-        .eq('id', jobId)
+        .eq('id', safeJobId)
         .is('deleted_at', null)
         .maybeSingle(),
-      { method: 'findById', jobId }
+      { method: 'findById' }
     );
   }
 
   async getPendingJobsForUser(userId, limit = 10) {
+    const safeUserId = normalizeId(userId, 'userId');
+
     return (
       await execute(
         supabase
           .from('automation_jobs')
           .select('id, status, created_at')
-          .eq('user_id', userId)
+          .eq('user_id', safeUserId)
           .in('status', ['pending', 'processing'])
           .is('deleted_at', null)
           .order('created_at', { ascending: false })
           .limit(limit),
-        { method: 'getPendingJobsForUser', userId }
+        { method: 'getPendingJobsForUser' }
       )
     ) ?? [];
   }
 
   async countPendingForUser(userId) {
+    const safeUserId = normalizeId(userId, 'userId');
+
     const { count, error } = await supabase
       .from('automation_jobs')
       .select('*', { count: 'exact', head: true })
-      .eq('user_id', userId)
+      .eq('user_id', safeUserId)
       .in('status', ['pending', 'processing'])
       .is('deleted_at', null);
 

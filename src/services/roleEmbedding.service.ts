@@ -8,16 +8,26 @@ import { getSupabaseClient } from '../config/supabaseClient';
 
 const supabase = getSupabaseClient();
 
+const TABLES = Object.freeze({
+  ROLES: 'roles',
+});
+
+const RPCS = Object.freeze({
+  MATCH_ROLES: 'match_roles',
+});
+
 // ----------------------------------------------------------------
 // Similarity thresholds — tune based on user feedback at scale
 // ----------------------------------------------------------------
 export const SIMILARITY_THRESHOLDS = {
-  STRONG: 0.85, // near-exact semantic match
-  GOOD: 0.75,   // strong candidate
-  WEAK: 0.65,   // broad match, may include noise
+  STRONG: 0.85,
+  GOOD: 0.75,
+  WEAK: 0.65,
 } as const;
 
-const DEFAULT_MIN_SIMILARITY = SIMILARITY_THRESHOLDS.WEAK;
+const DEFAULT_MIN_SIMILARITY =
+  SIMILARITY_THRESHOLDS.WEAK;
+
 const DEFAULT_MATCH_COUNT = 10;
 
 // ----------------------------------------------------------------
@@ -63,7 +73,8 @@ type RoleRow = {
 // ----------------------------------------------------------------
 
 const EMBEDDING_MODEL =
-  process.env.ROLE_EMBEDDING_MODEL || 'text-embedding-3-small';
+  process.env.ROLE_EMBEDDING_MODEL ||
+  'text-embedding-3-small';
 
 const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY!,
@@ -73,14 +84,13 @@ const openai = new OpenAI({
 // Internal helpers
 // ----------------------------------------------------------------
 
-/**
- * Build semantically rich embedding text from a role payload.
- */
 function buildEmbeddingText(payload: RoleInsert): string {
   return [
     `Role: ${payload.role_name}`,
     payload.normalized_name ?? null,
-    payload.seniority_level ? `Level: ${payload.seniority_level}` : null,
+    payload.seniority_level
+      ? `Level: ${payload.seniority_level}`
+      : null,
     payload.track ? `Track: ${payload.track}` : null,
     payload.description ?? null,
     ...(payload.alternative_titles ?? []),
@@ -89,25 +99,21 @@ function buildEmbeddingText(payload: RoleInsert): string {
     .join(' ');
 }
 
-/**
- * Normalize free-text input before embedding.
- */
 function normalizeQueryText(input: string): string {
   return input.trim().replace(/\s+/g, ' ');
 }
 
-/**
- * Clamp similarity threshold to valid cosine range.
- */
 function clampSimilarity(value: number): number {
-  if (!Number.isFinite(value)) return DEFAULT_MIN_SIMILARITY;
+  if (!Number.isFinite(value)) {
+    return DEFAULT_MIN_SIMILARITY;
+  }
+
   return Math.min(Math.max(value, 0), 1);
 }
 
-/**
- * Generate embedding vector from text via OpenAI.
- */
-async function generateEmbedding(text: string): Promise<number[]> {
+async function generateEmbedding(
+  text: string
+): Promise<number[]> {
   const response = await openai.embeddings.create({
     model: EMBEDDING_MODEL,
     input: text,
@@ -116,7 +122,9 @@ async function generateEmbedding(text: string): Promise<number[]> {
   const embedding = response.data?.[0]?.embedding;
 
   if (!embedding?.length) {
-    throw new Error('Embedding generation returned empty vector');
+    throw new Error(
+      'Embedding generation returned empty vector'
+    );
   }
 
   return embedding;
@@ -126,11 +134,6 @@ async function generateEmbedding(text: string): Promise<number[]> {
 // Public API
 // ----------------------------------------------------------------
 
-/**
- * Search for semantically similar roles using cosine similarity.
- *
- * Calls the match_roles RPC backed by the IVFFLAT pgvector index.
- */
 export async function searchRoles(
   queryText: string,
   options: RoleSearchOptions = {}
@@ -140,29 +143,34 @@ export async function searchRoles(
     : DEFAULT_MATCH_COUNT;
 
   const minSimilarity = clampSimilarity(
-    options.minSimilarity ?? DEFAULT_MIN_SIMILARITY
+    options.minSimilarity ??
+      DEFAULT_MIN_SIMILARITY
   );
 
-  const normalizedQuery = normalizeQueryText(queryText);
-  const queryEmbedding = await generateEmbedding(normalizedQuery);
+  const normalizedQuery =
+    normalizeQueryText(queryText);
 
-  const { data, error } = await supabase.rpc('match_roles', {
-    query_embedding: queryEmbedding,
-    match_count: matchCount,
-    min_similarity: minSimilarity,
-  });
+  const queryEmbedding =
+    await generateEmbedding(normalizedQuery);
+
+  const { data, error } = await supabase.rpc(
+    RPCS.MATCH_ROLES,
+    {
+      query_embedding: queryEmbedding,
+      match_count: matchCount,
+      min_similarity: minSimilarity,
+    }
+  );
 
   if (error) {
-    throw new Error(`searchRoles failed: ${error.message}`);
+    throw new Error(
+      `searchRoles failed: ${error.message}`
+    );
   }
 
   return (data ?? []) as RoleSearchResult[];
 }
 
-/**
- * Create role with embedding.
- * Falls back to non-embedding insert ONLY if embedding generation fails.
- */
 export async function createRoleWithEmbedding(
   payload: RoleInsert
 ): Promise<RoleRow> {
@@ -191,21 +199,22 @@ export async function createRoleWithEmbedding(
   };
 
   const { data, error } = await supabase
-    .from('roles')
+    .from(TABLES.ROLES)
     .insert(insertPayload)
-    .select('role_id, role_name, normalized_name, embedding_updated_at')
+    .select(
+      'role_id, role_name, normalized_name, embedding_updated_at'
+    )
     .single();
 
   if (error) {
-    throw new Error(`createRoleWithEmbedding failed: ${error.message}`);
+    throw new Error(
+      `createRoleWithEmbedding failed: ${error.message}`
+    );
   }
 
   return data as RoleRow;
 }
 
-/**
- * Update role fields + regenerate embedding if semantic fields changed.
- */
 export async function updateRoleEmbedding(
   roleId: string,
   payload: Partial<RoleInsert>
@@ -223,22 +232,30 @@ export async function updateRoleEmbedding(
     payload.alternative_titles;
 
   if (hasSemanticChanges) {
-    const text = buildEmbeddingText(payload as RoleInsert);
+    const text = buildEmbeddingText(
+      payload as RoleInsert
+    );
+
     const embedding = await generateEmbedding(text);
 
     updatePayload.embedding = embedding;
-    updatePayload.embedding_updated_at = new Date().toISOString();
+    updatePayload.embedding_updated_at =
+      new Date().toISOString();
   }
 
   const { data, error } = await supabase
-    .from('roles')
+    .from(TABLES.ROLES)
     .update(updatePayload)
     .eq('role_id', roleId)
-    .select('role_id, role_name, normalized_name, embedding_updated_at')
+    .select(
+      'role_id, role_name, normalized_name, embedding_updated_at'
+    )
     .single();
 
   if (error) {
-    throw new Error(`updateRoleEmbedding failed: ${error.message}`);
+    throw new Error(
+      `updateRoleEmbedding failed: ${error.message}`
+    );
   }
 
   return data as RoleRow;

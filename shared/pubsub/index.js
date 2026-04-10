@@ -3,14 +3,7 @@
 /**
  * shared/pubsub/index.js
  *
- * Supabase-native transport layer
- * ✅ Correct Supabase import path
- * ✅ Google Pub/Sub fully removed
- * ✅ Firebase legacy transport removed
- * ✅ Postgres outbox pattern
- * ✅ Retry-safe row lifecycle
- * ✅ Worker polling subscriber
- * ✅ SKIP LOCKED concurrency
+ * Wave 1 hardened outbox transport layer
  */
 
 const { supabase } = require('../../src/config/supabase');
@@ -25,9 +18,13 @@ const {
 const POLL_INTERVAL_MS = 1000;
 const MAX_RETRIES = 5;
 
-/**
- * Publish event into Postgres outbox
- */
+function normalizeClaimRows(data) {
+  if (!data) return [];
+  if (Array.isArray(data)) return data;
+  if (typeof data === 'object') return [data];
+  return [];
+}
+
 async function publishEvent(eventType, payload, attributes = {}) {
   const route = getTopicForEvent(eventType);
 
@@ -56,9 +53,11 @@ async function publishEvent(eventType, payload, attributes = {}) {
 
   if (error) {
     logger.error('Failed to publish event', {
-      err: error,
       eventType,
       eventId: envelope.eventId,
+      code: error.code,
+      details: error.details,
+      err: error.message,
     });
 
     const wrapped = new Error(`Publish failed: ${error.message}`);
@@ -79,20 +78,20 @@ async function publishEvent(eventType, payload, attributes = {}) {
   };
 }
 
-/**
- * Create DB polling subscriber
- */
 function createSubscriber(route, handler, options = {}) {
   const timeoutMs = options.timeoutMs ?? 30000;
   const pollInterval = options.pollIntervalMs ?? POLL_INTERVAL_MS;
+
   let stopped = false;
   let timer = null;
+  let polling = false;
 
   async function poll() {
-    if (stopped) return;
+    if (stopped || polling) return;
+    polling = true;
 
     try {
-      const { data: rows, error } = await supabase.rpc(
+      const { data, error } = await supabase.rpc(
         'claim_outbox_events',
         {
           p_route: route,
@@ -101,13 +100,19 @@ function createSubscriber(route, handler, options = {}) {
       );
 
       if (error) {
-        logger.error('Subscriber poll failed', { err: error, route });
+        logger.error('Subscriber claim RPC failed', {
+          route,
+          code: error.code,
+          details: error.details,
+          err: error.message,
+        });
         return;
       }
 
-      for (const row of rows || []) {
-        const envelope = row.payload;
+      const rows = normalizeClaimRows(data);
 
+      for (const row of rows) {
+        const envelope = row.payload;
         const validation = validateEnvelope(envelope);
 
         if (!validation.valid) {
@@ -148,8 +153,8 @@ function createSubscriber(route, handler, options = {}) {
             !err.code || err.code !== 'PERMANENT_ERROR';
 
           childLogger.error('Handler failed', {
-            err,
             retryable,
+            err: err.message,
           });
 
           if (retryable && row.retry_count < MAX_RETRIES) {
@@ -160,7 +165,12 @@ function createSubscriber(route, handler, options = {}) {
         }
       }
     } catch (err) {
-      logger.error('Subscriber loop error', { err, route });
+      logger.error('Subscriber loop error', {
+        route,
+        err: err.message,
+      });
+    } finally {
+      polling = false;
     }
   }
 
@@ -178,19 +188,42 @@ function createSubscriber(route, handler, options = {}) {
 }
 
 async function markProcessed(id, status) {
-  await supabase
+  const { error } = await supabase
     .from('event_outbox')
     .update({
       status,
       processed_at: new Date().toISOString(),
     })
     .eq('id', id);
+
+  if (error) {
+    logger.error('markProcessed failed', {
+      id,
+      status,
+      code: error.code,
+      details: error.details,
+      err: error.message,
+    });
+
+    throw error;
+  }
 }
 
 async function retryEvent(id) {
-  await supabase.rpc('retry_outbox_event', {
+  const { error } = await supabase.rpc('retry_outbox_event', {
     p_id: id,
   });
+
+  if (error) {
+    logger.error('retry_outbox_event failed', {
+      id,
+      code: error.code,
+      details: error.details,
+      err: error.message,
+    });
+
+    throw error;
+  }
 }
 
 module.exports = {
