@@ -4,15 +4,22 @@
   "description": "HireRise Career Intelligence Platform - Backend Core Engine",
   "main": "src/server.js",
   "engines": {
-    "node": ">=18.0.0"
+    "node": ">=20 <21",
+    "npm": ">=10"
   },
+  "packageManager": "npm@10",
   "scripts": {
     "start": "node src/server.js",
     "dev": "nodemon --signal SIGTERM src/server.js",
     "lint": "eslint src/**/*.js",
     "test": "cross-env NODE_ENV=test jest --runInBand",
     "test:watch": "cross-env NODE_ENV=test jest --watch",
-    "import:data": "node src/data-import/excelImporter.js"
+    "import:data": "node src/data-import/excelImporter.js",
+
+    "health:smoke": "node scripts/health-smoke.js",
+    "ready:smoke": "node scripts/ready-smoke.js",
+    "security:scan": "gitleaks detect --verbose",
+    "drift:check": "node scripts/check-migration-drift.js"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.78.0",

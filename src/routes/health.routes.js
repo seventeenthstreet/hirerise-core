@@ -1,8 +1,12 @@
 'use strict';
 
 /**
- * routes/health.routes.js
- * Supabase + dependency health probes
+ * src/routes/health.routes.js
+ * HireRise PR 2 — Health + Deep Diagnostics
+ *
+ * Split:
+ *   GET /health        → pure liveness
+ *   GET /health/deep   → dependency diagnostics
  */
 
 const express = require('express');
@@ -87,17 +91,21 @@ async function probeRedis() {
   const start = Date.now();
 
   try {
-    const mgr = require('../core/cache/cache.manager');
-    const client = mgr.getClient();
+    const {
+      getRedisStatus,
+    } = require('../config/redisClient');
 
-    if (typeof client.ping === 'function') {
-      return await client.ping();
-    }
+    const redis = getRedisStatus();
 
     return {
-      ok: true,
+      ok: redis.connected,
       latencyMs: Date.now() - start,
-      note: 'memory-cache (Redis not configured)',
+      provider: redis.provider,
+      backend: redis.backend,
+      ...(process.env.NODE_ENV !== 'production' &&
+      redis.error
+        ? { error: redis.error }
+        : {}),
     };
   } catch (error) {
     return {
@@ -218,29 +226,21 @@ function probeAiProviders() {
 // ─────────────────────────────────────────────────────────────
 // Routes
 // ─────────────────────────────────────────────────────────────
-router.get('/', async (req, res) => {
-  const dbOk = await Promise.race([
-    probeDatabase().then((r) => r.ok),
-    new Promise((resolve) =>
-      setTimeout(() => resolve(false), 2000)
-    ),
-  ]);
 
-  const ts = new Date().toISOString();
-
-  if (dbOk) {
-    return res.status(200).json({
-      status: 'healthy',
-      ts,
-    });
-  }
-
-  return res.status(503).json({
-    status: 'unhealthy',
-    ts,
+/**
+ * Pure liveness probe
+ * Returns 200 if Node process is alive.
+ */
+router.get('/', (_req, res) => {
+  return res.status(200).json({
+    status: 'healthy',
+    ts: new Date().toISOString(),
   });
 });
 
+/**
+ * Deep dependency diagnostics
+ */
 router.get('/deep', requireProbeToken, async (req, res) => {
   const start = Date.now();
 

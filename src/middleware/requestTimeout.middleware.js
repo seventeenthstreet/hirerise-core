@@ -1,62 +1,98 @@
 'use strict';
 
 /**
- * middleware/requestTimeout.middleware.js
- *
- * PR 2: Backend Infra Safety
- * Global request timeout middleware.
- *
- * - Returns 504 if request exceeds REQUEST_TIMEOUT_MS
- * - Skips health and readiness probes
- * - Prevents double responses after timeout
- * - Clears timers safely on finish/close
+ * src/middleware/requestTimeout.middleware.js
+ * HireRise PR 2 — Backend Infra Safety
  */
 
-const logger = require('../utils/logger');
+const env = require('../config/env');
 
-const TIMEOUT_MS = parseInt(
-  process.env.REQUEST_TIMEOUT_MS || '30000',
-  10
-);
+const TIMEOUT_MS = env.API_TIMEOUT_MS;
+const AI_TIMEOUT_MS = env.AI_PROVIDER_TIMEOUT_MS;
 
-const EXCLUDED_PREFIXES = ['/api/v1/health', '/api/v1/ready'];
+// Paths that must never be timed out
+const EXCLUDED = new Set([
+  '/api/v1/health',
+  '/api/v1/ready',
+]);
 
 function requestTimeout(req, res, next) {
-  // Skip health + readiness probes
-  if (EXCLUDED_PREFIXES.some(prefix => req.path.startsWith(prefix))) {
-    return next();
-  }
+  if (EXCLUDED.has(req.path)) return next();
 
-  req.timedout = false;
+  let fired = false;
 
   const timer = setTimeout(() => {
-    req.timedout = true;
+    fired = true;
 
-    logger.warn('[RequestTimeout] Request exceeded timeout', {
-      path: req.path,
-      method: req.method,
-      timeoutMs: TIMEOUT_MS,
-      correlationId: req.correlationId,
+    if (res.headersSent) return;
+
+    res.status(503).json({
+      success: false,
+      error: {
+        code: 'REQUEST_TIMEOUT',
+        message:
+          'The server did not respond in time. Please retry.',
+        retryable: true,
+        timeout_ms: TIMEOUT_MS,
+      },
     });
-
-    if (!res.headersSent) {
-      return res.status(504).json({
-        success: false,
-        error: {
-          code: 'REQUEST_TIMEOUT',
-          message: 'Request took too long to process. Please retry.',
-        },
-        timestamp: new Date().toISOString(),
-      });
-    }
   }, TIMEOUT_MS);
 
-  const clear = () => clearTimeout(timer);
+  if (timer.unref) timer.unref();
 
-  res.on('finish', clear);
-  res.on('close', clear);
+  const cleanup = () => clearTimeout(timer);
+  res.on('finish', cleanup);
+  res.on('close', cleanup);
 
-  return next();
+  req.timedOut = () => fired;
+
+  next();
 }
 
-module.exports = { requestTimeout };
+/**
+ * AI provider timeout wrapper
+ */
+async function withAITimeout(fn) {
+  return Promise.race([
+    fn(),
+    new Promise((_, reject) => {
+      const timer = setTimeout(() => {
+        const err = new Error(
+          `AI provider timeout after ${AI_TIMEOUT_MS}ms`
+        );
+        err.code = 'AI_TIMEOUT';
+        err.retryable = true;
+        reject(err);
+      }, AI_TIMEOUT_MS);
+
+      if (timer.unref) timer.unref();
+    }),
+  ]);
+}
+
+/**
+ * Supabase RPC timeout wrapper
+ */
+async function withSupabaseTimeout(fn, ms = 8000) {
+  return Promise.race([
+    fn(),
+    new Promise((_, reject) => {
+      const timer = setTimeout(() => {
+        const err = new Error(
+          `Supabase timeout after ${ms}ms`
+        );
+        err.code = 'SUPABASE_TIMEOUT';
+        err.retryable = true;
+        reject(err);
+      }, ms);
+
+      if (timer.unref) timer.unref();
+    }),
+  ]);
+}
+
+module.exports = {
+  requestTimeout,
+  withAITimeout,
+  withSupabaseTimeout,
+};

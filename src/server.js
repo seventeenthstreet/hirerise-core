@@ -39,7 +39,11 @@ const morgan      = require('morgan');
 const rateLimit   = require('express-rate-limit');
 
 // ── Config ────────────────────────────────────────────────────────────────────
-const { connectRedis } = require('./config/redisClient');
+const {
+  connectRedis,
+  getRedisStatus,
+  closeRedis,
+} = require('./config/redisClient');
 
 // ── Utilities ─────────────────────────────────────────────────────────────────
 const logger = require('./utils/logger');
@@ -145,10 +149,16 @@ app.use(requestTimeout);
 
 // ── HTTP request logger ───────────────────────────────────────────────────────
 if (process.env.NODE_ENV !== 'test') {
-  app.use(morgan(
-    process.env.NODE_ENV === 'production' ? 'combined' : 'dev',
-    { stream: { write: msg => logger.http(msg.trim()) } },
-  ));
+  app.use(
+    morgan(
+      process.env.NODE_ENV === 'production' ? 'combined' : 'dev',
+      {
+        stream: {
+          write: (msg) => logger.http(msg.trim()),
+        },
+      }
+    )
+  );
 }
 
 // ── API prefix ────────────────────────────────────────────────────────────────
@@ -187,9 +197,14 @@ app.use(globalLimiter);
 app.use(`${API_PREFIX}/health`, require('./routes/health.routes'));
 
 app.get(`${API_PREFIX}/ready`, (_req, res) => {
-  // Readiness: server is up and event loop is responsive.
-  // Add deeper checks (DB ping, Redis ping) here if required by your K8s setup.
-  res.status(200).json({ status: 'ready' });
+  const redis = getRedisStatus();
+  const ok = redis.connected;
+
+  res.status(ok ? 200 : 503).json({
+    status: ok ? 'ready' : 'degraded',
+    redis,
+    timestamp: new Date().toISOString(),
+  });
 });
 
 // =============================================================================
@@ -743,21 +758,6 @@ app.use(errorHandler);
 // ✅ Startup tasks (non-blocking — server is already listening)
 // =============================================================================
 
-// Redis connection
-// Redis connection
-(async () => {
-  try {
-    await connectRedis();
-  } catch (err) {
-    logger.error('[Server] Redis connection failed', {
-      err: err.message,
-    });
-
-    if (process.env.NODE_ENV === 'production') {
-      process.exit(1);
-    }
-  }
-})();
 
 // Gotenberg health check on startup.
 // If GOTENBERG_URL is set (production), verify it is reachable before accepting
@@ -850,59 +850,108 @@ if (process.env.RUN_ENGAGEMENT_WORKER === 'true') {
 const PORT = parseInt(process.env.PORT || '3000', 10);
 let server;
 
-if (process.env.NODE_ENV !== 'test') {
-  server = app.listen(PORT, () => {
-    logger.info(`[Server] HireRise Core running on port ${PORT} [${process.env.NODE_ENV}]`);
-    logger.info(`[Server] API Base: ${API_PREFIX}`);
-  });
+async function bootstrap() {
+  try {
+    // PR 2: Redis must be ready before serving traffic
+    await connectRedis();
 
-  server.on('error', (err) => {
-    if (err.code === 'EADDRINUSE') {
-      logger.error(`[Server] Port ${PORT} is already in use.`);
-    } else {
-      logger.error('[Server] Startup error:', err);
-    }
-    process.exit(1);
-  });
-
-  // Consolidated Graceful Shutdown
-  // Single async shutdown sequence — registered once each for SIGTERM + SIGINT.
-  //
-  // Order:
-  //   1. Drain all BullMQ workers + close queue connections (parallel)
-  //   2. Close HTTP server (stops accepting new requests, drains in-flight)
-  //
-  // process.once prevents duplicate listener registration on hot reloads.
-  // Promise.allSettled ensures every task runs even if one throws.
-  const gracefulShutdown = async (signal) => {
-    logger.info(`[Server] ${signal} received — shutting down gracefully...`);
-
-    // Step 1: drain all workers in parallel
-    if (workerShutdownTasks.length > 0) {
-      logger.info(`[Server] Stopping ${workerShutdownTasks.length} worker(s)...`);
-      await Promise.allSettled(workerShutdownTasks.map((task) => task()));
-      logger.info('[Server] All workers stopped.');
+    if (process.env.NODE_ENV === 'test') {
+      return;
     }
 
-    // Step 2: stop accepting new HTTP requests
-    if (server) {
-      await new Promise((resolve) => server.close(() => {
+    server = app.listen(PORT, () => {
+      logger.info(
+        `[Server] HireRise Core running on port ${PORT} [${process.env.NODE_ENV}]`
+      );
+      logger.info(`[Server] API Base: ${API_PREFIX}`);
+    });
+
+server.on('error', (err) => {
+  if (err.code === 'EADDRINUSE') {
+    logger.error(`[Server] Port ${PORT} is already in use.`);
+  } else {
+    logger.error('[Server] Startup error', {
+      error: err.message,
+    });
+  }
+
+  if (process.env.NODE_ENV === 'test') {
+    throw err;
+  }
+
+  process.exit(1);
+});
+} catch (err) {
+  logger.error('[BOOT] Startup failed', {
+    error: err.message,
+  });
+
+  if (process.env.NODE_ENV === 'test') {
+    throw err;
+  }
+
+  process.exit(1);
+}
+}
+
+bootstrap();
+
+// Consolidated Graceful Shutdown
+const gracefulShutdown = async (signal) => {
+  logger.info(`[Server] ${signal} received — shutting down gracefully...`);
+
+  // Step 1: drain all workers in parallel
+  if (workerShutdownTasks.length > 0) {
+    logger.info(
+      `[Server] Stopping ${workerShutdownTasks.length} worker(s)...`
+    );
+    await Promise.allSettled(
+      workerShutdownTasks.map((task) => task())
+    );
+    logger.info('[Server] All workers stopped.');
+  }
+
+  // Step 2: stop accepting new HTTP requests
+  if (server) {
+    await new Promise((resolve) =>
+      server.close(() => {
         logger.info('[Server] HTTP server closed.');
         resolve();
-      }));
+      })
+    );
+  }
+
+  // Step 3: close Redis gracefully
+    try {
+    await closeRedis();
+    logger.info('[Server] Redis closed gracefully.');
+  } catch (err) {
+    if (process.env.NODE_ENV !== 'test') {
+      logger.warn('[Server] Redis shutdown warning', {
+        error: err.message,
+      });
     }
+  }
 
-    process.exit(0);
-  };
+  process.exit(0);
+};
 
-  // process.once — safe against duplicate registration (PM2 cluster, hot reload)
-  process.once('SIGTERM', () => gracefulShutdown('SIGTERM'));
-  process.once('SIGINT',  () => gracefulShutdown('SIGINT'));
+// Safe one-time listeners
+process.once('SIGTERM', () =>
+  gracefulShutdown('SIGTERM')
+);
+process.once('SIGINT', () =>
+  gracefulShutdown('SIGINT')
+);
 
-  process.on('unhandledRejection', (reason) =>
-    logger.error('[Server] Unhandled Promise Rejection:', reason));
-  process.on('uncaughtException', (err) =>
-    logger.error('[Server] Uncaught Exception:', err));
-}
+process.on('unhandledRejection', (reason) =>
+  logger.error('[Server] Unhandled Promise Rejection:', reason)
+);
+
+process.on('uncaughtException', (err) =>
+  logger.error('[Server] Uncaught Exception:', err)
+);
+
+
 
 module.exports = app;
