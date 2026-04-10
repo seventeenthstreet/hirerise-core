@@ -6,8 +6,8 @@
  *
  * Middleware order (enforced):
  *   correlationMiddleware → helmet → compression → CORS →
- *   raw body (Stripe) → json/urlencoded → morgan →
- *   globalLimiter → [public routes] → [internal routes] →
+ *   raw body (Stripe) → json/urlencoded → requestTimeout →
+ *   morgan → globalLimiter → [public routes] → [internal routes] →
  *   [webhook routes] → [protected routes] → 404 → errorHandler
  *
  * Two-tier admin system:
@@ -47,6 +47,7 @@ const logger = require('./utils/logger');
 // ── Middleware ────────────────────────────────────────────────────────────────
 const { errorHandler, notFoundHandler }   = require('./middleware/errorHandler');
 const { correlationMiddleware }           = require('./middleware/correlation.middleware');
+const { requestTimeout } = require('./middleware/requestTimeout.middleware');
 const { authenticate, requireAdmin }      = require('./middleware/auth.middleware');
 const { requireMasterAdmin }              = require('./middleware/requireMasterAdmin.middleware');
 const { requireContributor }              = require('./middleware/requireContributor.middleware');
@@ -139,6 +140,8 @@ app.use('/api/v1/webhooks/stripe', express.raw({ type: 'application/json' }));
 
 app.use(express.json({ limit: '512kb' }));
 app.use(express.urlencoded({ extended: true, limit: '512kb' }));
+// PR 2: Global request timeout protection
+app.use(requestTimeout);
 
 // ── HTTP request logger ───────────────────────────────────────────────────────
 if (process.env.NODE_ENV !== 'test') {
@@ -741,9 +744,20 @@ app.use(errorHandler);
 // =============================================================================
 
 // Redis connection
-connectRedis().catch((err) =>
-  logger.error('[Server] Redis connection failed', { err: err.message }),
-);
+// Redis connection
+(async () => {
+  try {
+    await connectRedis();
+  } catch (err) {
+    logger.error('[Server] Redis connection failed', {
+      err: err.message,
+    });
+
+    if (process.env.NODE_ENV === 'production') {
+      process.exit(1);
+    }
+  }
+})();
 
 // Gotenberg health check on startup.
 // If GOTENBERG_URL is set (production), verify it is reachable before accepting

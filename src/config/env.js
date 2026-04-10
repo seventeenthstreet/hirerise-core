@@ -1,7 +1,11 @@
 'use strict';
 
 /**
- * config/env.js — HARDENED ENV VALIDATOR (SUPABASE READY)
+ * config/env.js — PRODUCTION HARDENED ENV VALIDATOR
+ * PR 2: Backend Infra Safety
+ * - Enforce Redis in production
+ * - Validate INTERNAL_SERVICE_TOKEN
+ * - Prevent soft-fail bypass in production
  */
 
 function required(name) {
@@ -78,6 +82,12 @@ const env = {
     required('MASTER_ENCRYPTION_KEY')
   ),
 
+  // Internal service token (required for /internal/* routes)
+ INTERNAL_SERVICE_TOKEN:
+  optional('NODE_ENV', 'development') === 'production'
+    ? safe(() => required('INTERNAL_SERVICE_TOKEN'))
+    : optional('INTERNAL_SERVICE_TOKEN', 'dev-internal-token'),
+
   // AI
   OPENROUTER_API_KEY: optional('OPENROUTER_API_KEY'),
   ANTHROPIC_API_KEY: optional('ANTHROPIC_API_KEY'),
@@ -125,7 +135,7 @@ try {
 // Encryption key length
 if (env.MASTER_ENCRYPTION_KEY && env.MASTER_ENCRYPTION_KEY.length !== 32) {
   errors.push(
-    `[env] MASTER_ENCRYPTION_KEY must be exactly 32 characters`
+    '[env] MASTER_ENCRYPTION_KEY must be exactly 32 characters'
   );
 }
 
@@ -145,7 +155,18 @@ if (env.NODE_ENV !== 'test') {
   }
 }
 
-// Redis validation
+// PR 2: FORCE Redis in production
+if (env.NODE_ENV === 'production') {
+  if (env.CACHE_PROVIDER !== 'redis') {
+    errors.push('[env] CACHE_PROVIDER must be "redis" in production');
+  }
+
+  if (!env.REDIS_URL) {
+    errors.push('[env] REDIS_URL is required in production');
+  }
+}
+
+// Redis validation (non-production)
 if (env.CACHE_PROVIDER === 'redis' && !env.REDIS_URL) {
   errors.push('[env] REDIS_URL required when CACHE_PROVIDER=redis');
 }
@@ -154,6 +175,7 @@ if (env.CACHE_PROVIDER === 'redis' && !env.REDIS_URL) {
 
 if (errors.length && env.NODE_ENV !== 'test') {
   const border = '═'.repeat(70);
+
   console.error(`\n${border}`);
   console.error('HIRERISE ENV VALIDATION FAILED');
   console.error(border);
@@ -162,15 +184,20 @@ if (errors.length && env.NODE_ENV !== 'test') {
 
   console.error(border);
 
-  // safer for serverless
-  if (process.env.ALLOW_SOFT_FAIL === 'true') {
+  // PR 2 hardening:
+  // allow soft-fail only outside production
+  const softFailAllowed =
+    process.env.ALLOW_SOFT_FAIL === 'true' &&
+    env.NODE_ENV !== 'production';
+
+  if (softFailAllowed) {
     console.warn('[env] Soft fail enabled — continuing startup');
   } else {
     process.exit(1);
   }
 }
 
-// ── Debug Summary (VERY USEFUL) ──────────────────────────────
+// ── Debug Summary ─────────────────────────────────────────────
 
 if (env.NODE_ENV !== 'test') {
   console.log('[env] Loaded config:', {
@@ -184,6 +211,8 @@ if (env.NODE_ENV !== 'test') {
       groq: !!env.GROQ_API_KEY,
     },
     CACHE: env.CACHE_PROVIDER,
+    REDIS: !!env.REDIS_URL,
+    INTERNAL_TOKEN: !!env.INTERNAL_SERVICE_TOKEN,
   });
 }
 
