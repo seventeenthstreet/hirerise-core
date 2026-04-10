@@ -1,8 +1,8 @@
 'use strict';
 
 /**
- * config/redisClient.js
- * PR 2: Backend Infra Safety
+ * src/config/redisClient.js
+ * HireRise PR 2 — Backend Infra Safety
  *
  * Guarantees:
  * - No unsafe localhost fallback
@@ -10,25 +10,37 @@
  * - Dev/test supports memory cache mode
  * - Explicit readiness tracking
  * - Safe for BullMQ + health probes
+ * - Idempotent connect bootstrap
  */
 
 const { createClient } = require('redis');
+const env = require('./env');
 const logger = require('../utils/logger');
 
-const redisUrl = process.env.REDIS_URL || null;
-const cacheProvider = process.env.CACHE_PROVIDER || 'memory';
-const isProduction = process.env.NODE_ENV === 'production';
+const redisUrl = env.REDIS_URL || null;
+const cacheProvider = env.CACHE_PROVIDER || 'memory';
+const isProduction = env.NODE_ENV === 'production';
 
 let isReady = false;
+let connectPromise = null;
 
 const client = redisUrl
-  ? createClient({ url: redisUrl })
+  ? createClient({
+      url: redisUrl,
+      socket: {
+        reconnectStrategy(retries) {
+          return Math.min(retries * 100, 3000);
+        },
+      },
+    })
   : null;
 
 if (client) {
   client.on('error', (err) => {
     isReady = false;
-    logger.error('[Redis] Error', { error: err.message });
+    logger.error('[Redis] Error', {
+      error: err.message,
+    });
   });
 
   client.on('connect', () => {
@@ -43,6 +55,11 @@ if (client) {
   client.on('end', () => {
     isReady = false;
     logger.warn('[Redis] Connection closed');
+  });
+
+  client.on('reconnecting', () => {
+    isReady = false;
+    logger.warn('[Redis] Reconnecting');
   });
 }
 
@@ -64,11 +81,37 @@ async function connectRedis() {
     return null;
   }
 
-  if (!client.isOpen) {
-    await client.connect();
+  if (client.isOpen && isReady) {
+    return client;
   }
 
-  return client;
+  if (connectPromise) {
+    return connectPromise;
+  }
+
+  connectPromise = (async () => {
+    try {
+      if (!client.isOpen) {
+        await client.connect();
+      }
+
+      await client.ping();
+
+      isReady = true;
+      return client;
+    } catch (error) {
+      isReady = false;
+      logger.error('[Redis] Startup connection failed', {
+        error: error.message,
+      });
+
+      throw error;
+    } finally {
+      connectPromise = null;
+    }
+  })();
+
+  return connectPromise;
 }
 
 /**
@@ -78,8 +121,20 @@ function redisReady() {
   return isReady;
 }
 
+/**
+ * Structured status helper for /ready endpoint.
+ */
+function getRedisStatus() {
+  return {
+    provider: cacheProvider,
+    connected: isReady,
+    client: client ? 'redis' : 'memory',
+  };
+}
+
 module.exports = {
   redis: client,
   connectRedis,
   redisReady,
+  getRedisStatus,
 };
