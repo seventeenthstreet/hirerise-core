@@ -2,8 +2,8 @@ const cache = require("./analyticsCache.service");
 
 const WINDOW_15M_MS = 15 * 60 * 1000;
 const WINDOW_1H_MS = 60 * 60 * 1000;
+const FORECAST_TTL_MS = 14 * 24 * 60 * 60 * 1000;
 const FORECAST_CAP = 40;
-const DAY_MINUTES = 24 * 60;
 
 function getTimeSlot(date = new Date(), bucketMinutes = 15) {
   const mins = date.getHours() * 60 + date.getMinutes();
@@ -18,19 +18,50 @@ function buildKey(type, tenantId, suffix) {
   return `${type}:${tenantId}:${suffix}`;
 }
 
+async function safeIncrement(key, amount = 1, ttlMs = WINDOW_1H_MS) {
+  const redis = cache.redis;
+
+  // Redis distributed path (Cloud Run multi-pod safe)
+  if (redis?.isReady) {
+    const next = await redis.incrBy(key, amount);
+    await redis.pexpire(key, ttlMs);
+    return next;
+  }
+
+  // degraded fallback (node-cache / memory)
+  const existing = await cache.get(key);
+  const next = Number(existing || 0) + amount;
+
+  await cache.set(key, next, Math.ceil(ttlMs / 1000));
+  return next;
+}
+
 async function recordHeat({ tenantId, signalType, weight = 1 }) {
-  const now = Date.now();
-  const slot15 = getTimeSlot(new Date(now), 15);
-  const slot60 = getTimeSlot(new Date(now), 60);
-  const weekday = getWeekday(new Date(now));
+  const now = new Date();
+
+  const slot15 = getTimeSlot(now, 15);
+  const slot60 = getTimeSlot(now, 60);
+  const weekday = getWeekday(now);
 
   const updates = [
-    cache.increment(buildKey("heat15m", tenantId, slot15), weight, WINDOW_15M_MS),
-    cache.increment(buildKey("heat1h", tenantId, slot60), weight, WINDOW_1H_MS),
-    cache.increment(
-      buildKey("forecast", tenantId, `${weekday}:${slot15}:${signalType}`),
+    safeIncrement(
+      buildKey("heat15m", tenantId, slot15),
       weight,
-      14 * 24 * 60 * 60 * 1000
+      WINDOW_15M_MS
+    ),
+    safeIncrement(
+      buildKey("heat1h", tenantId, slot60),
+      weight,
+      WINDOW_1H_MS
+    ),
+    safeIncrement(
+      buildKey(
+        "forecast",
+        tenantId,
+        `${weekday}:${slot15}:${signalType}`
+      ),
+      weight,
+      FORECAST_TTL_MS
     ),
   ];
 
@@ -39,6 +70,7 @@ async function recordHeat({ tenantId, signalType, weight = 1 }) {
 
 async function getPredictiveBoost({ tenantId, signalType }) {
   const now = new Date();
+
   const slot15 = getTimeSlot(now, 15);
   const slot60 = getTimeSlot(now, 60);
   const weekday = getWeekday(now);
@@ -46,7 +78,13 @@ async function getPredictiveBoost({ tenantId, signalType }) {
   const [heat15m, heat1h, replayMemory] = await Promise.all([
     cache.get(buildKey("heat15m", tenantId, slot15)),
     cache.get(buildKey("heat1h", tenantId, slot60)),
-    cache.get(buildKey("forecast", tenantId, `${weekday}:${slot15}:${signalType}`)),
+    cache.get(
+      buildKey(
+        "forecast",
+        tenantId,
+        `${weekday}:${slot15}:${signalType}`
+      )
+    ),
   ]);
 
   const score =

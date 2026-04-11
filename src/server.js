@@ -760,7 +760,14 @@ app.use(errorHandler);
 const {
   warmHotTenantsOnDeploy,
 } = require('./workers/lifecycle.worker');
-const predictiveHeat = require('./infrastructure/cache/predictiveHeat.service');
+
+const {
+  replayDeployConsensus,
+} = require('./workers/lifecycleHeat.worker');
+
+const predictiveHeat = require(
+  './infrastructure/cache/predictiveHeat.service'
+);
 
 // Gotenberg health check on startup.
 // If GOTENBERG_URL is set (production), verify it is reachable before accepting
@@ -882,14 +889,39 @@ async function bootstrap() {
 
   // Wave 3 Priority #5 Patch 4 → deploy benchmark MV warmup
   deployWarmupPromise = warmHotTenantsOnDeploy();
+  deployWarmupPromise = warmHotTenantsOnDeploy();
 
-    predictiveHeat
+// Patch 7 → cross-replica deploy consensus replay
+setTimeout(async () => {
+  try {
+    await replayDeployConsensus({
+      activeTenants: global.__ACTIVE_TENANTS__ || [],
+      warmFn: async (tenantId, meta) => {
+        if (global.benchmarkQueue?.enqueueTenantWarm) {
+          await global.benchmarkQueue.enqueueTenantWarm({
+            tenantId,
+            source: meta.source,
+            confidence: meta.confidence,
+          });
+        }
+      },
+    });
+  } catch (error) {
+    logger.warn('[Server] Deploy consensus replay failed', {
+      error: error.message,
+    });
+  }
+}, 5000);
+
+predictiveHeat
+
+       predictiveHeat
     .recordHeat({
       tenantId: 'global',
       signalType: 'deploy_warm_sync',
       weight: 7 + getWeeklySprintBias(),
     })
-
+    
     .catch((err) => {
       logger.warn('[Server] Predictive deploy heat record failed', {
         error: err.message,
