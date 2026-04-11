@@ -882,13 +882,12 @@ async function bootstrap() {
     }
 
   server = app.listen(PORT, () => {
-  logger.info(
-    `[Server] HireRise Core running on port ${PORT} [${process.env.NODE_ENV}]`
-  );
+ logger.info(
+  `[Server] HireRise Core running on port ${PORT} [${app.get('env')}]`
+);
   logger.info(`[Server] API Base: ${API_PREFIX}`);
 
   // Wave 3 Priority #5 Patch 4 → deploy benchmark MV warmup
-  deployWarmupPromise = warmHotTenantsOnDeploy();
   deployWarmupPromise = warmHotTenantsOnDeploy();
 
 // Patch 7 → cross-replica deploy consensus replay
@@ -913,20 +912,25 @@ setTimeout(async () => {
   }
 }, 5000);
 
-predictiveHeat
+// Patch 9 → self-healing predictive topology worker
+predictiveHeat.startPredictiveTopologyWorker();
+logger.info('[Server] Patch 9 predictive topology worker started');
 
-       predictiveHeat
-    .recordHeat({
-      tenantId: 'global',
-      signalType: 'deploy_warm_sync',
-      weight: 7 + getWeeklySprintBias(),
-    })
-    
-    .catch((err) => {
-      logger.warn('[Server] Predictive deploy heat record failed', {
-        error: err.message,
-      });
+// Patch 10 → adaptive predictive intelligence mesh worker
+predictiveHeat.startLearningMeshWorker();
+logger.info('[Server] Patch 10 learning mesh worker started');
+
+predictiveHeat
+  .recordHeat({
+    tenantId: 'global',
+    signalType: 'deploy_warm_sync',
+    weight: 7 + getWeeklySprintBias(),
+  })
+  .catch((err) => {
+    logger.warn('[Server] Predictive deploy heat record failed', {
+      error: err.message,
     });
+  });
 
   deployWarmupPromise
     .then((results) => {
@@ -981,15 +985,23 @@ const gracefulShutdown = async (signal) => {
   }
 
   // Step 1: drain all workers in parallel
-  if (workerShutdownTasks.length > 0) {
-    logger.info(
-      `[Server] Stopping ${workerShutdownTasks.length} worker(s)...`
-    );
-    await Promise.allSettled(
-      workerShutdownTasks.map((task) => task())
-    );
-    logger.info('[Server] All workers stopped.');
-  }
+predictiveHeat.stopPredictiveTopologyWorker();
+logger.info('[Server] Patch 9 predictive topology worker stopped');
+
+predictiveHeat.stopLearningMeshWorker();
+logger.info('[Server] Patch 10 learning mesh worker stopped');
+
+if (workerShutdownTasks.length > 0) {
+  logger.info(
+    `[Server] Stopping ${workerShutdownTasks.length} worker(s)...`
+  );
+
+  await Promise.allSettled(
+    workerShutdownTasks.map((task) => task())
+  );
+
+  logger.info('[Server] All workers stopped.');
+}
 
   // Step 2: stop accepting new HTTP requests
   if (server) {
@@ -1003,7 +1015,7 @@ const gracefulShutdown = async (signal) => {
   await predictiveHeat
     .recordHeat({
       tenantId: 'global',
-      signalType: 'replica_coldstart',
+      signalType: 'replica_cold_exit',
       weight: 5 + getWeeklySprintBias(),
     })
     .catch((err) => {
