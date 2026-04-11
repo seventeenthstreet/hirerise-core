@@ -57,7 +57,6 @@ const { requireMasterAdmin }              = require('./middleware/requireMasterA
 const { requireContributor }              = require('./middleware/requireContributor.middleware');
 const { adminRateLimit, masterRateLimit } = require('./middleware/adminRateLimit.middleware');
 const { requireInternalToken }            = require('./middleware/internalToken.middleware');
-
 // ── Route modules ─────────────────────────────────────────────────────────────
 const devRoutes            = require('./modules/dev/dev.routes');
 const { secretsRouter }    = require('./modules/secrets');
@@ -779,6 +778,13 @@ const snapshotWorker = require(
   './infrastructure/workers/cacheSnapshot.worker'
 );
 
+const warmStatePrefetch = require(
+  './infrastructure/cache/warmStatePrefetch.service'
+);
+
+const regionalHandoffWorker = require(
+  './infrastructure/cache/regionalHandoffWorker.service'
+);
 // Gotenberg health check on startup.
 // If GOTENBERG_URL is set (production), verify it is reachable before accepting
 // PDF generation requests. Fails fast at boot rather than at first PDF request.
@@ -950,6 +956,24 @@ logger.info('[Server] Patch 13 replay policy worker started');
 cacheHydrationWorker.startCacheHydrationWorker();
 logger.info('[Server] Patch 14 cache hydration mesh started');
 
+// Patch 15 → autonomous warm-state prefetch mesh
+warmStatePrefetch
+  .hydrateBootSnapshot()
+  .then(() => warmStatePrefetch.runPrefetchCycle())
+  .then(() => {
+    warmStatePrefetch.startWarmStatePrefetchWorker();
+    regionalHandoffWorker.startRegionalMigrationWorker();
+
+    logger.info(
+      '[Server] Patch 15 autonomous warm-state prefetch mesh started'
+    );
+  })
+  .catch((err) => {
+    logger.warn('[Server] Patch 15 startup degraded', {
+      error: err.message,
+    });
+  });
+
 predictiveHeat
   .recordHeat({
     tenantId: 'global',
@@ -1041,6 +1065,15 @@ logger.info('[Server] Patch 13 replay policy worker stopped');
 
 cacheHydrationWorker.stopCacheHydrationWorker();
 logger.info('[Server] Patch 14 cache hydration mesh stopped');
+
+warmStatePrefetch.stopWarmStatePrefetchWorker();
+logger.info('[Server] Patch 15 warm-state prefetch worker stopped');
+
+await warmStatePrefetch.preserveHotsetSnapshot();
+logger.info('[Server] Patch 15 warm-state hotset preserved');
+
+await regionalHandoffWorker.stopRegionalMigrationWorker();
+logger.info('[Server] Patch 16 regional handoff preserved');
 
 if (workerShutdownTasks.length > 0) {
   logger.info(
