@@ -11,7 +11,11 @@ const HOT_KEY_THRESHOLD = 100;
 const REPLICA_SYNC_TTL_MS = 10 * 60 * 1000;
 const FEDERATION_TTL_MS = 12 * 60 * 60 * 1000;
 
-const PATCH11 = {
+const SWARM_INTERVAL_MS = 120 * 1000;
+const GOVERNANCE_TTL_MS = 15 * 60 * 1000;
+const REINFORCEMENT_CAP = 0.92;
+
+const PATCH12 = {
   replayRegistry: new Map(),
   retryLoopTracker: new Map(),
   percentileStorms: new Map(),
@@ -30,6 +34,11 @@ const PATCH11 = {
   // Patch 11 federation
   federationMemory: new Map(),
   federationReplicaSync: new Map(),
+
+  // Patch 12 swarm governance
+  swarmConsensus: new Map(),
+  governanceWeights: new Map(),
+  replayRunawayTracker: new Map(),
 };
 
 function getTimeSlot(date = new Date(), bucketMinutes = 15) {
@@ -64,6 +73,29 @@ function getSimilarityWeight(sourceVolume, targetVolume) {
   if (diff <= 50) return 0.7;
   if (diff <= 100) return 0.4;
   return 0.2;
+}
+
+function suppressReinforcementRunaway(signalType, confidence) {
+  const state =
+    PATCH12.replayRunawayTracker.get(signalType) || {
+      spikes: 0,
+      last: confidence,
+    };
+
+  if (confidence > state.last + 0.08) {
+    state.spikes += 1;
+  } else {
+    state.spikes = Math.max(0, state.spikes - 1);
+  }
+
+  state.last = confidence;
+  PATCH12.replayRunawayTracker.set(signalType, state);
+
+  return state.spikes > 3;
+}
+
+function getAdaptiveGovernanceWeight(signalType) {
+  return PATCH12.governanceWeights.get(signalType) || 1;
 }
 
 async function safeIncrement(key, amount = 1, ttlMs = WINDOW_1H_MS) {
@@ -101,30 +133,30 @@ async function safeSet(key, value, ttlMs) {
 function pruneStaleReplayRegistry(maxAgeMs = WINDOW_15M_MS) {
   const cutoff = Date.now() - maxAgeMs;
 
-  for (const [tenantId, meta] of PATCH11.replayRegistry.entries()) {
+ for (const [tenantId, meta] of PATCH12.replayRegistry.entries()) {
     if (!meta?.ts || meta.ts < cutoff) {
-      PATCH11.orphanReplay.set(tenantId, meta);
-      PATCH11.replayRegistry.delete(tenantId);
+      PATCH12.orphanReplay.set(tenantId, meta);
+      PATCH12.replayRegistry.delete(tenantId);
     }
   }
 }
 
 function recoverOrphanReplay(tenantId) {
-  const orphan = PATCH11.orphanReplay.get(tenantId);
+  const orphan = PATCH12.orphanReplay.get(tenantId);
   if (!orphan) return null;
 
-  PATCH11.replayRegistry.set(tenantId, {
+  PATCH12.replayRegistry.set(tenantId, {
     ...orphan,
     recovered: true,
     ts: Date.now(),
   });
 
-  PATCH11.orphanReplay.delete(tenantId);
+  PATCH12.orphanReplay.delete(tenantId);
   return true;
 }
 
 function correctRevisionDrift(tenantId, incomingRevision) {
-  const current = PATCH11.revisionTracker.get(tenantId) || 0;
+  const current = PATCH12.revisionTracker.get(tenantId) || 0;
   const drift = incomingRevision - current;
 
   let corrected = incomingRevision;
@@ -133,13 +165,13 @@ function correctRevisionDrift(tenantId, incomingRevision) {
     corrected = current + Math.sign(drift);
   }
 
-  PATCH11.revisionTracker.set(tenantId, corrected);
+  PATCH12.revisionTracker.set(tenantId, corrected);
   return corrected;
 }
 
 function suppressRetryLoopAnomaly(key, ttlMs = 120000) {
   const now = Date.now();
-  const state = PATCH11.retryLoopTracker.get(key) || {
+  const state = PATCH12.retryLoopTracker.get(key) || {
     count: 0,
     ts: now,
   };
@@ -150,14 +182,14 @@ function suppressRetryLoopAnomaly(key, ttlMs = 120000) {
   }
 
   state.count += 1;
-  PATCH11.retryLoopTracker.set(key, state);
+  PATCH12.retryLoopTracker.set(key, state);
 
   return state.count > 5;
 }
 
 function dampenPercentileMissStorm(tenantId) {
   const now = Date.now();
-  const state = PATCH11.percentileStorms.get(tenantId) || {
+  const state = PATCH12.percentileStorms.get(tenantId) || {
     count: 0,
     ts: now,
   };
@@ -168,16 +200,16 @@ function dampenPercentileMissStorm(tenantId) {
   }
 
   state.count += 1;
-  PATCH11.percentileStorms.set(tenantId, state);
+  PATCH12.percentileStorms.set(tenantId, state);
 
   return Math.min(1, 10 / state.count);
 }
 
 function smoothChiBatchFlood(tenantId, score) {
-  const prev = PATCH11.chiFloodTracker.get(tenantId) || score;
+  const prev = PATCH12.chiFloodTracker.get(tenantId) || score;
   const smoothed = prev * 0.7 + score * 0.3;
 
-  PATCH11.chiFloodTracker.set(tenantId, smoothed);
+  PATCH12.chiFloodTracker.set(tenantId, smoothed);
   return smoothed;
 }
 
@@ -187,9 +219,9 @@ function normalizeLowVolumeFairness(score, tenantVolume) {
 }
 
 function trackShardPressure(tenantId, score) {
-  const current = PATCH11.shardPressure.get(tenantId) || 0;
+  const current = PATCH12.shardPressure.get(tenantId) || 0;
   const next = current * 0.8 + score * 0.2;
-  PATCH11.shardPressure.set(tenantId, next);
+  PATCH12.shardPressure.set(tenantId, next);
   return next;
 }
 
@@ -200,10 +232,10 @@ function rebalanceHotShard(tenantId, score) {
 }
 
 function rebalanceLaneEntropy(tenantId, score) {
-  const current = PATCH11.laneEntropy.get(tenantId) || score;
+  const current = PATCH12.laneEntropy.get(tenantId) || score;
   const entropy = current * 0.6 + score * 0.4;
 
-  PATCH11.laneEntropy.set(tenantId, entropy);
+  PATCH12.laneEntropy.set(tenantId, entropy);
 
   if (entropy > HOT_KEY_THRESHOLD) {
     return Math.round(score * 0.8);
@@ -214,12 +246,12 @@ function rebalanceLaneEntropy(tenantId, score) {
 
 function suppressScaleOutBurst(tenantId) {
   const now = Date.now();
-  const existing = PATCH11.burstScaleTracker.get(tenantId) || [];
+  const existing = PATCH12.burstScaleTracker.get(tenantId) || [];
 
   const recent = existing.filter((ts) => now - ts < 30000);
   recent.push(now);
 
-  PATCH11.burstScaleTracker.set(tenantId, recent);
+  PATCH12.burstScaleTracker.set(tenantId, recent);
 
   return recent.length > 10;
 }
@@ -232,7 +264,7 @@ function getLaneLearningProfile(tenantId, signalType) {
   const key = getLearningKey(tenantId, signalType);
 
   return (
-    PATCH11.replayLaneLearning.get(key) || {
+    PATCH12.replayLaneLearning.get(key) || {
       reward: 0,
       penalty: 0,
       confidence: 0.5,
@@ -266,8 +298,8 @@ function reinforceReplayLane({
     profile.confidence = Math.max(0.05, profile.confidence - 0.08);
   }
 
-  PATCH11.replayLaneLearning.set(key, profile);
-  PATCH11.burstOutcomeMemory.set(key, {
+  PATCH12.replayLaneLearning.set(key, profile);
+  PATCH12.burstOutcomeMemory.set(key, {
     success,
     burstScore,
     ts: Date.now(),
@@ -286,13 +318,31 @@ async function publishFederationLearning({
     tenantVolume
   );
 
+  let adjustedConfidence = Number(confidence || 0);
+
+  if (adjustedConfidence > REINFORCEMENT_CAP) {
+    adjustedConfidence = REINFORCEMENT_CAP;
+  }
+
+  if (
+    suppressReinforcementRunaway(
+      signalType,
+      adjustedConfidence
+    )
+  ) {
+    adjustedConfidence *= 0.85;
+  }
+
+  adjustedConfidence *=
+    getAdaptiveGovernanceWeight(signalType);
+
   const snapshot = {
-    confidence,
+    confidence: adjustedConfidence,
     tenantVolume,
     ts: Date.now(),
   };
 
-  PATCH11.federationMemory.set(clusterKey, snapshot);
+  PATCH12.federationMemory.set(clusterKey, snapshot);
 
   await safeSet(
     `federation:${clusterKey}`,
@@ -308,7 +358,7 @@ async function getFederatedBoost(signalType, tenantVolume) {
   );
 
   const snapshot =
-    PATCH11.federationMemory.get(clusterKey) ||
+    PATCH12.federationMemory.get(clusterKey) ||
     (await cache.get(`federation:${clusterKey}`));
 
   if (!snapshot) return 0;
@@ -348,11 +398,11 @@ async function syncReplicaIntelligence() {
   const snapshot = {
     replicaId,
     active: true,
-    learningProfiles: PATCH11.replayLaneLearning.size,
+    learningProfiles: PATCH12.replayLaneLearning.size,
     ts: Date.now(),
   };
 
-  PATCH11.replicaIntelligence.set(replicaId, snapshot);
+  PATCH12.replicaIntelligence.set(replicaId, snapshot);
 
   await safeSet(
     `predictive_mesh:${replicaId}`,
@@ -360,17 +410,16 @@ async function syncReplicaIntelligence() {
     REPLICA_SYNC_TTL_MS
   );
 }
-
 async function syncFederationReplica() {
   const replicaId = process.env.K_REVISION || "local-dev";
 
   const snapshot = {
     replicaId,
-    clusters: PATCH11.federationMemory.size,
+    clusters: PATCH12.federationMemory.size,
     ts: Date.now(),
   };
 
-  PATCH11.federationReplicaSync.set(replicaId, snapshot);
+  PATCH12.federationReplicaSync.set(replicaId, snapshot);
 
   await safeSet(
     `federation_sync:${replicaId}`,
@@ -379,6 +428,40 @@ async function syncFederationReplica() {
   );
 }
 
+async function syncSwarmConsensus() {
+  const replicaId = process.env.K_REVISION || "local-dev";
+
+  const snapshot = {
+    replicaId,
+    clusters: PATCH12.federationMemory.size,
+    learningProfiles: PATCH12.replayLaneLearning.size,
+    ts: Date.now(),
+  };
+
+  PATCH12.swarmConsensus.set(replicaId, snapshot);
+
+  await safeSet(
+    `swarm_consensus:${replicaId}`,
+    snapshot,
+    GOVERNANCE_TTL_MS
+  );
+}
+
+function startSwarmGovernanceWorker() {
+  if (global.__HIRERISE_PATCH12_SWARM_WORKER__) {
+    clearInterval(global.__HIRERISE_PATCH12_SWARM_WORKER__);
+  }
+
+  global.__HIRERISE_PATCH12_SWARM_WORKER__ = setInterval(() => {
+    syncSwarmConsensus().catch(() => null);
+  }, SWARM_INTERVAL_MS);
+}
+
+function stopSwarmGovernanceWorker() {
+  if (global.__HIRERISE_PATCH12_SWARM_WORKER__) {
+    clearInterval(global.__HIRERISE_PATCH12_SWARM_WORKER__);
+  }
+}
 // ============================================================
 // Core predictive logic
 // ============================================================
@@ -471,7 +554,7 @@ async function recordHeat({
     ),
   ]);
 
-  PATCH11.replayRegistry.set(tenantId, {
+  PATCH12.replayRegistry.set(tenantId, {
     signalType,
     revision: correctedRevision,
     ts: Date.now(),
@@ -515,9 +598,8 @@ async function getPredictiveBoost({
     replayScore
   );
 
-  let priority =
-    heatScore * 0.35 +
-    heatScore * 0.35 +
+   let priority =
+    heatScore * 0.7 +
     smoothedReplay * 0.2 +
     dampenPercentileMissStorm(tenantId) * 0.1;
 
@@ -545,56 +627,56 @@ async function getPredictiveBoost({
 // ============================================================
 
 function startPredictiveTopologyWorker() {
-  if (global.__HIRERISE_PATCH11_TOPOLOGY_WORKER__) {
-    clearInterval(global.__HIRERISE_PATCH11_TOPOLOGY_WORKER__);
+  if (global.__HIRERISE_PATCH12_TOPOLOGY_WORKER__) {
+    clearInterval(global.__HIRERISE_PATCH12_TOPOLOGY_WORKER__);
   }
 
-  global.__HIRERISE_PATCH11_TOPOLOGY_WORKER__ = setInterval(() => {
+  global.__HIRERISE_PATCH12_TOPOLOGY_WORKER__ = setInterval(() => {
     pruneStaleReplayRegistry();
 
-    for (const [tenantId, pressure] of PATCH11.shardPressure.entries()) {
+    for (const [tenantId, pressure] of PATCH12.shardPressure.entries()) {
       if (pressure < HOT_KEY_THRESHOLD * 0.4) {
-        PATCH11.shardPressure.delete(tenantId);
+        PATCH12.shardPressure.delete(tenantId);
       }
     }
   }, REBALANCE_INTERVAL_MS);
 }
 
 function stopPredictiveTopologyWorker() {
-  if (global.__HIRERISE_PATCH11_TOPOLOGY_WORKER__) {
-    clearInterval(global.__HIRERISE_PATCH11_TOPOLOGY_WORKER__);
+  if (global.__HIRERISE_PATCH12_TOPOLOGY_WORKER__) {
+    clearInterval(global.__HIRERISE_PATCH12_TOPOLOGY_WORKER__);
   }
 }
 
 function startLearningMeshWorker() {
-  if (global.__HIRERISE_PATCH11_LEARNING_WORKER__) {
-    clearInterval(global.__HIRERISE_PATCH11_LEARNING_WORKER__);
+  if (global.__HIRERISE_PATCH12_LEARNING_WORKER__) {
+    clearInterval(global.__HIRERISE_PATCH12_LEARNING_WORKER__);
   }
 
-  global.__HIRERISE_PATCH11_LEARNING_WORKER__ = setInterval(() => {
+  global.__HIRERISE_PATCH12_LEARNING_WORKER__ = setInterval(() => {
     syncReplicaIntelligence().catch(() => null);
   }, LEARNING_INTERVAL_MS);
 }
 
 function stopLearningMeshWorker() {
-  if (global.__HIRERISE_PATCH11_LEARNING_WORKER__) {
-    clearInterval(global.__HIRERISE_PATCH11_LEARNING_WORKER__);
+  if (global.__HIRERISE_PATCH12_LEARNING_WORKER__) {
+    clearInterval(global.__HIRERISE_PATCH12_LEARNING_WORKER__);
   }
 }
 
 function startFederationWorker() {
-  if (global.__HIRERISE_PATCH11_FEDERATION_WORKER__) {
-    clearInterval(global.__HIRERISE_PATCH11_FEDERATION_WORKER__);
+  if (global.__HIRERISE_PATCH12_FEDERATION_WORKER__) {
+    clearInterval(global.__HIRERISE_PATCH12_FEDERATION_WORKER__);
   }
 
-  global.__HIRERISE_PATCH11_FEDERATION_WORKER__ = setInterval(() => {
+  global.__HIRERISE_PATCH12_FEDERATION_WORKER__ = setInterval(() => {
     syncFederationReplica().catch(() => null);
   }, FEDERATION_INTERVAL_MS);
 }
 
 function stopFederationWorker() {
-  if (global.__HIRERISE_PATCH11_FEDERATION_WORKER__) {
-    clearInterval(global.__HIRERISE_PATCH11_FEDERATION_WORKER__);
+  if (global.__HIRERISE_PATCH12_FEDERATION_WORKER__) {
+    clearInterval(global.__HIRERISE_PATCH12_FEDERATION_WORKER__);
   }
 }
 
@@ -607,4 +689,6 @@ module.exports = {
   stopLearningMeshWorker,
   startFederationWorker,
   stopFederationWorker,
+  startSwarmGovernanceWorker,
+  stopSwarmGovernanceWorker,
 };

@@ -924,6 +924,10 @@ logger.info('[Server] Patch 10 learning mesh worker started');
 predictiveHeat.startFederationWorker();
 logger.info('[Server] Patch 11 federation worker started');
 
+// Patch 12 → global intelligence swarm governance worker
+predictiveHeat.startSwarmGovernanceWorker();
+logger.info('[Server] Patch 12 swarm governance worker started');
+
 predictiveHeat
   .recordHeat({
     tenantId: 'global',
@@ -997,6 +1001,9 @@ logger.info('[Server] Patch 10 learning mesh worker stopped');
 
 predictiveHeat.stopFederationWorker();
 logger.info('[Server] Patch 11 federation worker stopped');
+
+predictiveHeat.stopSwarmGovernanceWorker();
+logger.info('[Server] Patch 12 swarm governance worker stopped');
 
 if (workerShutdownTasks.length > 0) {
   logger.info(
