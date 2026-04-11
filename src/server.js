@@ -47,6 +47,9 @@ const {
 
 // ── Utilities ─────────────────────────────────────────────────────────────────
 const logger = require('./utils/logger');
+const aiUsage = require('./services/aiUsage.service');
+const quorumReplication = require('./services/cache/quorumReplication.service');
+const consensusMesh = require('./services/cache/replayConsensusMesh.service');
 
 // ── Middleware ────────────────────────────────────────────────────────────────
 const { errorHandler, notFoundHandler }   = require('./middleware/errorHandler');
@@ -850,6 +853,17 @@ const sovereignRouting = require(
 
 const globalPolicyMesh = require("./infrastructure/policy/globalPolicyArbitrationMesh.service");
 
+const recoveryScheduler = require(
+  "./infrastructure/resilience/recoveryScheduler.service"
+);
+const circuitMesh = require(
+  "./infrastructure/resilience/failureCircuitMesh.service"
+);
+
+const pressureBalancer = require(
+  "./infrastructure/cache/pressureBalancer.worker"
+);
+
 // Gotenberg health check on startup.
 // If GOTENBERG_URL is set (production), verify it is reachable before accepting
 // PDF generation requests. Fails fast at boot rather than at first PDF request.
@@ -1047,6 +1061,26 @@ globalPolicyMesh.initializeGlobalPolicyMesh({
 logger.info(
   '[Server] Patch 18 global policy arbitration mesh initialized'
 );
+recoveryScheduler.startRecoveryScheduler();
+logger.info('[Server] Patch 19 recovery scheduler started');
+
+pressureBalancer.startPressureBalancerWorker();
+logger.info('[Server] Patch 20 pressure balancer worker started');
+
+global.__tenantCacheMesh =
+  global.__tenantCacheMesh || new Map();
+
+quorumReplication.startQuorumReplicationWorker(
+  () => global.__tenantCacheMesh
+);
+
+logger.info(
+  '[Server] Patch 21 quorum replication mesh started'
+);
+
+logger.info(
+  '[Server] Patch 22 consensus replay mesh initialized'
+);
 
 // Patch 17 → latency-aware sovereign routing mesh
 sovereignRouting.updateRegionLatency('ap-south-1', 42);
@@ -1164,6 +1198,28 @@ logger.info('[Server] Patch 16 regional handoff preserved');
 
 globalPolicyMesh.shutdownGlobalPolicyMesh();
 logger.info('[Server] Patch 18 policy arbitration mesh stopped');
+
+recoveryScheduler.stopRecoveryScheduler();
+logger.info('[Server] Patch 19 recovery scheduler stopped');
+
+pressureBalancer.stopPressureBalancerWorker();
+logger.info('[Server] Patch 20 pressure balancer worker stopped');
+
+quorumReplication.stopQuorumReplicationWorker();
+logger.info(
+  '[Server] Patch 21 quorum replication mesh stopped'
+);
+
+consensusMesh.shutdown();
+logger.info(
+  '[Server] Patch 22 consensus replay mesh stopped'
+);
+
+logger.info(
+  `[Server] Final circuit states: ${JSON.stringify(
+    circuitMesh.getAllCircuitStates()
+  )}`
+);
 
 logger.info(
   '[Server] Patch 17 sovereign routing mesh state preserved'

@@ -4,6 +4,7 @@ const replayPolicyEngine = require(
   "../governance/replayPolicy.engine"
 );
 
+const pressureIndex = require("./tenantPressureIndex.service");
 const WINDOW_15M_MS = 15 * 60 * 1000;
 const WINDOW_1H_MS = 60 * 60 * 1000;
 const FORECAST_TTL_MS = 14 * 24 * 60 * 60 * 1000;
@@ -574,11 +575,17 @@ async function recordHeat({
     ),
   ]);
 
-  PATCH12.replayRegistry.set(tenantId, {
+    PATCH12.replayRegistry.set(tenantId, {
     signalType,
     revision: correctedRevision,
     ts: Date.now(),
   });
+
+  if (adjustedWeight >= 6) {
+    pressureIndex.recordPressure(tenantId, 0.3);
+  } else if (adjustedWeight >= 3) {
+    pressureIndex.recordPressure(tenantId, 0.1);
+  }
 }
 
 async function getPredictiveBoost({
