@@ -772,6 +772,13 @@ const replayPolicyEngine = require(
   './infrastructure/governance/replayPolicy.engine'
 );
 
+const cacheHydrationWorker = require(
+  './infrastructure/workers/cacheHydration.worker'
+);
+const snapshotWorker = require(
+  './infrastructure/workers/cacheSnapshot.worker'
+);
+
 // Gotenberg health check on startup.
 // If GOTENBERG_URL is set (production), verify it is reachable before accepting
 // PDF generation requests. Fails fast at boot rather than at first PDF request.
@@ -940,6 +947,9 @@ replayPolicyEngine.startReplayPolicyWorker({
 });
 logger.info('[Server] Patch 13 replay policy worker started');
 
+cacheHydrationWorker.startCacheHydrationWorker();
+logger.info('[Server] Patch 14 cache hydration mesh started');
+
 predictiveHeat
   .recordHeat({
     tenantId: 'global',
@@ -1004,6 +1014,15 @@ const gracefulShutdown = async (signal) => {
     await Promise.allSettled([deployWarmupPromise]);
   }
 
+try {
+  await snapshotWorker.preserveShutdownSnapshot();
+  logger.info('[Server] Patch 14 lineage snapshot preserved');
+} catch (err) {
+  logger.warn('[Server] Patch 14 lineage snapshot failed (non-fatal)', {
+    error: err.message,
+  });
+}
+
   // Step 1: drain all workers in parallel
 predictiveHeat.stopPredictiveTopologyWorker();
 logger.info('[Server] Patch 9 predictive topology worker stopped');
@@ -1019,6 +1038,9 @@ logger.info('[Server] Patch 12 swarm governance worker stopped');
 
 replayPolicyEngine.stopReplayPolicyWorker();
 logger.info('[Server] Patch 13 replay policy worker stopped');
+
+cacheHydrationWorker.stopCacheHydrationWorker();
+logger.info('[Server] Patch 14 cache hydration mesh stopped');
 
 if (workerShutdownTasks.length > 0) {
   logger.info(
