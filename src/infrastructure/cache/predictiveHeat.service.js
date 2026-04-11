@@ -1,5 +1,9 @@
 const cache = require("./analyticsCache.service");
 
+const replayPolicyEngine = require(
+  "../governance/replayPolicy.engine"
+);
+
 const WINDOW_15M_MS = 15 * 60 * 1000;
 const WINDOW_1H_MS = 60 * 60 * 1000;
 const FORECAST_TTL_MS = 14 * 24 * 60 * 60 * 1000;
@@ -96,6 +100,22 @@ function suppressReinforcementRunaway(signalType, confidence) {
 
 function getAdaptiveGovernanceWeight(signalType) {
   return PATCH12.governanceWeights.get(signalType) || 1;
+}
+
+function getGlobalSwarmWeight() {
+  if (PATCH12.governanceWeights.size === 0) {
+    return 1;
+  }
+
+  let total = 0;
+  let count = 0;
+
+  for (const weight of PATCH12.governanceWeights.values()) {
+    total += Number(weight || 1);
+    count += 1;
+  }
+
+  return count === 0 ? 1 : total / count;
 }
 
 async function safeIncrement(key, amount = 1, ttlMs = WINDOW_1H_MS) {
@@ -597,11 +617,25 @@ async function getPredictiveBoost({
     tenantId,
     replayScore
   );
+  const replayPolicy =
+  replayPolicyEngine.autonomousReplayDecision({
+    tenantId,
+    replayPressure: smoothedReplay,
+    anomalyScore: dampenPercentileMissStorm(tenantId),
+    globalReplayWeight: getGlobalSwarmWeight() || 1,
+  });
 
-   let priority =
-    heatScore * 0.7 +
-    smoothedReplay * 0.2 +
-    dampenPercentileMissStorm(tenantId) * 0.1;
+let priority =
+  heatScore * 0.35 +
+  heatScore * 0.25 +
+  smoothedReplay *
+    0.2 *
+    replayPolicy.policy.replayWeight +
+  dampenPercentileMissStorm(tenantId) * 0.1;
+
+if (!replayPolicy.shouldReplay) {
+  priority *= 0.7;
+}
 
   priority += federatedBoost;
 

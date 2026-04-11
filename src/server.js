@@ -768,6 +768,9 @@ const {
 const predictiveHeat = require(
   './infrastructure/cache/predictiveHeat.service'
 );
+const replayPolicyEngine = require(
+  './infrastructure/governance/replayPolicy.engine'
+);
 
 // Gotenberg health check on startup.
 // If GOTENBERG_URL is set (production), verify it is reachable before accepting
@@ -927,6 +930,15 @@ logger.info('[Server] Patch 11 federation worker started');
 // Patch 12 → global intelligence swarm governance worker
 predictiveHeat.startSwarmGovernanceWorker();
 logger.info('[Server] Patch 12 swarm governance worker started');
+replayPolicyEngine.startReplayPolicyWorker({
+  getTenantReplayMetrics: async () => {
+    return predictiveHeat.getReplayDriftTelemetry?.() || [];
+  },
+  getGlobalSwarmWeight: async () => {
+    return predictiveHeat.getGlobalSwarmWeight?.() || 1;
+  },
+});
+logger.info('[Server] Patch 13 replay policy worker started');
 
 predictiveHeat
   .recordHeat({
@@ -1004,6 +1016,9 @@ logger.info('[Server] Patch 11 federation worker stopped');
 
 predictiveHeat.stopSwarmGovernanceWorker();
 logger.info('[Server] Patch 12 swarm governance worker stopped');
+
+replayPolicyEngine.stopReplayPolicyWorker();
+logger.info('[Server] Patch 13 replay policy worker stopped');
 
 if (workerShutdownTasks.length > 0) {
   logger.info(
