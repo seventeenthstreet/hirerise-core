@@ -4,6 +4,7 @@
  * src/modules/analysis/repositories/chiSnapshots.repository.js
  *
  * Wave 3 Priority #4.1 — domain naming hardening
+ * Wave 3 Priority #5.3 — analytics cache invalidation orchestration
  *
  * IMPORTANT
  * ----------
@@ -20,10 +21,12 @@
  * - preserves all RPC contracts
  * - preserves telemetry patch flow
  * - enables phased migration to resumeAnalysis.repository.js
+ * - adds post-write analytics cache invalidation
  */
 
 const { supabase } = require('../../../config/supabase');
 const logger = require('../../../utils/logger');
+const analyticsCache = require('../../../infrastructure/cache/analyticsCache.service');
 
 const RPC = Object.freeze({
   CREATE_SNAPSHOT: 'create_resume_analysis_snapshot',
@@ -121,6 +124,40 @@ class ResumeAnalysisRepository {
     };
   }
 
+  async invalidateAnalyticsCache(scopeId) {
+    if (!scopeId) return;
+
+    try {
+      await Promise.allSettled([
+        analyticsCache.invalidatePattern(
+          `analytics:${scopeId}:percentile:*`
+        ),
+        analyticsCache.invalidatePattern(
+          `analytics:${scopeId}:trend:*`
+        ),
+        analyticsCache.invalidatePattern(
+          `analytics:${scopeId}:dashboard:*`
+        ),
+        analyticsCache.invalidatePattern(
+          `analytics:${scopeId}:cohort:*`
+        ),
+      ]);
+
+      logger.debug(
+        '[ResumeAnalysisRepository] analytics cache invalidated',
+        { scopeId }
+      );
+    } catch (error) {
+      logger.warn(
+        '[ResumeAnalysisRepository] analytics cache invalidation failed',
+        {
+          scopeId,
+          error: error?.message || 'Unknown cache error',
+        }
+      );
+    }
+  }
+
   async createSnapshot(payload) {
     try {
       const row = this.buildSnapshotRow(payload);
@@ -132,7 +169,10 @@ class ResumeAnalysisRepository {
       );
 
       const normalized = this.normalizeSingleResult(rpcResult);
-      if (normalized) return normalized;
+      if (normalized) {
+        await this.invalidateAnalyticsCache(payload.userId);
+        return normalized;
+      }
 
       const { data, error } = await supabase
         .from(this.table)
@@ -141,6 +181,9 @@ class ResumeAnalysisRepository {
         .single();
 
       if (error) throw error;
+
+      await this.invalidateAnalyticsCache(payload.userId);
+
       return data;
     } catch (error) {
       logger.error('Resume analysis snapshot insert failed', {

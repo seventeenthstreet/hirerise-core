@@ -757,7 +757,10 @@ app.use(errorHandler);
 // =============================================================================
 // ✅ Startup tasks (non-blocking — server is already listening)
 // =============================================================================
-
+const {
+  warmHotTenantsOnDeploy,
+} = require('./workers/lifecycle.worker');
+const predictiveHeat = require('./infrastructure/cache/predictiveHeat.service');
 
 // Gotenberg health check on startup.
 // If GOTENBERG_URL is set (production), verify it is reachable before accepting
@@ -784,6 +787,7 @@ if (process.env.GOTENBERG_URL && process.env.NODE_ENV !== 'test') {
 // Using an array (not scattered process.on calls) prevents listener stacking
 // on hot reloads and ensures correct sequencing: workers stop before HTTP closes.
 const workerShutdownTasks = [];
+let deployWarmupPromise = null;
 
 // AI Event Bus Workers — BullMQ
 // Workers process AI engine jobs asynchronously:
@@ -850,6 +854,17 @@ if (process.env.RUN_ENGAGEMENT_WORKER === 'true') {
 const PORT = parseInt(process.env.PORT || '3000', 10);
 let server;
 
+function getWeeklySprintBias() {
+  const now = new Date();
+  const isMonday = now.getDay() === 1;
+  const hour = now.getHours();
+
+  if (!isMonday) return 0;
+  if (hour >= 8 && hour <= 12) return 10;
+
+  return 0;
+}
+
 async function bootstrap() {
   try {
     // PR 2: Redis must be ready before serving traffic
@@ -859,12 +874,40 @@ async function bootstrap() {
       return;
     }
 
-    server = app.listen(PORT, () => {
-      logger.info(
-        `[Server] HireRise Core running on port ${PORT} [${process.env.NODE_ENV}]`
-      );
-      logger.info(`[Server] API Base: ${API_PREFIX}`);
+  server = app.listen(PORT, () => {
+  logger.info(
+    `[Server] HireRise Core running on port ${PORT} [${process.env.NODE_ENV}]`
+  );
+  logger.info(`[Server] API Base: ${API_PREFIX}`);
+
+  // Wave 3 Priority #5 Patch 4 → deploy benchmark MV warmup
+  deployWarmupPromise = warmHotTenantsOnDeploy();
+
+    predictiveHeat
+    .recordHeat({
+      tenantId: 'global',
+      signalType: 'deploy_warm_sync',
+      weight: 7 + getWeeklySprintBias(),
+    })
+
+    .catch((err) => {
+      logger.warn('[Server] Predictive deploy heat record failed', {
+        error: err.message,
+      });
     });
+
+  deployWarmupPromise
+    .then((results) => {
+      logger.info('[Server] Benchmark deploy warmup complete', {
+        tenants: Array.isArray(results) ? results.length : 0,
+      });
+    })
+    .catch((err) => {
+      logger.warn('[Server] Benchmark deploy warmup failed (non-fatal)', {
+        error: err.message,
+      });
+    });
+});
 
 server.on('error', (err) => {
   if (err.code === 'EADDRINUSE') {
@@ -900,6 +943,11 @@ bootstrap();
 const gracefulShutdown = async (signal) => {
   logger.info(`[Server] ${signal} received — shutting down gracefully...`);
 
+  if (deployWarmupPromise) {
+    logger.info('[Server] Waiting for deploy benchmark warmup...');
+    await Promise.allSettled([deployWarmupPromise]);
+  }
+
   // Step 1: drain all workers in parallel
   if (workerShutdownTasks.length > 0) {
     logger.info(
@@ -920,6 +968,17 @@ const gracefulShutdown = async (signal) => {
       })
     );
   }
+  await predictiveHeat
+    .recordHeat({
+      tenantId: 'global',
+      signalType: 'replica_coldstart',
+      weight: 5 + getWeeklySprintBias(),
+    })
+    .catch((err) => {
+      logger.warn('[Server] Predictive shutdown heat record failed', {
+        error: err.message,
+      });
+    });
 
   // Step 3: close Redis gracefully
     try {
