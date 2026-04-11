@@ -313,7 +313,6 @@ app.use(`${API_PREFIX}/career-onboarding`,  authenticate, require('./routes/care
  *   GET /api/v1/job-seeker/jobs/match            → top matched roles (scored)
  *   GET /api/v1/job-seeker/jobs/recommendations  → enriched top-5 recommendations
  */
-app.use(`${API_PREFIX}/job-seeker`, authenticate, require('./modules/jobSeeker/jobSeeker.routes'));
 
 /**
  * Semantic AI Upgrade — Skill Intelligence + Job Matching
@@ -402,8 +401,6 @@ app.use(API_PREFIX, authenticate, require('./modules/personalization/personaliza
  *   GET  /api/v1/copilot/context                 → debug context (non-prod only)
  */
 app.use(`${API_PREFIX}/ava-memory`, authenticate, require('./modules/ava-memory/routes/avaMemory.routes'));
-app.use(`${API_PREFIX}/copilot`,    authenticate, require('./modules/career-copilot/routes/careerCopilot.routes'));
-app.use(`${API_PREFIX}/copilot`,    authenticate, require('./modules/career-copilot/routes/agentCoordinator.routes'));
 
 /**
  * Education Intelligence — AI Pipeline
@@ -418,12 +415,67 @@ app.use(`${API_PREFIX}/copilot`,    authenticate, require('./modules/career-copi
  *
  * Auth: students may only access their own profile; admins may access any.
  */
-app.use(`${API_PREFIX}/education`, authenticate, require('./modules/education-intelligence/routes/student.routes'));
-app.use(`${API_PREFIX}/education`, authenticate, require('./modules/education-intelligence/routes/analysis.routes'));
-app.use(`${API_PREFIX}/education`, authenticate, require('./modules/education-intelligence/routes/careerPrediction.routes'));
-app.use(`${API_PREFIX}/education`, authenticate, require('./modules/education-intelligence/routes/roiAnalysis.routes'));
-app.use(`${API_PREFIX}/education`, authenticate, require('./modules/education-intelligence/routes/careerSimulation.routes'));
+app.use(
+  `${API_PREFIX}/education`,
+  authenticate,
+  tenantRegionMiddleware,
+  require('./modules/education-intelligence/routes/student.routes')
+);
+app.use(
+  `${API_PREFIX}/analytics`,
+  authenticate,
+  tenantRegionMiddleware,
+  require('./modules/career-intelligence-dashboard/routes/analytics.routes')
+);
 
+app.use(
+  `${API_PREFIX}/advisor`,
+  authenticate,
+  tenantRegionMiddleware,
+  require('./modules/ai-career-advisor/routes/advisor.routes')
+);
+
+app.use(
+  `${API_PREFIX}/copilot`,
+  authenticate,
+  tenantRegionMiddleware,
+  require('./modules/career-copilot/routes/careerCopilot.routes')
+);
+
+app.use(
+  `${API_PREFIX}/copilot`,
+  authenticate,
+  tenantRegionMiddleware,
+  require('./modules/career-copilot/routes/agentCoordinator.routes')
+);
+
+app.use(
+  `${API_PREFIX}/job-seeker`,
+  authenticate,
+  tenantRegionMiddleware,
+  require('./modules/jobSeeker/jobSeeker.routes')
+);
+
+app.use(
+  `${API_PREFIX}/education`,
+  authenticate,
+  tenantRegionMiddleware,
+  require('./modules/education-intelligence/routes/roiAnalysis.routes')
+);
+
+app.use(
+  `${API_PREFIX}/education`,
+  authenticate,
+  tenantRegionMiddleware,
+  require('./modules/education-intelligence/routes/careerPrediction.routes')
+);
+
+app.use(
+  `${API_PREFIX}/education`,
+  authenticate,
+  tenantRegionMiddleware,
+  require('./modules/education-intelligence/routes/careerSimulation.routes')
+);
 /**
  * Skill Evolution Engine (SEE)
  *   GET /api/v1/education/skills/recommendations/:studentId → ranked skills + roadmap
@@ -452,7 +504,6 @@ app.use(`${API_PREFIX}/market`, authenticate, require('./modules/labor-market-in
  *   GET /api/v1/analytics/overview         → All five in one response
  *   GET /api/v1/analytics/snapshots/:metric → Historical snapshots
  */
-app.use(`${API_PREFIX}/analytics`,    authenticate, require('./modules/career-intelligence-dashboard/routes/analytics.routes'));
 app.use(`${API_PREFIX}/career-health`, authenticate, require('./modules/careerHealthIndex/careerHealthIndex.routes'));
 
 /**
@@ -461,7 +512,6 @@ app.use(`${API_PREFIX}/career-health`, authenticate, require('./modules/careerHe
  *   GET  /api/v1/advisor/welcome/:studentId → personalised welcome message
  *   GET  /api/v1/advisor/history/:studentId → conversation history
  */
-app.use(`${API_PREFIX}/advisor`, authenticate, require('./modules/ai-career-advisor/routes/advisor.routes'));
 
 /**
  * School & Counselor Platform
