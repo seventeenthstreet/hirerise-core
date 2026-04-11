@@ -6,11 +6,12 @@ const FORECAST_TTL_MS = 14 * 24 * 60 * 60 * 1000;
 const FORECAST_CAP = 40;
 const REBALANCE_INTERVAL_MS = 60 * 1000;
 const LEARNING_INTERVAL_MS = 45 * 1000;
+const FEDERATION_INTERVAL_MS = 90 * 1000;
 const HOT_KEY_THRESHOLD = 100;
-const LEARNING_TTL_MS = 6 * 60 * 60 * 1000;
 const REPLICA_SYNC_TTL_MS = 10 * 60 * 1000;
+const FEDERATION_TTL_MS = 12 * 60 * 60 * 1000;
 
-const PATCH10 = {
+const PATCH11 = {
   replayRegistry: new Map(),
   retryLoopTracker: new Map(),
   percentileStorms: new Map(),
@@ -25,6 +26,10 @@ const PATCH10 = {
   replayLaneLearning: new Map(),
   burstOutcomeMemory: new Map(),
   replicaIntelligence: new Map(),
+
+  // Patch 11 federation
+  federationMemory: new Map(),
+  federationReplicaSync: new Map(),
 };
 
 function getTimeSlot(date = new Date(), bucketMinutes = 15) {
@@ -44,6 +49,23 @@ function getLearningKey(tenantId, signalType) {
   return `${tenantId}:${signalType}`;
 }
 
+function getFederationClusterKey(signalType, tenantVolume) {
+  const band =
+    tenantVolume >= 100 ? "high" :
+    tenantVolume >= 25 ? "mid" : "low";
+
+  return `${signalType}:${band}`;
+}
+
+function getSimilarityWeight(sourceVolume, targetVolume) {
+  const diff = Math.abs(sourceVolume - targetVolume);
+
+  if (diff <= 10) return 1;
+  if (diff <= 50) return 0.7;
+  if (diff <= 100) return 0.4;
+  return 0.2;
+}
+
 async function safeIncrement(key, amount = 1, ttlMs = WINDOW_1H_MS) {
   const redis = cache.redis;
 
@@ -61,47 +83,48 @@ async function safeIncrement(key, amount = 1, ttlMs = WINDOW_1H_MS) {
 }
 
 async function safeSet(key, value, ttlMs) {
-  const redis = cache.redis;
-
-  if (redis?.isReady) {
-    await redis.set(key, JSON.stringify(value), "PX", ttlMs);
-    return;
+  try {
+    await cache.set(
+      key,
+      value,
+      Math.ceil(ttlMs / 1000)
+    );
+  } catch (error) {
+    return null;
   }
-
-  await cache.set(key, value, Math.ceil(ttlMs / 1000));
 }
 
 // ============================================================
-// Patch 8 + Patch 9 healing layer
+// Patch 8 + 9 healing
 // ============================================================
 
 function pruneStaleReplayRegistry(maxAgeMs = WINDOW_15M_MS) {
   const cutoff = Date.now() - maxAgeMs;
 
-  for (const [tenantId, meta] of PATCH10.replayRegistry.entries()) {
+  for (const [tenantId, meta] of PATCH11.replayRegistry.entries()) {
     if (!meta?.ts || meta.ts < cutoff) {
-      PATCH10.orphanReplay.set(tenantId, meta);
-      PATCH10.replayRegistry.delete(tenantId);
+      PATCH11.orphanReplay.set(tenantId, meta);
+      PATCH11.replayRegistry.delete(tenantId);
     }
   }
 }
 
 function recoverOrphanReplay(tenantId) {
-  const orphan = PATCH10.orphanReplay.get(tenantId);
+  const orphan = PATCH11.orphanReplay.get(tenantId);
   if (!orphan) return null;
 
-  PATCH10.replayRegistry.set(tenantId, {
+  PATCH11.replayRegistry.set(tenantId, {
     ...orphan,
     recovered: true,
     ts: Date.now(),
   });
 
-  PATCH10.orphanReplay.delete(tenantId);
+  PATCH11.orphanReplay.delete(tenantId);
   return true;
 }
 
 function correctRevisionDrift(tenantId, incomingRevision) {
-  const current = PATCH10.revisionTracker.get(tenantId) || 0;
+  const current = PATCH11.revisionTracker.get(tenantId) || 0;
   const drift = incomingRevision - current;
 
   let corrected = incomingRevision;
@@ -110,13 +133,13 @@ function correctRevisionDrift(tenantId, incomingRevision) {
     corrected = current + Math.sign(drift);
   }
 
-  PATCH10.revisionTracker.set(tenantId, corrected);
+  PATCH11.revisionTracker.set(tenantId, corrected);
   return corrected;
 }
 
 function suppressRetryLoopAnomaly(key, ttlMs = 120000) {
   const now = Date.now();
-  const state = PATCH10.retryLoopTracker.get(key) || {
+  const state = PATCH11.retryLoopTracker.get(key) || {
     count: 0,
     ts: now,
   };
@@ -127,14 +150,14 @@ function suppressRetryLoopAnomaly(key, ttlMs = 120000) {
   }
 
   state.count += 1;
-  PATCH10.retryLoopTracker.set(key, state);
+  PATCH11.retryLoopTracker.set(key, state);
 
   return state.count > 5;
 }
 
 function dampenPercentileMissStorm(tenantId) {
   const now = Date.now();
-  const state = PATCH10.percentileStorms.get(tenantId) || {
+  const state = PATCH11.percentileStorms.get(tenantId) || {
     count: 0,
     ts: now,
   };
@@ -145,16 +168,16 @@ function dampenPercentileMissStorm(tenantId) {
   }
 
   state.count += 1;
-  PATCH10.percentileStorms.set(tenantId, state);
+  PATCH11.percentileStorms.set(tenantId, state);
 
   return Math.min(1, 10 / state.count);
 }
 
 function smoothChiBatchFlood(tenantId, score) {
-  const prev = PATCH10.chiFloodTracker.get(tenantId) || score;
+  const prev = PATCH11.chiFloodTracker.get(tenantId) || score;
   const smoothed = prev * 0.7 + score * 0.3;
 
-  PATCH10.chiFloodTracker.set(tenantId, smoothed);
+  PATCH11.chiFloodTracker.set(tenantId, smoothed);
   return smoothed;
 }
 
@@ -164,27 +187,23 @@ function normalizeLowVolumeFairness(score, tenantVolume) {
 }
 
 function trackShardPressure(tenantId, score) {
-  const current = PATCH10.shardPressure.get(tenantId) || 0;
+  const current = PATCH11.shardPressure.get(tenantId) || 0;
   const next = current * 0.8 + score * 0.2;
-  PATCH10.shardPressure.set(tenantId, next);
+  PATCH11.shardPressure.set(tenantId, next);
   return next;
 }
 
 function rebalanceHotShard(tenantId, score) {
   const pressure = trackShardPressure(tenantId, score);
-
-  if (pressure < HOT_KEY_THRESHOLD) {
-    return score;
-  }
-
+  if (pressure < HOT_KEY_THRESHOLD) return score;
   return Math.round(score * 0.75);
 }
 
 function rebalanceLaneEntropy(tenantId, score) {
-  const current = PATCH10.laneEntropy.get(tenantId) || score;
+  const current = PATCH11.laneEntropy.get(tenantId) || score;
   const entropy = current * 0.6 + score * 0.4;
 
-  PATCH10.laneEntropy.set(tenantId, entropy);
+  PATCH11.laneEntropy.set(tenantId, entropy);
 
   if (entropy > HOT_KEY_THRESHOLD) {
     return Math.round(score * 0.8);
@@ -195,25 +214,25 @@ function rebalanceLaneEntropy(tenantId, score) {
 
 function suppressScaleOutBurst(tenantId) {
   const now = Date.now();
-  const existing = PATCH10.burstScaleTracker.get(tenantId) || [];
+  const existing = PATCH11.burstScaleTracker.get(tenantId) || [];
 
   const recent = existing.filter((ts) => now - ts < 30000);
   recent.push(now);
 
-  PATCH10.burstScaleTracker.set(tenantId, recent);
+  PATCH11.burstScaleTracker.set(tenantId, recent);
 
   return recent.length > 10;
 }
 
 // ============================================================
-// Patch 10 adaptive intelligence mesh
+// Patch 10 + 11 learning + federation
 // ============================================================
 
 function getLaneLearningProfile(tenantId, signalType) {
   const key = getLearningKey(tenantId, signalType);
 
   return (
-    PATCH10.replayLaneLearning.get(key) || {
+    PATCH11.replayLaneLearning.get(key) || {
       reward: 0,
       penalty: 0,
       confidence: 0.5,
@@ -240,27 +259,66 @@ function reinforceReplayLane({
   if (success) {
     profile.reward += 1 + burstScore;
     profile.wins += 1;
-    profile.confidence = Math.min(
-      0.99,
-      profile.confidence + 0.05
-    );
+    profile.confidence = Math.min(0.99, profile.confidence + 0.05);
   } else {
     profile.penalty += 1;
     profile.losses += 1;
-    profile.confidence = Math.max(
-      0.05,
-      profile.confidence - 0.08
-    );
+    profile.confidence = Math.max(0.05, profile.confidence - 0.08);
   }
 
-  PATCH10.replayLaneLearning.set(key, profile);
-  PATCH10.burstOutcomeMemory.set(key, {
+  PATCH11.replayLaneLearning.set(key, profile);
+  PATCH11.burstOutcomeMemory.set(key, {
     success,
     burstScore,
     ts: Date.now(),
   });
 
   return profile;
+}
+
+async function publishFederationLearning({
+  signalType,
+  confidence,
+  tenantVolume,
+}) {
+  const clusterKey = getFederationClusterKey(
+    signalType,
+    tenantVolume
+  );
+
+  const snapshot = {
+    confidence,
+    tenantVolume,
+    ts: Date.now(),
+  };
+
+  PATCH11.federationMemory.set(clusterKey, snapshot);
+
+  await safeSet(
+    `federation:${clusterKey}`,
+    snapshot,
+    FEDERATION_TTL_MS
+  );
+}
+
+async function getFederatedBoost(signalType, tenantVolume) {
+  const clusterKey = getFederationClusterKey(
+    signalType,
+    tenantVolume
+  );
+
+  const snapshot =
+    PATCH11.federationMemory.get(clusterKey) ||
+    (await cache.get(`federation:${clusterKey}`));
+
+  if (!snapshot) return 0;
+
+  const similarity = getSimilarityWeight(
+    snapshot.tenantVolume,
+    tenantVolume
+  );
+
+  return Math.round(snapshot.confidence * 8 * similarity);
 }
 
 function applyAdaptiveLearningBoost(
@@ -290,14 +348,32 @@ async function syncReplicaIntelligence() {
   const snapshot = {
     replicaId,
     active: true,
-    learningProfiles: PATCH10.replayLaneLearning.size,
+    learningProfiles: PATCH11.replayLaneLearning.size,
     ts: Date.now(),
   };
 
-  PATCH10.replicaIntelligence.set(replicaId, snapshot);
+  PATCH11.replicaIntelligence.set(replicaId, snapshot);
 
   await safeSet(
     `predictive_mesh:${replicaId}`,
+    snapshot,
+    REPLICA_SYNC_TTL_MS
+  );
+}
+
+async function syncFederationReplica() {
+  const replicaId = process.env.K_REVISION || "local-dev";
+
+  const snapshot = {
+    replicaId,
+    clusters: PATCH11.federationMemory.size,
+    ts: Date.now(),
+  };
+
+  PATCH11.federationReplicaSync.set(replicaId, snapshot);
+
+  await safeSet(
+    `federation_sync:${replicaId}`,
     snapshot,
     REPLICA_SYNC_TTL_MS
   );
@@ -362,12 +438,18 @@ async function recordHeat({
     burstScore: adjustedWeight,
   });
 
+  await publishFederationLearning({
+    signalType,
+    confidence: learningProfile.confidence,
+    tenantVolume: adjustedWeight,
+  });
+
   adjustedWeight = Math.max(
     adjustedWeight,
     Math.round(adjustedWeight * learningProfile.confidence)
   );
 
-  const updates = [
+  await Promise.allSettled([
     safeIncrement(
       buildKey("heat15m", tenantId, slot15),
       adjustedWeight,
@@ -387,11 +469,9 @@ async function recordHeat({
       adjustedWeight,
       FORECAST_TTL_MS
     ),
-  ];
+  ]);
 
-  await Promise.allSettled(updates);
-
-  PATCH10.replayRegistry.set(tenantId, {
+  PATCH11.replayRegistry.set(tenantId, {
     signalType,
     revision: correctedRevision,
     ts: Date.now(),
@@ -410,17 +490,19 @@ async function getPredictiveBoost({
   const slot60 = getTimeSlot(now, 60);
   const weekday = getWeekday(now);
 
-  const [heat15m, heat1h, replayMemory] = await Promise.all([
-    cache.get(buildKey("heat15m", tenantId, slot15)),
-    cache.get(buildKey("heat1h", tenantId, slot60)),
-    cache.get(
-      buildKey(
-        "forecast",
-        tenantId,
-        `${weekday}:${slot15}:${signalType}`
-      )
-    ),
-  ]);
+  const [heat15m, heat1h, replayMemory, federatedBoost] =
+    await Promise.all([
+      cache.get(buildKey("heat15m", tenantId, slot15)),
+      cache.get(buildKey("heat1h", tenantId, slot60)),
+      cache.get(
+        buildKey(
+          "forecast",
+          tenantId,
+          `${weekday}:${slot15}:${signalType}`
+        )
+      ),
+      getFederatedBoost(signalType, tenantVolume),
+    ]);
 
   const heatScore =
     Number(heat15m || 0) * 1.4 +
@@ -438,6 +520,8 @@ async function getPredictiveBoost({
     heatScore * 0.35 +
     smoothedReplay * 0.2 +
     dampenPercentileMissStorm(tenantId) * 0.1;
+
+  priority += federatedBoost;
 
   priority = normalizeLowVolumeFairness(
     priority,
@@ -457,44 +541,60 @@ async function getPredictiveBoost({
 }
 
 // ============================================================
-// Patch 10 lifecycle workers
+// Lifecycle workers
 // ============================================================
 
 function startPredictiveTopologyWorker() {
-  if (global.__HIRERISE_PATCH10_TOPOLOGY_WORKER__) {
-    clearInterval(global.__HIRERISE_PATCH10_TOPOLOGY_WORKER__);
+  if (global.__HIRERISE_PATCH11_TOPOLOGY_WORKER__) {
+    clearInterval(global.__HIRERISE_PATCH11_TOPOLOGY_WORKER__);
   }
 
-  global.__HIRERISE_PATCH10_TOPOLOGY_WORKER__ = setInterval(() => {
+  global.__HIRERISE_PATCH11_TOPOLOGY_WORKER__ = setInterval(() => {
     pruneStaleReplayRegistry();
 
-    for (const [tenantId, pressure] of PATCH10.shardPressure.entries()) {
+    for (const [tenantId, pressure] of PATCH11.shardPressure.entries()) {
       if (pressure < HOT_KEY_THRESHOLD * 0.4) {
-        PATCH10.shardPressure.delete(tenantId);
+        PATCH11.shardPressure.delete(tenantId);
       }
     }
   }, REBALANCE_INTERVAL_MS);
 }
 
 function stopPredictiveTopologyWorker() {
-  if (global.__HIRERISE_PATCH10_TOPOLOGY_WORKER__) {
-    clearInterval(global.__HIRERISE_PATCH10_TOPOLOGY_WORKER__);
+  if (global.__HIRERISE_PATCH11_TOPOLOGY_WORKER__) {
+    clearInterval(global.__HIRERISE_PATCH11_TOPOLOGY_WORKER__);
   }
 }
 
 function startLearningMeshWorker() {
-  if (global.__HIRERISE_PATCH10_LEARNING_WORKER__) {
-    clearInterval(global.__HIRERISE_PATCH10_LEARNING_WORKER__);
+  if (global.__HIRERISE_PATCH11_LEARNING_WORKER__) {
+    clearInterval(global.__HIRERISE_PATCH11_LEARNING_WORKER__);
   }
 
-  global.__HIRERISE_PATCH10_LEARNING_WORKER__ = setInterval(() => {
+  global.__HIRERISE_PATCH11_LEARNING_WORKER__ = setInterval(() => {
     syncReplicaIntelligence().catch(() => null);
   }, LEARNING_INTERVAL_MS);
 }
 
 function stopLearningMeshWorker() {
-  if (global.__HIRERISE_PATCH10_LEARNING_WORKER__) {
-    clearInterval(global.__HIRERISE_PATCH10_LEARNING_WORKER__);
+  if (global.__HIRERISE_PATCH11_LEARNING_WORKER__) {
+    clearInterval(global.__HIRERISE_PATCH11_LEARNING_WORKER__);
+  }
+}
+
+function startFederationWorker() {
+  if (global.__HIRERISE_PATCH11_FEDERATION_WORKER__) {
+    clearInterval(global.__HIRERISE_PATCH11_FEDERATION_WORKER__);
+  }
+
+  global.__HIRERISE_PATCH11_FEDERATION_WORKER__ = setInterval(() => {
+    syncFederationReplica().catch(() => null);
+  }, FEDERATION_INTERVAL_MS);
+}
+
+function stopFederationWorker() {
+  if (global.__HIRERISE_PATCH11_FEDERATION_WORKER__) {
+    clearInterval(global.__HIRERISE_PATCH11_FEDERATION_WORKER__);
   }
 }
 
@@ -505,4 +605,6 @@ module.exports = {
   stopPredictiveTopologyWorker,
   startLearningMeshWorker,
   stopLearningMeshWorker,
+  startFederationWorker,
+  stopFederationWorker,
 };

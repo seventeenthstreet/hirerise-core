@@ -920,6 +920,10 @@ logger.info('[Server] Patch 9 predictive topology worker started');
 predictiveHeat.startLearningMeshWorker();
 logger.info('[Server] Patch 10 learning mesh worker started');
 
+// Patch 11 → cross-tenant transfer learning federation worker
+predictiveHeat.startFederationWorker();
+logger.info('[Server] Patch 11 federation worker started');
+
 predictiveHeat
   .recordHeat({
     tenantId: 'global',
@@ -990,6 +994,9 @@ logger.info('[Server] Patch 9 predictive topology worker stopped');
 
 predictiveHeat.stopLearningMeshWorker();
 logger.info('[Server] Patch 10 learning mesh worker stopped');
+
+predictiveHeat.stopFederationWorker();
+logger.info('[Server] Patch 11 federation worker stopped');
 
 if (workerShutdownTasks.length > 0) {
   logger.info(
