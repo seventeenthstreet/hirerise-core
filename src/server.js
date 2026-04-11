@@ -847,6 +847,9 @@ const regionalHandoffWorker = require(
 const sovereignRouting = require(
   './infrastructure/routing/sovereignRoutingMesh.service'
 );
+
+const globalPolicyMesh = require("./infrastructure/policy/globalPolicyArbitrationMesh.service");
+
 // Gotenberg health check on startup.
 // If GOTENBERG_URL is set (production), verify it is reachable before accepting
 // PDF generation requests. Fails fast at boot rather than at first PDF request.
@@ -1027,14 +1030,24 @@ warmStatePrefetch
     regionalHandoffWorker.startRegionalMigrationWorker();
 
     logger.info(
-      '[Server] Patch 15 autonomous warm-state prefetch mesh started'
-    );
+  '[Server] Patch 15 autonomous warm-state prefetch mesh started'
+);
   })
   .catch((err) => {
     logger.warn('[Server] Patch 15 startup degraded', {
       error: err.message,
     });
   });
+
+// Patch 18 → global policy arbitration control plane
+globalPolicyMesh.initializeGlobalPolicyMesh({
+  regions: ['ap-south-1', 'me-central-1', 'eu-west-1'],
+});
+
+logger.info(
+  '[Server] Patch 18 global policy arbitration mesh initialized'
+);
+
 // Patch 17 → latency-aware sovereign routing mesh
 sovereignRouting.updateRegionLatency('ap-south-1', 42);
 sovereignRouting.updateRegionLatency('me-central-1', 78);
@@ -1148,6 +1161,9 @@ logger.info('[Server] Patch 15 warm-state hotset preserved');
 
 await regionalHandoffWorker.stopRegionalMigrationWorker();
 logger.info('[Server] Patch 16 regional handoff preserved');
+
+globalPolicyMesh.shutdownGlobalPolicyMesh();
+logger.info('[Server] Patch 18 policy arbitration mesh stopped');
 
 logger.info(
   '[Server] Patch 17 sovereign routing mesh state preserved'
