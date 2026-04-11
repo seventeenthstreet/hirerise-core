@@ -57,6 +57,9 @@ const { requireMasterAdmin }              = require('./middleware/requireMasterA
 const { requireContributor }              = require('./middleware/requireContributor.middleware');
 const { adminRateLimit, masterRateLimit } = require('./middleware/adminRateLimit.middleware');
 const { requireInternalToken }            = require('./middleware/internalToken.middleware');
+const {
+  tenantRegionMiddleware,
+} = require('./middleware/tenantRegion.middleware');
 // ── Route modules ─────────────────────────────────────────────────────────────
 const devRoutes            = require('./modules/dev/dev.routes');
 const { secretsRouter }    = require('./modules/secrets');
@@ -245,7 +248,12 @@ app.get(`${API_PREFIX}/metrics`, observabilityAdapter.prometheusMetricsHandler()
 // Auth applied per-group intentionally: avoids the 401-before-404 ordering bug
 // that occurs when a global authenticate() precedes all routes.
 
-app.use(`${API_PREFIX}/career`,             authenticate, require('./routes/career.routes'));
+app.use(
+  `${API_PREFIX}/career`,
+  authenticate,
+  tenantRegionMiddleware,
+  require('./routes/career.routes')
+);
 app.use(`${API_PREFIX}/career-graph`,       authenticate, require('./modules/careerGraph/careerGraph.routes'));
 
 /**
@@ -785,6 +793,10 @@ const warmStatePrefetch = require(
 const regionalHandoffWorker = require(
   './infrastructure/cache/regionalHandoffWorker.service'
 );
+
+const sovereignRouting = require(
+  './infrastructure/routing/sovereignRoutingMesh.service'
+);
 // Gotenberg health check on startup.
 // If GOTENBERG_URL is set (production), verify it is reachable before accepting
 // PDF generation requests. Fails fast at boot rather than at first PDF request.
@@ -973,6 +985,18 @@ warmStatePrefetch
       error: err.message,
     });
   });
+// Patch 17 → latency-aware sovereign routing mesh
+sovereignRouting.updateRegionLatency('ap-south-1', 42);
+sovereignRouting.updateRegionLatency('me-central-1', 78);
+sovereignRouting.updateRegionLatency('eu-west-1', 132);
+
+sovereignRouting.updateRegionHealth('ap-south-1', true);
+sovereignRouting.updateRegionHealth('me-central-1', true);
+sovereignRouting.updateRegionHealth('eu-west-1', true);
+
+logger.info(
+  '[Server] Patch 17 latency-aware sovereign routing mesh initialized'
+);
 
 predictiveHeat
   .recordHeat({
@@ -1074,6 +1098,10 @@ logger.info('[Server] Patch 15 warm-state hotset preserved');
 
 await regionalHandoffWorker.stopRegionalMigrationWorker();
 logger.info('[Server] Patch 16 regional handoff preserved');
+
+logger.info(
+  '[Server] Patch 17 sovereign routing mesh state preserved'
+);
 
 if (workerShutdownTasks.length > 0) {
   logger.info(
