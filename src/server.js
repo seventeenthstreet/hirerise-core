@@ -50,6 +50,8 @@ const logger = require('./utils/logger');
 const aiUsage = require('./services/aiUsage.service');
 const quorumReplication = require('./services/cache/quorumReplication.service');
 const consensusMesh = require('./services/cache/replayConsensusMesh.service');
+const consensusDriftAnomaly = require('./services/cache/consensusDriftAnomaly.service');
+const predictiveSplitBrain = require('./services/cache/predictiveSplitBrain.service');
 
 // ── Middleware ────────────────────────────────────────────────────────────────
 const { errorHandler, notFoundHandler }   = require('./middleware/errorHandler');
@@ -1214,6 +1216,28 @@ consensusMesh.shutdown();
 logger.info(
   '[Server] Patch 22 consensus replay mesh stopped'
 );
+
+try {
+  consensusDriftAnomaly.shutdown();
+  logger.info(
+    '[Server] Patch 23 drift anomaly detector stopped'
+  );
+} catch (err) {
+  logger.warn('[Server] Patch 23 shutdown warning', {
+    error: err.message,
+  });
+}
+
+try {
+  predictiveSplitBrain.shutdown();
+  logger.info(
+    '[Server] Patch 24 predictive split-brain prevention stopped'
+  );
+} catch (err) {
+  logger.warn('[Server] Patch 24 shutdown warning', {
+    error: err.message,
+  });
+}
 
 logger.info(
   `[Server] Final circuit states: ${JSON.stringify(

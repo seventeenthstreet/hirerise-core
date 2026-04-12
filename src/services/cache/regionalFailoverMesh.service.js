@@ -1,9 +1,11 @@
 const logger = require("../../utils/logger");
 const quorum = require("./quorumReplication.service");
 const pressure = require("./regionalPressureMesh.service");
+const predictiveSplitBrain = require("./predictiveSplitBrain.service");
 
-const FAILOVER_COOLDOWN_MS = Number(
-  process.env.FAILOVER_COOLDOWN_MS || 30000
+const FAILOVER_COOLDOWN_MS = Math.max(
+  10000,
+  Number(process.env.FAILOVER_COOLDOWN_MS) || 30000
 );
 
 const tenantFailoverMap = new Map();
@@ -17,6 +19,10 @@ function isCooldownActive(entry) {
   return Date.now() - entry.ts < FAILOVER_COOLDOWN_MS;
 }
 
+function isPredictiveDampened(tenantId) {
+  return predictiveSplitBrain.isPromotionDampened(tenantId);
+}
+
 function resolveReadRegion(
   tenantId,
   preferredRegion,
@@ -28,6 +34,15 @@ function resolveReadRegion(
   if (!replica) return preferredRegion;
 
   const existing = getActiveFailover(tenantId);
+
+  // Patch 24 — predictive split-brain dampening barrier
+  if (isPredictiveDampened(tenantId)) {
+    logger.warn(
+      `[Patch24] failover dampened due to predictive split-brain risk tenant=${tenantId}`
+    );
+
+    return existing?.region || preferredRegion;
+  }
 
   // Prevent route flapping during repeated pressure spikes
   if (
@@ -52,23 +67,24 @@ function resolveReadRegion(
 
   // No safe peer available → preserve primary
   if (!peer || peer === preferredRegion) {
-    return preferredRegion;
+    return existing?.region || preferredRegion;
   }
 
   // Prevent stale replay resurrection
-  if (replica.revision < revisionFloor) {
+  if (Number(replica.revision || 0) < Number(revisionFloor || 0)) {
     logger.warn(
       `[Patch21] stale failover prevented for tenant=${tenantId}`
     );
-    return preferredRegion;
+    return existing?.region || preferredRegion;
   }
 
   const failoverState = {
     tenantId,
     primaryRegion: preferredRegion,
     region: peer,
-    revision: replica.revision,
+    revision: Number(replica.revision || 0),
     ts: Date.now(),
+    reason: "pressure_failover",
   };
 
   tenantFailoverMap.set(tenantId, failoverState);
@@ -83,6 +99,14 @@ function resolveReadRegion(
 function restorePrimaryIfHealthy(tenantId, primaryRegion) {
   const existing = getActiveFailover(tenantId);
   if (!existing) return false;
+
+  // Patch 24 — block restore while predictive risk remains high
+  if (isPredictiveDampened(tenantId)) {
+    logger.warn(
+      `[Patch24] primary restore delayed by split-brain dampening tenant=${tenantId}`
+    );
+    return false;
+  }
 
   if (!pressure.isRegionRecovered(primaryRegion)) {
     return false;
@@ -111,6 +135,7 @@ function getFailoverSnapshot() {
     ([tenantId, state]) => ({
       tenantId,
       ...state,
+      predictiveDampened: isPredictiveDampened(tenantId),
     })
   );
 }

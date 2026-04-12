@@ -1,6 +1,8 @@
 const logger = require("../../utils/logger");
 const predictiveHeat = require("../../infrastructure/cache/predictiveHeat.service");
 const consensusMesh = require("./replayConsensusMesh.service");
+const driftAnomaly = require("./consensusDriftAnomaly.service");
+const predictiveSplitBrain = require("./predictiveSplitBrain.service");
 
 const HOT_REPLICA_LIMIT = Number(
   process.env.QUORUM_REPLICA_TOP_N || 24
@@ -39,6 +41,29 @@ function chooseReplicaRegions(primaryRegion) {
     .slice(0, 2);
 }
 
+function buildRevisionSpread(votes, fallbackRevision) {
+  const revisions = votes
+    .map((v) => Number(v?.revision))
+    .filter((v) => Number.isFinite(v));
+
+  if (!revisions.length) {
+    return {
+      min: fallbackRevision,
+      max: fallbackRevision,
+      spread: 0,
+    };
+  }
+
+  const min = Math.min(...revisions);
+  const max = Math.max(...revisions);
+
+  return {
+    min,
+    max,
+    spread: max - min,
+  };
+}
+
 function promoteWithConsensus({
   tenantId,
   candidate,
@@ -46,6 +71,24 @@ function promoteWithConsensus({
   lineageRegistry,
   replayRegistry,
 }) {
+  const primaryRegion = candidate?.primaryRegion || "primary";
+
+  // Patch 23 — block unstable region promotion
+  if (driftAnomaly.isRegionIsolated(primaryRegion)) {
+    logger.warn(
+      `[Patch23] Promotion blocked for unstable isolated region ${primaryRegion}`
+    );
+    return null;
+  }
+
+  // Patch 24 — predictive split-brain dampening
+  if (predictiveSplitBrain.isPromotionDampened(tenantId)) {
+    logger.warn(
+      `[Patch24] Promotion dampened due to predictive split-brain risk tenant=${tenantId}`
+    );
+    return null;
+  }
+
   const votes = consensusMesh.requestVotes({
     tenantId,
     candidate,
@@ -53,7 +96,11 @@ function promoteWithConsensus({
     lineageRegistry,
   });
 
-  if (!consensusMesh.majorityAccepted(votes)) {
+  const rejectedPeers = [];
+
+  const consensusAccepted = consensusMesh.majorityAccepted(votes);
+
+  if (!consensusAccepted) {
     logger.warn(
       `[Patch22] Consensus rejected replay promotion for ${tenantId}`
     );
@@ -64,13 +111,73 @@ function promoteWithConsensus({
       );
 
       if (!acceptedVote) {
+        rejectedPeers.push(peer.region);
         consensusMesh.markPeerDegraded(
           peer.region,
           "consensus_rejected"
         );
       }
     }
+  }
 
+  const revisionSpreadState = buildRevisionSpread(
+    votes,
+    Number(candidate?.revision || 0)
+  );
+
+  // Patch 24 — predictive prevention telemetry
+  const splitBrainState = predictiveSplitBrain.recordSignal({
+    tenantId,
+    replaySpread: revisionSpreadState.spread,
+    latencySpread: rejectedPeers.length * 25,
+    degradedPeers: rejectedPeers.length,
+  });
+
+  if (splitBrainState.earlyHealingRecommended) {
+    logger.warn(
+      `[Patch24] Early self-healing triggered tenant=${tenantId} risk=${splitBrainState.risk}`
+    );
+
+    for (const peer of peers) {
+      consensusMesh.healPeer(peer.region, candidate);
+    }
+  }
+
+  // Patch 23 — anomaly telemetry feed
+  const anomalyState = driftAnomaly.analyzeSnapshot(
+    {
+      region: primaryRegion,
+      votes: {
+        total: Math.max(votes.length, 1),
+        disagree: votes.filter((v) => !v.accepted).length,
+      },
+      revisions: revisionSpreadState,
+      peerState: {
+        degraded: rejectedPeers.length > 0,
+      },
+    },
+    {
+      healPeerMesh: (region, severity) => {
+        logger.warn(
+          `[Patch23] Self-healing quorum mesh region=${region} severity=${severity}`
+        );
+
+        for (const peer of peers) {
+          consensusMesh.healPeer(peer.region, candidate);
+        }
+      },
+    }
+  );
+
+  logger.info(
+    `[Patch23] Drift severity tenant=${tenantId} severity=${anomalyState.severity}`
+  );
+
+  logger.info(
+    `[Patch24] Split-brain risk tenant=${tenantId} risk=${splitBrainState.risk}`
+  );
+
+  if (!consensusAccepted) {
     return null;
   }
 
