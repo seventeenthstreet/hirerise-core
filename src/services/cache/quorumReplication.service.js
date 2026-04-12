@@ -64,6 +64,17 @@ function buildRevisionSpread(votes, fallbackRevision) {
   };
 }
 
+function getAverageConfidence(votes = []) {
+  if (!votes.length) return 0;
+
+  const total = votes.reduce(
+    (sum, vote) => sum + Number(vote.confidence || 0),
+    0
+  );
+
+  return Number((total / votes.length).toFixed(4));
+}
+
 function promoteWithConsensus({
   tenantId,
   candidate,
@@ -98,11 +109,15 @@ function promoteWithConsensus({
 
   const rejectedPeers = [];
 
-  const consensusAccepted = consensusMesh.majorityAccepted(votes);
+  // Patch 25 — weighted majority acceptance
+  const consensusAccepted = consensusMesh.majorityAccepted(
+    votes,
+    tenantId
+  );
 
   if (!consensusAccepted) {
     logger.warn(
-      `[Patch22] Consensus rejected replay promotion for ${tenantId}`
+      `[Patch25] Weighted consensus rejected replay promotion for ${tenantId}`
     );
 
     for (const peer of peers) {
@@ -114,7 +129,7 @@ function promoteWithConsensus({
         rejectedPeers.push(peer.region);
         consensusMesh.markPeerDegraded(
           peer.region,
-          "consensus_rejected"
+          "weighted_consensus_rejected"
         );
       }
     }
@@ -125,6 +140,8 @@ function promoteWithConsensus({
     Number(candidate?.revision || 0)
   );
 
+  const averageConfidence = getAverageConfidence(votes);
+
   // Patch 24 — predictive prevention telemetry
   const splitBrainState = predictiveSplitBrain.recordSignal({
     tenantId,
@@ -133,9 +150,13 @@ function promoteWithConsensus({
     degradedPeers: rejectedPeers.length,
   });
 
-  if (splitBrainState.earlyHealingRecommended) {
+  // Patch 25 — confidence-aware early healing
+  if (
+    splitBrainState.earlyHealingRecommended ||
+    averageConfidence < 0.55
+  ) {
     logger.warn(
-      `[Patch24] Early self-healing triggered tenant=${tenantId} risk=${splitBrainState.risk}`
+      `[Patch25] Confidence-aware healing tenant=${tenantId} confidence=${averageConfidence}`
     );
 
     for (const peer of peers) {
@@ -150,6 +171,7 @@ function promoteWithConsensus({
       votes: {
         total: Math.max(votes.length, 1),
         disagree: votes.filter((v) => !v.accepted).length,
+        averageConfidence,
       },
       revisions: revisionSpreadState,
       peerState: {
@@ -175,6 +197,10 @@ function promoteWithConsensus({
 
   logger.info(
     `[Patch24] Split-brain risk tenant=${tenantId} risk=${splitBrainState.risk}`
+  );
+
+  logger.info(
+    `[Patch25] Average quorum confidence tenant=${tenantId} confidence=${averageConfidence}`
   );
 
   if (!consensusAccepted) {

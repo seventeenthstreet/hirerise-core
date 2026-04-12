@@ -52,6 +52,7 @@ const quorumReplication = require('./services/cache/quorumReplication.service');
 const consensusMesh = require('./services/cache/replayConsensusMesh.service');
 const consensusDriftAnomaly = require('./services/cache/consensusDriftAnomaly.service');
 const predictiveSplitBrain = require('./services/cache/predictiveSplitBrain.service');
+const quorumConfidence = require('./services/cache/quorumConfidence.service');
 
 // ── Middleware ────────────────────────────────────────────────────────────────
 const { errorHandler, notFoundHandler }   = require('./middleware/errorHandler');
@@ -1239,6 +1240,16 @@ try {
   });
 }
 
+try {
+  quorumConfidence.shutdown();
+  logger.info(
+    '[Server] Patch 25 quorum confidence engine stopped'
+  );
+} catch (err) {
+  logger.warn('[Server] Patch 25 shutdown warning', {
+    error: err.message,
+  });
+}
 logger.info(
   `[Server] Final circuit states: ${JSON.stringify(
     circuitMesh.getAllCircuitStates()

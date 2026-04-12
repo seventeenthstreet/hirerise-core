@@ -1,4 +1,5 @@
 const logger = require("../../utils/logger");
+const quorumConfidence = require("./quorumConfidence.service");
 
 const peerHealth = new Map();
 const peerVotes = new Map();
@@ -68,6 +69,10 @@ function requestVotes({
       revision: Number(candidate.revision || 0),
       ts: now(),
       score: Number(peer.healthScore || 0),
+      confidence: quorumConfidence.getConfidence(
+        peer.region,
+        tenantId
+      ),
     });
   }
 
@@ -75,13 +80,11 @@ function requestVotes({
   return votes;
 }
 
-function majorityAccepted(votes = []) {
-  if (!votes.length) return false;
-
-  const accepted = votes.filter((v) => v.accepted).length;
-  const quorum = Math.floor(votes.length / 2) + 1;
-
-  return accepted >= quorum;
+function majorityAccepted(votes = [], tenantId) {
+  return quorumConfidence.majorityAccepted(
+    votes,
+    tenantId
+  );
 }
 
 function electWinner(votes = [], candidate) {
@@ -90,7 +93,17 @@ function electWinner(votes = [], candidate) {
   const healthiest = [...votes]
     .filter((v) => v.accepted)
     .sort((a, b) => {
-      if (b.score !== a.score) return b.score - a.score;
+      const confidenceA = Number(a.confidence || 0);
+      const confidenceB = Number(b.confidence || 0);
+
+      if (confidenceB !== confidenceA) {
+        return confidenceB - confidenceA;
+      }
+
+      if (b.score !== a.score) {
+        return b.score - a.score;
+      }
+
       return b.ts - a.ts;
     })[0];
 
@@ -100,6 +113,7 @@ function electWinner(votes = [], candidate) {
     ...candidate,
     promotedRegion: healthiest.region,
     consensusTs: now(),
+    consensusConfidence: healthiest.confidence,
   };
 }
 
@@ -132,6 +146,8 @@ function markPeerDegraded(region, reason = "consensus_miss") {
     degradedReason: reason,
     ts: now(),
   });
+
+  quorumConfidence.decayConfidence(region, 1);
 }
 
 function healPeer(region, winnerState) {
@@ -144,6 +160,8 @@ function healPeer(region, winnerState) {
     lastRecoveryTs: now(),
     syncedRevision: winnerState?.revision ?? null,
   });
+
+  quorumConfidence.restoreConfidence(region);
 }
 
 function getConsensusState(tenantId) {
@@ -154,6 +172,10 @@ function getConsensusState(tenantId) {
     peerHealth: [...peerHealth.entries()].map(([region, state]) => ({
       region,
       ...state,
+      confidence: quorumConfidence.getConfidence(
+        region,
+        tenantId
+      ),
     })),
   };
 }
