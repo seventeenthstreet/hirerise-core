@@ -53,6 +53,8 @@ const consensusMesh = require('./services/cache/replayConsensusMesh.service');
 const consensusDriftAnomaly = require('./services/cache/consensusDriftAnomaly.service');
 const predictiveSplitBrain = require('./services/cache/predictiveSplitBrain.service');
 const quorumConfidence = require('./services/cache/quorumConfidence.service');
+const consensusMemoryForecast = require('./services/cache/consensusMemoryForecast.service');
+const autonomousTopologyMutation = require('./services/cache/autonomousTopologyMutation.service');
 
 // ── Middleware ────────────────────────────────────────────────────────────────
 const { errorHandler, notFoundHandler }   = require('./middleware/errorHandler');
@@ -958,6 +960,8 @@ if (process.env.RUN_ENGAGEMENT_WORKER === 'true') {
 // =============================================================================
 const PORT = parseInt(process.env.PORT || '3000', 10);
 let server;
+let consensusMemoryForecastLoop;
+let autonomousTopologyMutationWorker;
 
 function getWeeklySprintBias() {
   const now = new Date();
@@ -1064,6 +1068,7 @@ globalPolicyMesh.initializeGlobalPolicyMesh({
 logger.info(
   '[Server] Patch 18 global policy arbitration mesh initialized'
 );
+
 recoveryScheduler.startRecoveryScheduler();
 logger.info('[Server] Patch 19 recovery scheduler started');
 
@@ -1083,6 +1088,20 @@ logger.info(
 
 logger.info(
   '[Server] Patch 22 consensus replay mesh initialized'
+);
+
+consensusMemoryForecastLoop =
+  consensusMemoryForecast.startForecastLoop();
+
+logger.info(
+  '[Server] Patch 26 consensus memory forecast engine started'
+);
+
+autonomousTopologyMutationWorker =
+  autonomousTopologyMutation.startMutationWorker();
+
+logger.info(
+  '[Server] Patch 27 autonomous topology mutation worker started'
 );
 
 // Patch 17 → latency-aware sovereign routing mesh
@@ -1250,6 +1269,28 @@ try {
     error: err.message,
   });
 }
+try {
+  consensusMemoryForecastLoop?.shutdown();
+  logger.info(
+    '[Server] Patch 26 consensus memory forecast stopped'
+  );
+} catch (err) {
+  logger.warn('[Server] Patch 26 shutdown warning', {
+    error: err.message,
+  });
+}
+
+try {
+  autonomousTopologyMutationWorker?.shutdown();
+  logger.info(
+    '[Server] Patch 27 autonomous topology mutation worker stopped'
+  );
+} catch (err) {
+  logger.warn('[Server] Patch 27 shutdown warning', {
+    error: err.message,
+  });
+}
+
 logger.info(
   `[Server] Final circuit states: ${JSON.stringify(
     circuitMesh.getAllCircuitStates()

@@ -1,24 +1,35 @@
 const logger = require("../../utils/logger");
+const consensusMemoryForecast = require("./consensusMemoryForecast.service");
 
-const MAX_POINTS = Number(process.env.CONSENSUS_DRIFT_MAX_POINTS || 20);
+const MAX_POINTS = Number(
+  process.env.CONSENSUS_DRIFT_MAX_POINTS || 20
+);
+
 const DISAGREEMENT_SPIKE_THRESHOLD = Number(
   process.env.CONSENSUS_DISAGREEMENT_THRESHOLD || 0.35
 );
+
 const REVISION_DRIFT_THRESHOLD = Number(
   process.env.CONSENSUS_REVISION_DRIFT_THRESHOLD || 3
 );
+
 const FLAP_THRESHOLD = Number(
   process.env.CONSENSUS_FLAP_THRESHOLD || 4
 );
+
 const SEVERITY_HEAL_THRESHOLD = Number(
   process.env.CONSENSUS_HEAL_THRESHOLD || 70
 );
+
 const SEVERITY_ISOLATE_THRESHOLD = Number(
   process.env.CONSENSUS_ISOLATE_THRESHOLD || 85
 );
+
 const HEAL_COOLDOWN_MS = Number(
   process.env.CONSENSUS_HEAL_COOLDOWN_MS || 15000
 );
+
+const DEFAULT_DRIFT_LATENCY_MS = 180;
 
 const STATE = {
   disagreementHistory: new Map(),
@@ -42,10 +53,12 @@ function boundedPush(bucket, value) {
 
 function getOrCreateBucket(map, key) {
   let bucket = map.get(key);
+
   if (!bucket) {
     bucket = [];
     map.set(key, bucket);
   }
+
   return bucket;
 }
 
@@ -54,7 +67,11 @@ function recordDisagreement(region, votes = {}) {
   const disagree = Math.max(Number(votes.disagree || 0), 0);
   const ratio = disagree / total;
 
-  const bucket = getOrCreateBucket(STATE.disagreementHistory, region);
+  const bucket = getOrCreateBucket(
+    STATE.disagreementHistory,
+    region
+  );
+
   boundedPush(bucket, ratio);
 
   return ratio;
@@ -65,7 +82,11 @@ function recordRevisionDrift(region, revisions = {}) {
   const max = Number(revisions.max || 0);
   const spread = Math.abs(max - min);
 
-  const bucket = getOrCreateBucket(STATE.revisionDrift, region);
+  const bucket = getOrCreateBucket(
+    STATE.revisionDrift,
+    region
+  );
+
   boundedPush(bucket, spread);
 
   return spread;
@@ -73,7 +94,11 @@ function recordRevisionDrift(region, revisions = {}) {
 
 function recordFlap(region, peerState = {}) {
   const degraded = Boolean(peerState.degraded);
-  const bucket = getOrCreateBucket(STATE.flapHistory, region);
+
+  const bucket = getOrCreateBucket(
+    STATE.flapHistory,
+    region
+  );
 
   boundedPush(bucket, degraded ? 1 : 0);
 
@@ -89,12 +114,24 @@ function recordFlap(region, peerState = {}) {
   return flaps;
 }
 
-function calculateSeverity({ disagreement, drift, flaps }) {
+function calculateSeverity({
+  disagreement,
+  drift,
+  flaps,
+}) {
   let score = 0;
 
-  if (disagreement > DISAGREEMENT_SPIKE_THRESHOLD) score += 35;
-  if (drift > REVISION_DRIFT_THRESHOLD) score += 35;
-  if (flaps > FLAP_THRESHOLD) score += 30;
+  if (disagreement > DISAGREEMENT_SPIKE_THRESHOLD) {
+    score += 35;
+  }
+
+  if (drift > REVISION_DRIFT_THRESHOLD) {
+    score += 35;
+  }
+
+  if (flaps > FLAP_THRESHOLD) {
+    score += 30;
+  }
 
   return Math.min(score, 100);
 }
@@ -112,7 +149,9 @@ function shouldHeal(region) {
 }
 
 function isolateRegion(region) {
-  if (STATE.isolatedRegions.has(region)) return;
+  if (STATE.isolatedRegions.has(region)) {
+    return;
+  }
 
   STATE.isolatedRegions.add(region);
 
@@ -122,7 +161,9 @@ function isolateRegion(region) {
 }
 
 function clearIsolation(region) {
-  if (!STATE.isolatedRegions.has(region)) return;
+  if (!STATE.isolatedRegions.has(region)) {
+    return;
+  }
 
   STATE.isolatedRegions.delete(region);
 
@@ -131,8 +172,28 @@ function clearIsolation(region) {
   );
 }
 
+function recordForecastMemory(region, severity, drift) {
+  try {
+    consensusMemoryForecast.recordConsensusEvent(region, {
+      voteAligned: severity < SEVERITY_ISOLATE_THRESHOLD,
+      driftDetected: drift > REVISION_DRIFT_THRESHOLD,
+      latency: DEFAULT_DRIFT_LATENCY_MS + severity,
+      region,
+    });
+  } catch (err) {
+    logger.warn(
+      "[Patch26] drift anomaly memory hook failed",
+      {
+        region,
+        error: err.message,
+      }
+    );
+  }
+}
+
 function analyzeSnapshot(snapshot = {}, hooks = {}) {
   const region = snapshot.region;
+
   if (!region) {
     return {
       severity: 0,
@@ -164,6 +225,8 @@ function analyzeSnapshot(snapshot = {}, hooks = {}) {
     flaps,
   });
 
+  recordForecastMemory(region, severity, drift);
+
   if (
     severity >= SEVERITY_HEAL_THRESHOLD &&
     typeof hooks.healPeerMesh === "function" &&
@@ -174,7 +237,9 @@ function analyzeSnapshot(snapshot = {}, hooks = {}) {
     } catch (error) {
       logger.error(
         `[Patch23] healPeerMesh failed for ${region}`,
-        error
+        {
+          error: error.message,
+        }
       );
     }
   }
@@ -211,7 +276,7 @@ function shutdown() {
   STATE.healCooldown.clear();
 
   logger.info(
-    "[Patch23] consensus drift anomaly detector shutdown complete"
+    "[Patch23+26] consensus drift anomaly detector shutdown complete"
   );
 }
 

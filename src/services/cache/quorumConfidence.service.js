@@ -1,11 +1,13 @@
 const logger = require("../../utils/logger");
 const predictiveSplitBrain = require("./predictiveSplitBrain.service");
+const consensusMemoryForecast = require("./consensusMemoryForecast.service");
 
 const BASE_CONFIDENCE = 1;
 const MIN_CONFIDENCE = 0.1;
 const MAX_CONFIDENCE = 1;
 const DECAY_RATE = 0.08;
 const HEAL_RESTORE_RATE = 0.05;
+const DEFAULT_LATENCY_MS = 120;
 
 const peerConfidence = new Map();
 
@@ -67,19 +69,56 @@ function getWeightedVotes(votes = [], tenantId) {
   }));
 }
 
+function recordConsensusForecast(weightedVotes = [], accepted, tenantId) {
+  for (const vote of weightedVotes) {
+    try {
+      consensusMemoryForecast.recordConsensusEvent(
+        vote.region || "unknown",
+        {
+          voteAligned: Boolean(vote.accepted) === Boolean(accepted),
+          driftDetected: Boolean(vote.driftDetected),
+          latency:
+            Number(vote.latency) || DEFAULT_LATENCY_MS,
+          region: vote.region || "unknown",
+          tenantId,
+        }
+      );
+    } catch (err) {
+      logger.warn(
+        "[Patch26] consensus forecast memory hook failed",
+        {
+          region: vote.region,
+          error: err.message,
+        }
+      );
+    }
+  }
+}
+
 function majorityAccepted(votes = [], tenantId) {
   const weightedVotes = getWeightedVotes(votes, tenantId);
 
-  const accepted = weightedVotes
+  const acceptedConfidence = weightedVotes
     .filter((v) => v.accepted)
     .reduce((sum, v) => sum + v.confidence, 0);
 
-  const total = weightedVotes.reduce(
+  const totalConfidence = weightedVotes.reduce(
     (sum, v) => sum + v.confidence,
     0
   );
 
-  return total > 0 ? accepted / total >= 0.51 : false;
+  const accepted =
+    totalConfidence > 0
+      ? acceptedConfidence / totalConfidence >= 0.51
+      : false;
+
+  recordConsensusForecast(
+    weightedVotes,
+    accepted,
+    tenantId
+  );
+
+  return accepted;
 }
 
 function shutdown() {
@@ -87,7 +126,7 @@ function shutdown() {
   peerConfidence.clear();
 
   logger.info(
-    `[Patch25] quorum confidence engine stopped peers=${peers}`
+    `[Patch25+26] quorum confidence engine stopped peers=${peers}`
   );
 }
 

@@ -1,4 +1,5 @@
 const logger = require("../../utils/logger");
+const consensusMemoryForecast = require("./consensusMemoryForecast.service");
 
 const WINDOW_LIMIT = Math.max(
   5,
@@ -17,6 +18,8 @@ const DAMPEN_TTL_MS = Math.max(
   10000,
   Number(process.env.SPLIT_BRAIN_DAMPEN_TTL_MS) || 30000
 );
+
+const DEFAULT_FORECAST_REGION = "split-brain-engine";
 
 const tenantState = new Map();
 
@@ -71,6 +74,7 @@ function calculateAcceleration(points) {
 function normalize(value, divisor) {
   const safeDivisor = Math.max(1, toSafeNumber(divisor));
   const normalized = toSafeNumber(value) / safeDivisor;
+
   return Math.max(0, Math.min(1, normalized));
 }
 
@@ -93,13 +97,44 @@ function computeRiskScore(state) {
   const weightedRisk =
     replayVelocity * 0.35 +
     latencyAcceleration * 0.35 +
-    degradedTrend * 0.30;
+    degradedTrend * 0.3;
 
   state.lastRiskScore = Number(
     Math.max(0, Math.min(1, weightedRisk)).toFixed(4)
   );
 
   return state.lastRiskScore;
+}
+
+function recordForecastMemory({
+  tenantId,
+  replaySpread,
+  latencySpread,
+  degradedPeers,
+  risk,
+}) {
+  try {
+    consensusMemoryForecast.recordConsensusEvent(
+      DEFAULT_FORECAST_REGION,
+      {
+        voteAligned: risk < RISK_THRESHOLD,
+        driftDetected:
+          replaySpread > 0 ||
+          degradedPeers > 0,
+        latency: toSafeNumber(latencySpread),
+        region: DEFAULT_FORECAST_REGION,
+        tenantId,
+      }
+    );
+  } catch (err) {
+    logger.warn(
+      "[Patch26] split-brain memory forecast hook failed",
+      {
+        tenantId,
+        error: err.message,
+      }
+    );
+  }
 }
 
 function armPromotionDampening(state, tenantId, risk) {
@@ -132,6 +167,14 @@ function recordSignal({
 
   const risk = computeRiskScore(state);
 
+  recordForecastMemory({
+    tenantId: safeTenantId,
+    replaySpread,
+    latencySpread,
+    degradedPeers,
+    risk,
+  });
+
   if (risk >= RISK_THRESHOLD) {
     armPromotionDampening(state, safeTenantId, risk);
   }
@@ -140,7 +183,8 @@ function recordSignal({
     tenantId: safeTenantId,
     risk,
     dampened: isPromotionDampened(safeTenantId),
-    earlyHealingRecommended: shouldTriggerEarlyHealing(safeTenantId),
+    earlyHealingRecommended:
+      shouldTriggerEarlyHealing(safeTenantId),
   };
 }
 
@@ -198,7 +242,7 @@ function shutdown() {
   tenantState.clear();
 
   logger.info(
-    `[PredictiveSplitBrain] Engine shutdown complete clearedTenants=${totalTenants}`
+    `[PredictiveSplitBrain+Patch26] Engine shutdown complete clearedTenants=${totalTenants}`
   );
 }
 
