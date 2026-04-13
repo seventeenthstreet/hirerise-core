@@ -8,10 +8,12 @@ const { logAIInteraction } = require('../../infrastructure/aiLogger');
 const { conversionEventService } = require('../conversion');
 const { publishEvent } = require('../../shared/pubsub');
 const { scoreResume } = require('../resume/resume.service');
-const { calculateProvisionalChi } = require('../careerHealthIndex/careerHealthIndex.service');
+const {
+  calculateProvisionalChi,
+} = require('../careerHealthIndex/careerHealthIndex.service');
 
 const TABLE_PROGRESS = 'onboarding_progress';
-const TABLE_USERS = 'users';
+const TABLE_USERS = 'user_profiles';
 const TABLE_PROFILES = 'user_profiles';
 const TABLE_IDEMPOTENCY = 'idempotency_keys';
 const TABLE_NOTIFICATION_JOBS = 'notification_jobs';
@@ -117,7 +119,7 @@ async function mergeStepHistory(userId, newStep) {
   const { data, error } = await supabase
     .from(TABLE_PROGRESS)
     .select('step_history')
-    .eq('id', userId)
+    .eq('user_id', userId)
     .maybeSingle();
 
   if (error && error.code !== 'PGRST116') {
@@ -127,10 +129,12 @@ async function mergeStepHistory(userId, newStep) {
     });
   }
 
-  const existing = data?.step_history || [];
+  const existing = Array.isArray(data?.step_history)
+    ? data.step_history
+    : [];
 
   return [
-    ...existing,
+    ...existing.slice(-49),
     {
       step: newStep,
       at: new Date().toISOString(),
@@ -145,7 +149,7 @@ async function deductCredits(userId, amount, operationKey = null) {
     .from(TABLE_USERS)
     .select('ai_credits_remaining, credit_deduction_log')
     .eq('id', userId)
-    .maybeSingle();
+    .single();
 
   if (error || !data) {
     logger.warn('[Helpers] credit fetch failed', {
@@ -155,28 +159,43 @@ async function deductCredits(userId, amount, operationKey = null) {
     return;
   }
 
-  const current = data.ai_credits_remaining || 0;
-  const log = data.credit_deduction_log || [];
+  const currentCredits = Number(data.ai_credits_remaining || 0);
+  const deductionLog = Array.isArray(data.credit_deduction_log)
+    ? data.credit_deduction_log
+    : [];
 
-  if (operationKey && log.includes(operationKey)) {
+  if (operationKey && deductionLog.includes(operationKey)) {
+    logger.info('[Helpers] duplicate credit deduction prevented', {
+      userId,
+      operationKey,
+    });
     return;
   }
 
-  const { error: updateErr } = await supabase
-    .from(TABLE_USERS)
-    .upsert({
-      id: userId,
-      ai_credits_remaining: Math.max(0, current - amount),
-      credit_deduction_log: operationKey
-        ? [...log.slice(-49), operationKey]
-        : log,
-      updated_at: new Date().toISOString(),
-    });
+  const nextCredits = Math.max(0, currentCredits - amount);
 
-  if (updateErr) {
-    logger.warn('[Helpers] credit update failed', {
+  const payload = {
+    ai_credits_remaining: nextCredits,
+    updated_at: new Date().toISOString(),
+  };
+
+  if (operationKey) {
+    payload.credit_deduction_log = [
+      ...deductionLog.slice(-49),
+      operationKey,
+    ];
+  }
+
+  const { error: updateError } = await supabase
+    .from(TABLE_USERS)
+    .update(payload)
+    .eq('id', userId)
+    .eq('ai_credits_remaining', currentCredits);
+
+  if (updateError) {
+    logger.warn('[Helpers] credit atomic update failed', {
       userId,
-      error: updateErr.message,
+      error: updateError.message,
     });
   }
 }
@@ -195,8 +214,7 @@ function mergeSkills(trackBSkills = [], trackASkills = []) {
 
       map.set(name.toLowerCase(), {
         name,
-        proficiency:
-          skill?.proficiency || 'intermediate',
+        proficiency: skill?.proficiency || 'intermediate',
       });
     }
   }
@@ -225,8 +243,14 @@ function buildAIContext(onboarding = {}, profile = {}) {
   );
 
   return {
-    city: profile.current_city || onboarding.personal_details?.city || null,
-    country: profile.current_country || onboarding.personal_details?.country || null,
+    city:
+      profile.current_city ||
+      onboarding.personal_details?.city ||
+      null,
+    country:
+      profile.current_country ||
+      onboarding.personal_details?.country ||
+      null,
     targetRole:
       onboarding.target_role_id ||
       profile.target_role_id ||
@@ -262,12 +286,19 @@ function evaluateCompletion(progress = {}, profile = {}) {
   };
 }
 
-async function persistCompletionIfReady(userId, progressData, profileData) {
-  if (profileData.onboarding_completed === true) {
+async function persistCompletionIfReady(
+  userId,
+  progressData,
+  profileData
+) {
+  if (profileData?.onboarding_completed === true) {
     return;
   }
 
-  const completion = evaluateCompletion(progressData, profileData);
+  const completion = evaluateCompletion(
+    progressData,
+    profileData
+  );
 
   if (!completion.isComplete) {
     return;
@@ -280,38 +311,48 @@ async function persistCompletionIfReady(userId, progressData, profileData) {
   );
 
   const writes = await Promise.all([
-    supabase.from(TABLE_PROFILES).upsert({
-      id: userId,
-      onboarding_completed: true,
-      onboarding_completed_at: now,
-      updated_at: now,
-    }),
+    supabase
+      .from(TABLE_PROFILES)
+      .update({
+        onboarding_completed: true,
+        onboarding_completed_at: now,
+        updated_at: now,
+      })
+      .eq('id', userId),
 
-    supabase.from(TABLE_USERS).upsert({
-      id: userId,
-      onboarding_completed: true,
-      onboarding_completed_at: now,
-      updated_at: now,
-      ...(progressData.cv_resume_id
-        ? {
-            resume_uploaded: true,
-            latest_resume_id: progressData.cv_resume_id,
-          }
-        : {}),
-    }),
+    supabase
+      .from(TABLE_USERS)
+      .update({
+        onboarding_completed: true,
+        onboarding_completed_at: now,
+        updated_at: now,
+        ...(progressData?.cv_resume_id
+          ? {
+              resume_uploaded: true,
+              latest_resume_id: progressData.cv_resume_id,
+            }
+          : {}),
+      })
+      .eq('id', userId),
 
-    supabase.from(TABLE_PROGRESS).upsert({
-      id: userId,
-      completed_at: now,
-      step_history: stepHistory,
-      updated_at: now,
-    }),
+    supabase
+      .from(TABLE_PROGRESS)
+      .update({
+        completed_at: now,
+        step_history: stepHistory,
+        updated_at: now,
+      })
+      .eq('user_id', userId),
   ]);
 
   const failed = writes.find(w => w.error);
-  if (failed?.error) throw failed.error;
+  if (failed?.error) {
+    throw failed.error;
+  }
 
-  logger.info('[Helpers] onboarding completed', { userId });
+  logger.info('[Helpers] onboarding completed', {
+    userId,
+  });
 }
 
 module.exports = {

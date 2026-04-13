@@ -37,6 +37,8 @@ const compression = require('compression');
 const cors        = require('cors');
 const morgan      = require('morgan');
 const rateLimit   = require('express-rate-limit');
+const fs = require('fs');
+const path = require('path');
 
 // ── Config ────────────────────────────────────────────────────────────────────
 const {
@@ -99,6 +101,54 @@ const observabilityAdapter = require('./adapters/observability-adapter');
 // Express app
 // =============================================================================
 const app = express();
+
+const legacyBackendPath = path.join(
+  __dirname,
+  '..',
+  'api-service',
+  'src',
+  'server.js'
+);
+
+if (fs.existsSync(legacyBackendPath)) {
+  logger.warn(
+    '[Server] Legacy backend collision risk detected: api-service/src/server.js still exists',
+    { legacyBackendPath }
+  );
+}
+
+const registeredRouteKeys = new Set();
+
+function registerRoute(path, ...handlers) {
+  // Key includes the last handler's identity so that multiple routers mounted
+  // on the same path (e.g. three distinct /career mounts) each get a unique
+  // signature instead of colliding on handler count alone.
+  const lastHandler = handlers[handlers.length - 1];
+  const handlerKey =
+  typeof lastHandler === 'function'
+    ? lastHandler.name || `anonymous_${handlers.length}`
+    : lastHandler?.stack
+      ? `router_${lastHandler.stack.length}`
+      : `handler_${handlers.length}`;
+  const signature = `${path}::${handlerKey}`;
+
+  if (registeredRouteKeys.has(signature)) {
+    logger.warn('[Server] Duplicate route registration prevented', {
+      path,
+      handlerKey,
+    });
+    return;
+  }
+
+  registeredRouteKeys.add(signature);
+  app.use(path, ...handlers);
+}
+
+function logRouteRegistrySummary() {
+  logger.info('[Server] Route registry initialized', {
+    total_registered_routes: registeredRouteKeys.size,
+  });
+}
 
 // Trust proxy — safe for Cloud Run / GCP Load Balancer.
 // '1' means trust exactly one proxy hop; do not use 'true' (trusts all).
@@ -256,24 +306,24 @@ app.get(`${API_PREFIX}/metrics`, observabilityAdapter.prometheusMetricsHandler()
 // Auth applied per-group intentionally: avoids the 401-before-404 ordering bug
 // that occurs when a global authenticate() precedes all routes.
 
-app.use(
+registerRoute(
   `${API_PREFIX}/career`,
   authenticate,
   tenantRegionMiddleware,
   require('./routes/career.routes')
 );
-app.use(`${API_PREFIX}/career-graph`,       authenticate, require('./modules/careerGraph/careerGraph.routes'));
 
-/**
- * Career Path Prediction Engine
- *   POST /api/v1/career-path/predict       → full prediction with timeline
- *   GET  /api/v1/career-path/chain/:role   → raw CSV progression chain
- *
- * Uses /data/career-paths.csv (100+ role progressions).
- * Experience-adjusted timeline: years already served reduce first step duration.
- * CHI v2 engine also calls this internally and appends career_path_prediction.
- */
-app.use(`${API_PREFIX}/career-path`,          authenticate, require('./routes/career-path.routes'));
+registerRoute(
+  `${API_PREFIX}/career`,
+  authenticate,
+  engagementRouter
+);
+
+registerRoute(
+  `${API_PREFIX}/career`,
+  authenticate,
+  require('./modules/career-digital-twin/routes/digitalTwin.routes')
+);
 app.use(`${API_PREFIX}/career-opportunities`, authenticate, require('./routes/career-opportunity.routes'));
 app.use(`${API_PREFIX}/skill-graph`,          authenticate, require('./modules/skillGraph/skillGraph.routes'));
 
@@ -283,20 +333,7 @@ app.use(`${API_PREFIX}/admin/platform-intelligence`, authenticate, requireAdmin,
 
 app.use(`${API_PREFIX}/chi-v2`,        authenticate, require('./modules/chiV2/chiV2.routes'));
 app.use(`${API_PREFIX}/salary`,        authenticate, require('./routes/salary.routes'));
-app.use(`${API_PREFIX}/skills`,        authenticate, require('./routes/skills.routes'));
 
-/**
- * Skill Demand Intelligence Engine
- *   POST /api/v1/skills/analyze            → full skill demand analysis
- *   GET  /api/v1/skills/demand/top         → top demand skills (filter by industry)
- *   GET  /api/v1/skills/demand/role/:role  → required skills for a role
- *   GET  /api/v1/skills/demand/history     → user's analysis history
- *
- * Mounted on the same /skills prefix as skills.routes above — intentional.
- * Express chains both routers sequentially; no path overlap exists.
- */
-app.use(`${API_PREFIX}/skills`,        authenticate, skillDemandRouter);
-app.use(`${API_PREFIX}/skills`,        authenticate, require('./routes/skills-priority.routes'));
 
 app.use(`${API_PREFIX}/jobs`,          authenticate, require('./routes/jobs.routes'));
 app.use(`${API_PREFIX}/resume-growth`, authenticate, require('./routes/resumeGrowth.routes'));
@@ -423,7 +460,7 @@ app.use(`${API_PREFIX}/ava-memory`, authenticate, require('./modules/ava-memory/
  *
  * Auth: students may only access their own profile; admins may access any.
  */
-app.use(
+registerRoute(
   `${API_PREFIX}/education`,
   authenticate,
   tenantRegionMiddleware,
@@ -443,14 +480,14 @@ app.use(
   require('./modules/ai-career-advisor/routes/advisor.routes')
 );
 
-app.use(
+registerRoute(
   `${API_PREFIX}/copilot`,
   authenticate,
   tenantRegionMiddleware,
   require('./modules/career-copilot/routes/careerCopilot.routes')
 );
 
-app.use(
+registerRoute(
   `${API_PREFIX}/copilot`,
   authenticate,
   tenantRegionMiddleware,
@@ -464,26 +501,6 @@ app.use(
   require('./modules/jobSeeker/jobSeeker.routes')
 );
 
-app.use(
-  `${API_PREFIX}/education`,
-  authenticate,
-  tenantRegionMiddleware,
-  require('./modules/education-intelligence/routes/roiAnalysis.routes')
-);
-
-app.use(
-  `${API_PREFIX}/education`,
-  authenticate,
-  tenantRegionMiddleware,
-  require('./modules/education-intelligence/routes/careerPrediction.routes')
-);
-
-app.use(
-  `${API_PREFIX}/education`,
-  authenticate,
-  tenantRegionMiddleware,
-  require('./modules/education-intelligence/routes/careerSimulation.routes')
-);
 /**
  * Skill Evolution Engine (SEE)
  *   GET /api/v1/education/skills/recommendations/:studentId → ranked skills + roadmap
@@ -802,16 +819,7 @@ app.use(`${API_PREFIX}/admin/market-intelligence`, authenticate, requireMasterAd
  *   GET  /api/v1/career/alerts                  → opportunity alert feed (cached 10 min)
  *   POST /api/v1/career/alerts/read             → mark alerts as read
  */
-app.use(`${API_PREFIX}/career`, authenticate, engagementRouter);
 
-/**
- * Career Digital Twin — Simulation Engine
- *   POST   /api/v1/career/simulations          → run simulation
- *   GET    /api/v1/career/simulations          → simulation history
- *   GET    /api/v1/career/future-paths         → quick path preview
- *   DELETE /api/v1/career/simulations/cache    → bust Redis cache
- */
-app.use(`${API_PREFIX}/career`, authenticate, require('./modules/career-digital-twin/routes/digitalTwin.routes'));
 
 // =============================================================================
 // ✅ Terminal handlers — must be last
@@ -962,6 +970,7 @@ const PORT = parseInt(process.env.PORT || '3000', 10);
 let server;
 let consensusMemoryForecastLoop;
 let autonomousTopologyMutationWorker;
+let isShuttingDown = false;
 
 function getWeeklySprintBias() {
   const now = new Date();
@@ -987,6 +996,8 @@ async function bootstrap() {
  logger.info(
   `[Server] HireRise Core running on port ${PORT} [${app.get('env')}]`
 );
+logRouteRegistrySummary();
+
   logger.info(`[Server] API Base: ${API_PREFIX}`);
 
   // Wave 3 Priority #5 Patch 4 → deploy benchmark MV warmup
@@ -1174,7 +1185,18 @@ bootstrap();
 
 // Consolidated Graceful Shutdown
 const gracefulShutdown = async (signal) => {
-  logger.info(`[Server] ${signal} received — shutting down gracefully...`);
+  if (isShuttingDown) {
+    logger.warn('[Server] Duplicate shutdown signal ignored', {
+      signal,
+    });
+    return;
+  }
+
+  isShuttingDown = true;
+
+  logger.info(
+    `[Server] ${signal} received — shutting down gracefully...`
+  );
 
   if (deployWarmupPromise) {
     logger.info('[Server] Waiting for deploy benchmark warmup...');
@@ -1364,7 +1386,4 @@ process.on('unhandledRejection', (reason) =>
 process.on('uncaughtException', (err) =>
   logger.error('[Server] Uncaught Exception:', err)
 );
-
-
-
 module.exports = app;

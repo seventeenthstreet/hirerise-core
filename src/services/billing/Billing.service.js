@@ -7,6 +7,10 @@ const {
 } = require('../../middleware/errorHandler');
 const logger = require('../../utils/logger');
 
+const TABLE_USERS = 'user_profiles';
+const TABLE_SUBSCRIPTIONS = 'subscriptions';
+const TABLE_EVENTS = 'subscription_events';
+
 const PLAN_CONFIG = Object.freeze({
   499: { tier: 'pro', credits: 16, currency: 'INR', durationDays: 30 },
   699: { tier: 'pro', credits: 23, currency: 'INR', durationDays: 30 },
@@ -18,7 +22,8 @@ const PLAN_CONFIG = Object.freeze({
 const EXPIRE_BATCH_SIZE = 100;
 
 function getPlanConfig(amount) {
-  const config = PLAN_CONFIG[amount];
+  const normalizedAmount = Number(amount);
+  const config = PLAN_CONFIG[normalizedAmount];
 
   if (!config) {
     throw new AppError(
@@ -56,7 +61,7 @@ function buildSubscriptionEvent({
     credits_granted: creditsGranted,
     previous_tier: previousTier,
     new_tier: newTier,
-    metadata,
+    metadata: metadata || {},
     idempotency_key: idempotencyKey,
     created_at: nowISO,
   };
@@ -64,7 +69,7 @@ function buildSubscriptionEvent({
 
 async function isEventAlreadyProcessed(idempotencyKey) {
   const { data, error } = await supabase
-    .from('subscription_events')
+    .from(TABLE_EVENTS)
     .select('id')
     .eq('idempotency_key', idempotencyKey)
     .limit(1);
@@ -81,6 +86,15 @@ async function activateSubscription({
   externalEventId,
   currency = 'INR',
 }) {
+  if (!userId || !subscriptionId) {
+    throw new AppError(
+      'userId and subscriptionId are required',
+      400,
+      { userId, subscriptionId },
+      ErrorCodes.VALIDATION_ERROR
+    );
+  }
+
   const idempotencyKey = `activate:${subscriptionId}`;
   const plan = getPlanConfig(planAmount);
 
@@ -89,7 +103,7 @@ async function activateSubscription({
   expiresAt.setDate(expiresAt.getDate() + plan.durationDays);
 
   const { data: userRow, error: userFetchError } = await supabase
-    .from('users')
+    .from(TABLE_USERS)
     .select('tier')
     .eq('id', userId)
     .maybeSingle();
@@ -103,11 +117,11 @@ async function activateSubscription({
     {
       p_user_id: userId,
       p_tier: plan.tier,
-      p_plan_amount: planAmount,
+      p_plan_amount: Number(planAmount),
       p_plan_currency: currency,
       p_credits: plan.credits,
       p_subscription_id: subscriptionId,
-      p_provider: provider,
+      p_provider: provider || 'stripe',
       p_external_event_id:
         externalEventId ?? subscriptionId,
       p_previous_tier: previousTier,
@@ -127,7 +141,10 @@ async function activateSubscription({
         idempotencyKey,
       });
 
-      return { skipped: true, reason: 'duplicate' };
+      return {
+        skipped: true,
+        reason: 'duplicate',
+      };
     }
 
     if (error.message?.includes('USER_NOT_FOUND')) {
@@ -175,16 +192,30 @@ async function cancelSubscription({
   reason = 'cancelled',
   externalEventId,
 }) {
+  if (!userId || !subscriptionId) {
+    throw new AppError(
+      'userId and subscriptionId are required',
+      400,
+      { userId, subscriptionId },
+      ErrorCodes.VALIDATION_ERROR
+    );
+  }
+
   const idempotencyKey = `cancel:${subscriptionId}`;
 
   if (await isEventAlreadyProcessed(idempotencyKey)) {
+    logger.info('[Billing] Duplicate cancellation skipped', {
+      userId,
+      subscriptionId,
+    });
+
     return { skipped: true };
   }
 
   const nowISO = new Date().toISOString();
 
   const { data: userRow, error } = await supabase
-    .from('users')
+    .from(TABLE_USERS)
     .select('tier, plan_amount, plan_currency')
     .eq('id', userId)
     .maybeSingle();
@@ -196,8 +227,8 @@ async function cancelSubscription({
   const eventRow = buildSubscriptionEvent({
     userId,
     eventType:
-      reason === 'refund' ? 'refunded' : 'cancelled',
-    provider,
+      reason === 'refund' ? 'refunded' : reason,
+    provider: provider || 'stripe',
     externalEventId: externalEventId ?? subscriptionId,
     planAmount: userRow?.plan_amount ?? null,
     currency: userRow?.plan_currency ?? 'INR',
@@ -212,19 +243,19 @@ async function cancelSubscription({
   const [userUpdate, subscriptionUpdate, eventInsert] =
     await Promise.all([
       supabase
-        .from('users')
+        .from(TABLE_USERS)
         .update({
           tier: 'free',
-          subscription_status: 'cancelled',
+          subscription_status: reason,
           ai_credits_remaining: 0,
           updated_at: nowISO,
         })
         .eq('id', userId),
 
       supabase
-        .from('subscriptions')
+        .from(TABLE_SUBSCRIPTIONS)
         .update({
-          status: 'cancelled',
+          status: reason,
           tier: 'free',
           cancelled_at: nowISO,
           updated_at: nowISO,
@@ -232,7 +263,7 @@ async function cancelSubscription({
         .eq('user_id', userId),
 
       supabase
-        .from('subscription_events')
+        .from(TABLE_EVENTS)
         .insert([eventRow]),
     ]);
 
@@ -240,7 +271,11 @@ async function cancelSubscription({
   if (subscriptionUpdate.error) throw subscriptionUpdate.error;
   if (eventInsert.error) throw eventInsert.error;
 
-  return { skipped: false, userId, newTier: 'free' };
+  return {
+    skipped: false,
+    userId,
+    newTier: 'free',
+  };
 }
 
 async function refundSubscription(params) {
@@ -258,7 +293,7 @@ async function expireOverdueSubscriptions() {
     const now = new Date().toISOString();
 
     const { data, error } = await supabase
-      .from('subscriptions')
+      .from(TABLE_SUBSCRIPTIONS)
       .select('user_id, subscription_id, provider')
       .eq('status', 'active')
       .lte('expires_at', now)
@@ -272,7 +307,7 @@ async function expireOverdueSubscriptions() {
         cancelSubscription({
           userId: row.user_id,
           subscriptionId:
-            row.subscription_id ?? 'expired',
+            row.subscription_id ?? `expired:${row.user_id}`,
           provider: row.provider ?? 'system',
           reason: 'expired',
           externalEventId: `expiry:${row.user_id}`,
@@ -291,12 +326,17 @@ async function expireOverdueSubscriptions() {
     if (data.length < EXPIRE_BATCH_SIZE) break;
   }
 
+  logger.info('[Billing] Expiry batch completed', {
+    processed,
+    failed,
+  });
+
   return { processed, failed };
 }
 
 async function getSubscriptionStatus(userId) {
   const { data, error } = await supabase
-    .from('subscriptions')
+    .from(TABLE_SUBSCRIPTIONS)
     .select(
       'tier,status,plan_amount,plan_currency,provider,activated_at,expires_at,auto_renew,ai_credits_allocated,ai_credits_remaining'
     )
@@ -310,7 +350,9 @@ async function getSubscriptionStatus(userId) {
       userId,
       tier: 'free',
       status: 'inactive',
-      credits: { allocated: 0, remaining: 0 },
+      credits_used: 0,
+      credits_limit: 0,
+      is_premium: false,
     };
   }
 
@@ -324,10 +366,11 @@ async function getSubscriptionStatus(userId) {
     activatedAt: data.activated_at,
     expiresAt: data.expires_at,
     autoRenew: data.auto_renew,
-    credits: {
-      allocated: data.ai_credits_allocated,
-      remaining: data.ai_credits_remaining,
-    },
+    credits_used:
+      (data.ai_credits_allocated || 0) -
+      (data.ai_credits_remaining || 0),
+    credits_limit: data.ai_credits_allocated || 0,
+    is_premium: data.tier !== 'free',
   };
 }
 
