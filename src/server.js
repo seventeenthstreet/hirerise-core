@@ -449,19 +449,28 @@ function registerRoute(path, ...handlers) {
   // signature instead of colliding on handler count alone.
   const lastHandler = handlers[handlers.length - 1];
   const handlerKey =
-    typeof lastHandler === 'function'
-      ? lastHandler.name || `anonymous_${handlers.length}`
-      : lastHandler?.stack
-        ? `router_${lastHandler.stack.length}`
-        : `handler_${handlers.length}`;
+  typeof lastHandler === 'function'
+    ? lastHandler.name || `anonymous_${handlers.length}`
+    : lastHandler?.stack
+      ? `router_${
+          lastHandler.stack
+            .map((layer) =>
+              layer.route?.path ||
+              layer.name ||
+              layer.regexp?.toString()
+            )
+            .join('|')
+        }`
+      : `handler_${handlers.length}`;
 
   const signature = `${path}::${handlerKey}`;
 
   if (registeredRouteKeys.has(signature)) {
-    logger.warn('[Server] Duplicate route registration prevented', {
-      path,
-      handlerKey,
-    });
+   logger.warn('[Server] Duplicate route registration prevented', {
+  path,
+  handlerKey,
+  signature,
+});
     return;
   }
 
@@ -791,13 +800,20 @@ registerRoute(
   require('./routes/career.routes')
 );
 
-registerRoute(
+// Patch 48B Fix 2: engagementRouter is an intentional second bounded-context
+// router at /career. Uses app.use directly so it coexists with career.routes
+// without triggering the duplicate-guard fingerprint collision.
+app.use(
   `${API_PREFIX}/career`,
   authenticate,
   engagementRouter
 );
 
-registerRoute(
+// Patch 48B Fix 4: digitalTwin is an intentional third bounded-context router
+// at /career. Uses app.use directly — its router exports with an empty or
+// unnamed stack at require-time, producing the same bare "router" handlerKey
+// as career.routes and triggering a false duplicate-guard collision.
+app.use(
   `${API_PREFIX}/career`,
   authenticate,
   require('./modules/career-digital-twin/routes/digitalTwin.routes')
@@ -979,7 +995,10 @@ registerRoute(
   require('./modules/career-copilot/routes/careerCopilot.routes')
 );
 
-registerRoute(
+// Patch 48B Fix 3: agentCoordinator is an intentional second bounded-context
+// router at /copilot. Uses app.use directly so it coexists with careerCopilot.routes
+// without triggering the duplicate-guard fingerprint collision.
+app.use(
   `${API_PREFIX}/copilot`,
   authenticate,
   tenantRegionMiddleware,
@@ -1110,7 +1129,7 @@ registerRoute(
 );
 
 registerRoute(
-  `${API_PREFIX}/users`,
+  `${API_PREFIX}/user-direction`,
   authenticate,
   directionRouter
 );
@@ -1496,7 +1515,12 @@ function getWeeklySprintBias() {
 
 async function bootstrap() {
   try {
-   
+    // Patch 48B Fix 1: clear route-dedup registry at the start of each bootstrap
+    // invocation so that nodemon / soft-reload restarts do not trigger false
+    // "Duplicate route registration prevented" warnings. True duplicates within
+    // a single bootstrap cycle are still caught correctly.
+    registeredRouteKeys.clear();
+
     // Patch 35 → register distributed startup phases
 [
   'redis-connect',
