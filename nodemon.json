@@ -1,6 +1,20 @@
 {
+  "watch": ["src"],
+  "ext": "js,mjs,cjs",
   "ignore": [
     "src/data/**/*",
-    "src/**/*.json"
-  ]
+    "src/**/*.json",
+    "src/**/*.log",
+    "src/**/snapshots/**/*",
+    "src/**/snapshot/**/*",
+    "src/**/cache/**/*",
+    "src/**/tmp/**/*",
+    "src/**/temp/**/*",
+    "src/**/generated/**/*",
+    "src/**/exports/**/*",
+    "coverage/**/*",
+    ".git/**/*",
+    "node_modules/**/*"
+  ],
+  "delay": "500"
 }

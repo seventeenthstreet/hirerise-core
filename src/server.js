@@ -1976,6 +1976,20 @@ bootstrap();
 const gracefulShutdown = async (signal) => {
   const shutdownStartedAt = process.hrtime.bigint();
 
+  const shutdownTimeoutMs = parseInt(
+    process.env.SHUTDOWN_TIMEOUT_MS || '25000',
+    10
+  );
+
+  const forcedShutdownTimer = setTimeout(() => {
+    logger.error(
+      '[Server] Graceful shutdown timeout exceeded — forcing exit'
+    );
+    process.exit(1);
+  }, shutdownTimeoutMs);
+
+  forcedShutdownTimer.unref();
+
   if (isShuttingDown) {
     logger.warn('[Server] Duplicate shutdown signal ignored', {
       signal,
@@ -2179,6 +2193,7 @@ try {
     duration_ms: Number(shutdownDurationMs.toFixed(2)),
   });
 
-  workerBootRegistry.clear();
-  process.exit(0);
+clearTimeout(forcedShutdownTimer);
+workerBootRegistry.clear();
+process.exit(0);
 };
