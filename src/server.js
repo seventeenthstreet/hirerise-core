@@ -132,6 +132,8 @@ const startupRegressionProfiler = {
   lastBootSlowestPhase: null,
 };
 
+const DAG_FINGERPRINT_RETENTION_LIMIT = 100;
+
 // Patch 49 → startup DAG slack analysis + bottleneck regression intelligence
 const startupDagProfiler = {
   slackByPhase: new Map(),
@@ -141,6 +143,24 @@ const startupDagProfiler = {
   lastCriticalPathDurationMs: null,
   criticalPathDeltaMs: null,
   reclassificationCandidates: [],
+};
+
+// Wave 16 → autonomous DAG self-healing + async promotion policy
+const startupDagSelfHealing = {
+  candidateScores: new Map(),
+  promotionThreshold: 3,
+  autoPromotedCandidates: [],
+  permanentlyPromoted: new Set(),
+  healingHistory: [],
+  lastHealingActionAt: null,
+};
+
+// Wave 17 → controlled live DAG mutation + rollback ledger
+const startupDagMutationLedger = {
+  appliedMutations: new Map(),
+  rollbackEvents: [],
+  lastMutationAt: null,
+  lastRollbackAt: null,
 };
 
 const startupWatchdog = {
@@ -421,20 +441,112 @@ function fingerprintCriticalChain() {
     .sort()
     .join(' -> ');
 
-  const previous =
+  const previousEntry =
     startupDagProfiler.chainFingerprints.get(
       criticalChain
-    ) || 0;
+    );
+  const previousCount =
+    typeof previousEntry === 'number'
+      ? previousEntry
+      : previousEntry?.count || 0;
+
+  const entry = {
+    count: previousCount + 1,
+    lastSeenAt: Date.now(),
+  };
 
   startupDagProfiler.chainFingerprints.set(
     criticalChain,
-    previous + 1
+    entry
   );
+
+  if (
+    startupDagProfiler.chainFingerprints.size >
+    DAG_FINGERPRINT_RETENTION_LIMIT
+  ) {
+    const oldestKey =
+      startupDagProfiler.chainFingerprints.keys().next().value;
+    if (oldestKey) {
+      startupDagProfiler.chainFingerprints.delete(oldestKey);
+    }
+  }
+
+  const ageMs = Date.now() - entry.lastSeenAt;
+  const agePenalty = Math.floor(ageMs / 3600000);
+  const weightedCount = Math.max(1, entry.count - agePenalty);
 
   return {
     chain: criticalChain,
-    repetitionCount: previous + 1,
+    repetitionCount: weightedCount,
   };
+}
+
+function applyControlledDagMutation() {
+  if (
+    startupChaosConfidence.confidenceScore <
+    startupChaosConfidence.rollbackThreshold
+  ) {
+    return;
+  }
+  for (const phase of
+    startupDagSelfHealing.permanentlyPromoted) {
+    const meta = startupBarrier.phases.get(phase);
+    if (!meta || !meta.critical) {
+      continue;
+    }
+    startupBarrier.phases.set(phase, {
+      ...meta,
+      critical: false,
+      asyncPhase: true,
+      mutatedByWave17: true,
+    });
+    startupDagMutationLedger.appliedMutations.set(
+      phase,
+      {
+        mutatedAt: Date.now(),
+        previousCritical: true,
+      }
+    );
+    startupDagMutationLedger.lastMutationAt =
+      Date.now();
+  }
+}
+
+function evaluateDagSelfHealing() {
+  startupDagSelfHealing.autoPromotedCandidates = [];
+  for (const phase of
+    startupDagProfiler.reclassificationCandidates) {
+    const currentScore =
+      startupDagSelfHealing.candidateScores.get(
+        phase
+      ) || 0;
+    const nextScore = currentScore + 1;
+    startupDagSelfHealing.candidateScores.set(
+      phase,
+      nextScore
+    );
+    if (
+      nextScore >=
+        startupDagSelfHealing.promotionThreshold &&
+      !startupDagSelfHealing.permanentlyPromoted.has(
+        phase
+      )
+    ) {
+      startupDagSelfHealing.autoPromotedCandidates.push(
+        phase
+      );
+      startupDagSelfHealing.permanentlyPromoted.add(
+        phase
+      );
+      startupDagSelfHealing.healingHistory.push({
+        phase,
+        promotedAt: Date.now(),
+        reason: 'stable-high-slack',
+      });
+      startupDagSelfHealing.lastHealingActionAt =
+        Date.now();
+    }
+  }
 }
 
 function completeStartupPhase(phase) {
@@ -572,6 +684,8 @@ const ready = criticalPhases.every((phase) =>
 
   const chainFingerprint = fingerprintCriticalChain();
 
+  evaluateDagSelfHealing();
+
   const slowestPhaseName =
     startupBarrier.slowestPhase?.phase || null;
 
@@ -627,6 +741,31 @@ const ready = criticalPhases.every((phase) =>
   }
 
   if (
+    startupDagProfiler.criticalPathDeltaMs !== null &&
+    startupDagProfiler.criticalPathDeltaMs > 500
+  ) {
+    for (const [phase, mutation] of
+      startupDagMutationLedger.appliedMutations) {
+      const meta = startupBarrier.phases.get(phase);
+      if (!meta) continue;
+      startupBarrier.phases.set(phase, {
+        ...meta,
+        critical: mutation.previousCritical,
+        asyncPhase: false,
+        rolledBackByWave17: true,
+      });
+      startupDagMutationLedger.rollbackEvents.push({
+        phase,
+        rolledBackAt: Date.now(),
+        reason: 'critical-path-regression',
+      });
+      startupDagMutationLedger.lastRollbackAt =
+        Date.now();
+    }
+    startupDagMutationLedger.appliedMutations.clear();
+  }
+
+  if (
     startupSlaHistory.rollingP95Ms &&
     criticalPathDurationMs >
       startupSlaHistory.rollingP95Ms
@@ -646,6 +785,22 @@ const ready = criticalPhases.every((phase) =>
           startupDagProfiler.zeroValueCriticalBlockers,
         async_candidates:
           startupDagProfiler.reclassificationCandidates,
+      }
+    );
+  }
+
+  if (
+    startupDagSelfHealing.autoPromotedCandidates.length
+  ) {
+    logger.info(
+      '[Server] Wave 16 DAG self-healing promotion candidates detected',
+      {
+        promoted_candidates:
+          startupDagSelfHealing.autoPromotedCandidates,
+        threshold:
+          startupDagSelfHealing.promotionThreshold,
+        healing_actions:
+          startupDagSelfHealing.healingHistory.length,
       }
     );
   }
@@ -971,6 +1126,22 @@ movablePostRelease:
   startupDagProfiler.movablePostRelease,
 criticalAsyncCandidates:
   startupDagProfiler.reclassificationCandidates,
+dagSelfHealingCandidates:
+  startupDagSelfHealing.autoPromotedCandidates,
+dagSelfHealingThreshold:
+  startupDagSelfHealing.promotionThreshold,
+dagHealingActions:
+  startupDagSelfHealing.healingHistory.length,
+lastDagHealingActionAt:
+  startupDagSelfHealing.lastHealingActionAt,
+dagMutationsApplied:
+  startupDagMutationLedger.appliedMutations.size,
+dagMutationLastAppliedAt:
+  startupDagMutationLedger.lastMutationAt,
+dagMutationRollbackEvents:
+  startupDagMutationLedger.rollbackEvents.length,
+dagMutationLastRollbackAt:
+  startupDagMutationLedger.lastRollbackAt,
 },
   });
 });
@@ -1746,6 +1917,21 @@ async function bootstrap() {
     registeredRouteKeys.clear();
     startupWatchdog.startedAt = Date.now();
 
+    startupBarrier.completed.clear();
+    startupBarrier.phaseDurations.clear();
+    startupBarrier.slowestPhase = null;
+    startupBarrier.isReleased = false;
+    startupBarrier.releaseTimestamp = null;
+    startupDagProfiler.slackByPhase.clear();
+    startupDagProfiler.zeroValueCriticalBlockers = [];
+    startupDagProfiler.movablePostRelease = [];
+    startupDagProfiler.reclassificationCandidates = [];
+    startupDagProfiler.criticalPathDeltaMs = null;
+    startupDagSelfHealing.autoPromotedCandidates = [];
+    startupDagSelfHealing.lastHealingActionAt = null;
+    startupDagMutationLedger.appliedMutations.clear();
+    startupDagMutationLedger.lastMutationAt = null;
+
     [
       {
         phase: 'redis-connect',
@@ -1831,6 +2017,7 @@ async function bootstrap() {
       registerStartupPhase(phase, meta)
     );
 
+    applyControlledDagMutation();
     startupBarrier.registrationComplete = true;
 
     logger.info(
