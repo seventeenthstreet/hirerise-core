@@ -124,11 +124,23 @@ const startupBarrier = {
   slowestPhase: null,
   isReleased: false,
   releaseTimestamp: null,
+  registrationComplete: false,
 };
 
 const startupRegressionProfiler = {
   repeatedSlowPhase: new Map(),
   lastBootSlowestPhase: null,
+};
+
+// Patch 49 → startup DAG slack analysis + bottleneck regression intelligence
+const startupDagProfiler = {
+  slackByPhase: new Map(),
+  zeroValueCriticalBlockers: [],
+  movablePostRelease: [],
+  chainFingerprints: new Map(),
+  lastCriticalPathDurationMs: null,
+  criticalPathDeltaMs: null,
+  reclassificationCandidates: [],
 };
 
 const startupWatchdog = {
@@ -180,13 +192,6 @@ const startupPhaseAttribution = {
   lastRootCause: null,
 };
 
-function markStartupPhase(phase, metadata = {}) {
-  startupPhaseAttribution.phases.set(phase, {
-    phase,
-    startedAt: Date.now(),
-    ...metadata,
-  });
-}
 
 const routeLeaderboardInterval = setInterval(() => {
   try {
@@ -262,6 +267,29 @@ function releaseDegradedStartupBarrier(
   if (startupBarrier.isReleased) {
     return;
   }
+const minimumDegradedCritical = Array.from(
+  startupBarrier.phases.entries()
+)
+  .filter(([, meta]) => meta.degradedFloor)
+  .map(([phase]) => phase);
+
+const degradedSafe = minimumDegradedCritical.every((phase) =>
+  startupBarrier.completed.has(phase)
+);
+
+if (!degradedSafe) {
+  logger.error(
+    '[Server] degraded startup release denied: critical quorum floor unmet',
+    {
+      completed_phases: Array.from(startupBarrier.completed),
+      pending_critical: minimumDegradedCritical.filter(
+        (phase) => !startupBarrier.completed.has(phase)
+      ),
+      reason,
+    }
+  );
+  return;
+}
 
   startupWatchdog.degradedReleaseAllowed = true;
   startupChaosConfidence.degradedReleases += 1;
@@ -298,28 +326,125 @@ function releaseDegradedStartupBarrier(
  * Register a named startup phase with the barrier.
  * Call once per phase name at bootstrap initialisation.
  */
-function registerStartupPhase(phase) {
+function registerStartupPhase(
+  phase,
+  {
+    critical = false,
+    degradedFloor = false,
+    asyncPhase = false,
+    dependsOn = [],
+  } = {}
+) {
   const registeredAt = Date.now();
 
   startupBarrier.phases.set(phase, {
     registeredAt,
     status: 'pending',
+    critical,
+    degradedFloor,
+    asyncPhase,
+    dependsOn,
   });
 
   markStartupPhase(phase, {
     registeredAt,
     status: 'pending',
+    critical,
+    degradedFloor,
+    asyncPhase,
+    dependsOn,
   });
 }
 
 /**
  * Mark a named startup phase as complete and attempt to release the barrier.
  */
+function markStartupPhase(phase, data = {}) {
+  const existing =
+    startupPhaseAttribution.phases.get(phase) || {};
+
+  const merged = {
+    ...existing,
+    ...data,
+  };
+
+  startupPhaseAttribution.phases.set(phase, merged);
+
+  if (merged.status === 'failed') {
+    const failure = {
+      phase,
+      timestamp: Date.now(),
+      reason: merged.reason || 'unknown',
+      critical: merged.critical || false,
+      degradedFloor: merged.degradedFloor || false,
+      dependsOn: merged.dependsOn || [],
+    };
+
+    startupPhaseAttribution.failures.push(failure);
+    startupPhaseAttribution.lastRootCause = failure;
+  }
+}
+
+function calculatePhaseSlack(phase) {
+  const meta = startupBarrier.phases.get(phase);
+  const duration =
+    startupBarrier.phaseDurations.get(phase) || 0;
+
+  if (!meta) return 0;
+
+  const downstreamDependents = Array.from(
+    startupBarrier.phases.entries()
+  ).filter(([, m]) =>
+    (m.dependsOn || []).includes(phase)
+  );
+
+  if (downstreamDependents.length === 0) {
+    return duration;
+  }
+
+  const maxDependentDuration = Math.max(
+    ...downstreamDependents.map(
+      ([p]) =>
+        startupBarrier.phaseDurations.get(p) || 0
+    )
+  );
+
+  return Math.max(0, maxDependentDuration - duration);
+}
+
+function fingerprintCriticalChain() {
+  const criticalChain = Array.from(
+    startupBarrier.phases.entries()
+  )
+    .filter(([, meta]) => meta.critical)
+    .map(([phase]) => phase)
+    .sort()
+    .join(' -> ');
+
+  const previous =
+    startupDagProfiler.chainFingerprints.get(
+      criticalChain
+    ) || 0;
+
+  startupDagProfiler.chainFingerprints.set(
+    criticalChain,
+    previous + 1
+  );
+
+  return {
+    chain: criticalChain,
+    repetitionCount: previous + 1,
+  };
+}
+
 function completeStartupPhase(phase) {
   startupBarrier.completed.add(phase);
 
-  const existing = startupBarrier.phases.get(phase) || {};
+  const existing =
+    startupBarrier.phases.get(phase) || {};
+
   const completedAt = Date.now();
+
   const durationMs = existing.registeredAt
     ? completedAt - existing.registeredAt
     : null;
@@ -331,23 +456,22 @@ function completeStartupPhase(phase) {
     status: 'completed',
   });
 
-  const attributionExisting =
-    startupPhaseAttribution.phases.get(phase) || {};
-
-  startupPhaseAttribution.phases.set(phase, {
-    ...attributionExisting,
-    phase,
+  markStartupPhase(phase, {
     completedAt,
     durationMs,
     status: 'completed',
   });
 
   if (durationMs !== null) {
-    startupBarrier.phaseDurations.set(phase, durationMs);
+    startupBarrier.phaseDurations.set(
+      phase,
+      durationMs
+    );
 
     if (
       !startupBarrier.slowestPhase ||
-      durationMs > startupBarrier.slowestPhase.durationMs
+      durationMs >
+        startupBarrier.slowestPhase.durationMs
     ) {
       startupBarrier.slowestPhase = {
         phase,
@@ -364,20 +488,19 @@ function tryReleaseStartupBarrier() {
     return true;
   }
 
-  const requiredPhases = [
-    'redis-connect',
-    'supabase-bootstrap-verification',
-    'http-server-bind',
-    'predictive-topology-worker',
-    'cache-hydration',
-    'global-policy-mesh',
-    'pressure-balancer',
-    'quorum-replication',
-  ];
+  if (!startupBarrier.registrationComplete) {
+    return false;
+  }
 
-  const ready = requiredPhases.every((phase) =>
-    startupBarrier.completed.has(phase)
-  );
+const criticalPhases = Array.from(
+  startupBarrier.phases.entries()
+)
+  .filter(([, meta]) => meta.critical)
+  .map(([phase]) => phase);
+
+const ready = criticalPhases.every((phase) =>
+  startupBarrier.completed.has(phase)
+);
 
   if (!ready) {
     return false;
@@ -385,6 +508,69 @@ function tryReleaseStartupBarrier() {
 
   startupBarrier.isReleased = true;
   startupBarrier.releaseTimestamp = Date.now();
+
+  // Wave 15 → DAG slack + critical path telemetry
+  let criticalPathDurationMs = 0;
+
+  startupDagProfiler.zeroValueCriticalBlockers = [];
+  startupDagProfiler.movablePostRelease = [];
+  startupDagProfiler.reclassificationCandidates = [];
+  startupDagProfiler.slackByPhase.clear();
+
+  for (const [phase, meta] of startupBarrier.phases.entries()) {
+    const duration =
+      startupBarrier.phaseDurations.get(phase) || 0;
+
+    if (meta.critical) {
+      criticalPathDurationMs += duration;
+    }
+
+    const slackMs = calculatePhaseSlack(phase);
+    startupDagProfiler.slackByPhase.set(phase, slackMs);
+
+    if (
+      meta.critical &&
+      slackMs > duration &&
+      !meta.degradedFloor
+    ) {
+      startupDagProfiler.zeroValueCriticalBlockers.push(
+        phase
+      );
+    }
+
+    if (
+      meta.critical &&
+      slackMs >= duration * 2 &&
+      !meta.degradedFloor
+    ) {
+      startupDagProfiler.reclassificationCandidates.push(
+        phase
+      );
+    }
+
+    if (
+      meta.critical &&
+      slackMs > 300 &&
+      !meta.degradedFloor
+    ) {
+      startupDagProfiler.movablePostRelease.push(
+        phase
+      );
+    }
+  }
+
+  if (
+    startupDagProfiler.lastCriticalPathDurationMs !== null
+  ) {
+    startupDagProfiler.criticalPathDeltaMs =
+      criticalPathDurationMs -
+      startupDagProfiler.lastCriticalPathDurationMs;
+  }
+
+  startupDagProfiler.lastCriticalPathDurationMs =
+    criticalPathDurationMs;
+
+  const chainFingerprint = fingerprintCriticalChain();
 
   const slowestPhaseName =
     startupBarrier.slowestPhase?.phase || null;
@@ -440,6 +626,30 @@ function tryReleaseStartupBarrier() {
     );
   }
 
+  if (
+    startupSlaHistory.rollingP95Ms &&
+    criticalPathDurationMs >
+      startupSlaHistory.rollingP95Ms
+  ) {
+    logger.warn(
+      '[Server] Wave 15 critical path regression detected',
+      {
+        critical_path_duration_ms:
+          criticalPathDurationMs,
+        rolling_p95_ms:
+          startupSlaHistory.rollingP95Ms,
+        delta_ms:
+          startupDagProfiler.criticalPathDeltaMs,
+        repeated_chain_count:
+          chainFingerprint.repetitionCount,
+        zero_value_blockers:
+          startupDagProfiler.zeroValueCriticalBlockers,
+        async_candidates:
+          startupDagProfiler.reclassificationCandidates,
+      }
+    );
+  }
+
   return true;
 }
 
@@ -480,7 +690,7 @@ function registerRoute(path, ...handlers) {
 
 function logRouteRegistrySummary() {
   logger.info('[Server] Route registry initialized', {
-    total_registered_routes: registeredRouteKeys.size,
+    total_guarded_route_mounts: registeredRouteKeys.size,
   });
 }
 // Trust proxy — safe for Cloud Run / GCP Load Balancer.
@@ -750,6 +960,17 @@ successfulAdaptiveRecoveries:
 rollbackAdvisory:
   startupChaosConfidence.confidenceScore <
   startupChaosConfidence.rollbackThreshold,
+dagSlackPhases: Object.fromEntries(
+  startupDagProfiler.slackByPhase
+),
+criticalPathDeltaMs:
+  startupDagProfiler.criticalPathDeltaMs,
+zeroValueCriticalBlockers:
+  startupDagProfiler.zeroValueCriticalBlockers,
+movablePostRelease:
+  startupDagProfiler.movablePostRelease,
+criticalAsyncCandidates:
+  startupDagProfiler.reclassificationCandidates,
 },
   });
 });
@@ -1519,35 +1740,109 @@ async function bootstrap() {
     // invocation so that nodemon / soft-reload restarts do not trigger false
     // "Duplicate route registration prevented" warnings. True duplicates within
     // a single bootstrap cycle are still caught correctly.
+
+     // Patch 35 → register distributed startup phases
+    startupBarrier.registrationComplete = false;
     registeredRouteKeys.clear();
+    startupWatchdog.startedAt = Date.now();
 
-    // Patch 35 → register distributed startup phases
-[
-  'redis-connect',
-  'supabase-bootstrap-verification',
-  'http-server-bind',
-  'deploy-warmup',
-  'predictive-topology-worker',
-  'learning-mesh-worker',
-  'federation-worker',
-  'swarm-governance-worker',
-  'cache-hydration',
-  'warm-state-prefetch',
-  'global-policy-mesh',
-  'recovery-scheduler',
-  'pressure-balancer',
-  'quorum-replication',
-  'consensus-memory-forecast',
-  'autonomous-topology-mutation',
-  'sovereign-routing',
-].forEach(registerStartupPhase);
+    [
+      {
+        phase: 'redis-connect',
+        critical: true,
+        degradedFloor: true,
+      },
+      {
+        phase: 'supabase-bootstrap-verification',
+        critical: true,
+        degradedFloor: true,
+        dependsOn: ['redis-connect'],
+      },
+      {
+        phase: 'http-server-bind',
+        critical: true,
+        degradedFloor: true,
+        dependsOn: ['supabase-bootstrap-verification'],
+      },
+      {
+        phase: 'deploy-warmup',
+        asyncPhase: true,
+      },
+      {
+        phase: 'predictive-topology-worker',
+        critical: true,
+      },
+      {
+        phase: 'learning-mesh-worker',
+        asyncPhase: true,
+      },
+      {
+        phase: 'federation-worker',
+        asyncPhase: true,
+      },
+      {
+        phase: 'swarm-governance-worker',
+        asyncPhase: true,
+      },
+      {
+        phase: 'cache-hydration',
+        critical: true,
+        dependsOn: ['redis-connect'],
+      },
+      {
+        phase: 'warm-state-prefetch',
+        asyncPhase: true,
+      },
+      {
+        phase: 'global-policy-mesh',
+        critical: true,
+        dependsOn: ['cache-hydration'],
+      },
+      {
+        phase: 'recovery-scheduler',
+        asyncPhase: true,
+      },
+      {
+        phase: 'pressure-balancer',
+        critical: true,
+        dependsOn: ['cache-hydration'],
+      },
+      {
+        phase: 'quorum-replication',
+        critical: true,
+        dependsOn: [
+          'redis-connect',
+          'pressure-balancer',
+        ],
+      },
+      {
+        phase: 'consensus-memory-forecast',
+        asyncPhase: true,
+      },
+      {
+        phase: 'autonomous-topology-mutation',
+        asyncPhase: true,
+      },
+      {
+        phase: 'sovereign-routing',
+        asyncPhase: true,
+      },
+    ].forEach(({ phase, ...meta }) =>
+      registerStartupPhase(phase, meta)
+    );
 
-startupWatchdog.degradedReleaseAllowed = false;
-startupWatchdog.startedAt = Date.now();
+    startupBarrier.registrationComplete = true;
 
-startupWatchdog.timer = setTimeout(() => {
-  releaseDegradedStartupBarrier('startup-sla-timeout');
-}, startupWatchdog.timeoutMs);
+    logger.info(
+      '[Server] Wave 14 startup DAG registration frozen',
+      {
+        total_registered_phases:
+          startupBarrier.phases.size,
+        critical_registered_phases: Array.from(
+          startupBarrier.phases.values()
+        ).filter((meta) => meta.critical).length,
+      }
+    );
 
  // PR 2: Redis must be ready before serving traffic
     await connectRedis();
@@ -1633,13 +1928,16 @@ replayPolicyEngine.startReplayPolicyWorker({
     return predictiveHeat.getGlobalSwarmWeight?.() || 1;
   },
 });
-logger.info('[Server] Patch 13 replay policy worker started');
+logger.info(
+  '[Server] Patch 13 replay policy worker registered in startup orchestration'
+);
 
 cacheHydrationWorker.startCacheHydrationWorker();
 completeStartupPhase('cache-hydration');
 
-logger.info('[Server] Patch 14 cache hydration mesh started');
-
+logger.info(
+  '[Server] Patch 14 cache hydration worker registered in startup orchestration'
+);
 // Patch 15 → autonomous warm-state prefetch mesh
 warmStatePrefetch
   .hydrateBootSnapshot()
@@ -1694,7 +1992,7 @@ logger.info(
 );
 
 logger.info(
-  '[Server] Patch 22 consensus replay mesh initialized'
+  '[Server] Patch 22 consensus worker registered in startup orchestration'
 );
 
 if (!workerBootRegistry.has('consensus-memory-forecast')) {
@@ -1724,7 +2022,7 @@ if (!workerBootRegistry.has('autonomous-topology-mutation')) {
   );
 }
 logger.info(
-  '[Server] Patch 27 autonomous topology mutation worker started'
+  '[Server] Patch 27 autonomous topology mutation worker registered in startup orchestration'
 );
 completeStartupPhase('autonomous-topology-mutation');
 
@@ -1866,11 +2164,21 @@ predictiveHeat
       }
     }
 
-    startupChaosConfidence.confidenceScore = Math.max(
-      0,
-      100 -
-        startupChaosConfidence.rollbackRiskScore
-    );
+ const allCriticalComplete = Array.from(
+  startupBarrier.phases.entries()
+)
+  .filter(([, meta]) => meta.critical)
+  .every(([phase]) =>
+    startupBarrier.completed.has(phase)
+  );
+
+startupChaosConfidence.confidenceScore =
+  allCriticalComplete
+    ? Math.max(
+        0,
+        100 - startupChaosConfidence.rollbackRiskScore
+      )
+    : 0;
 
     if (
       startupChaosConfidence.confidenceScore <
