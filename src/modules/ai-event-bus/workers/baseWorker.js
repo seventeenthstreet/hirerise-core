@@ -3,7 +3,8 @@
 /**
  * baseWorker.js — BullMQ + Supabase production-grade base worker
  *
- * Patch 44 hardened:
+ * Patch 45 repaired:
+ * - fixed Supabase client destructuring
  * - authoritative failure persistence
  * - deterministic result upserts
  * - retry-final-attempt replay fence
@@ -13,14 +14,13 @@
 
 const { Worker, MetricsTime } = require('bullmq');
 const logger = require('../../../utils/logger');
-const supabase = require('../../config/supabase');
+const { supabase } = require('../../config/supabase');
 const cacheManager = require('../../core/cache/cache.manager');
 const { publishCompletion, publishFailure } = require('../bus/aiEventBus');
 const { getBullMQRedisConnection } = require('../queues/queue.config');
 const {
   authoritativeUpsert,
 } = require('../../../lib/db/authoritativeMutation');
-
 const RESULT_CACHE_TTL = 600;
 const now = () => new Date().toISOString();
 

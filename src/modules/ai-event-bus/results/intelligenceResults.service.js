@@ -3,8 +3,8 @@
 /**
  * intelligenceResults.service.js — Supabase + Redis optimized
  *
- * Firebase: none in original.
- * Optimizations:
+ * Patch 45 repaired:
+ * - fixed Supabase client destructuring
  * - Column-select minimization instead of select('*')
  * - Better cache serialization safety
  * - Shared DB helpers reduce duplicate logic
@@ -12,7 +12,7 @@
  * - Optional stale-while-revalidate friendly structure
  */
 
-const supabase = require('../../config/supabase');
+const { supabase } = require('../../config/supabase');
 const cacheManager = require('../../core/cache/cache.manager');
 const logger = require('../../../utils/logger');
 

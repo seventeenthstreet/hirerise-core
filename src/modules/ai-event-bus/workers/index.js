@@ -3,7 +3,8 @@
 /**
  * workers/index.js — optimized worker implementations
  *
- * Key upgrades:
+ * Patch 45 repaired:
+ * - fixed Supabase client destructuring
  * - Removed remaining Firestore-style profile loading logic
  * - Fully Supabase-native profile reads
  * - Shared engine fallback helper
@@ -14,7 +15,7 @@
 
 const BaseWorker = require('./baseWorker');
 const { QUEUE_NAMES } = require('../queues/queue.config');
-const supabase = require('../../config/supabase');
+const { supabase } = require('../../config/supabase');
 const logger = require('../../../utils/logger');
 
 const engines = {};
