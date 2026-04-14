@@ -3,11 +3,14 @@
 /**
  * src/modules/dashboard/dashboard.service.js
  *
- * Wave 3 Priority #4.1 — CHI canonical repository unification
+ * Wave 4 — Patch 44
  *
  * Production-safe dashboard service
  * ✅ CHI reads via canonical repository
  * ✅ Redis cache safe
+ * ✅ free-tier query elimination
+ * ✅ inflight hydration dedupe
+ * ✅ job match micro-cache
  * ✅ zero direct chi_snapshots access
  * ✅ partition-ready
  */
@@ -24,10 +27,13 @@ const {
 } = require('../analysis/analysis.constants');
 
 let redisClient = null;
+const inflightDashboardHydration = new Map();
+const jobMatchMicroCache = new Map();
 
 const CACHE_KEY_PREFIX = 'dashboard:snap:';
 const CACHE_TTL_BASE_SECONDS = 120;
 const CACHE_JITTER_MAX_SECONDS = 30;
+const JOB_MATCH_MICRO_TTL_MS = 15000;
 
 function getRedis() {
   if (redisClient) return redisClient;
@@ -114,6 +120,8 @@ async function invalidateDashboardCache(userId) {
       error: error.message,
     });
   }
+
+  jobMatchMicroCache.delete(userId);
 }
 
 async function fetchLatestCHI(userId) {
@@ -164,14 +172,15 @@ async function fetchLatestJobMatch(userId) {
     lastAnalyzedAt: null,
   };
 
+  const cached = jobMatchMicroCache.get(userId);
+  if (cached && cached.expiresAt > Date.now()) {
+    return cached.value;
+  }
+
   try {
     const { data, error } = await supabase
       .from('job_match_analyses')
-      .select(`
-        match_score,
-        job_title,
-        analyzed_at
-      `)
+      .select('match_score,job_title,analyzed_at')
       .eq('user_id', userId)
       .order('analyzed_at', { ascending: false })
       .limit(1)
@@ -179,12 +188,20 @@ async function fetchLatestJobMatch(userId) {
 
     if (error || !data) return fallback;
 
-    return {
+    const result = {
       hasAnalyzedBefore: true,
       lastMatchScore: data.match_score ?? null,
       lastJobTitle: data.job_title ?? null,
       lastAnalyzedAt: data.analyzed_at ?? null,
     };
+
+    jobMatchMicroCache.set(userId, {
+      value: result,
+      expiresAt:
+        Date.now() + JOB_MATCH_MICRO_TTL_MS,
+    });
+
+    return result;
   } catch (error) {
     logger.warn('[DashboardService] Job match fetch failed', {
       userId,
@@ -263,44 +280,69 @@ async function getDashboardData(userId, tier) {
   const cached = await getCachedSnapshot(userId, tier);
   if (cached) return cached;
 
-  const [credits, chiData, jobMatchData] =
-    await Promise.all([
-      fetchCredits(userId, tier),
-      fetchLatestCHI(userId),
-      fetchLatestJobMatch(userId),
-    ]);
+  const inflightKey = `${userId}:${tier}`;
 
-  const remainingUses =
-    tier !== 'free'
-      ? getRemainingUses(credits)
-      : Object.fromEntries(
-          Object.keys(CREDIT_COSTS).map((op) => [op, 0])
-        );
+  if (inflightDashboardHydration.has(inflightKey)) {
+    return inflightDashboardHydration.get(inflightKey);
+  }
 
-  const snapshot = {
-    tier,
-    features: buildFeatures(tier, chiData),
-    user: {
+  const hydrationPromise = (async () => {
+    const [credits, chiData, jobMatchData] =
+      await Promise.all([
+        fetchCredits(userId, tier),
+        fetchLatestCHI(userId),
+        tier === 'free'
+          ? Promise.resolve({
+              hasAnalyzedBefore: false,
+              lastMatchScore: null,
+              lastJobTitle: null,
+              lastAnalyzedAt: null,
+            })
+          : fetchLatestJobMatch(userId),
+      ]);
+
+    const remainingUses =
+      tier !== 'free'
+        ? getRemainingUses(credits)
+        : Object.fromEntries(
+            Object.keys(CREDIT_COSTS).map((op) => [op, 0])
+          );
+
+    const snapshot = {
       tier,
-      aiCreditsRemaining: credits,
-    },
-    careerIntelligence: chiData ?? {
-      chiScore: null,
-      skillCoverage: null,
-      growthSummary: null,
-      salaryPreview: null,
-    },
-    applySmarter: jobMatchData,
-    credits: {
-      remaining: credits,
-      remainingUses,
-      ...computeCanRunFlags(tier, credits),
-    },
-  };
+      features: buildFeatures(tier, chiData),
+      user: {
+        tier,
+        aiCreditsRemaining: credits,
+      },
+      careerIntelligence: chiData ?? {
+        chiScore: null,
+        skillCoverage: null,
+        growthSummary: null,
+        salaryPreview: null,
+      },
+      applySmarter: jobMatchData,
+      credits: {
+        remaining: credits,
+        remainingUses,
+        ...computeCanRunFlags(tier, credits),
+      },
+    };
 
-  await setCachedSnapshot(userId, snapshot);
+    await setCachedSnapshot(userId, snapshot);
+    return snapshot;
+  })();
 
-  return snapshot;
+  inflightDashboardHydration.set(
+    inflightKey,
+    hydrationPromise
+  );
+
+  try {
+    return await hydrationPromise;
+  } finally {
+    inflightDashboardHydration.delete(inflightKey);
+  }
 }
 
 module.exports = {

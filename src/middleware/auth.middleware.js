@@ -3,12 +3,16 @@
 /**
  * src/middleware/auth.middleware.js
  *
- * Patch 32: Final Supabase-first authentication authority
- * - singleton Supabase admin client
- * - timeout-safe JWT verification
- * - token cache fast path
- * - canonical billing tier from subscriptions
- * - stable downstream req.user contract
+ * Wave 4 — Patch 40
+ *
+ * Final production auth authority
+ * ✅ singleton Supabase admin client
+ * ✅ timeout-safe JWT verification
+ * ✅ token cache fast path
+ * ✅ JWT-first billing tier resolution
+ * ✅ tier micro-cache fallback
+ * ✅ DB fallback only when JWT lacks plan
+ * ✅ stable downstream req.user contract
  */
 
 const { createClient } = require('@supabase/supabase-js');
@@ -18,8 +22,10 @@ const { requireAdmin } = require('./requireAdmin.middleware');
 
 const API_PREFIX = '/api/v1';
 const SUPABASE_TIMEOUT_MS = 2000;
+const PLAN_CACHE_TTL_MS = 30000;
 
 let supabaseAdmin;
+const planMicroCache = new Map();
 
 function getSupabaseAdmin() {
   if (supabaseAdmin) return supabaseAdmin;
@@ -77,53 +83,79 @@ function buildClaimSet(user, plan) {
   return Object.freeze({
     id: user.id,
     sub: user.id,
-
-    // Transitional compatibility bridge
-    // Safe to remove after all req.user.uid consumers migrate
     uid: user.id,
-
     email: user.email ?? null,
     emailVerified: Boolean(
       user.email_confirmed_at
     ),
-
     role,
     roles,
-
     admin: Boolean(
       appMeta.admin || role === 'admin'
     ),
-
     plan: plan ?? 'free',
     planAmount: appMeta.planAmount ?? null,
   });
 }
 
-/**
- * Canonical billing source
- * Patch 32: subscriptions.tier is the only authority
- */
 async function resolvePlan(user) {
   const appMeta = user.app_metadata ?? {};
-  const metaPlan = appMeta.plan ?? appMeta.tier;
+  const jwtPlan = appMeta.plan ?? appMeta.tier;
 
-  if (metaPlan) return metaPlan;
+  // Patch 40 → JWT-first fast path
+  if (jwtPlan) {
+    const cached = planMicroCache.get(user.id);
 
-  const { data, error } = await getSupabaseAdmin()
-    .from('subscriptions')
-    .select('tier')
-    .eq('user_id', user.id)
-    .maybeSingle();
+    if (
+      !cached ||
+      cached.value !== jwtPlan ||
+      cached.expiresAt <= Date.now()
+    ) {
+      planMicroCache.set(user.id, {
+        value: jwtPlan,
+        expiresAt: Date.now() + PLAN_CACHE_TTL_MS,
+      });
+    }
 
-  if (error) {
-    logger.warn('[Auth] Plan lookup failed', {
+    return jwtPlan;
+  }
+
+  const cached = planMicroCache.get(user.id);
+  if (cached && cached.expiresAt > Date.now()) {
+    return cached.value;
+  }
+
+  try {
+    const { data, error } = await getSupabaseAdmin()
+      .from('subscriptions')
+      .select('tier')
+      .eq('user_id', user.id)
+      .maybeSingle();
+
+    if (error) {
+      logger.warn('[Auth] Plan lookup failed', {
+        userId: user.id,
+        error: error.message,
+      });
+      return 'free';
+    }
+
+    const resolvedPlan = data?.tier ?? 'free';
+
+    planMicroCache.set(user.id, {
+      value: resolvedPlan,
+      expiresAt: Date.now() + PLAN_CACHE_TTL_MS,
+    });
+
+    return resolvedPlan;
+  } catch (error) {
+    logger.warn('[Auth] Plan lookup exception', {
       userId: user.id,
       error: error.message,
     });
+
     return 'free';
   }
-
-  return data?.tier ?? 'free';
 }
 
 async function safeGetUser(rawToken) {

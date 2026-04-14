@@ -169,6 +169,10 @@ const startupChaosConfidence = {
   confidenceScore: 100,
   rollbackThreshold: 65,
 };
+
+const routeLatencyBuckets = new Map();
+const ROUTE_BUCKET_SAMPLE_LIMIT = 100;
+const ROUTE_LEADERBOARD_INTERVAL_MS = 15000;
 // Patch 38 → startup phase failure attribution registry
 const startupPhaseAttribution = {
   phases: new Map(),
@@ -183,6 +187,55 @@ function markStartupPhase(phase, metadata = {}) {
     ...metadata,
   });
 }
+
+const routeLeaderboardInterval = setInterval(() => {
+  try {
+    const leaderboard = [];
+
+    for (const [routeKey, samples] of routeLatencyBuckets) {
+      if (!samples.length) continue;
+
+      const sorted = [...samples].sort(
+        (a, b) => b - a
+      );
+
+      const p95Index = Math.max(
+        0,
+        Math.floor(sorted.length * 0.05)
+      );
+
+      leaderboard.push({
+        route: routeKey,
+        p95_duration_ms:
+          sorted[p95Index] ?? sorted[0],
+        sample_count: samples.length,
+      });
+    }
+
+    const topRoutes = leaderboard
+      .sort(
+        (a, b) =>
+          b.p95_duration_ms -
+          a.p95_duration_ms
+      )
+      .slice(0, 5);
+
+    if (topRoutes.length) {
+      logger.info(
+        '[Telemetry] Hottest route leaderboard',
+        { routes: topRoutes }
+      );
+    }
+  } catch (error) {
+    logger.warn(
+      '[Telemetry] Route leaderboard failed',
+      { error: error.message }
+    );
+  }
+}, ROUTE_LEADERBOARD_INTERVAL_MS);
+routeLeaderboardInterval.unref();
+
+// next startup helpers continue below
 
 function recordStartupFailureAttribution(
   phase,
@@ -485,7 +538,46 @@ app.use((req, res, next) => {
     const durationMs =
       Number(process.hrtime.bigint() - startedAt) / 1e6;
 
-    logger.info('[Telemetry] HTTP request completed', {
+    const roundedDurationMs = Number(
+      durationMs.toFixed(2)
+    );
+
+    const routeKey = `${req.method}:${
+  req.route?.path ||
+  req.path ||
+  req.originalUrl
+}`;
+
+if (!routeLatencyBuckets.has(routeKey)) {
+  routeLatencyBuckets.set(routeKey, []);
+}
+
+const samples = routeLatencyBuckets.get(routeKey);
+samples.push(roundedDurationMs);
+
+if (samples.length > ROUTE_BUCKET_SAMPLE_LIMIT) {
+  samples.shift();
+}
+
+const sortedSamples = [...samples].sort(
+  (a, b) => a - b
+);
+
+const p95Index = Math.max(
+  0,
+  Math.floor(sortedSamples.length * 0.95) - 1
+);
+
+const p95DurationMs =
+  sortedSamples[p95Index] ??
+  roundedDurationMs;
+
+    const logMethod =
+      roundedDurationMs >= 250
+        ? logger.warn.bind(logger)
+        : logger.info.bind(logger);
+
+    logMethod('[Telemetry] HTTP request completed', {
       requestId:
         req.requestId ||
         req.headers['x-request-id'] ||
@@ -497,7 +589,9 @@ app.use((req, res, next) => {
       method: req.method,
       path: req.originalUrl,
       statusCode: res.statusCode,
-      duration_ms: Number(durationMs.toFixed(2)),
+      duration_ms: roundedDurationMs,
+      p95_duration_ms: p95DurationMs,
+      slow_route: roundedDurationMs >= 250,
     });
   });
 
@@ -1797,6 +1891,8 @@ predictiveHeat
       }
     );
   });
+
+}); // end app.listen callback
 
 server.on('error', (err) => {
   recordStartupFailureAttribution(
