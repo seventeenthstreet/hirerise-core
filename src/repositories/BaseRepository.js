@@ -18,7 +18,6 @@ class BaseRepository {
   // ───────────────────────────────────────────────────────────────────────────
   // READ
   // ───────────────────────────────────────────────────────────────────────────
-
   async findById(id, { includeDeleted = false } = {}) {
     if (!id) return null;
 
@@ -79,7 +78,7 @@ class BaseRepository {
     this._throwDbError(error, 'find');
 
     return {
-      docs: (data ?? []).map(row => this._normalize(row)),
+      docs: (data ?? []).map((row) => this._normalize(row)),
       count: count ?? 0,
     };
   }
@@ -87,7 +86,6 @@ class BaseRepository {
   // ───────────────────────────────────────────────────────────────────────────
   // WRITE
   // ───────────────────────────────────────────────────────────────────────────
-
   async create(data = {}, userId = 'system', docId = null) {
     const now = this._now();
 
@@ -123,22 +121,10 @@ class BaseRepository {
       );
     }
 
-    const current = await this.findById(id);
-
-    if (!current) {
-      throw new AppError(
-        'Document not found',
-        404,
-        { id },
-        ErrorCodes.NOT_FOUND
-      );
-    }
-
     const payload = {
       ...this._toSnakeCase(updates),
       updated_at: this._now(),
       updated_by: userId,
-      version: Number(current.version ?? 1) + 1,
     };
 
     const { data: updated, error } = await this.db
@@ -154,40 +140,81 @@ class BaseRepository {
   }
 
   async softDelete(id, userId = 'system') {
-    return this.update(
-      id,
-      {
-        softDeleted: true,
+    if (!id) {
+      throw new AppError(
+        'Missing document id',
+        400,
+        { table: this.table },
+        ErrorCodes.VALIDATION_ERROR
+      );
+    }
+
+    const { data, error } = await this.db
+      .from(this.table)
+      .update({
+        soft_deleted: true,
         status: 'inactive',
-      },
-      userId
-    );
+        updated_at: this._now(),
+        updated_by: userId,
+      })
+      .eq('id', id)
+      .eq('soft_deleted', false)
+      .select('*')
+      .single();
+
+    this._throwDbError(error, 'softDelete', { id });
+    return this._normalize(data);
   }
 
   // ───────────────────────────────────────────────────────────────────────────
   // INTERNAL HELPERS
   // ───────────────────────────────────────────────────────────────────────────
-
   _applyFilter(query, field, op, value) {
     const dbField = this._toSnakeKey(field);
 
     switch (op) {
-      case '==': return query.eq(dbField, value);
-      case '!=': return query.neq(dbField, value);
-      case '>': return query.gt(dbField, value);
-      case '>=': return query.gte(dbField, value);
-      case '<': return query.lt(dbField, value);
-      case '<=': return query.lte(dbField, value);
-      case 'in': return query.in(dbField, Array.isArray(value) ? value : [value]);
-      case 'array-contains': return query.contains(dbField, [value]);
-      default:
-        logger.error('[BaseRepository] Unsupported filter operator', {
-          table: this.table,
-          field,
+      case '==':
+        return value == null
+          ? query.is(dbField, null)
+          : query.eq(dbField, value);
+
+      case '!=':
+        return value == null
+          ? query.not(dbField, 'is', null)
+          : query.neq(dbField, value);
+
+      case '>':
+        return query.gt(dbField, value);
+
+      case '>=':
+        return query.gte(dbField, value);
+
+      case '<':
+        return query.lt(dbField, value);
+
+      case '<=':
+        return query.lte(dbField, value);
+
+      case 'in':
+        return query.in(
           dbField,
-          op,
-          valueType: typeof value,
-        });
+          Array.isArray(value) ? value : [value]
+        );
+
+      case 'array-contains':
+        return query.contains(dbField, [value]);
+
+      default:
+        logger.error(
+          '[BaseRepository] Unsupported filter operator',
+          {
+            table: this.table,
+            field,
+            dbField,
+            op,
+            valueType: typeof value,
+          }
+        );
 
         throw new AppError(
           `Unsupported filter operator: ${op}`,
@@ -205,7 +232,9 @@ class BaseRepository {
 
     for (const [key, value] of Object.entries(row)) {
       out[this._toCamelKey(key)] =
-        value instanceof Date ? value.toISOString() : value;
+        value instanceof Date
+          ? value.toISOString()
+          : value;
     }
 
     return out;
@@ -224,11 +253,17 @@ class BaseRepository {
   }
 
   _toSnakeKey(key) {
-    return String(key).replace(/[A-Z]/g, c => `_${c.toLowerCase()}`);
+    return String(key).replace(
+      /[A-Z]/g,
+      (c) => `_${c.toLowerCase()}`
+    );
   }
 
   _toCamelKey(key) {
-    return String(key).replace(/_([a-z])/g, (_, c) => c.toUpperCase());
+    return String(key).replace(
+      /_([a-z])/g,
+      (_, c) => c.toUpperCase()
+    );
   }
 
   _now() {

@@ -6,46 +6,37 @@ const {
   ErrorCodes,
 } = require('../middleware/errorHandler');
 
-const PROTECTED_FIELDS = new Set([
-  'uid',
-  'id',
-  'email',
-  'role',
-  'roles',
-  'admin',
-  'plan',
-  'tier',
-  'planAmount',
-  'plan_amount',
-  'aiCreditsRemaining',
-  'ai_credits_remaining',
-  'reportUnlocked',
-  'report_unlocked',
-  'subscriptionStatus',
-  'subscription_status',
-  'subscriptionProvider',
-  'subscription_provider',
-  'subscriptionId',
-  'subscription_id',
-  'chiScore',
-  'chi_score',
-  'onboardingCompleted',
-  'onboarding_completed',
-  'resumeUploaded',
-  'resume_uploaded',
-  'consentGrantedAt',
-  'consent_granted_at',
-  'consentVersion',
-  'consent_version',
-  'consentSource',
-  'consent_source',
-  'createdAt',
-  'created_at',
-  'deletedAt',
-  'deleted_at',
-]);
+const PROTECTED_FIELDS = Object.freeze(
+  new Set([
+    // identity
+    'uid',
+    'id',
+    'email',
+    'role',
+    'roles',
+    'admin',
 
-// API request aliases → canonical camelCase domain keys
+    // billing-owned
+    'tier',
+    'subscriptionStatus',
+    'subscriptionProvider',
+    'subscriptionId',
+
+    // scoring / derived
+    'chiScore',
+    'onboardingCompleted',
+    'resumeUploaded',
+
+    // consent / lifecycle
+    'consentGrantedAt',
+    'consentVersion',
+    'consentSource',
+    'createdAt',
+    'deletedAt',
+  ])
+);
+
+// API aliases → canonical domain keys
 const FIELD_MAP = Object.freeze({
   name: 'displayName',
   careerGoal: 'careerGoal',
@@ -73,7 +64,10 @@ class UserRepository extends BaseRepository {
     for (const [key, value] of Object.entries(fields)) {
       const canonicalKey = FIELD_MAP[key] ?? key;
 
-      if (!PROTECTED_FIELDS.has(canonicalKey)) {
+      if (
+        canonicalKey &&
+        !PROTECTED_FIELDS.has(canonicalKey)
+      ) {
         normalized[canonicalKey] = value;
       }
     }
@@ -82,14 +76,13 @@ class UserRepository extends BaseRepository {
       throw new AppError(
         'No valid fields provided for update.',
         400,
-        null,
+        { attemptedFields: Object.keys(fields) },
         ErrorCodes.VALIDATION_ERROR
       );
     }
 
-    // BaseRepository handles snake_case conversion safely
     return this.update(userId, normalized);
   }
 }
 
-module.exports = new UserRepository();
+module.exports = Object.freeze(new UserRepository());

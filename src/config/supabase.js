@@ -1,15 +1,23 @@
 'use strict';
 
 /**
- * supabase.js (FINAL - PRODUCTION SAFE)
- * Firebase compatibility shims removed
+ * src/config/supabase.js
+ *
+ * FINAL — Production-safe Supabase singleton
+ * Patch 33 compliant:
+ * - global fetch timeout protection
+ * - latency telemetry
+ * - slow request warnings
+ * - timeout anomaly detection
  */
 
 const { createClient } = require('@supabase/supabase-js');
 
 let logger;
 try {
-  logger = require('../utils/logger').logger || require('../utils/logger');
+  logger =
+    require('../utils/logger').logger ||
+    require('../utils/logger');
 } catch {
   logger = console;
 }
@@ -19,11 +27,16 @@ try {
 // ─────────────────────────────────────────────
 
 const SUPABASE_URL =
-  process.env.SUPABASE_URL || process.env.NEXT_PUBLIC_SUPABASE_URL;
+  process.env.SUPABASE_URL ||
+  process.env.NEXT_PUBLIC_SUPABASE_URL;
 
-const SUPABASE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
+const SUPABASE_KEY =
+  process.env.SUPABASE_SERVICE_ROLE_KEY;
 
-const TIMEOUT_MS = parseInt(process.env.SUPABASE_TIMEOUT_MS || '10000', 10);
+const TIMEOUT_MS = parseInt(
+  process.env.SUPABASE_TIMEOUT_MS || '10000',
+  10
+);
 
 // ─────────────────────────────────────────────
 // VALIDATION
@@ -31,8 +44,8 @@ const TIMEOUT_MS = parseInt(process.env.SUPABASE_TIMEOUT_MS || '10000', 10);
 
 if (!SUPABASE_URL || !SUPABASE_KEY) {
   logger.error('[Supabase] Missing env', {
-    hasUrl: !!SUPABASE_URL,
-    hasKey: !!SUPABASE_KEY,
+    hasUrl: Boolean(SUPABASE_URL),
+    hasKey: Boolean(SUPABASE_KEY),
   });
 
   throw new Error('Supabase configuration missing');
@@ -55,13 +68,57 @@ function getClient() {
     global: {
       fetch: async (url, options = {}) => {
         const controller = new AbortController();
-        const timeout = setTimeout(() => controller.abort(), TIMEOUT_MS);
+
+        const timeout = setTimeout(() => {
+          logger.error(
+            '[Telemetry] Supabase request timeout',
+            {
+              url: String(url),
+              timeout_ms: TIMEOUT_MS,
+            }
+          );
+
+          controller.abort();
+        }, TIMEOUT_MS);
+
+        const startedAt = process.hrtime.bigint();
 
         try {
-          return await fetch(url, {
+          const response = await fetch(url, {
             ...options,
             signal: controller.signal,
           });
+
+          const durationMs =
+            Number(
+              process.hrtime.bigint() - startedAt
+            ) / 1e6;
+
+          logger.info(
+            '[Telemetry] Supabase fetch completed',
+            {
+              url: String(url),
+              status: response.status,
+              duration_ms: Number(
+                durationMs.toFixed(2)
+              ),
+            }
+          );
+
+          if (durationMs > 1500) {
+            logger.warn(
+              '[Telemetry] Slow Supabase request',
+              {
+                url: String(url),
+                status: response.status,
+                duration_ms: Number(
+                  durationMs.toFixed(2)
+                ),
+              }
+            );
+          }
+
+          return response;
         } finally {
           clearTimeout(timeout);
         }
@@ -93,7 +150,9 @@ async function withRetry(fn, retries = 2) {
       });
 
       if (i < retries) {
-        await new Promise((r) => setTimeout(r, 200 * (i + 1)));
+        await new Promise((resolve) =>
+          setTimeout(resolve, 200 * (i + 1))
+        );
       }
     }
   }
@@ -102,7 +161,7 @@ async function withRetry(fn, retries = 2) {
 }
 
 // ─────────────────────────────────────────────
-// HEALTH CHECK (LAZY SAFE)
+// HEALTH CHECK
 // ─────────────────────────────────────────────
 
 async function verifyConnection() {

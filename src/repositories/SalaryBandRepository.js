@@ -11,7 +11,6 @@ class SalaryBandRepository extends BaseRepository {
   // ─────────────────────────────────────────────────────────
   // PRIMARY LOOKUP
   // ─────────────────────────────────────────────────────────
-
   async findByRoleId(roleId) {
     if (!roleId) {
       throw new AppError(
@@ -26,22 +25,8 @@ class SalaryBandRepository extends BaseRepository {
   }
 
   // ─────────────────────────────────────────────────────────
-  // LEGACY COMPATIBILITY
+  // PATCH 32 CANONICAL UPDATE PATH
   // ─────────────────────────────────────────────────────────
-
-  async findByRoleIdLegacy(roleId) {
-    const result = await this.find(
-      [{ field: 'roleId', op: '==', value: roleId }],
-      { limit: 1 }
-    );
-
-    return result.docs?.[0] ?? null;
-  }
-
-  // ─────────────────────────────────────────────────────────
-  // BACKWARD-COMPAT SAFE UPDATE
-  // ─────────────────────────────────────────────────────────
-
   async updateWithTransaction(
     id,
     updates,

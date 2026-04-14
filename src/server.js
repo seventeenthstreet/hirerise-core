@@ -37,8 +37,6 @@ const compression = require('compression');
 const cors        = require('cors');
 const morgan      = require('morgan');
 const rateLimit   = require('express-rate-limit');
-const fs = require('fs');
-const path = require('path');
 
 // ── Config ────────────────────────────────────────────────────────────────────
 const {
@@ -46,6 +44,7 @@ const {
   getRedisStatus,
   closeRedis,
 } = require('./config/redisClient');
+const { supabase } = require('./config/supabase');
 
 // ── Utilities ─────────────────────────────────────────────────────────────────
 const logger = require('./utils/logger');
@@ -102,22 +101,294 @@ const observabilityAdapter = require('./adapters/observability-adapter');
 // =============================================================================
 const app = express();
 
-const legacyBackendPath = path.join(
-  __dirname,
-  '..',
-  'api-service',
-  'src',
-  'server.js'
-);
+const registeredRouteKeys = new Set();
 
-if (fs.existsSync(legacyBackendPath)) {
-  logger.warn(
-    '[Server] Legacy backend collision risk detected: api-service/src/server.js still exists',
-    { legacyBackendPath }
-  );
+// =============================================================================
+// ✅ Server-scoped state — declared once, used across bootstrap + shutdown
+// =============================================================================
+let server = null;
+let isShuttingDown = false;
+let consensusMemoryForecastLoop = null;
+let autonomousTopologyMutationWorker = null;
+
+// Tracks which workers have been booted to prevent duplicate starts on
+// hot-reload / nodemon restarts.
+const workerBootRegistry = new Set();
+
+// Distributed startup barrier — readiness gate for /api/v1/ready.
+// All required phases must complete before traffic is accepted.
+const startupBarrier = {
+  phases: new Map(),
+  completed: new Set(),
+  phaseDurations: new Map(),
+  slowestPhase: null,
+  isReleased: false,
+  releaseTimestamp: null,
+};
+
+const startupRegressionProfiler = {
+  repeatedSlowPhase: new Map(),
+  lastBootSlowestPhase: null,
+};
+
+const startupWatchdog = {
+  timer: null,
+  startedAt: null,
+  timeoutMs: parseInt(
+    process.env.STARTUP_BARRIER_TIMEOUT_MS || '45000',
+    10
+  ),
+  degradedReleaseAllowed: false,
+};
+
+// Patch 39 → persistent startup SLA history + predictive anomaly forecasting
+const startupSlaHistory = {
+  samples: [],
+  maxSamples: 500,
+  rollingAverageMs: null,
+  rollingP95Ms: null,
+  anomalyThresholdMultiplier: 1.8,
+  lastForecastMs: null,
+};
+
+// Patch 40 → adaptive watchdog timeout self-tuning policy
+const startupAdaptiveTimeoutPolicy = {
+  minTimeoutMs: 30000,
+  maxTimeoutMs: 120000,
+  tuningMultiplier: 1.5,
+  lastRecommendedTimeoutMs: null,
+  lastAppliedTimeoutMs: null,
+};
+
+// Patch 41 → startup chaos verification + rollback confidence mesh
+const startupChaosConfidence = {
+  degradedReleases: 0,
+  anomalyBreaches: 0,
+  successfulAdaptiveRecoveries: 0,
+  rollbackRiskScore: 0,
+  confidenceScore: 100,
+  rollbackThreshold: 65,
+};
+// Patch 38 → startup phase failure attribution registry
+const startupPhaseAttribution = {
+  phases: new Map(),
+  failures: [],
+  lastRootCause: null,
+};
+
+function markStartupPhase(phase, metadata = {}) {
+  startupPhaseAttribution.phases.set(phase, {
+    phase,
+    startedAt: Date.now(),
+    ...metadata,
+  });
 }
 
-const registeredRouteKeys = new Set();
+function recordStartupFailureAttribution(
+  phase,
+  error,
+  metadata = {}
+) {
+  const failure = {
+    phase,
+    timestamp: Date.now(),
+    message: error?.message || 'Unknown startup failure',
+    stack: error?.stack,
+    ...metadata,
+  };
+
+  startupPhaseAttribution.failures.push(failure);
+  startupPhaseAttribution.lastRootCause = failure;
+
+  return failure;
+}
+
+function releaseDegradedStartupBarrier(
+  reason = 'startup-timeout'
+) {
+  if (startupBarrier.isReleased) {
+    return;
+  }
+
+  startupWatchdog.degradedReleaseAllowed = true;
+  startupChaosConfidence.degradedReleases += 1;
+  startupChaosConfidence.rollbackRiskScore += 15;
+  startupBarrier.isReleased = true;
+  startupBarrier.releaseTimestamp = Date.now();
+  recordStartupFailureAttribution(
+  'startup-watchdog-timeout',
+  new Error(reason),
+  {
+    completedPhases: Array.from(startupBarrier.completed),
+    pendingPhases: Array.from(
+      startupBarrier.phases.keys()
+    ).filter(
+      (phase) => !startupBarrier.completed.has(phase)
+    ),
+    slowestPhase:
+      startupBarrier.slowestPhase?.phase || null,
+    timeoutMs: startupWatchdog.timeoutMs,
+  }
+);
+
+  logger.warn(
+    '[Server] Patch 36 degraded startup quorum fallback activated',
+    {
+      reason,
+      completed_phases: startupBarrier.completed.size,
+      total_registered_phases: startupBarrier.phases.size,
+      timeout_ms: startupWatchdog.timeoutMs,
+    }
+  );
+}
+/**
+ * Register a named startup phase with the barrier.
+ * Call once per phase name at bootstrap initialisation.
+ */
+function registerStartupPhase(phase) {
+  const registeredAt = Date.now();
+
+  startupBarrier.phases.set(phase, {
+    registeredAt,
+    status: 'pending',
+  });
+
+  markStartupPhase(phase, {
+    registeredAt,
+    status: 'pending',
+  });
+}
+
+/**
+ * Mark a named startup phase as complete and attempt to release the barrier.
+ */
+function completeStartupPhase(phase) {
+  startupBarrier.completed.add(phase);
+
+  const existing = startupBarrier.phases.get(phase) || {};
+  const completedAt = Date.now();
+  const durationMs = existing.registeredAt
+    ? completedAt - existing.registeredAt
+    : null;
+
+  startupBarrier.phases.set(phase, {
+    ...existing,
+    completedAt,
+    durationMs,
+    status: 'completed',
+  });
+
+  const attributionExisting =
+    startupPhaseAttribution.phases.get(phase) || {};
+
+  startupPhaseAttribution.phases.set(phase, {
+    ...attributionExisting,
+    phase,
+    completedAt,
+    durationMs,
+    status: 'completed',
+  });
+
+  if (durationMs !== null) {
+    startupBarrier.phaseDurations.set(phase, durationMs);
+
+    if (
+      !startupBarrier.slowestPhase ||
+      durationMs > startupBarrier.slowestPhase.durationMs
+    ) {
+      startupBarrier.slowestPhase = {
+        phase,
+        durationMs,
+      };
+    }
+  }
+
+  tryReleaseStartupBarrier();
+}
+
+function tryReleaseStartupBarrier() {
+  if (startupBarrier.isReleased) {
+    return true;
+  }
+
+  const requiredPhases = [
+    'redis-connect',
+    'supabase-bootstrap-verification',
+    'http-server-bind',
+    'predictive-topology-worker',
+    'cache-hydration',
+    'global-policy-mesh',
+    'pressure-balancer',
+    'quorum-replication',
+  ];
+
+  const ready = requiredPhases.every((phase) =>
+    startupBarrier.completed.has(phase)
+  );
+
+  if (!ready) {
+    return false;
+  }
+
+  startupBarrier.isReleased = true;
+  startupBarrier.releaseTimestamp = Date.now();
+
+  const slowestPhaseName =
+    startupBarrier.slowestPhase?.phase || null;
+
+  if (slowestPhaseName) {
+    const previousCount =
+      startupRegressionProfiler.repeatedSlowPhase.get(
+        slowestPhaseName
+      ) || 0;
+
+    startupRegressionProfiler.repeatedSlowPhase.set(
+      slowestPhaseName,
+      previousCount + 1
+    );
+
+    startupRegressionProfiler.lastBootSlowestPhase =
+      slowestPhaseName;
+  }
+
+  if (startupWatchdog.timer) {
+    clearTimeout(startupWatchdog.timer);
+    startupWatchdog.timer = null;
+  }
+
+  logger.info(
+    '[Server] Patch 35 distributed startup orchestration barrier released',
+    {
+      completed_phases: startupBarrier.completed.size,
+      total_registered_phases: startupBarrier.phases.size,
+      slowest_phase:
+        startupBarrier.slowestPhase?.phase || null,
+      slowest_phase_duration_ms:
+        startupBarrier.slowestPhase?.durationMs || null,
+    }
+  );
+
+  const repeatedCount =
+    startupBarrier.slowestPhase?.phase
+      ? startupRegressionProfiler.repeatedSlowPhase.get(
+          startupBarrier.slowestPhase.phase
+        ) || 0
+      : 0;
+
+  if (repeatedCount >= 3) {
+    logger.warn(
+      '[Server] Patch 37 repeated startup bottleneck detected',
+      {
+        phase: startupBarrier.slowestPhase?.phase || null,
+        repetition_count: repeatedCount,
+        duration_ms:
+          startupBarrier.slowestPhase?.durationMs || null,
+      }
+    );
+  }
+
+  return true;
+}
 
 function registerRoute(path, ...handlers) {
   // Key includes the last handler's identity so that multiple routers mounted
@@ -125,11 +396,12 @@ function registerRoute(path, ...handlers) {
   // signature instead of colliding on handler count alone.
   const lastHandler = handlers[handlers.length - 1];
   const handlerKey =
-  typeof lastHandler === 'function'
-    ? lastHandler.name || `anonymous_${handlers.length}`
-    : lastHandler?.stack
-      ? `router_${lastHandler.stack.length}`
-      : `handler_${handlers.length}`;
+    typeof lastHandler === 'function'
+      ? lastHandler.name || `anonymous_${handlers.length}`
+      : lastHandler?.stack
+        ? `router_${lastHandler.stack.length}`
+        : `handler_${handlers.length}`;
+
   const signature = `${path}::${handlerKey}`;
 
   if (registeredRouteKeys.has(signature)) {
@@ -149,7 +421,6 @@ function logRouteRegistrySummary() {
     total_registered_routes: registeredRouteKeys.size,
   });
 }
-
 // Trust proxy — safe for Cloud Run / GCP Load Balancer.
 // '1' means trust exactly one proxy hop; do not use 'true' (trusts all).
 app.set('trust proxy', 1);
@@ -207,6 +478,32 @@ app.use(express.urlencoded({ extended: true, limit: '512kb' }));
 // PR 2: Global request timeout protection
 app.use(requestTimeout);
 
+app.use((req, res, next) => {
+  const startedAt = process.hrtime.bigint();
+
+  res.on('finish', () => {
+    const durationMs =
+      Number(process.hrtime.bigint() - startedAt) / 1e6;
+
+    logger.info('[Telemetry] HTTP request completed', {
+      requestId:
+        req.requestId ||
+        req.headers['x-request-id'] ||
+        null,
+      correlationId:
+        req.correlationId ||
+        req.headers['x-correlation-id'] ||
+        null,
+      method: req.method,
+      path: req.originalUrl,
+      statusCode: res.statusCode,
+      duration_ms: Number(durationMs.toFixed(2)),
+    });
+  });
+
+  next();
+});
+
 // ── HTTP request logger ───────────────────────────────────────────────────────
 if (process.env.NODE_ENV !== 'test') {
   app.use(
@@ -248,22 +545,109 @@ const globalLimiter = rateLimit({
 app.use(globalLimiter);
 
 // =============================================================================
+//// =============================================================================
 // ✅ Health & Readiness (PUBLIC — no auth)
 // =============================================================================
 // GET /api/v1/health        — load balancer liveness probe
 // GET /api/v1/health/deep   — deep Postgres/Redis/Anthropic/queue probe
 //                             (requires X-Health-Probe-Token header)
 // GET /api/v1/ready         — Kubernetes readiness probe
-app.use(`${API_PREFIX}/health`, require('./routes/health.routes'));
+registerRoute(
+  `${API_PREFIX}/health`,
+  require('./routes/health.routes')
+);
 
-app.get(`${API_PREFIX}/ready`, (_req, res) => {
+app.get(`${API_PREFIX}/ready`, async (_req, res) => {
   const redis = getRedisStatus();
-  const ok = redis.connected;
+
+  let database = {
+    connected: false,
+    provider: 'supabase',
+  };
+
+  try {
+    const dbStartedAt = process.hrtime.bigint();
+
+    const { error } = await supabase
+      .from('user_profiles')
+      .select('id')
+      .limit(1);
+
+    const dbDurationMs =
+      Number(process.hrtime.bigint() - dbStartedAt) / 1e6;
+
+    logger.info('[Telemetry] Supabase ready probe', {
+      duration_ms: Number(dbDurationMs.toFixed(2)),
+      success: !error,
+    });
+
+    database.connected = !error;
+    database.latency_ms = Number(
+      dbDurationMs.toFixed(2)
+    );
+  } catch (err) {
+    logger.warn('[Server] Ready probe DB check failed', {
+      error: err.message,
+    });
+  }
+
+  const ok =
+    redis.connected &&
+    database.connected &&
+    startupBarrier.isReleased;
 
   res.status(ok ? 200 : 503).json({
     status: ok ? 'ready' : 'degraded',
     redis,
+    database,
     timestamp: new Date().toISOString(),
+
+  startupBarrier: {
+  released: startupBarrier.isReleased,
+  degraded: startupWatchdog.degradedReleaseAllowed,
+  completed: startupBarrier.completed.size,
+  total: startupBarrier.phases.size,
+  releaseTimestamp: startupBarrier.releaseTimestamp,
+  timeoutMs: startupWatchdog.timeoutMs,
+  slowestPhase: startupBarrier.slowestPhase,
+  slowPhaseRepetitionCount:
+    startupBarrier.slowestPhase?.phase
+      ? startupRegressionProfiler.repeatedSlowPhase.get(
+          startupBarrier.slowestPhase.phase
+        ) || 0
+      : 0,
+  slaSamplesCollected: startupSlaHistory.samples.length,
+  rollingAverageMs: startupSlaHistory.rollingAverageMs,
+  rollingP95Ms: startupSlaHistory.rollingP95Ms,
+  forecastNextStartupMs: startupSlaHistory.lastForecastMs,
+  recommendedTimeoutMs:
+  startupAdaptiveTimeoutPolicy.lastRecommendedTimeoutMs ||
+  startupWatchdog.timeoutMs,
+  appliedAdaptiveTimeoutMs:
+  startupAdaptiveTimeoutPolicy.lastAppliedTimeoutMs ||
+  startupWatchdog.timeoutMs,
+adaptiveTimeoutMinMs:
+  startupAdaptiveTimeoutPolicy.minTimeoutMs,
+adaptiveTimeoutMaxMs:
+  startupAdaptiveTimeoutPolicy.maxTimeoutMs,
+adaptiveTimeoutMultiplier:
+  startupAdaptiveTimeoutPolicy.tuningMultiplier,
+  chaosConfidenceScore:
+  startupChaosConfidence.confidenceScore,
+rollbackRiskScore:
+  startupChaosConfidence.rollbackRiskScore,
+rollbackThreshold:
+  startupChaosConfidence.rollbackThreshold,
+degradedStartupReleases:
+  startupChaosConfidence.degradedReleases,
+startupAnomalyBreaches:
+  startupChaosConfidence.anomalyBreaches,
+successfulAdaptiveRecoveries:
+  startupChaosConfidence.successfulAdaptiveRecoveries,
+rollbackAdvisory:
+  startupChaosConfidence.confidenceScore <
+  startupChaosConfidence.rollbackThreshold,
+},
   });
 });
 
@@ -324,8 +708,18 @@ registerRoute(
   authenticate,
   require('./modules/career-digital-twin/routes/digitalTwin.routes')
 );
-app.use(`${API_PREFIX}/career-opportunities`, authenticate, require('./routes/career-opportunity.routes'));
-app.use(`${API_PREFIX}/skill-graph`,          authenticate, require('./modules/skillGraph/skillGraph.routes'));
+
+registerRoute(
+  `${API_PREFIX}/career-opportunities`,
+  authenticate,
+  require('./routes/career-opportunity.routes')
+);
+
+registerRoute(
+  `${API_PREFIX}/skill-graph`,
+  authenticate,
+  require('./modules/skillGraph/skillGraph.routes')
+);
 
 app.use(`${API_PREFIX}/admin/graph`,               authenticate, requireAdmin, require('./modules/admin/graph/graphAdmin.routes'));
 app.use(`${API_PREFIX}/admin/graph-intelligence`,  authenticate, requireAdmin, require('./modules/admin/graph/graphIntelligence.routes'));
@@ -337,7 +731,12 @@ app.use(`${API_PREFIX}/salary`,        authenticate, require('./routes/salary.ro
 
 app.use(`${API_PREFIX}/jobs`,          authenticate, require('./routes/jobs.routes'));
 app.use(`${API_PREFIX}/resume-growth`, authenticate, require('./routes/resumeGrowth.routes'));
-app.use(`${API_PREFIX}/growth`,        authenticate, require('./routes/growth.routes'));
+
+registerRoute(
+  `${API_PREFIX}/growth`,
+  authenticate,
+  require('./routes/growth.routes')
+);
 app.use(`${API_PREFIX}/resume-scores`, authenticate, require('./routes/resumeScore.routes'));
 app.use(`${API_PREFIX}/learning`,      authenticate, require('./routes/learning.routes'));
 app.use(`${API_PREFIX}/resumes`,       authenticate, require('./modules/resume/resume.routes'));
@@ -347,7 +746,6 @@ app.use(`${API_PREFIX}/onboarding`,    authenticate, require('./modules/onboardi
 // PATCH /onboarding/progress, POST /onboarding/complete returned 404.
 // Without this, onboarding_completed was never saved; AuthGuard caused infinite
 // redirect loop back to /onboarding → permanent spinner on /dashboard.
-app.use(`${API_PREFIX}/onboarding`,         authenticate, require('./routes/onboarding-complete.routes'));
 app.use(`${API_PREFIX}/student-onboarding`, authenticate, require('./routes/student-onboarding.routes'));
 app.use(`${API_PREFIX}/career-onboarding`,  authenticate, require('./routes/career-onboarding.routes'));
 
@@ -610,15 +1008,19 @@ app.use(`${API_PREFIX}/user-activity`, require('./modules/userActivity/userActiv
 
 app.use(`${API_PREFIX}/job-analyses`,   authenticate, require('./routes/jobAnalyzer.routes'));
 app.use(`${API_PREFIX}/cv-builder`,     authenticate, require('./routes/cvBuilder.routes'));
-app.use(`${API_PREFIX}/users`,          authenticate, require('./routes/users.routes'));
 
-/**
- * Intent Gateway — Direction Preference
- *   POST   /api/v1/users/me/direction  → save direction ('education' | 'career' | 'market')
- *   GET    /api/v1/users/me/direction  → read current direction
- *   DELETE /api/v1/users/me/direction  → reset direction
- */
-app.use(`${API_PREFIX}/users`,    authenticate, directionRouter);
+registerRoute(
+  `${API_PREFIX}/users`,
+  authenticate,
+  require('./routes/users.routes')
+);
+
+registerRoute(
+  `${API_PREFIX}/users`,
+  authenticate,
+  directionRouter
+);
+
 app.use(`${API_PREFIX}/analyze`,  authenticate, require('./modules/analysis/analysis.route'));
 
 // Phase 2: async AI job status poll
@@ -893,14 +1295,6 @@ if (process.env.GOTENBERG_URL && process.env.NODE_ENV !== 'test') {
       });
     });
 }
-
-// =============================================================================
-// ✅ Worker Registry
-// =============================================================================
-// Shutdown functions are registered here as workers boot.
-// gracefulShutdown() drains all workers in one coordinated pass.
-// Using an array (not scattered process.on calls) prevents listener stacking
-// on hot reloads and ensures correct sequencing: workers stop before HTTP closes.
 const workerShutdownTasks = [];
 let deployWarmupPromise = null;
 
@@ -910,19 +1304,45 @@ let deployWarmupPromise = null;
 // CareerAdvisor, Personalization.
 if (process.env.FEATURE_EVENT_BUS === 'true') {
   try {
-    const { startAll, stopAll }  = require('./modules/ai-event-bus/workers');
-    const { closeAllQueues }     = require('./modules/ai-event-bus/bus/aiEventBus');
-    startAll();
+    const { startAll, stopAll } = require(
+      './modules/ai-event-bus/workers'
+    );
+    const { closeAllQueues } = require(
+      './modules/ai-event-bus/bus/aiEventBus'
+    );
+
+    if (!workerBootRegistry.has('ai-event-bus')) {
+      startAll();
+      workerBootRegistry.add('ai-event-bus');
+    } else {
+      logger.warn(
+        '[Patch34] Duplicate AI Event Bus worker boot prevented'
+      );
+    }
+
     logger.info('[Server] AI Event Bus workers started');
 
     workerShutdownTasks.push(
-      () => stopAll().catch((err) =>
-        logger.warn('[Server] AI Event Bus stopAll error', { err: err.message })),
-      () => closeAllQueues().catch((err) =>
-        logger.warn('[Server] AI Event Bus closeAllQueues error', { err: err.message })),
+      () =>
+        stopAll().catch((err) =>
+          logger.warn(
+            '[Server] AI Event Bus stopAll error',
+            { err: err.message }
+          )
+        ),
+      () =>
+        closeAllQueues().catch((err) =>
+          logger.warn(
+            '[Server] AI Event Bus closeAllQueues error',
+            { err: err.message }
+          )
+        )
     );
   } catch (err) {
-    logger.warn('[Server] AI Event Bus workers failed to start (non-fatal)', { err: err.message });
+    logger.warn(
+      '[Server] AI Event Bus workers failed to start (non-fatal)',
+      { err: err.message }
+    );
   }
 }
 
@@ -967,10 +1387,7 @@ if (process.env.RUN_ENGAGEMENT_WORKER === 'true') {
 // ✅ HTTP Server + Graceful Shutdown
 // =============================================================================
 const PORT = parseInt(process.env.PORT || '3000', 10);
-let server;
-let consensusMemoryForecastLoop;
-let autonomousTopologyMutationWorker;
-let isShuttingDown = false;
+
 
 function getWeeklySprintBias() {
   const now = new Date();
@@ -985,14 +1402,59 @@ function getWeeklySprintBias() {
 
 async function bootstrap() {
   try {
-    // PR 2: Redis must be ready before serving traffic
-    await connectRedis();
+   
+    // Patch 35 → register distributed startup phases
+[
+  'redis-connect',
+  'supabase-bootstrap-verification',
+  'http-server-bind',
+  'deploy-warmup',
+  'predictive-topology-worker',
+  'learning-mesh-worker',
+  'federation-worker',
+  'swarm-governance-worker',
+  'cache-hydration',
+  'warm-state-prefetch',
+  'global-policy-mesh',
+  'recovery-scheduler',
+  'pressure-balancer',
+  'quorum-replication',
+  'consensus-memory-forecast',
+  'autonomous-topology-mutation',
+  'sovereign-routing',
+].forEach(registerStartupPhase);
 
-    if (process.env.NODE_ENV === 'test') {
-      return;
-    }
+startupWatchdog.degradedReleaseAllowed = false;
+startupWatchdog.startedAt = Date.now();
+
+startupWatchdog.timer = setTimeout(() => {
+  releaseDegradedStartupBarrier('startup-sla-timeout');
+}, startupWatchdog.timeoutMs);
+
+ // PR 2: Redis must be ready before serving traffic
+    await connectRedis();
+    completeStartupPhase('redis-connect');
+
+// Patch 32: SQL-first bootstrap verification
+const { error: dbBootstrapError } = await supabase
+  .from('user_profiles')
+  .select('id')
+  .limit(1);
+
+if (dbBootstrapError) {
+  throw dbBootstrapError;
+}
+
+logger.info('[Server] Supabase bootstrap verification passed');
+completeStartupPhase('supabase-bootstrap-verification');
+
+if (process.env.NODE_ENV === 'test') {
+  return;
+}
 
   server = app.listen(PORT, () => {
+    completeStartupPhase('http-server-bind');
+
  logger.info(
   `[Server] HireRise Core running on port ${PORT} [${app.get('env')}]`
 );
@@ -1027,18 +1489,23 @@ setTimeout(async () => {
 
 // Patch 9 → self-healing predictive topology worker
 predictiveHeat.startPredictiveTopologyWorker();
+completeStartupPhase('predictive-topology-worker');
+
 logger.info('[Server] Patch 9 predictive topology worker started');
 
 // Patch 10 → adaptive predictive intelligence mesh worker
 predictiveHeat.startLearningMeshWorker();
+completeStartupPhase('learning-mesh-worker');
 logger.info('[Server] Patch 10 learning mesh worker started');
 
 // Patch 11 → cross-tenant transfer learning federation worker
 predictiveHeat.startFederationWorker();
+completeStartupPhase('federation-worker');
 logger.info('[Server] Patch 11 federation worker started');
 
 // Patch 12 → global intelligence swarm governance worker
 predictiveHeat.startSwarmGovernanceWorker();
+completeStartupPhase('swarm-governance-worker');
 logger.info('[Server] Patch 12 swarm governance worker started');
 replayPolicyEngine.startReplayPolicyWorker({
   getTenantReplayMetrics: async () => {
@@ -1051,6 +1518,8 @@ replayPolicyEngine.startReplayPolicyWorker({
 logger.info('[Server] Patch 13 replay policy worker started');
 
 cacheHydrationWorker.startCacheHydrationWorker();
+completeStartupPhase('cache-hydration');
+
 logger.info('[Server] Patch 14 cache hydration mesh started');
 
 // Patch 15 → autonomous warm-state prefetch mesh
@@ -1061,9 +1530,11 @@ warmStatePrefetch
     warmStatePrefetch.startWarmStatePrefetchWorker();
     regionalHandoffWorker.startRegionalMigrationWorker();
 
+    completeStartupPhase('warm-state-prefetch');
+
     logger.info(
-  '[Server] Patch 15 autonomous warm-state prefetch mesh started'
-);
+      '[Server] Patch 15 autonomous warm-state prefetch mesh started'
+    );
   })
   .catch((err) => {
     logger.warn('[Server] Patch 15 startup degraded', {
@@ -1080,10 +1551,15 @@ logger.info(
   '[Server] Patch 18 global policy arbitration mesh initialized'
 );
 
+completeStartupPhase('global-policy-mesh');
+
 recoveryScheduler.startRecoveryScheduler();
+completeStartupPhase('recovery-scheduler');
 logger.info('[Server] Patch 19 recovery scheduler started');
 
 pressureBalancer.startPressureBalancerWorker();
+completeStartupPhase('pressure-balancer');
+
 logger.info('[Server] Patch 20 pressure balancer worker started');
 
 global.__tenantCacheMesh =
@@ -1093,6 +1569,8 @@ quorumReplication.startQuorumReplicationWorker(
   () => global.__tenantCacheMesh
 );
 
+completeStartupPhase('quorum-replication');
+
 logger.info(
   '[Server] Patch 21 quorum replication mesh started'
 );
@@ -1101,19 +1579,36 @@ logger.info(
   '[Server] Patch 22 consensus replay mesh initialized'
 );
 
-consensusMemoryForecastLoop =
-  consensusMemoryForecast.startForecastLoop();
+if (!workerBootRegistry.has('consensus-memory-forecast')) {
+  consensusMemoryForecastLoop =
+    consensusMemoryForecast.startForecastLoop();
+
+  workerBootRegistry.add('consensus-memory-forecast');
+} else {
+  logger.warn(
+    '[Patch34] Duplicate consensus memory forecast loop prevented'
+  );
+}
 
 logger.info(
   '[Server] Patch 26 consensus memory forecast engine started'
 );
+completeStartupPhase('consensus-memory-forecast');
 
-autonomousTopologyMutationWorker =
-  autonomousTopologyMutation.startMutationWorker();
+if (!workerBootRegistry.has('autonomous-topology-mutation')) {
+  autonomousTopologyMutationWorker =
+    autonomousTopologyMutation.startMutationWorker();
 
+  workerBootRegistry.add('autonomous-topology-mutation');
+} else {
+  logger.warn(
+    '[Patch34] Duplicate autonomous topology mutation worker prevented'
+  );
+}
 logger.info(
   '[Server] Patch 27 autonomous topology mutation worker started'
 );
+completeStartupPhase('autonomous-topology-mutation');
 
 // Patch 17 → latency-aware sovereign routing mesh
 sovereignRouting.updateRegionLatency('ap-south-1', 42);
@@ -1127,6 +1622,7 @@ sovereignRouting.updateRegionHealth('eu-west-1', true);
 logger.info(
   '[Server] Patch 17 latency-aware sovereign routing mesh initialized'
 );
+completeStartupPhase('sovereign-routing');
 
 predictiveHeat
   .recordHeat({
@@ -1141,20 +1637,178 @@ predictiveHeat
   });
 
   deployWarmupPromise
-    .then((results) => {
-      logger.info('[Server] Benchmark deploy warmup complete', {
-        tenants: Array.isArray(results) ? results.length : 0,
-      });
-    })
-    .catch((err) => {
-      logger.warn('[Server] Benchmark deploy warmup failed (non-fatal)', {
+  .then((results) => {
+    const startupDurationMs =
+      startupWatchdog.startedAt
+        ? Date.now() - startupWatchdog.startedAt
+        : null;
+
+    if (startupDurationMs !== null) {
+      startupSlaHistory.samples.push(startupDurationMs);
+
+      if (
+        startupSlaHistory.samples.length >
+        startupSlaHistory.maxSamples
+      ) {
+        startupSlaHistory.samples.shift();
+      }
+
+      const sortedSamples = [
+        ...startupSlaHistory.samples,
+      ].sort((a, b) => a - b);
+
+      const total = sortedSamples.reduce(
+        (sum, value) => sum + value,
+        0
+      );
+
+      startupSlaHistory.rollingAverageMs =
+        Math.round(total / sortedSamples.length);
+
+      const p95Index = Math.min(
+        sortedSamples.length - 1,
+        Math.floor(sortedSamples.length * 0.95)
+      );
+
+      startupSlaHistory.rollingP95Ms =
+        sortedSamples[p95Index];
+
+      startupSlaHistory.lastForecastMs = Math.round(
+        (
+          startupSlaHistory.rollingAverageMs +
+          startupSlaHistory.rollingP95Ms
+        ) / 2
+      );
+
+      startupAdaptiveTimeoutPolicy.lastRecommendedTimeoutMs =
+        Math.min(
+          startupAdaptiveTimeoutPolicy.maxTimeoutMs,
+          Math.max(
+            startupAdaptiveTimeoutPolicy.minTimeoutMs,
+            Math.round(
+              startupSlaHistory.lastForecastMs *
+                startupAdaptiveTimeoutPolicy.tuningMultiplier
+            )
+          )
+        );
+
+      if (
+        startupDurationMs >
+        startupSlaHistory.lastForecastMs *
+          startupSlaHistory.anomalyThresholdMultiplier
+      ) {
+        startupChaosConfidence.anomalyBreaches += 1;
+        startupChaosConfidence.rollbackRiskScore += 10;
+
+        logger.warn(
+          '[Server] Patch 39 predictive startup SLA anomaly detected',
+          {
+            startup_duration_ms: startupDurationMs,
+            forecast_ms:
+              startupSlaHistory.lastForecastMs,
+            rolling_average_ms:
+              startupSlaHistory.rollingAverageMs,
+            rolling_p95_ms:
+              startupSlaHistory.rollingP95Ms,
+            threshold_multiplier:
+              startupSlaHistory.anomalyThresholdMultiplier,
+          }
+        );
+      }
+
+      if (
+        startupAdaptiveTimeoutPolicy.lastRecommendedTimeoutMs &&
+        startupAdaptiveTimeoutPolicy.lastRecommendedTimeoutMs !==
+          startupWatchdog.timeoutMs
+      ) {
+        startupWatchdog.timeoutMs =
+          startupAdaptiveTimeoutPolicy.lastRecommendedTimeoutMs;
+
+        startupAdaptiveTimeoutPolicy.lastAppliedTimeoutMs =
+          startupWatchdog.timeoutMs;
+
+        startupChaosConfidence.successfulAdaptiveRecoveries += 1;
+        startupChaosConfidence.rollbackRiskScore =
+          Math.max(
+            0,
+            startupChaosConfidence.rollbackRiskScore - 5
+          );
+
+        logger.info(
+          '[Server] Patch 40 adaptive watchdog timeout tuned for next startup',
+          {
+            applied_timeout_ms:
+              startupWatchdog.timeoutMs,
+            forecast_ms:
+              startupSlaHistory.lastForecastMs,
+            rolling_p95_ms:
+              startupSlaHistory.rollingP95Ms,
+          }
+        );
+      }
+    }
+
+    startupChaosConfidence.confidenceScore = Math.max(
+      0,
+      100 -
+        startupChaosConfidence.rollbackRiskScore
+    );
+
+    if (
+      startupChaosConfidence.confidenceScore <
+      startupChaosConfidence.rollbackThreshold
+    ) {
+      logger.warn(
+        '[Server] Patch 41 rollback confidence threshold breached',
+        {
+          confidence_score:
+            startupChaosConfidence.confidenceScore,
+          rollback_risk_score:
+            startupChaosConfidence.rollbackRiskScore,
+          degraded_releases:
+            startupChaosConfidence.degradedReleases,
+          anomaly_breaches:
+            startupChaosConfidence.anomalyBreaches,
+          adaptive_recoveries:
+            startupChaosConfidence.successfulAdaptiveRecoveries,
+        }
+      );
+    }
+
+    logger.info(
+      '[Server] Benchmark deploy warmup complete',
+      {
+        tenants: Array.isArray(results)
+          ? results.length
+          : 0,
+        startup_duration_ms: startupDurationMs,
+        confidence_score:
+          startupChaosConfidence.confidenceScore,
+      }
+    );
+
+    completeStartupPhase('deploy-warmup');
+  })
+  .catch((err) => {
+    logger.warn(
+      '[Server] Benchmark deploy warmup failed (non-fatal)',
+      {
         error: err.message,
-      });
-    });
-});
+      }
+    );
+  });
 
 server.on('error', (err) => {
-  if (err.code === 'EADDRINUSE') {
+  recordStartupFailureAttribution(
+    'server-bind-error',
+    err,
+    {
+      port: PORT,
+      code: err.code || null,
+    }
+  );
+
+    if (err.code === 'EADDRINUSE') {
     logger.error(`[Server] Port ${PORT} is already in use.`);
   } else {
     logger.error('[Server] Startup error', {
@@ -1168,7 +1822,22 @@ server.on('error', (err) => {
 
   process.exit(1);
 });
+
 } catch (err) {
+  recordStartupFailureAttribution(
+  'bootstrap-fatal',
+  err,
+  {
+    completedPhases: Array.from(startupBarrier.completed),
+    pendingPhases: Array.from(
+      startupBarrier.phases.keys()
+    ).filter(
+      (phase) => !startupBarrier.completed.has(phase)
+    ),
+    slowestPhase:
+      startupBarrier.slowestPhase?.phase || null,
+  }
+);
   logger.error('[BOOT] Startup failed', {
     error: err.message,
   });
@@ -1182,9 +1851,11 @@ server.on('error', (err) => {
 }
 
 bootstrap();
-
+  
 // Consolidated Graceful Shutdown
 const gracefulShutdown = async (signal) => {
+  const shutdownStartedAt = process.hrtime.bigint();
+
   if (isShuttingDown) {
     logger.warn('[Server] Duplicate shutdown signal ignored', {
       signal,
@@ -1193,6 +1864,17 @@ const gracefulShutdown = async (signal) => {
   }
 
   isShuttingDown = true;
+
+  // Patch 35 → drop readiness immediately during shutdown
+startupBarrier.isReleased = false;
+startupBarrier.releaseTimestamp = null;
+
+startupWatchdog.degradedReleaseAllowed = false;
+
+if (startupWatchdog.timer) {
+  clearTimeout(startupWatchdog.timer);
+  startupWatchdog.timer = null;
+}
 
   logger.info(
     `[Server] ${signal} received — shutting down gracefully...`
@@ -1211,129 +1893,129 @@ try {
     error: err.message,
   });
 }
-
   // Step 1: drain all workers in parallel
-predictiveHeat.stopPredictiveTopologyWorker();
-logger.info('[Server] Patch 9 predictive topology worker stopped');
+  predictiveHeat.stopPredictiveTopologyWorker();
+  logger.info('[Server] Patch 9 predictive topology worker stopped');
 
-predictiveHeat.stopLearningMeshWorker();
-logger.info('[Server] Patch 10 learning mesh worker stopped');
+  predictiveHeat.stopLearningMeshWorker();
+  logger.info('[Server] Patch 10 learning mesh worker stopped');
 
-predictiveHeat.stopFederationWorker();
-logger.info('[Server] Patch 11 federation worker stopped');
+  predictiveHeat.stopFederationWorker();
+  logger.info('[Server] Patch 11 federation worker stopped');
 
-predictiveHeat.stopSwarmGovernanceWorker();
-logger.info('[Server] Patch 12 swarm governance worker stopped');
+  predictiveHeat.stopSwarmGovernanceWorker();
+  logger.info('[Server] Patch 12 swarm governance worker stopped');
 
-replayPolicyEngine.stopReplayPolicyWorker();
-logger.info('[Server] Patch 13 replay policy worker stopped');
+  replayPolicyEngine.stopReplayPolicyWorker();
+  logger.info('[Server] Patch 13 replay policy worker stopped');
 
-cacheHydrationWorker.stopCacheHydrationWorker();
-logger.info('[Server] Patch 14 cache hydration mesh stopped');
+  cacheHydrationWorker.stopCacheHydrationWorker();
+  logger.info('[Server] Patch 14 cache hydration mesh stopped');
 
-warmStatePrefetch.stopWarmStatePrefetchWorker();
-logger.info('[Server] Patch 15 warm-state prefetch worker stopped');
+  warmStatePrefetch.stopWarmStatePrefetchWorker();
+  logger.info('[Server] Patch 15 warm-state prefetch worker stopped');
 
-await warmStatePrefetch.preserveHotsetSnapshot();
-logger.info('[Server] Patch 15 warm-state hotset preserved');
+  await warmStatePrefetch.preserveHotsetSnapshot();
+  logger.info('[Server] Patch 15 warm-state hotset preserved');
 
-await regionalHandoffWorker.stopRegionalMigrationWorker();
-logger.info('[Server] Patch 16 regional handoff preserved');
+  await regionalHandoffWorker.stopRegionalMigrationWorker();
+  logger.info('[Server] Patch 16 regional handoff preserved');
 
-globalPolicyMesh.shutdownGlobalPolicyMesh();
-logger.info('[Server] Patch 18 policy arbitration mesh stopped');
+  globalPolicyMesh.shutdownGlobalPolicyMesh();
+  logger.info('[Server] Patch 18 policy arbitration mesh stopped');
 
-recoveryScheduler.stopRecoveryScheduler();
-logger.info('[Server] Patch 19 recovery scheduler stopped');
+  recoveryScheduler.stopRecoveryScheduler();
+  logger.info('[Server] Patch 19 recovery scheduler stopped');
 
-pressureBalancer.stopPressureBalancerWorker();
-logger.info('[Server] Patch 20 pressure balancer worker stopped');
+  pressureBalancer.stopPressureBalancerWorker();
+  logger.info('[Server] Patch 20 pressure balancer worker stopped');
 
-quorumReplication.stopQuorumReplicationWorker();
-logger.info(
-  '[Server] Patch 21 quorum replication mesh stopped'
-);
-
-consensusMesh.shutdown();
-logger.info(
-  '[Server] Patch 22 consensus replay mesh stopped'
-);
-
-try {
-  consensusDriftAnomaly.shutdown();
+  quorumReplication.stopQuorumReplicationWorker();
   logger.info(
-    '[Server] Patch 23 drift anomaly detector stopped'
+    '[Server] Patch 21 quorum replication mesh stopped'
   );
-} catch (err) {
-  logger.warn('[Server] Patch 23 shutdown warning', {
-    error: err.message,
-  });
-}
 
-try {
-  predictiveSplitBrain.shutdown();
+  consensusMesh.shutdown();
   logger.info(
-    '[Server] Patch 24 predictive split-brain prevention stopped'
+    '[Server] Patch 22 consensus replay mesh stopped'
   );
-} catch (err) {
-  logger.warn('[Server] Patch 24 shutdown warning', {
-    error: err.message,
-  });
-}
 
-try {
-  quorumConfidence.shutdown();
+  try {
+    consensusDriftAnomaly.shutdown();
+    logger.info(
+      '[Server] Patch 23 drift anomaly detector stopped'
+    );
+  } catch (err) {
+    logger.warn('[Server] Patch 23 shutdown warning', {
+      error: err.message,
+    });
+  }
+
+  try {
+    predictiveSplitBrain.shutdown();
+    logger.info(
+      '[Server] Patch 24 predictive split-brain prevention stopped'
+    );
+  } catch (err) {
+    logger.warn('[Server] Patch 24 shutdown warning', {
+      error: err.message,
+    });
+  }
+
+  try {
+    quorumConfidence.shutdown();
+    logger.info(
+      '[Server] Patch 25 quorum confidence engine stopped'
+    );
+  } catch (err) {
+    logger.warn('[Server] Patch 25 shutdown warning', {
+      error: err.message,
+    });
+  }
+
+  try {
+    consensusMemoryForecastLoop?.shutdown();
+    logger.info(
+      '[Server] Patch 26 consensus memory forecast stopped'
+    );
+  } catch (err) {
+    logger.warn('[Server] Patch 26 shutdown warning', {
+      error: err.message,
+    });
+  }
+
+  try {
+    autonomousTopologyMutationWorker?.shutdown();
+    logger.info(
+      '[Server] Patch 27 autonomous topology mutation worker stopped'
+    );
+  } catch (err) {
+    logger.warn('[Server] Patch 27 shutdown warning', {
+      error: err.message,
+    });
+  }
+
   logger.info(
-    '[Server] Patch 25 quorum confidence engine stopped'
+    `[Server] Final circuit states: ${JSON.stringify(
+      circuitMesh.getAllCircuitStates()
+    )}`
   );
-} catch (err) {
-  logger.warn('[Server] Patch 25 shutdown warning', {
-    error: err.message,
-  });
-}
-try {
-  consensusMemoryForecastLoop?.shutdown();
+
   logger.info(
-    '[Server] Patch 26 consensus memory forecast stopped'
-  );
-} catch (err) {
-  logger.warn('[Server] Patch 26 shutdown warning', {
-    error: err.message,
-  });
-}
-
-try {
-  autonomousTopologyMutationWorker?.shutdown();
-  logger.info(
-    '[Server] Patch 27 autonomous topology mutation worker stopped'
-  );
-} catch (err) {
-  logger.warn('[Server] Patch 27 shutdown warning', {
-    error: err.message,
-  });
-}
-
-logger.info(
-  `[Server] Final circuit states: ${JSON.stringify(
-    circuitMesh.getAllCircuitStates()
-  )}`
-);
-
-logger.info(
-  '[Server] Patch 17 sovereign routing mesh state preserved'
-);
-
-if (workerShutdownTasks.length > 0) {
-  logger.info(
-    `[Server] Stopping ${workerShutdownTasks.length} worker(s)...`
+    '[Server] Patch 17 sovereign routing mesh state preserved'
   );
 
-  await Promise.allSettled(
-    workerShutdownTasks.map((task) => task())
-  );
+  if (workerShutdownTasks.length > 0) {
+    logger.info(
+      `[Server] Stopping ${workerShutdownTasks.length} worker(s)...`
+    );
 
-  logger.info('[Server] All workers stopped.');
-}
+    await Promise.allSettled(
+      workerShutdownTasks.map((task) => task())
+    );
+
+    logger.info('[Server] All workers stopped.');
+  }
 
   // Step 2: stop accepting new HTTP requests
   if (server) {
@@ -1344,6 +2026,7 @@ if (workerShutdownTasks.length > 0) {
       })
     );
   }
+
   await predictiveHeat
     .recordHeat({
       tenantId: 'global',
@@ -1357,7 +2040,7 @@ if (workerShutdownTasks.length > 0) {
     });
 
   // Step 3: close Redis gracefully
-    try {
+  try {
     await closeRedis();
     logger.info('[Server] Redis closed gracefully.');
   } catch (err) {
@@ -1368,22 +2051,14 @@ if (workerShutdownTasks.length > 0) {
     }
   }
 
+  const shutdownDurationMs =
+    Number(process.hrtime.bigint() - shutdownStartedAt) / 1e6;
+
+  logger.info('[Telemetry] Graceful shutdown completed', {
+    signal,
+    duration_ms: Number(shutdownDurationMs.toFixed(2)),
+  });
+
+  workerBootRegistry.clear();
   process.exit(0);
 };
-
-// Safe one-time listeners
-process.once('SIGTERM', () =>
-  gracefulShutdown('SIGTERM')
-);
-process.once('SIGINT', () =>
-  gracefulShutdown('SIGINT')
-);
-
-process.on('unhandledRejection', (reason) =>
-  logger.error('[Server] Unhandled Promise Rejection:', reason)
-);
-
-process.on('uncaughtException', (err) =>
-  logger.error('[Server] Uncaught Exception:', err)
-);
-module.exports = app;

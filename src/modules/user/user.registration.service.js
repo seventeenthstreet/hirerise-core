@@ -3,22 +3,38 @@
 /**
  * src/modules/user/user.registration.service.js
  *
- * Wave 4 Patch 29B
- * Production-safe identity bootstrap RPC layer
+ * Patch 32: Final production-hardened identity bootstrap RPC layer
+ * - strict AppError validation
+ * - DTO shape normalization symmetry
+ * - deterministic display sync
  */
 
 const { supabase } = require('../../config/supabase');
+const {
+  AppError,
+  ErrorCodes,
+} = require('../../middleware/errorHandler');
 const logger = require('../../utils/logger');
 
 const MAX_EMAIL_LENGTH = 320;
 const MAX_NAME_LENGTH = 160;
 const MAX_PHOTO_URL_LENGTH = 500;
 
+function requireUserId(userId) {
+  if (!userId) {
+    throw new AppError(
+      'userId is required',
+      400,
+      { userId },
+      ErrorCodes.VALIDATION_ERROR
+    );
+  }
+}
+
 function normalizeString(value, maxLength = null) {
   if (value == null) return null;
 
   const cleaned = String(value).trim();
-
   if (!cleaned) return null;
 
   return maxLength
@@ -37,12 +53,6 @@ function isValidHttpUrl(value) {
   }
 }
 
-/**
- * Normalize auth payloads from:
- * - Supabase auth
- * - OAuth providers
- * - legacy JWT payloads
- */
 function normalizeAuthUser(authUser = {}) {
   const meta = authUser.user_metadata || {};
 
@@ -54,6 +64,7 @@ function normalizeAuthUser(authUser = {}) {
   const display_name = normalizeString(
     authUser.name ||
       authUser.display_name ||
+      authUser.displayName ||
       authUser.full_name ||
       meta.full_name ||
       meta.name,
@@ -63,6 +74,7 @@ function normalizeAuthUser(authUser = {}) {
   const rawPhotoUrl = normalizeString(
     authUser.picture ||
       authUser.photo_url ||
+      authUser.photoUrl ||
       authUser.avatar_url ||
       meta.avatar_url ||
       meta.picture,
@@ -73,35 +85,25 @@ function normalizeAuthUser(authUser = {}) {
     ? rawPhotoUrl
     : null;
 
-  return {
+  return Object.freeze({
     email: email || '',
     display_name,
     photo_url,
-  };
+  });
 }
 
-/**
- * Normalize RPC object/array/null payloads
- */
 function normalizeRpcObject(data) {
   if (!data) return {};
-
-  if (Array.isArray(data)) {
-    return data[0] || {};
-  }
-
-  if (typeof data !== 'object') {
-    return {};
-  }
-
+  if (Array.isArray(data)) return data[0] || {};
+  if (typeof data !== 'object') return {};
   return data;
 }
 
-async function executeRpc(rpcName, payload, userId) {
+async function safeRpc(rpcName, payload, userId) {
   const { data, error } = await supabase.rpc(rpcName, payload);
 
   if (error) {
-    logger.error(`[UserRegistration] ${rpcName} RPC failed`, {
+    logger.error('[UserRegistration] RPC failed', {
       rpc: rpcName,
       userId,
       code: error.code,
@@ -115,17 +117,12 @@ async function executeRpc(rpcName, payload, userId) {
   return normalizeRpcObject(data);
 }
 
-/**
- * Atomic user + profile seed
- */
 async function ensureUserSeeded(userId, authUser = {}) {
-  if (!userId) {
-    throw new Error('[UserRegistration] userId is required');
-  }
+  requireUserId(userId);
 
   const identity = normalizeAuthUser(authUser);
 
-  const payload = await executeRpc(
+  const payload = await safeRpc(
     'seed_user_and_profile',
     {
       p_user_id: userId,
@@ -140,18 +137,16 @@ async function ensureUserSeeded(userId, authUser = {}) {
   const created_profile = Boolean(payload.created_profile);
   const created = created_user || created_profile;
 
-  if (!created) {
-    logger.debug(
-      '[UserRegistration] User already seeded — skipping',
-      { userId }
-    );
-  } else {
-    logger.info('[UserRegistration] User seeded via RPC', {
+  logger[created ? 'info' : 'debug'](
+    created
+      ? '[UserRegistration] User seeded via RPC'
+      : '[UserRegistration] User already seeded — skipping',
+    {
       userId,
       created_user,
       created_profile,
-    });
-  }
+    }
+  );
 
   return {
     created,
@@ -161,24 +156,28 @@ async function ensureUserSeeded(userId, authUser = {}) {
   };
 }
 
-/**
- * Atomic display sync
- */
 async function syncProfileDisplayFields(
   userId,
   authUser = {},
   existingFields = {}
 ) {
-  if (!userId) {
-    throw new Error('[UserRegistration] userId is required');
-  }
+  requireUserId(userId);
 
   const identity = normalizeAuthUser(authUser);
 
-  const currentDisplayName =
-    existingFields?.display_name ?? null;
-  const currentPhotoUrl =
-    existingFields?.photo_url ?? null;
+  const currentDisplayName = normalizeString(
+    existingFields?.display_name ??
+      existingFields?.displayName,
+    MAX_NAME_LENGTH
+  );
+
+  const currentPhotoUrl = isValidHttpUrl(
+    existingFields?.photo_url ??
+      existingFields?.photoUrl
+  )
+    ? existingFields?.photo_url ??
+      existingFields?.photoUrl
+    : null;
 
   if (
     identity.display_name === currentDisplayName &&
@@ -193,10 +192,11 @@ async function syncProfileDisplayFields(
       updated: false,
       users_updated: false,
       profile_updated: false,
+      identity,
     };
   }
 
-  const payload = await executeRpc(
+  const payload = await safeRpc(
     'sync_user_display_fields',
     {
       p_user_id: userId,
@@ -215,10 +215,6 @@ async function syncProfileDisplayFields(
       userId,
       users_updated,
       profile_updated,
-      to: {
-        display_name: identity.display_name,
-        photo_url: identity.photo_url,
-      },
     }
   );
 
@@ -230,7 +226,7 @@ async function syncProfileDisplayFields(
   };
 }
 
-module.exports = {
+module.exports = Object.freeze({
   ensureUserSeeded,
   syncProfileDisplayFields,
-};
+});

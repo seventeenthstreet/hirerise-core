@@ -3,8 +3,14 @@
 /**
  * src/modules/onboarding/onboarding.service.js
  *
- * Pure facade re-export layer
- * Backward compatibility preserved for legacy callers.
+ * Patch 32: Supabase-first deterministic onboarding facade.
+ * This file intentionally remains a pure orchestration/export layer.
+ *
+ * Responsibilities:
+ * - stable backward-compatible exports
+ * - centralized onboarding service surface
+ * - zero persistence logic
+ * - zero schema drift logic
  */
 
 const intake = require('./onboarding.intake.service');
@@ -14,7 +20,7 @@ const linkedin = require('./onboarding.linkedin.service');
 const analytics = require('./onboarding.analytics.service');
 const helpers = require('./onboarding.helpers');
 
-module.exports = {
+const onboardingFacade = {
   // ── Intake ───────────────────────────────────────────────────
   saveConsent: intake.saveConsent,
   saveQuickStart: intake.saveQuickStart,
@@ -52,7 +58,7 @@ module.exports = {
   // ── Shared helpers / compatibility exports ───────────────────
   sanitiseInput: helpers.sanitiseInput,
 
-  // backward compatibility alias
+  // Backward compatibility alias retained intentionally
   appendStepHistory: helpers.mergeStepHistory,
 
   mergeStepHistory: helpers.mergeStepHistory,
@@ -61,3 +67,5 @@ module.exports = {
   mergeSkills: helpers.mergeSkills,
   CHI_TREND_THRESHOLD: helpers.CHI_TREND_THRESHOLD,
 };
+
+module.exports = Object.freeze(onboardingFacade);

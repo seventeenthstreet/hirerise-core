@@ -23,9 +23,9 @@ class RoleRepository extends BaseRepository {
     salaryBandsRepo,
     careerPathsRepo,
   }) {
-    this.jobFamiliesRepo = jobFamiliesRepo;
-    this.salaryBandsRepo = salaryBandsRepo;
-    this.careerPathsRepo = careerPathsRepo;
+    this.jobFamiliesRepo = jobFamiliesRepo || null;
+    this.salaryBandsRepo = salaryBandsRepo || null;
+    this.careerPathsRepo = careerPathsRepo || null;
   }
 
   async create(roleData, userId = 'system', docId = null) {
@@ -70,7 +70,7 @@ class RoleRepository extends BaseRepository {
   }
 
   // ───────────────────────────────────────────
-  // DOMAIN QUERIES (camelCase only)
+  // DOMAIN QUERIES
   // ───────────────────────────────────────────
 
   async findByJobFamily(jobFamilyId, options = {}) {
@@ -98,6 +98,15 @@ class RoleRepository extends BaseRepository {
   }
 
   async findByTrack(track, options = {}) {
+    if (!VALID_TRACKS.includes(track)) {
+      throw new AppError(
+        `Invalid track: ${track}`,
+        400,
+        { track },
+        ErrorCodes.VALIDATION_ERROR
+      );
+    }
+
     const result = await this.find(
       [{ field: 'track', op: '==', value: track }],
       options
@@ -110,6 +119,8 @@ class RoleRepository extends BaseRepository {
     const term = String(titleFragment || '').trim();
     if (!term) return [];
 
+    const safeLimit = Math.min(Number(limit) || 20, 100);
+
     const { data, error } = await this.db
       .from(this.table)
       .select('*')
@@ -117,40 +128,30 @@ class RoleRepository extends BaseRepository {
       .or(
         `role_name.ilike.%${term}%,alternative_titles.cs.{${term}}`
       )
-      .limit(Math.min(Number(limit) || 20, 100));
+      .limit(safeLimit);
 
     if (error) {
       logger.error('[RoleRepository] searchByTitle failed', {
         term,
+        safeLimit,
         message: error.message,
       });
       throw error;
     }
 
-    return (data ?? []).map(row => this._normalize(row));
+    return (data ?? []).map((row) => this._normalize(row));
   }
 
   async getProgressionPath(jobFamilyId, track) {
-    const result = await this.find(
-      [
-        { field: 'roleFamily', op: '==', value: jobFamilyId },
-        { field: 'track', op: '==', value: track },
-      ],
-      {
-        orderBy: {
-          field: 'seniorityLevel',
-          direction: 'asc',
-        },
-      }
-    );
-
-    return result.docs;
+    return this.findByJobFamily(jobFamilyId, {
+      filters: [{ field: 'track', op: '==', value: track }],
+    });
   }
 
   async findByDemandTrend(trend, limit = 50) {
     const result = await this.find(
       [{ field: 'demandTrend', op: '==', value: trend }],
-      { limit }
+      { limit: Math.min(Number(limit) || 50, 100) }
     );
 
     return result.docs;
@@ -182,7 +183,9 @@ class RoleRepository extends BaseRepository {
       'jobFamilyId',
     ];
 
-    const missing = required.filter(field => !roleData[field]);
+    const missing = required.filter(
+      (field) => !roleData[field]
+    );
 
     if (missing.length) {
       throw new AppError(
@@ -213,9 +216,10 @@ class RoleRepository extends BaseRepository {
   }
 
   #normalizeRoleInput(data = {}) {
-    return {
+    const normalized = {
       ...data,
-      roleName: data.roleName ?? data.role_name ?? data.title,
+      roleName:
+        data.roleName ?? data.role_name ?? data.title,
       seniorityLevel:
         data.seniorityLevel ??
         data.seniority_level ??
@@ -229,6 +233,8 @@ class RoleRepository extends BaseRepository {
         data.roleFamily ??
         data.role_family,
     };
+
+    return normalized;
   }
 
   async _checkDependencies(roleId) {
@@ -253,13 +259,13 @@ class RoleRepository extends BaseRepository {
           : null,
       ]);
 
-    if (pathsFrom.docs.length) {
+    if (pathsFrom.docs?.length) {
       dependencies.push(
         `${pathsFrom.docs.length} outgoing career paths`
       );
     }
 
-    if (pathsTo.docs.length) {
+    if (pathsTo.docs?.length) {
       dependencies.push(
         `${pathsTo.docs.length} incoming career paths`
       );

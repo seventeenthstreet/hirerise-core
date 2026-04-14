@@ -147,6 +147,13 @@ const errorHandler = (err, req, res, next) => {
     url: req.originalUrl,
     statusCode,
     errorCode: resolvedErr.errorCode,
+    duration_ms: req.requestStart
+  ? Number(
+      (
+        Number(process.hrtime.bigint() - req.requestStart) / 1e6
+      ).toFixed(2)
+    )
+  : null,
     message: resolvedErr.message || 'Unknown error',
   };
 
@@ -187,6 +194,13 @@ const errorHandler = (err, req, res, next) => {
 // ─────────────────────────────────────────────────────────────────────────────
 
 const notFoundHandler = (req, res, next) => {
+  logger.warn('[Telemetry] Route not found', {
+    requestId: getRequestId(req),
+    correlationId: req.correlationId || null,
+    method: req.method,
+    url: req.originalUrl,
+  });
+
   next(new AppError(
     `Endpoint not found: ${req.method} ${req.originalUrl}`,
     404,

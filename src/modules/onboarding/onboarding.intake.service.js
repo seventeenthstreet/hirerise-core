@@ -2,11 +2,19 @@
 
 /**
  * src/modules/onboarding/onboarding.intake.service.js
- * Production-safe intake workflow service
+ *
+ * Patch 32: Final production-hardened intake workflow service
+ * - centralized validation
+ * - safe async CHI trigger
+ * - strict metadata-rich AppErrors
+ * - deterministic progress ownership
  */
 
 const { supabase } = require('../../config/supabase');
-const { AppError } = require('../../middleware/errorHandler');
+const {
+  AppError,
+  ErrorCodes,
+} = require('../../middleware/errorHandler');
 const logger = require('../../utils/logger');
 
 const {
@@ -23,20 +31,48 @@ const TABLE_PROGRESS = 'onboarding_progress';
 const TABLE_USERS = 'users';
 const TABLE_PROFILES = 'user_profiles';
 
+const CONFLICT_KEYS = Object.freeze({
+  [TABLE_PROGRESS]: 'id',
+  [TABLE_USERS]: 'id',
+  [TABLE_PROFILES]: 'id',
+});
+
+function requireUserId(userId) {
+  if (!userId) {
+    throw new AppError(
+      'userId required',
+      400,
+      { userId },
+      ErrorCodes.VALIDATION_ERROR
+    );
+  }
+}
+
 function nowISO() {
   return new Date().toISOString();
 }
 
 async function safeUpsert(table, payload) {
+  if (!payload || typeof payload !== 'object') {
+    throw new AppError(
+      'Invalid upsert payload',
+      400,
+      { table },
+      ErrorCodes.VALIDATION_ERROR
+    );
+  }
+
   const { error } = await supabase
     .from(table)
-    .upsert(payload, { onConflict: 'id' });
+    .upsert(payload, {
+      onConflict: CONFLICT_KEYS[table] || 'id',
+    });
 
   if (error) {
-    logger.error(`[OnboardingIntake] ${table}.upsert failed`, {
+    logger.error('[OnboardingIntake] upsert failed', {
       table,
       error: error.message,
-      payloadKeys: Object.keys(payload || {}),
+      payloadKeys: Object.keys(payload),
     });
     throw error;
   }
@@ -50,7 +86,7 @@ async function safeRead(table, userId, columns = '*') {
     .maybeSingle();
 
   if (error) {
-    logger.error(`[OnboardingIntake] ${table}.read failed`, {
+    logger.error('[OnboardingIntake] read failed', {
       table,
       userId,
       error: error.message,
@@ -61,25 +97,45 @@ async function safeRead(table, userId, columns = '*') {
   return data || {};
 }
 
-// ─────────────────────────────────────────────────────────────
-// CONSENT
-// ─────────────────────────────────────────────────────────────
+async function writeProgress(userId, step, payload = {}) {
+  const updated_at = nowISO();
+  const step_history = await mergeStepHistory(userId, step);
+
+  await safeUpsert(TABLE_PROGRESS, {
+    id: userId,
+    step,
+    ...payload,
+    step_history,
+    updated_at,
+  });
+
+  return { updated_at, step_history };
+}
+
 async function saveConsent(userId, payload) {
-  if (!userId) throw new AppError('userId required', 400);
+  requireUserId(userId);
 
   const { consentVersion } = payload || {};
   if (!consentVersion) {
-    throw new AppError('consentVersion required', 400);
+    throw new AppError(
+      'consentVersion required',
+      400,
+      { payload },
+      ErrorCodes.VALIDATION_ERROR
+    );
   }
 
-  const existing = await safeRead(TABLE_PROGRESS, userId, 'consent_version');
+  const existing = await safeRead(
+    TABLE_PROGRESS,
+    userId,
+    'consent_version'
+  );
 
   if (existing?.consent_version === consentVersion) {
     return { userId, alreadyRecorded: true };
   }
 
   const now = nowISO();
-  const stepHistory = await mergeStepHistory(userId, 'consent_saved');
 
   await Promise.all([
     safeUpsert(TABLE_USERS, {
@@ -96,13 +152,9 @@ async function saveConsent(userId, payload) {
       updated_at: now,
     }),
 
-    safeUpsert(TABLE_PROGRESS, {
-      id: userId,
-      step: 'consent_saved',
+    writeProgress(userId, 'consent_saved', {
       consent_version: consentVersion,
       consent_granted_at: now,
-      step_history: stepHistory,
-      updated_at: now,
     }),
   ]);
 
@@ -113,11 +165,8 @@ async function saveConsent(userId, payload) {
   return { userId, step: 'consent_saved' };
 }
 
-// ─────────────────────────────────────────────────────────────
-// QUICK START
-// ─────────────────────────────────────────────────────────────
 async function saveQuickStart(userId, payload) {
-  if (!userId) throw new AppError('userId required', 400);
+  requireUserId(userId);
 
   const {
     jobTitle,
@@ -127,46 +176,54 @@ async function saveQuickStart(userId, payload) {
   } = payload || {};
 
   if (!jobTitle || !company || !startDate) {
-    throw new AppError('Missing required fields', 400);
+    throw new AppError(
+      'Missing required fields',
+      400,
+      { payload },
+      ErrorCodes.VALIDATION_ERROR
+    );
   }
 
-  const now = nowISO();
-
-  const experience = [{
-    job_title: stripHtml(jobTitle),
-    company: stripHtml(company),
-    start_date: startDate,
-  }];
-
-  const stepHistory = await mergeStepHistory(userId, 'quick_start_saved');
+  const experience = [
+    {
+      job_title: stripHtml(jobTitle),
+      company: stripHtml(company),
+      start_date: startDate,
+    },
+  ];
 
   await Promise.all([
-    safeUpsert(TABLE_PROGRESS, {
-      id: userId,
-      step: 'quick_start_saved',
+    writeProgress(userId, 'quick_start_saved', {
       experience,
       skills,
-      step_history: stepHistory,
-      updated_at: now,
     }),
 
     safeUpsert(TABLE_PROFILES, {
       id: userId,
       skills,
-      updated_at: now,
+      updated_at: nowISO(),
     }),
   ]);
 
-  triggerProvisionalChi(userId, {}, {}, null, 'free');
+  Promise.resolve()
+    .then(() =>
+      triggerProvisionalChi(userId, {}, {}, null, 'free')
+    )
+    .catch((error) => {
+      logger.warn(
+        '[OnboardingIntake] Provisional CHI trigger failed',
+        {
+          userId,
+          error: error.message,
+        }
+      );
+    });
 
   return { userId, step: 'quick_start_saved' };
 }
 
-// ─────────────────────────────────────────────────────────────
-// EDUCATION + EXPERIENCE
-// ─────────────────────────────────────────────────────────────
 async function saveEducationAndExperience(userId, payload) {
-  if (!userId) throw new AppError('userId required', 400);
+  requireUserId(userId);
 
   const {
     education = [],
@@ -175,34 +232,32 @@ async function saveEducationAndExperience(userId, payload) {
   } = payload || {};
 
   if (!education.length && !experience.length) {
-    throw new AppError('At least one entry required', 400);
+    throw new AppError(
+      'At least one entry required',
+      400,
+      { payload },
+      ErrorCodes.VALIDATION_ERROR
+    );
   }
 
   validateExperienceDates(experience);
 
-  const now = nowISO();
-  const totalExperienceMonths = computeExperienceMonths(experience);
-  const stepHistory = await mergeStepHistory(
-    userId,
-    'education_experience_saved'
-  );
+  const totalExperienceMonths =
+    computeExperienceMonths(experience);
 
   await Promise.all([
-    safeUpsert(TABLE_PROGRESS, {
-      id: userId,
-      step: 'education_experience_saved',
+    writeProgress(userId, 'education_experience_saved', {
       education,
       experience,
       skills,
-      total_experience_months: totalExperienceMonths,
-      step_history: stepHistory,
-      updated_at: now,
+      total_experience_months:
+        totalExperienceMonths,
     }),
 
     safeUpsert(TABLE_PROFILES, {
       id: userId,
       skills,
-      updated_at: now,
+      updated_at: nowISO(),
     }),
   ]);
 
@@ -211,35 +266,36 @@ async function saveEducationAndExperience(userId, payload) {
     safeRead(TABLE_PROFILES, userId),
   ]);
 
-  await persistCompletionIfReady(userId, progress, profile);
+  await persistCompletionIfReady(
+    userId,
+    progress,
+    profile
+  );
 
-  return { userId, step: 'education_experience_saved' };
+  return {
+    userId,
+    step: 'education_experience_saved',
+  };
 }
 
-// ─────────────────────────────────────────────────────────────
-// DRAFT
-// ─────────────────────────────────────────────────────────────
 async function saveDraft(userId, payload) {
-  if (!userId) throw new AppError('userId required', 400);
+  requireUserId(userId);
 
-  const now = nowISO();
-  const stepHistory = await mergeStepHistory(userId, 'draft_saved');
-
-  await safeUpsert(TABLE_PROGRESS, {
-    id: userId,
-    step: 'draft',
+  await writeProgress(userId, 'draft', {
     draft: payload,
-    step_history: stepHistory,
-    updated_at: now,
   });
 
   return { userId, step: 'draft' };
 }
 
 async function getDraft(userId) {
-  if (!userId) throw new AppError('userId required', 400);
+  requireUserId(userId);
 
-  const data = await safeRead(TABLE_PROGRESS, userId, 'draft');
+  const data = await safeRead(
+    TABLE_PROGRESS,
+    userId,
+    'draft'
+  );
 
   return {
     userId,
@@ -247,69 +303,55 @@ async function getDraft(userId) {
   };
 }
 
-// ─────────────────────────────────────────────────────────────
-// PERSONAL DETAILS
-// ─────────────────────────────────────────────────────────────
 async function savePersonalDetails(userId, payload) {
-  if (!userId) throw new AppError('userId required', 400);
+  requireUserId(userId);
 
   const { fullName, email } = payload || {};
   if (!fullName || !email) {
-    throw new AppError('Missing required fields', 400);
+    throw new AppError(
+      'Missing required fields',
+      400,
+      { payload },
+      ErrorCodes.VALIDATION_ERROR
+    );
   }
 
-  const now = nowISO();
-  const stepHistory = await mergeStepHistory(
-    userId,
-    'personal_details_saved'
-  );
-
-  await safeUpsert(TABLE_PROGRESS, {
-    id: userId,
-    step: 'personal_details_saved',
+  await writeProgress(userId, 'personal_details_saved', {
     personal_details: payload,
-    step_history: stepHistory,
-    updated_at: now,
   });
 
-  return { userId, step: 'personal_details_saved' };
+  return {
+    userId,
+    step: 'personal_details_saved',
+  };
 }
 
-// ─────────────────────────────────────────────────────────────
-// CAREER INTENT
-// ─────────────────────────────────────────────────────────────
 async function saveCareerIntent(userId, payload) {
-  if (!userId) throw new AppError('userId required', 400);
+  requireUserId(userId);
 
   if (!payload?.expectedRoleIds?.length) {
-    throw new AppError('expectedRoleIds required', 400);
+    throw new AppError(
+      'expectedRoleIds required',
+      400,
+      { payload },
+      ErrorCodes.VALIDATION_ERROR
+    );
   }
-
-  const now = nowISO();
-  const stepHistory = await mergeStepHistory(
-    userId,
-    'career_intent_saved'
-  );
 
   await Promise.all([
     safeUpsert(TABLE_PROFILES, {
       id: userId,
       expected_role_ids: payload.expectedRoleIds,
-      updated_at: now,
+      updated_at: nowISO(),
     }),
 
-    safeUpsert(TABLE_PROGRESS, {
-      id: userId,
-      step: 'career_intent_saved',
-      step_history: stepHistory,
-      updated_at: now,
-    }),
+    writeProgress(userId, 'career_intent_saved'),
   ]);
 
   return { userId, step: 'career_intent_saved' };
 }
 
-module.exports = {
+module.exports = Object.freeze({
   saveConsent,
   saveQuickStart,
   saveEducationAndExperience,
@@ -317,4 +359,4 @@ module.exports = {
   getDraft,
   savePersonalDetails,
   saveCareerIntent,
-};
+});
