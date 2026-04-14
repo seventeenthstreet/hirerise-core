@@ -172,7 +172,7 @@ const startupChaosConfidence = {
 
 const routeLatencyBuckets = new Map();
 const ROUTE_BUCKET_SAMPLE_LIMIT = 100;
-const ROUTE_LEADERBOARD_INTERVAL_MS = 15000;
+const ROUTE_LEADERBOARD_INTERVAL_MS = 300000;
 // Patch 38 → startup phase failure attribution registry
 const startupPhaseAttribution = {
   phases: new Map(),
