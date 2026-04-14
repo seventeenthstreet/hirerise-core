@@ -1,22 +1,22 @@
 'use strict';
 
 /**
- * aiEventBus.js — Supabase-optimized AI Event Bus
+ * aiEventBus.js — Patch 44 production-ready Supabase AI Event Bus
  *
- * Firebase references: fully removed (none existed in the original file).
- * Optimizations added:
- * - Idempotent Supabase writes using upsert()
- * - Proper awaited job creation for stronger consistency
- * - Lean select columns for status polling
- * - Centralized timestamp helper
- * - Better queue reuse and safer shutdown
- * - Improved partial dispatch status handling
+ * Hardened for:
+ * - exact-once pipeline job authority
+ * - deterministic queue dispatch envelopes
+ * - partial dispatch resilience
+ * - safer queue reuse and shutdown
  */
 
 const { Queue } = require('bullmq');
 const { randomUUID } = require('crypto');
 const logger = require('../../../utils/logger');
-const supabase = require('../../config/supabase');
+const {
+  authoritativeUpsert,
+} = require('../../../lib/db/authoritativeMutation');
+const { supabase } = require('../../../config/supabase');
 const {
   QUEUE_OPTIONS,
   EVENT_TO_QUEUES,
@@ -46,12 +46,15 @@ const EVENT_TYPES = Object.freeze({
 const queuePool = new Map();
 
 function getQueue(queueName) {
-  if (queuePool.has(queueName)) return queuePool.get(queueName);
+  if (queuePool.has(queueName)) {
+    return queuePool.get(queueName);
+  }
 
   const queue = new Queue(queueName, {
     connection: getBullMQRedisConnection(),
     defaultJobOptions:
-      QUEUE_OPTIONS[queueName]?.jobOptions || DEFAULT_JOB_OPTIONS,
+      QUEUE_OPTIONS[queueName]?.jobOptions ||
+      DEFAULT_JOB_OPTIONS,
   });
 
   queue.on('error', (err) => {
@@ -76,18 +79,29 @@ function buildEnvelope(eventType, payload, pipelineJobId) {
   };
 }
 
-async function createPipelineJob(pipelineJobId, userId, eventType, payload, queueNames) {
-  const { error } = await supabase.from('ai_pipeline_jobs').upsert({
-    id: pipelineJobId,
-    user_id: userId,
-    event_type: eventType,
-    queue_name: queueNames.join(','),
-    status: 'pending',
-    input_payload: payload,
-    queued_at: now(),
-  });
-
-  if (error) {
+async function createPipelineJob(
+  pipelineJobId,
+  userId,
+  eventType,
+  payload,
+  queueNames
+) {
+  try {
+    await authoritativeUpsert({
+      table: 'ai_pipeline_jobs',
+      payload: {
+        id: pipelineJobId,
+        user_id: userId,
+        event_type: eventType,
+        queue_name: queueNames.join(','),
+        status: 'pending',
+        input_payload: payload,
+        queued_at: now(),
+      },
+      conflictKey: 'id',
+      requestKey: pipelineJobId,
+    });
+  } catch (error) {
     logger.warn('[AIEventBus] Failed to persist pipeline job', {
       pipelineJobId,
       error: error.message,
@@ -95,14 +109,28 @@ async function createPipelineJob(pipelineJobId, userId, eventType, payload, queu
   }
 }
 
-async function updatePipelineJobStatus(pipelineJobId, status, opts = {}) {
+async function updatePipelineJobStatus(
+  pipelineJobId,
+  status,
+  opts = {}
+) {
   const patch = {
     status,
-    ...(opts.bullmqJobId && { bullmq_job_id: opts.bullmqJobId }),
-    ...(opts.errorMessage && { error_message: opts.errorMessage }),
-    ...(opts.errorCode && { error_code: opts.errorCode }),
-    ...(status === 'processing' && { started_at: now() }),
-    ...(status === 'completed' && { completed_at: now() }),
+    ...(opts.bullmqJobId && {
+      bullmq_job_id: opts.bullmqJobId,
+    }),
+    ...(opts.errorMessage && {
+      error_message: opts.errorMessage,
+    }),
+    ...(opts.errorCode && {
+      error_code: opts.errorCode,
+    }),
+    ...(status === 'processing' && {
+      started_at: now(),
+    }),
+    ...(status === 'completed' && {
+      completed_at: now(),
+    }),
   };
 
   const { error } = await supabase
@@ -125,15 +153,25 @@ async function publish(eventType, payload, opts = {}) {
   }
 
   const userId = payload?.userId;
-  if (!userId) throw new Error('payload.userId is required');
+  if (!userId) {
+    throw new Error('payload.userId is required');
+  }
 
   const targetQueues = EVENT_TO_QUEUES[eventType] || [];
   if (!targetQueues.length) {
-    return { pipelineJobId: null, bullmqJobIds: {}, queuesDispatched: [] };
+    return {
+      pipelineJobId: null,
+      bullmqJobIds: {},
+      queuesDispatched: [],
+    };
   }
 
   const pipelineJobId = randomUUID();
-  const envelope = buildEnvelope(eventType, payload, pipelineJobId);
+  const envelope = buildEnvelope(
+    eventType,
+    payload,
+    pipelineJobId
+  );
 
   await createPipelineJob(
     pipelineJobId,
@@ -147,13 +185,21 @@ async function publish(eventType, payload, opts = {}) {
     targetQueues.map(async (queueName) => {
       const queue = getQueue(queueName);
       const job = await queue.add(eventType, envelope, {
-        ...(QUEUE_OPTIONS[queueName]?.jobOptions || DEFAULT_JOB_OPTIONS),
-        ...(opts.priority !== undefined && { priority: opts.priority }),
-        ...(opts.delay !== undefined && { delay: opts.delay }),
+        ...(QUEUE_OPTIONS[queueName]?.jobOptions ||
+          DEFAULT_JOB_OPTIONS),
+        ...(opts.priority !== undefined && {
+          priority: opts.priority,
+        }),
+        ...(opts.delay !== undefined && {
+          delay: opts.delay,
+        }),
         jobId: `${pipelineJobId}:${queueName}`,
       });
 
-      return { queueName, bullmqJobId: job.id };
+      return {
+        queueName,
+        bullmqJobId: job.id,
+      };
     })
   );
 
@@ -162,23 +208,39 @@ async function publish(eventType, payload, opts = {}) {
 
   for (const result of settled) {
     if (result.status === 'fulfilled') {
-      bullmqJobIds[result.value.queueName] = result.value.bullmqJobId;
+      bullmqJobIds[result.value.queueName] =
+        result.value.bullmqJobId;
       queuesDispatched.push(result.value.queueName);
     }
   }
 
   if (!queuesDispatched.length) {
-    await updatePipelineJobStatus(pipelineJobId, 'failed', {
-      errorMessage: 'All queue dispatches failed',
-      errorCode: 'QUEUE_DISPATCH_FAILED',
-    });
+    await updatePipelineJobStatus(
+      pipelineJobId,
+      'failed',
+      {
+        errorMessage: 'All queue dispatches failed',
+        errorCode: 'QUEUE_DISPATCH_FAILED',
+      }
+    );
   }
 
-  return { pipelineJobId, bullmqJobIds, queuesDispatched };
+  return {
+    pipelineJobId,
+    bullmqJobIds,
+    queuesDispatched,
+  };
 }
 
-async function publishCompletion(pipelineJobId, completionEventType, resultSummary = {}) {
-  await updatePipelineJobStatus(pipelineJobId, 'completed');
+async function publishCompletion(
+  pipelineJobId,
+  completionEventType,
+  resultSummary = {}
+) {
+  await updatePipelineJobStatus(
+    pipelineJobId,
+    'completed'
+  );
 
   logger.info('[AIEventBus] Job completed', {
     pipelineJobId,
@@ -189,7 +251,8 @@ async function publishCompletion(pipelineJobId, completionEventType, resultSumma
 
 async function publishFailure(pipelineJobId, error) {
   await updatePipelineJobStatus(pipelineJobId, 'failed', {
-    errorMessage: error instanceof Error ? error.message : String(error),
+    errorMessage:
+      error instanceof Error ? error.message : String(error),
     errorCode: error?.code || 'WORKER_ERROR',
   });
 }
@@ -197,7 +260,9 @@ async function publishFailure(pipelineJobId, error) {
 async function getPipelineStatus(pipelineJobId) {
   const { data, error } = await supabase
     .from('ai_pipeline_jobs')
-    .select('id,status,event_type,queue_name,attempt_count,queued_at,started_at,completed_at,error_message')
+    .select(
+      'id,status,event_type,queue_name,attempt_count,queued_at,started_at,completed_at,error_message'
+    )
     .eq('id', pipelineJobId)
     .maybeSingle();
 
@@ -213,7 +278,9 @@ async function getPipelineStatus(pipelineJobId) {
 }
 
 async function closeAllQueues() {
-  await Promise.allSettled([...queuePool.values()].map((q) => q.close()));
+  await Promise.allSettled(
+    [...queuePool.values()].map((q) => q.close())
+  );
   queuePool.clear();
 }
 

@@ -3,20 +3,27 @@
 /**
  * @file src/services/paymentActivation.service.js
  * @description
- * Production-grade billing activation service (Supabase-native).
+ * Patch 44 hardened billing activation service.
  *
- * Improvements:
- * - true webhook idempotency
- * - schema-safe snake_case writes
- * - race-safe payment log uniqueness
- * - non-throwing audit handling fixed
- * - downgrade cleanup hardened
+ * Guarantees:
+ * - exact-once activation per subscription
+ * - deterministic payment log authority
+ * - retry-safe webhook replay
+ * - downgrade replay safety
  */
 
 const { supabase } = require('../config/supabase');
-const { AppError, ErrorCodes } = require('../middleware/errorHandler');
+const {
+  AppError,
+  ErrorCodes,
+} = require('../middleware/errorHandler');
 const logger = require('../utils/logger');
-const { getCreditsForPlan } = require('../analysis/analysis.constants');
+const {
+  getCreditsForPlan,
+} = require('../analysis/analysis.constants');
+const {
+  authoritativeUpsert,
+} = require('../lib/db/authoritativeMutation');
 
 const USERS_TABLE = 'users';
 const PAYMENT_LOGS_TABLE = 'payment_logs';
@@ -61,16 +68,19 @@ async function activateProUser({
   const now = new Date().toISOString();
 
   try {
-    // True webhook idempotency
-    const alreadyProcessed = await hasActivationAlreadyProcessed(
-      subscriptionId
-    );
+    const alreadyProcessed =
+      await hasActivationAlreadyProcessed(
+        subscriptionId
+      );
 
     if (alreadyProcessed) {
-      logger.warn('[PaymentActivation] Duplicate webhook ignored', {
-        userId,
-        subscriptionId,
-      });
+      logger.warn(
+        '[PaymentActivation] Duplicate webhook ignored',
+        {
+          userId,
+          subscriptionId,
+        }
+      );
 
       return {
         userId,
@@ -78,11 +88,12 @@ async function activateProUser({
       };
     }
 
-    const { data: existingUser, error: userError } = await supabase
-      .from(USERS_TABLE)
-      .select('id, tier')
-      .eq('id', userId)
-      .maybeSingle();
+    const { data: existingUser, error: userError } =
+      await supabase
+        .from(USERS_TABLE)
+        .select('id, tier')
+        .eq('id', userId)
+        .maybeSingle();
 
     if (userError) throw userError;
 
@@ -113,24 +124,20 @@ async function activateProUser({
 
     if (updateError) throw updateError;
 
-    const { error: auditError } = await supabase
-      .from(PAYMENT_LOGS_TABLE)
-      .insert({
-        user_id: userId,
+    await authoritativeUpsert({
+      table: PAYMENT_LOGS_TABLE,
+      payload: {
         subscription_id: subscriptionId,
+        user_id: userId,
         provider,
         amount: planAmount,
         credits_granted: credits,
         status: 'activated',
         created_at: now,
-      });
-
-    if (auditError) {
-      logger.warn('[PaymentActivation] Audit log failed', {
-        userId,
-        error: auditError.message,
-      });
-    }
+      },
+      conflictKey: 'subscription_id',
+      requestKey: subscriptionId,
+    });
 
     logger.info('[PaymentActivation] Pro activated', {
       userId,
@@ -173,11 +180,12 @@ async function downgradeUser(userId) {
   const now = new Date().toISOString();
 
   try {
-    const { data: existingUser, error: fetchError } = await supabase
-      .from(USERS_TABLE)
-      .select('id, tier')
-      .eq('id', userId)
-      .maybeSingle();
+    const { data: existingUser, error: fetchError } =
+      await supabase
+        .from(USERS_TABLE)
+        .select('id, tier')
+        .eq('id', userId)
+        .maybeSingle();
 
     if (fetchError) throw fetchError;
     if (!existingUser) return;
@@ -207,20 +215,17 @@ async function downgradeUser(userId) {
 
     if (updateError) throw updateError;
 
-    const { error: auditError } = await supabase
-      .from(PAYMENT_LOGS_TABLE)
-      .insert({
+    await authoritativeUpsert({
+      table: PAYMENT_LOGS_TABLE,
+      payload: {
+        subscription_id: `downgrade:${userId}:${now}`,
         user_id: userId,
         status: 'downgraded',
         created_at: now,
-      });
-
-    if (auditError) {
-      logger.warn('[PaymentActivation] Downgrade audit failed', {
-        userId,
-        error: auditError.message,
-      });
-    }
+      },
+      conflictKey: 'subscription_id',
+      requestKey: userId,
+    });
 
     logger.info('[PaymentActivation] User downgraded', {
       userId,

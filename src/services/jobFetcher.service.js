@@ -3,33 +3,28 @@
 /**
  * @file src/services/jobFetcher.service.js
  * @description
- * Supabase-native job listings fetcher with:
+ * Patch 44 production-ready Supabase-native job listings fetcher with:
  * - memory cache
- * - durable Supabase cache
+ * - authoritative durable Supabase cache
  * - Adzuna live fallback
  * - TTL expiry enforcement
- * - null-safe normalization
- * - query projection optimization
- *
- * Fixes applied:
- * - TABLE_NAME corrected from 'job_listings' to 'job_listings_cache'
- * - storeJobListings row keys aligned to actual snake_case DB columns
- * - storedAt removed (column does not exist in job_listings_cache)
- * - readCachedFromSupabase select/filter fields aligned to snake_case columns
- * - readCachedFromSupabase return mapping aligned to snake_case response keys
+ * - retry-safe cache convergence
  */
 
 const { supabase } = require('../config/supabase');
 const cacheManager = require('../core/cache/cache.manager');
 const logger = require('../utils/logger');
 const { detectUserCountry } = require('./salary.service');
+const {
+  authoritativeUpsert,
+} = require('../lib/db/authoritativeMutation');
 
 const cache = cacheManager.getClient();
 
 const ADZUNA_BASE_URL = 'https://api.adzuna.com/v1/api/jobs';
 const CACHE_TTL_SECONDS = 24 * 60 * 60;
 const RESULTS_PER_PAGE = 10;
-const TABLE_NAME = 'job_listings_cache'; // Fix: was 'job_listings' (table does not exist)
+const TABLE_NAME = 'job_listings_cache';
 
 const ADZUNA_COUNTRY_MAP = {
   IN: 'in',
@@ -87,7 +82,8 @@ function normalizeJobs(results = [], fallbackCountry) {
     title: job?.title || 'Untitled',
     company: job?.company?.display_name || 'Unknown Company',
     location:
-      job?.location?.display_name || String(fallbackCountry || 'IN').toUpperCase(),
+      job?.location?.display_name ||
+      String(fallbackCountry || 'IN').toUpperCase(),
     description: String(job?.description || '').slice(0, 500),
     salary: {
       min: job?.salary_min ?? null,
@@ -111,18 +107,27 @@ async function fetchFromAdzuna({
   resultsPerPage = RESULTS_PER_PAGE,
 }) {
   const adzunaCountry =
-    ADZUNA_COUNTRY_MAP[country] || ADZUNA_FALLBACK_COUNTRY;
+    ADZUNA_COUNTRY_MAP[country] ||
+    ADZUNA_FALLBACK_COUNTRY;
 
   const topSkills = Array.isArray(skills)
     ? skills.filter(Boolean).slice(0, 3).join(' ')
     : '';
 
-  const query = [role, topSkills].filter(Boolean).join(' ');
+  const query = [role, topSkills]
+    .filter(Boolean)
+    .join(' ');
 
-  const url = new URL(`${ADZUNA_BASE_URL}/${adzunaCountry}/search/1`);
+  const url = new URL(
+    `${ADZUNA_BASE_URL}/${adzunaCountry}/search/1`
+  );
+
   url.searchParams.set('app_id', appId);
   url.searchParams.set('app_key', appKey);
-  url.searchParams.set('results_per_page', String(resultsPerPage));
+  url.searchParams.set(
+    'results_per_page',
+    String(resultsPerPage)
+  );
   url.searchParams.set('what', query);
   url.searchParams.set('content-type', 'application/json');
   url.searchParams.set('sort_by', 'relevance');
@@ -140,7 +145,6 @@ async function fetchFromAdzuna({
   }
 
   const data = await response.json();
-
   const jobs = normalizeJobs(data?.results, adzunaCountry);
 
   return {
@@ -155,28 +159,35 @@ async function fetchFromAdzuna({
 async function storeJobListings(userId, cacheKey, result) {
   const rowId = buildRowId(userId, cacheKey);
   const now = new Date();
-  const expiresAt = new Date(now.getTime() + CACHE_TTL_SECONDS * 1000);
+  const expiresAt = new Date(
+    now.getTime() + CACHE_TTL_SECONDS * 1000
+  );
 
   const row = {
     id: rowId,
-    user_id: userId,           // Fix: was userId
-    cache_key: cacheKey,       // Fix: was cacheKey
+    user_id: userId,
+    cache_key: cacheKey,
     jobs: result.jobs || [],
-    total_count: result.totalResults || 0, // Fix: was totalResults
+    total_count: result.totalResults || 0,
     query: result.query || '',
-    country: result.country || ADZUNA_FALLBACK_COUNTRY,
-    fetched_at: result.fetchedAt || now.toISOString(), // Fix: was fetchedAt
-    expires_at: expiresAt.toISOString(),               // Fix: was expiresAt
-    // removed: storedAt — column does not exist in job_listings_cache
+    country:
+      result.country || ADZUNA_FALLBACK_COUNTRY,
+    fetched_at:
+      result.fetchedAt || now.toISOString(),
+    expires_at: expiresAt.toISOString(),
   };
 
-  const { error } = await supabase
-    .from(TABLE_NAME)
-    .upsert(row, { onConflict: 'id' });
-
-  if (error) {
+  try {
+    await authoritativeUpsert({
+      table: TABLE_NAME,
+      payload: row,
+      conflictKey: 'id',
+      requestKey: rowId,
+    });
+  } catch (error) {
     logger.warn('[JobFetcher] Durable cache write failed', {
       userId,
+      rowId,
       error: error.message,
     });
   }
@@ -187,18 +198,16 @@ async function readCachedFromSupabase(userId, cacheKey) {
 
   const { data, error } = await supabase
     .from(TABLE_NAME)
-    .select(
-      `
+    .select(`
       jobs,
       total_count,
       query,
       country,
       fetched_at,
       expires_at
-    `
-    )                                              // Fix: all fields now snake_case
+    `)
     .eq('id', rowId)
-    .gt('expires_at', new Date().toISOString())   // Fix: was expiresAt
+    .gt('expires_at', new Date().toISOString())
     .maybeSingle();
 
   if (error || !data) {
@@ -207,10 +216,12 @@ async function readCachedFromSupabase(userId, cacheKey) {
 
   return {
     jobs: Array.isArray(data.jobs) ? data.jobs : [],
-    totalResults: data.total_count || 0,          // Fix: was data.totalResults
+    totalResults: data.total_count || 0,
     query: data.query || '',
-    country: data.country || ADZUNA_FALLBACK_COUNTRY,
-    fetchedAt: data.fetched_at || new Date().toISOString(), // Fix: was data.fetchedAt
+    country:
+      data.country || ADZUNA_FALLBACK_COUNTRY,
+    fetchedAt:
+      data.fetched_at || new Date().toISOString(),
     source: 'supabase_cache',
   };
 }
@@ -255,7 +266,11 @@ async function fetchJobsForUser({
       return { ...memoryCached, source: 'memory_cache' };
     }
 
-    const durableCached = await readCachedFromSupabase(userId, cacheKey);
+    const durableCached = await readCachedFromSupabase(
+      userId,
+      cacheKey
+    );
+
     if (durableCached) {
       await setMemoryCache(cacheKey, durableCached);
       return durableCached;
@@ -307,7 +322,11 @@ async function fetchJobsForUser({
       error: error.message,
     });
 
-    const staleFallback = await readCachedFromSupabase(userId, cacheKey);
+    const staleFallback = await readCachedFromSupabase(
+      userId,
+      cacheKey
+    );
+
     if (staleFallback) {
       return {
         ...staleFallback,
@@ -325,7 +344,11 @@ async function fetchJobsForUser({
   }
 }
 
-async function invalidateJobCache(userId, role, country = 'IN') {
+async function invalidateJobCache(
+  userId,
+  role,
+  country = 'IN'
+) {
   const cacheKey = buildCacheKey(userId, role, country);
 
   try {

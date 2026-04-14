@@ -1,16 +1,14 @@
 'use strict';
 
 /**
- * baseWorker.js — BullMQ + Supabase optimized base worker
+ * baseWorker.js — BullMQ + Supabase production-grade base worker
  *
- * Firebase: none in original.
- * Optimizations:
- * - awaited processing status updates
- * - safer result/failure upserts with merge semantics
- * - shared timestamp helper
- * - cache invalidation hooks
- * - better worker lifecycle flags
- * - improved final-attempt detection
+ * Patch 44 hardened:
+ * - authoritative failure persistence
+ * - deterministic result upserts
+ * - retry-final-attempt replay fence
+ * - cache-safe result layer
+ * - worker lifecycle protection
  */
 
 const { Worker, MetricsTime } = require('bullmq');
@@ -19,6 +17,9 @@ const supabase = require('../../config/supabase');
 const cacheManager = require('../../core/cache/cache.manager');
 const { publishCompletion, publishFailure } = require('../bus/aiEventBus');
 const { getBullMQRedisConnection } = require('../queues/queue.config');
+const {
+  authoritativeUpsert,
+} = require('../../../lib/db/authoritativeMutation');
 
 const RESULT_CACHE_TTL = 600;
 const now = () => new Date().toISOString();
@@ -39,15 +40,21 @@ class BaseWorker {
   }
 
   get resultTableName() {
-    throw new Error(`${this.constructor.name} must implement resultTableName`);
+    throw new Error(
+      `${this.constructor.name} must implement resultTableName`
+    );
   }
 
   get cacheKeyPrefix() {
-    throw new Error(`${this.constructor.name} must implement cacheKeyPrefix`);
+    throw new Error(
+      `${this.constructor.name} must implement cacheKeyPrefix`
+    );
   }
 
   async process(job, envelope) {
-    throw new Error(`${this.constructor.name} must implement process()`);
+    throw new Error(
+      `${this.constructor.name} must implement process()`
+    );
   }
 
   start() {
@@ -95,6 +102,7 @@ class BaseWorker {
     await this._worker.close();
     this._worker = null;
     this._started = false;
+
     logger.info(`[${this.constructor.name}] Worker stopped`);
   }
 
@@ -104,7 +112,9 @@ class BaseWorker {
     const userId = envelope?.payload?.userId;
     const eventType = envelope?.eventType;
 
-    if (!userId) throw new Error('Job envelope missing payload.userId');
+    if (!userId) {
+      throw new Error('Job envelope missing payload.userId');
+    }
 
     await this._updateJobStatus(pipelineJobId, 'processing');
 
@@ -118,6 +128,11 @@ class BaseWorker {
         this._cacheResult(userId, result),
       ]);
 
+      await this._updateJobStatus(
+        pipelineJobId,
+        'completed'
+      );
+
       await publishCompletion(
         pipelineJobId,
         `${eventType}_COMPLETED`,
@@ -130,12 +145,21 @@ class BaseWorker {
       return result;
     } catch (error) {
       const maxAttempts = job.opts?.attempts || 3;
-      const isFinalAttempt = job.attemptsMade + 1 >= maxAttempts;
+      const isFinalAttempt =
+        job.attemptsMade + 1 >= maxAttempts;
 
       if (isFinalAttempt) {
         await Promise.allSettled([
-          this._storeFailure(userId, pipelineJobId, error),
+          this._storeFailure(
+            userId,
+            pipelineJobId,
+            error
+          ),
           publishFailure(pipelineJobId, error),
+          this._updateJobStatus(
+            pipelineJobId,
+            'failed'
+          ),
         ]);
       }
 
@@ -144,42 +168,50 @@ class BaseWorker {
   }
 
   async _persistResult(userId, pipelineJobId, result) {
-    const row = {
-      user_id: userId,
-      job_id: pipelineJobId || null,
-      computed_at: now(),
-      ...result,
-    };
-
-    const { error } = await supabase
-      .from(this.resultTableName)
-      .upsert(row, {
-        onConflict: 'user_id',
-        ignoreDuplicates: false,
-      });
-
-    if (error) {
-      logger.error(`[${this.constructor.name}] Persist error`, {
+    try {
+      await authoritativeUpsert({
         table: this.resultTableName,
-        userId,
-        error: error.message,
+        payload: {
+          user_id: userId,
+          job_id: pipelineJobId || null,
+          computed_at: now(),
+          ...result,
+        },
+        conflictKey: 'user_id',
       });
+    } catch (error) {
+      logger.error(
+        `[${this.constructor.name}] Persist error`,
+        {
+          table: this.resultTableName,
+          userId,
+          error: error.message,
+        }
+      );
     }
   }
 
   async _cacheResult(userId, result) {
     const key = `${this.cacheKeyPrefix}:${userId}`;
+
     try {
-      await this._cache.set(key, JSON.stringify(result), 'EX', RESULT_CACHE_TTL);
-    } catch (error) {
-      logger.debug(`[${this.constructor.name}] Cache write skipped`, {
+      await this._cache.set(
         key,
-      });
+        JSON.stringify(result),
+        'EX',
+        RESULT_CACHE_TTL
+      );
+    } catch {
+      logger.debug(
+        `[${this.constructor.name}] Cache write skipped`,
+        { key }
+      );
     }
   }
 
   async getCachedResult(userId) {
     const key = `${this.cacheKeyPrefix}:${userId}`;
+
     try {
       const hit = await this._cache.get(key);
       return hit ? JSON.parse(hit) : null;
@@ -189,16 +221,28 @@ class BaseWorker {
   }
 
   async _storeFailure(userId, pipelineJobId, err) {
-    await supabase.from(this.resultTableName).upsert(
-      {
-        user_id: userId,
-        job_id: pipelineJobId || null,
-        _error: err.message,
-        _failed_at: now(),
-        computed_at: now(),
-      },
-      { onConflict: 'user_id' }
-    );
+    try {
+      await authoritativeUpsert({
+        table: this.resultTableName,
+        payload: {
+          user_id: userId,
+          job_id: pipelineJobId || null,
+          _error: err.message,
+          _failed_at: now(),
+          computed_at: now(),
+        },
+        conflictKey: 'user_id',
+      });
+    } catch (error) {
+      logger.error(
+        `[${this.constructor.name}] Failure persist error`,
+        {
+          table: this.resultTableName,
+          userId,
+          error: error.message,
+        }
+      );
+    }
   }
 
   async _updateJobStatus(pipelineJobId, status) {
@@ -206,14 +250,32 @@ class BaseWorker {
 
     const patch = {
       status,
-      ...(status === 'processing' && { started_at: now() }),
-      ...(status === 'completed' && { completed_at: now() }),
+      ...(status === 'processing' && {
+        started_at: now(),
+      }),
+      ...(status === 'completed' && {
+        completed_at: now(),
+      }),
+      ...(status === 'failed' && {
+        failed_at: now(),
+      }),
     };
 
-    await supabase
+    const { error } = await supabase
       .from('ai_pipeline_jobs')
       .update(patch)
       .eq('id', pipelineJobId);
+
+    if (error) {
+      logger.warn(
+        `[${this.constructor.name}] Status update skipped`,
+        {
+          pipelineJobId,
+          status,
+          error: error.message,
+        }
+      );
+    }
   }
 }
 

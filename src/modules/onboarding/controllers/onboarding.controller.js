@@ -4,9 +4,10 @@
  * src/modules/onboarding/controllers/onboarding.controller.js
  *
  * FULL production-safe controller
- * ✅ All original handlers preserved
- * ✅ Supabase snake_case aligned
- * ✅ No route export breakage
+ * Patch 44 hardened:
+ * - authoritative onboarding completion writes
+ * - CV upload progress consistency guard
+ * - split-write detection
  */
 
 const onboardingService = require('../onboarding.service');
@@ -16,6 +17,9 @@ const {
   mapParsedToOnboardingShape,
 } = require('../../../services/resumeParser');
 const { uploadResume } = require('../../resume/resume.service');
+const {
+  authoritativeUpsert,
+} = require('../../../lib/db/authoritativeMutation');
 
 let classifyDocument = null;
 function getCvClassifier() {
@@ -330,11 +334,11 @@ const uploadCvDuringOnboarding = withAuth(
       updated_at: nowISO,
     };
 
-    const { error } = await supabase
-      .from('onboarding_progress')
-      .upsert(progressUpdate);
-
-    if (error) throw error;
+    await authoritativeUpsert({
+      table: 'onboarding_progress',
+      payload: progressUpdate,
+      conflictKey: 'id',
+    });
 
     const [{ data: progressRow }, { data: profileRow }] =
       await Promise.all([
@@ -370,42 +374,76 @@ const uploadCvDuringOnboarding = withAuth(
 
 const completeOnboarding = withAuth(
   async (req, res, _next, userId) => {
-    const now = new Date().toISOString();
+    const completedAt = new Date().toISOString();
+
     const stepHistory = await mergeStepHistory(
       userId,
       'onboarding_completed'
     );
 
-    const writes = await Promise.all([
-      supabase.from('users').upsert({
-        id: userId,
-        onboarding_completed: true,
-        onboarding_completed_at: now,
-        updated_at: now,
+    const writes = await Promise.allSettled([
+      authoritativeUpsert({
+        table: 'users',
+        payload: {
+          id: userId,
+          onboarding_completed: true,
+          onboarding_completed_at: completedAt,
+          updated_at: completedAt,
+        },
+        conflictKey: 'id',
       }),
 
-      supabase.from('user_profiles').upsert({
-        id: userId,
-        onboarding_completed: true,
-        onboarding_completed_at: now,
-        updated_at: now,
+      authoritativeUpsert({
+        table: 'user_profiles',
+        payload: {
+          id: userId,
+          onboarding_completed: true,
+          onboarding_completed_at: completedAt,
+          updated_at: completedAt,
+        },
+        conflictKey: 'id',
       }),
 
-      supabase.from('onboarding_progress').upsert({
-        id: userId,
-        step: 'completed',
-        completed_at: now,
-        step_history: stepHistory,
-        updated_at: now,
+      authoritativeUpsert({
+        table: 'onboarding_progress',
+        payload: {
+          id: userId,
+          step: 'completed',
+          completed_at: completedAt,
+          step_history: stepHistory,
+          updated_at: completedAt,
+        },
+        conflictKey: 'id',
       }),
     ]);
 
-    const failed = writes.find((r) => r.error);
-    if (failed?.error) throw failed.error;
+    const failed = writes.find(
+      (result) => result.status === 'rejected'
+    );
+
+    if (failed) {
+      logger.error(
+        '[OnboardingController] completion split-write prevented',
+        {
+          userId,
+          reason: failed.reason?.message,
+        }
+      );
+
+      return res.status(500).json({
+        success: false,
+        message:
+          'Failed to finalize onboarding consistently.',
+      });
+    }
 
     return res.status(200).json({
       success: true,
-      data: { userId, step: 'completed' },
+      data: {
+        userId,
+        step: 'completed',
+        completedAt,
+      },
     });
   }
 );

@@ -1,16 +1,14 @@
 'use strict';
 
 /**
- * @file services/jobAnalyzer.service.js
+ * @file src/services/jobAnalyzer.service.js
  * @description
- * Premium Job Fit Analyzer service (Supabase-native).
+ * Patch 44 production-ready Premium Job Fit Analyzer service.
  *
  * Features:
- * - deterministic Supabase row-based persistence
- * - minimal column selection
- * - strict null-safe payload normalization
+ * - authoritative analysis persistence
+ * - deterministic exact-once row authority
  * - resilient AI JSON parsing
- * - production-safe logging
  * - isolated non-fatal dashboard update
  * - optimized history retrieval
  */
@@ -19,8 +17,12 @@ const crypto = require('crypto');
 const { supabase } = require('../config/supabase');
 const { AppError, ErrorCodes } = require('../middleware/errorHandler');
 const logger = require('../utils/logger');
+const {
+  authoritativeUpsert,
+} = require('../lib/db/authoritativeMutation');
 
-const MODEL = process.env.ANTHROPIC_MODEL || 'claude-sonnet-4-20250514';
+const MODEL =
+  process.env.ANTHROPIC_MODEL || 'claude-sonnet-4-20250514';
 
 function getAnthropicClient() {
   if (process.env.NODE_ENV === 'test') return null;
@@ -55,8 +57,12 @@ function normalizeAnalysisResult(result = {}) {
       ? Math.max(0, Math.min(100, Math.round(result.jobFitScore)))
       : 0,
     fitSummary:
-      typeof result.fitSummary === 'string' ? result.fitSummary.trim() : '',
-    topRecommendations: normalizeStringArray(result.topRecommendations),
+      typeof result.fitSummary === 'string'
+        ? result.fitSummary.trim()
+        : '',
+    topRecommendations: normalizeStringArray(
+      result.topRecommendations
+    ),
   };
 }
 
@@ -177,7 +183,8 @@ async function runAIJobAnalysis(userSkills, jobText, userId) {
 }
 
 async function persistAnalysis(userId, payload) {
-  const { jobDescription, jobUrl, userSkills, analysis } = payload;
+  const { jobDescription, jobUrl, userSkills, analysis } =
+    payload;
 
   const analysisId = crypto.randomUUID();
   const now = new Date().toISOString();
@@ -188,7 +195,8 @@ async function persistAnalysis(userId, payload) {
     userId,
     jobTitle: analysis.jobTitle,
     jobUrl: jobUrl || null,
-    jobDescription: jobDescription?.slice(0, 5000) || null,
+    jobDescription:
+      jobDescription?.slice(0, 5000) || null,
     jobSkills: analysis.jobSkills,
     matchedSkills: analysis.matchedSkills,
     missingSkills: analysis.missingSkills,
@@ -200,15 +208,22 @@ async function persistAnalysis(userId, payload) {
     updatedAt: now,
   };
 
-  const { error } = await supabase
-    .from('job_analyses')
-    .upsert(row, { onConflict: 'id' });
-
-  if (error) {
-    logger.error('[JobAnalyzer] Failed to persist analysis', {
-      userId,
-      error: error.message,
+  try {
+    await authoritativeUpsert({
+      table: 'job_analyses',
+      payload: row,
+      conflictKey: 'id',
+      requestKey: analysisId,
     });
+  } catch (error) {
+    logger.error(
+      '[JobAnalyzer] Failed authoritative persist',
+      {
+        userId,
+        analysisId,
+        error: error.message,
+      }
+    );
 
     throw new AppError(
       error.message,
@@ -221,7 +236,12 @@ async function persistAnalysis(userId, payload) {
   return { analysisId, now };
 }
 
-async function updateLatestJobFit(userId, analysisId, analysis, timestamp) {
+async function updateLatestJobFit(
+  userId,
+  analysisId,
+  analysis,
+  timestamp
+) {
   const { error } = await supabase
     .from('users')
     .update({
@@ -236,10 +256,13 @@ async function updateLatestJobFit(userId, analysisId, analysis, timestamp) {
     .eq('id', userId);
 
   if (error) {
-    logger.warn('[JobAnalyzer] Failed latestJobFit dashboard update', {
-      userId,
-      error: error.message,
-    });
+    logger.warn(
+      '[JobAnalyzer] Failed latestJobFit dashboard update',
+      {
+        userId,
+        error: error.message,
+      }
+    );
   }
 }
 
@@ -267,16 +290,28 @@ async function analyzeJobFit(userId, payload = {}) {
   const userSkills = await fetchUserSkills(userId);
   const jobText = jobDescription || `Job URL: ${jobUrl}`;
 
-  const analysis = await runAIJobAnalysis(userSkills, jobText, userId);
-
-  const { analysisId, now } = await persistAnalysis(userId, {
-    jobDescription,
-    jobUrl,
+  const analysis = await runAIJobAnalysis(
     userSkills,
-    analysis,
-  });
+    jobText,
+    userId
+  );
 
-  await updateLatestJobFit(userId, analysisId, analysis, now);
+  const { analysisId, now } = await persistAnalysis(
+    userId,
+    {
+      jobDescription,
+      jobUrl,
+      userSkills,
+      analysis,
+    }
+  );
+
+  await updateLatestJobFit(
+    userId,
+    analysisId,
+    analysis,
+    now
+  );
 
   return {
     analysisId,
@@ -294,20 +329,21 @@ async function getJobAnalysisHistory(userId, limit = 10) {
     );
   }
 
-  const safeLimit = Math.min(Math.max(Number(limit) || 10, 1), 100);
+  const safeLimit = Math.min(
+    Math.max(Number(limit) || 10, 1),
+    100
+  );
 
   const { data, error } = await supabase
     .from('job_analyses')
-    .select(
-      `
+    .select(`
       analysisId,
       jobTitle,
       jobFitScore,
       matchedSkills,
       missingSkills,
       createdAt
-    `
-    )
+    `)
     .eq('userId', userId)
     .order('createdAt', { ascending: false })
     .limit(safeLimit);

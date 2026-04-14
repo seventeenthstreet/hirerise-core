@@ -1,8 +1,21 @@
 'use strict';
 
+/**
+ * adminMetrics.aggregator.js
+ *
+ * Patch 44 production-safe:
+ * - authoritative daily snapshot writes
+ * - deterministic date-key idempotency
+ * - retry-safe daily aggregation fence
+ * - shard overlap protection
+ */
+
 const { supabase } = require('../config/supabase');
 const BaseWorker = require('./shared/BaseWorker');
 const logger = require('../utils/logger');
+const {
+  authoritativeUpsert,
+} = require('../lib/db/authoritativeMutation');
 
 const WORKER_NAME = 'admin-metrics';
 const SNAPSHOT_TABLE = 'metrics_daily_snapshots';
@@ -28,21 +41,6 @@ class AdminMetricsAggregator extends BaseWorker {
       this._fetchUsageLogs(startISO, endISO, targetDate),
       this._fetchTotalUsers(),
     ]);
-
-    if (usageRows.length === 0) {
-      logger.warn(
-        '[AdminMetricsAggregator] No usage data found',
-        {
-          targetDate,
-        }
-      );
-
-      return {
-        date: targetDate,
-        docCount: 0,
-        durationMs: Date.now() - startedAt,
-      };
-    }
 
     const aggregate = this._buildAggregateSnapshot(
       usageRows,
@@ -216,17 +214,15 @@ class AdminMetricsAggregator extends BaseWorker {
 
   async _upsertSnapshot(snapshot, targetDate) {
     try {
-      const { error } = await supabase
-        .from(SNAPSHOT_TABLE)
-        .upsert(snapshot, {
-          onConflict: 'date',
-          ignoreDuplicates: false,
-        });
-
-      if (error) throw error;
+      await authoritativeUpsert({
+        table: SNAPSHOT_TABLE,
+        payload: snapshot,
+        conflictKey: 'date',
+        requestKey: targetDate,
+      });
     } catch (error) {
       logger.error(
-        '[AdminMetricsAggregator] snapshot upsert failed',
+        '[AdminMetricsAggregator] snapshot authoritative upsert failed',
         {
           targetDate,
           error: error?.message,

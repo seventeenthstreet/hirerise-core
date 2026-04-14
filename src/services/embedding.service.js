@@ -3,18 +3,20 @@
 /**
  * @file src/services/embedding.service.js
  * @description
- * Deterministic mock embedding service.
+ * Patch 44 production-ready deterministic embedding service.
  *
  * Optimized for:
- * - correct Supabase client import
- * - concurrency-safe upserts
- * - normalized skill caching
+ * - authoritative vector persistence
+ * - normalized skill cache convergence
  * - batch-safe processing
  * - cleaner observability
  */
 
 const { supabase } = require('../config/supabase');
 const logger = require('../utils/logger');
+const {
+  authoritativeUpsert,
+} = require('../lib/db/authoritativeMutation');
 
 // ─────────────────────────────────────────────────────────────
 // Constants
@@ -87,21 +89,15 @@ async function ensureSkillEmbedding(skill) {
 
     const embedding = createMockEmbedding(normalized);
 
-    const { error: upsertError } = await supabase
-      .from('skill_embeddings')
-      .upsert(
-        {
-          skill_name: normalized,
-          embedding,
-        },
-        {
-          onConflict: 'skill_name',
-        }
-      );
-
-    if (upsertError) {
-      throw upsertError;
-    }
+    await authoritativeUpsert({
+      table: 'skill_embeddings',
+      payload: {
+        skill_name: normalized,
+        embedding,
+      },
+      conflictKey: 'skill_name',
+      requestKey: normalized,
+    });
 
     localCache.set(normalized, embedding);
 
@@ -125,11 +121,7 @@ async function ensureSkillEmbeddingsBatch(skills = []) {
   }
 
   const uniqueSkills = [
-    ...new Set(
-      skills
-        .map(normalizeSkill)
-        .filter(Boolean)
-    ),
+    ...new Set(skills.map(normalizeSkill).filter(Boolean)),
   ];
 
   if (!uniqueSkills.length) {

@@ -3,13 +3,19 @@
 /**
  * abandonedOnboarding.worker.js
  *
- * Production-hardened abandoned onboarding recovery worker.
- * Fully Supabase-ready and grep-clean for Wave 1.
+ * Patch 44 production-safe:
+ * - authoritative onboarding abandonment stamping
+ * - split-brain safe completion checks
+ * - chunked replay-safe mutation flow
+ * - deterministic idempotency support
  */
 
 const { supabase } = require('../config/supabase');
 const logger = require('../utils/logger');
 const BaseWorker = require('./shared/BaseWorker');
+const {
+  authoritativeUpsert,
+} = require('../lib/db/authoritativeMutation');
 
 const ABANDON_THRESHOLD_DAYS = parseInt(
   process.env.ONBOARDING_ABANDON_DAYS || '7',
@@ -37,10 +43,13 @@ class AbandonedOnboardingWorker extends BaseWorker {
     const jobStart = Date.now();
     const cutoffISO = cutoffDate.toISOString();
 
-    logger.info('[AbandonedOnboardingWorker] Starting job', {
-      thresholdDays: ABANDON_THRESHOLD_DAYS,
-      cutoff: cutoffISO,
-    });
+    logger.info(
+      '[AbandonedOnboardingWorker] Starting job',
+      {
+        thresholdDays: ABANDON_THRESHOLD_DAYS,
+        cutoff: cutoffISO,
+      }
+    );
 
     const { data: rows, error } = await supabase
       .from(TABLES.ONBOARDING_PROGRESS)
@@ -54,7 +63,9 @@ class AbandonedOnboardingWorker extends BaseWorker {
     }
 
     const docs = (rows ?? []).filter(
-      (row) => !row.onboarding_completed
+      (row) =>
+        !row.onboarding_completed &&
+        !row.abandoned_at
     );
 
     if (docs.length === 0) {
@@ -76,42 +87,33 @@ class AbandonedOnboardingWorker extends BaseWorker {
     const scanned = docs.length;
     let stamped = 0;
     let skipped = 0;
-
-    const now = new Date().toISOString();
+    const nowISO = new Date().toISOString();
 
     for (let i = 0; i < docs.length; i += BATCH_SIZE) {
       const chunk = docs.slice(i, i + BATCH_SIZE);
-      const toStamp = [];
 
       for (const row of chunk) {
-        if (row.abandoned_at) {
+        if (
+          row.abandoned_at ||
+          row.onboarding_completed
+        ) {
           skipped++;
           continue;
         }
 
-        toStamp.push({
-          id: row.id,
-          abandoned_at: now,
-          abandoned_at_step:
-            row.last_active_step || 'unknown',
+        await authoritativeUpsert({
+          table: TABLES.ONBOARDING_PROGRESS,
+          payload: {
+            id: row.id,
+            abandoned_at: nowISO,
+            abandoned_at_step:
+              row.last_active_step || 'unknown',
+            updated_at: nowISO,
+          },
+          conflictKey: 'id',
         });
 
         stamped++;
-      }
-
-      if (toStamp.length > 0) {
-        const { error: upsertErr } = await supabase
-          .from(TABLES.ONBOARDING_PROGRESS)
-          .upsert(toStamp, {
-            onConflict: 'id',
-            ignoreDuplicates: false,
-          });
-
-        if (upsertErr) {
-          throw new Error(
-            `[AbandonedOnboardingWorker] Batch upsert failed: ${upsertErr.message}`
-          );
-        }
       }
 
       logger.debug(
@@ -119,19 +121,22 @@ class AbandonedOnboardingWorker extends BaseWorker {
         {
           batchIndex: Math.floor(i / BATCH_SIZE),
           batchSize: chunk.length,
-          stamped: toStamp.length,
+          stamped,
         }
       );
     }
 
     const durationMs = Date.now() - jobStart;
 
-    logger.info('[AbandonedOnboardingWorker] Job complete', {
-      scanned,
-      stamped,
-      skipped,
-      durationMs,
-    });
+    logger.info(
+      '[AbandonedOnboardingWorker] Job complete',
+      {
+        scanned,
+        stamped,
+        skipped,
+        durationMs,
+      }
+    );
 
     return {
       scanned,

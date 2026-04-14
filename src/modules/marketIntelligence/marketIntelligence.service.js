@@ -4,14 +4,11 @@
  * src/modules/marketIntelligence/marketIntelligence.service.js
  *
  * Market Intelligence service layer.
- * Fully Supabase-optimized, Firebase-clean, and production hardened.
+ * Fully Supabase-optimized, Patch 44 hardened, and production ready.
  *
  * DB Tables:
  *   - market_intelligence_cache  (PK: id text — deterministic upserts)
  *   - market_intelligence_sync   (PK: id bigint identity — append-only sync log)
- *
- * Indexes:
- *   - idx_market_sync_synced_at_desc  ON market_intelligence_sync (synced_at DESC)
  */
 
 const {
@@ -21,24 +18,18 @@ const {
 
 const { supabase } = require('../../config/supabase');
 const logger = require('../../utils/logger');
-
-// ───────────────────────────────────────────────────────────────────────────────
-// Table References
-// Hardcoded after migration confirmed both tables exist with correct schema.
-// ───────────────────────────────────────────────────────────────────────────────
+const {
+  authoritativeUpsert,
+} = require('../../lib/db/authoritativeMutation');
 
 const CACHE_TABLE = 'market_intelligence_cache';
-const SYNC_TABLE  = 'market_intelligence_sync';
+const SYNC_TABLE = 'market_intelligence_sync';
 
 const PROVIDERS = Object.freeze({
-  ADZUNA:  'adzuna',
+  ADZUNA: 'adzuna',
   SERPAPI: 'serpapi',
-  CUSTOM:  'custom',
+  CUSTOM: 'custom',
 });
-
-// ───────────────────────────────────────────────────────────────────────────────
-// Helpers
-// ───────────────────────────────────────────────────────────────────────────────
 
 function nowIso() {
   return new Date().toISOString();
@@ -66,10 +57,6 @@ async function getProviderOrNull() {
   }
 }
 
-// ───────────────────────────────────────────────────────────────────────────────
-// CONFIG
-// ───────────────────────────────────────────────────────────────────────────────
-
 async function saveConfig(config, adminUid) {
   const provider = normalizeText(config?.provider);
 
@@ -96,7 +83,6 @@ async function saveConfig(config, adminUid) {
       operations.push(
         upsertSecret('MARKET_SERPAPI_KEY', config.apiKey, adminUid)
       );
-
       if (config.searchEngine) {
         operations.push(
           upsertSecret(
@@ -130,10 +116,6 @@ async function saveConfig(config, adminUid) {
   };
 }
 
-// ───────────────────────────────────────────────────────────────────────────────
-// STATUS
-// ───────────────────────────────────────────────────────────────────────────────
-
 async function getStatus() {
   const provider = await getProviderOrNull();
 
@@ -158,17 +140,11 @@ async function getStatus() {
   };
 }
 
-// ───────────────────────────────────────────────────────────────────────────────
-// DATA SOURCES
-// ───────────────────────────────────────────────────────────────────────────────
-
 async function getDataSources() {
   const provider = await getProviderOrNull();
 
   const [cacheResult, syncResult] = await Promise.allSettled([
-    supabase
-      .from(CACHE_TABLE)
-      .select('*', { count: 'exact', head: true }),
+    supabase.from(CACHE_TABLE).select('*', { count: 'exact', head: true }),
     supabase
       .from(SYNC_TABLE)
       .select('synced_at')
@@ -177,40 +153,22 @@ async function getDataSources() {
       .maybeSingle(),
   ]);
 
-  if (cacheResult.status === 'rejected') {
-    logger.warn('Failed to fetch market cache count', {
-      table: CACHE_TABLE,
-      error: cacheResult.reason?.message,
-    });
-  }
-
-  if (syncResult.status === 'rejected') {
-    logger.warn('Failed to fetch market sync record', {
-      table: SYNC_TABLE,
-      error: syncResult.reason?.message,
-    });
-  }
-
-  const count     = cacheResult.value?.count ?? 0;
-  const lastSync  = syncResult.value?.data?.synced_at || null;
+  const count = cacheResult.value?.count ?? 0;
+  const lastSync = syncResult.value?.data?.synced_at || null;
 
   return {
     sources: [
       {
-        name:        'Market Intelligence API',
+        name: 'Market Intelligence API',
         provider,
         isConfigured: Boolean(provider),
-        status:       provider ? 'connected' : 'not_configured',
+        status: provider ? 'connected' : 'not_configured',
         lastSync,
-        recordCount:  count,
+        recordCount: count,
       },
     ],
   };
 }
-
-// ───────────────────────────────────────────────────────────────────────────────
-// TEST CONNECTION
-// ───────────────────────────────────────────────────────────────────────────────
 
 async function testConnection() {
   const provider = await getProviderOrNull();
@@ -222,71 +180,57 @@ async function testConnection() {
     };
   }
 
-  try {
-    const result = await fetchDemandFromProvider(
-      'Software Engineer',
-      'in',
-      provider
-    );
+  const result = await fetchDemandFromProvider(
+    'Software Engineer',
+    'in',
+    provider
+  );
 
-    return {
-      connected: true,
-      provider,
-      ...result,
-      message:  'Connection successful',
-      testedAt: nowIso(),
-    };
-  } catch (error) {
-    logger.error('Market provider connection test failed', {
-      provider,
-      error: error.message,
-    });
-
-    return {
-      connected: false,
-      provider,
-      message: error.message,
-    };
-  }
+  return {
+    connected: true,
+    provider,
+    ...result,
+    message: 'Connection successful',
+    testedAt: nowIso(),
+  };
 }
-
-// ───────────────────────────────────────────────────────────────────────────────
-// FETCH DEMAND
-// ───────────────────────────────────────────────────────────────────────────────
 
 async function fetchDemand(role, country = 'in') {
   const provider = await getProviderOrNull();
 
   if (!provider) {
-    throw Object.assign(
-      new Error('Provider not configured'),
-      { status: 503 }
-    );
+    throw Object.assign(new Error('Provider not configured'), {
+      status: 503,
+    });
   }
 
-  const normalizedRole    = normalizeText(role);
+  const normalizedRole = normalizeText(role);
   const normalizedCountry = normalizeText(country, 'in').toLowerCase();
-  const result            = await fetchDemandFromProvider(
+
+  const result = await fetchDemandFromProvider(
     normalizedRole,
     normalizedCountry,
     provider
   );
 
   const timestamp = nowIso();
-  const id        = cacheKey(normalizedRole, normalizedCountry);
+  const id = cacheKey(normalizedRole, normalizedCountry);
 
   const [cacheWrite, syncWrite] = await Promise.allSettled([
-    supabase.from(CACHE_TABLE).upsert(
-      {
+    authoritativeUpsert({
+      table: CACHE_TABLE,
+      payload: {
         id,
         ...result,
         cached_at: timestamp,
       },
-      { onConflict: 'id' }
-    ),
+      conflictKey: 'id',
+      requestKey: id,
+    }),
+
     supabase.from(SYNC_TABLE).insert({
-      role:      normalizedRole,
-      country:   normalizedCountry,
+      role: normalizedRole,
+      country: normalizedCountry,
       provider,
       synced_at: timestamp,
     }),
@@ -296,7 +240,7 @@ async function fetchDemand(role, country = 'in') {
     logger.warn('Market cache upsert failed', {
       table: CACHE_TABLE,
       error: cacheWrite.reason?.message,
-      role:  normalizedRole,
+      role: normalizedRole,
     });
   }
 
@@ -304,16 +248,12 @@ async function fetchDemand(role, country = 'in') {
     logger.warn('Market sync insert failed', {
       table: SYNC_TABLE,
       error: syncWrite.reason?.message,
-      role:  normalizedRole,
+      role: normalizedRole,
     });
   }
 
   return result;
 }
-
-// ───────────────────────────────────────────────────────────────────────────────
-// PROVIDER DISPATCH
-// ───────────────────────────────────────────────────────────────────────────────
 
 async function fetchDemandFromProvider(role, country, provider) {
   switch (provider) {
@@ -351,43 +291,43 @@ async function fetchFromAdzuna(role, country) {
     `https://api.adzuna.com/v1/api/jobs/${country}/search/1`
   );
 
-  url.searchParams.set('app_id',  appId);
+  url.searchParams.set('app_id', appId);
   url.searchParams.set('app_key', appKey);
-  url.searchParams.set('what',    role);
+  url.searchParams.set('what', role);
 
   const json = await fetchJson(url.toString());
 
   return {
     role,
     country,
-    job_postings:  json.count ?? 0,
-    salary_median: json.mean  ?? null,
-    growth_rate:   null,
-    remote_ratio:  0,
-    provider:      PROVIDERS.ADZUNA,
-    fetched_at:    nowIso(),
+    job_postings: json.count ?? 0,
+    salary_median: json.mean ?? null,
+    growth_rate: null,
+    remote_ratio: 0,
+    provider: PROVIDERS.ADZUNA,
+    fetched_at: nowIso(),
   };
 }
 
 async function fetchFromSerpApi(role, country) {
   const apiKey = await getSecret('MARKET_SERPAPI_KEY');
-
   const url = new URL('https://serpapi.com/search.json');
-  url.searchParams.set('q',        role);
+
+  url.searchParams.set('q', role);
   url.searchParams.set('location', country);
-  url.searchParams.set('api_key',  apiKey);
+  url.searchParams.set('api_key', apiKey);
 
   const json = await fetchJson(url.toString());
 
   return {
     role,
     country,
-    job_postings:  json.search_information?.total_results ?? 0,
+    job_postings: json.search_information?.total_results ?? 0,
     salary_median: null,
-    growth_rate:   null,
-    remote_ratio:  0,
-    provider:      PROVIDERS.SERPAPI,
-    fetched_at:    nowIso(),
+    growth_rate: null,
+    remote_ratio: 0,
+    provider: PROVIDERS.SERPAPI,
+    fetched_at: nowIso(),
   };
 }
 
@@ -398,7 +338,7 @@ async function fetchFromCustom(role, country) {
   ]);
 
   const url = new URL('/demand', baseUrl);
-  url.searchParams.set('role',    role);
+  url.searchParams.set('role', role);
   url.searchParams.set('country', country);
 
   const json = await fetchJson(url.toString(), {
@@ -410,12 +350,12 @@ async function fetchFromCustom(role, country) {
   return {
     role,
     country,
-    job_postings:  json.job_postings  ?? 0,
+    job_postings: json.job_postings ?? 0,
     salary_median: json.salary_median ?? null,
-    growth_rate:   json.growth_rate   ?? null,
-    remote_ratio:  json.remote_ratio  ?? 0,
-    provider:      PROVIDERS.CUSTOM,
-    fetched_at:    nowIso(),
+    growth_rate: json.growth_rate ?? null,
+    remote_ratio: json.remote_ratio ?? 0,
+    provider: PROVIDERS.CUSTOM,
+    fetched_at: nowIso(),
   };
 }
 

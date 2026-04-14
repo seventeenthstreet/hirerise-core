@@ -1,8 +1,23 @@
 'use strict';
 
+/**
+ * @file src/data-import/excelImporter.js
+ * @description
+ * Patch 44 production-ready Excel importer.
+ *
+ * Hardened for:
+ * - deterministic chunked authoritative writes
+ * - retry-safe reruns
+ * - partial import crash recovery
+ * - conflict-aware seed loading
+ */
+
 require('dotenv').config();
 const ExcelJS = require('exceljs');
 const { createClient } = require('@supabase/supabase-js');
+const {
+  authoritativeUpsert,
+} = require('../lib/db/authoritativeMutation');
 
 const supabase = createClient(
   process.env.SUPABASE_URL,
@@ -18,17 +33,21 @@ async function batchInsert(table, rows, conflict = null) {
   for (let i = 0; i < rows.length; i += BATCH_SIZE) {
     const chunk = rows.slice(i, i + BATCH_SIZE);
 
-    const query = supabase.from(table).upsert(chunk, {
-      onConflict: conflict || undefined
-    });
-
-    const { error } = await query;
-    if (error) {
+    try {
+      await authoritativeUpsert({
+        table,
+        payload: chunk,
+        ...(conflict && { conflictKey: conflict }),
+        requestKey: `${table}:${i}`,
+      });
+    } catch (error) {
       console.error(`❌ Error inserting into ${table}:`, error);
       throw error;
     }
 
-    console.log(`✅ Inserted ${i + chunk.length}/${rows.length} into ${table}`);
+    console.log(
+      `✅ Inserted ${i + chunk.length}/${rows.length} into ${table}`
+    );
   }
 }
 
@@ -63,11 +82,11 @@ async function loadSheet(filePath, sheetName) {
    🔥 Import Roles
 ───────────────────────────────────────────── */
 async function importRoles(rows) {
-  const formatted = rows.map(r => ({
+  const formatted = rows.map((r) => ({
     role_name: r.title,
     seniority_level: parseInt(r.level, 10),
     role_family: r.jobFamilyId,
-    description: r.description || ''
+    description: r.description || '',
   }));
 
   await batchInsert('roles', formatted, 'role_name');
@@ -79,15 +98,19 @@ async function importRoles(rows) {
 async function importSkills(rows) {
   const uniqueSkills = new Map();
 
-  rows.forEach(r => {
+  rows.forEach((r) => {
     if (!uniqueSkills.has(r.skill)) {
       uniqueSkills.set(r.skill, {
-        name: r.skill
+        name: r.skill,
       });
     }
   });
 
-  await batchInsert('skills', Array.from(uniqueSkills.values()), 'name');
+  await batchInsert(
+    'skills',
+    Array.from(uniqueSkills.values()),
+    'name'
+  );
 }
 
 /* ─────────────────────────────────────────────
@@ -96,34 +119,49 @@ async function importSkills(rows) {
 async function importCourses(rows) {
   const uniqueCourses = new Map();
 
-  rows.forEach(r => {
+  rows.forEach((r) => {
     if (!uniqueCourses.has(r.course_name)) {
       uniqueCourses.set(r.course_name, {
         name: r.course_name,
         provider: r.provider,
         level: r.level,
-        duration_hours: parseInt(r.duration_hours || 0, 10),
-        url: r.url
+        duration_hours: parseInt(
+          r.duration_hours || 0,
+          10
+        ),
+        url: r.url,
       });
     }
   });
 
-  await batchInsert('courses', Array.from(uniqueCourses.values()), 'name');
+  await batchInsert(
+    'courses',
+    Array.from(uniqueCourses.values()),
+    'name'
+  );
 }
 
 /* ─────────────────────────────────────────────
    🔥 Build Mapping (Skill ↔ Course)
 ───────────────────────────────────────────── */
 async function importSkillCourses(rows) {
-  const { data: skills } = await supabase.from('skills').select('id, name');
-  const { data: courses } = await supabase.from('courses').select('id, name');
+  const { data: skills } = await supabase
+    .from('skills')
+    .select('id, name');
+  const { data: courses } = await supabase
+    .from('courses')
+    .select('id, name');
 
-  const skillMap = new Map(skills.map(s => [s.name, s.id]));
-  const courseMap = new Map(courses.map(c => [c.name, c.id]));
+  const skillMap = new Map(
+    skills.map((s) => [s.name, s.id])
+  );
+  const courseMap = new Map(
+    courses.map((c) => [c.name, c.id])
+  );
 
   const mappings = [];
 
-  rows.forEach(r => {
+  rows.forEach((r) => {
     const skillId = skillMap.get(r.skill);
     const courseId = courseMap.get(r.course_name);
 
@@ -131,24 +169,32 @@ async function importSkillCourses(rows) {
 
     mappings.push({
       skill_id: skillId,
-      course_id: courseId
+      course_id: courseId,
     });
   });
 
-  await batchInsert('skill_courses', mappings, 'skill_id,course_id');
+  await batchInsert(
+    'skill_courses',
+    mappings,
+    'skill_id,course_id'
+  );
 }
 
 /* ─────────────────────────────────────────────
    🔥 Import Career Paths
 ───────────────────────────────────────────── */
 async function importCareerPaths(rows) {
-  const { data: roles } = await supabase.from('roles').select('id, role_name');
+  const { data: roles } = await supabase
+    .from('roles')
+    .select('id, role_name');
 
-  const roleMap = new Map(roles.map(r => [r.role_name, r.id]));
+  const roleMap = new Map(
+    roles.map((r) => [r.role_name, r.id])
+  );
 
   const paths = [];
 
-  rows.forEach(r => {
+  rows.forEach((r) => {
     const fromId = roleMap.get(r.from_role);
     const toId = roleMap.get(r.to_role);
 
@@ -157,11 +203,15 @@ async function importCareerPaths(rows) {
     paths.push({
       from_role_id: fromId,
       to_role_id: toId,
-      years_to_next: parseInt(r.years_to_next, 10)
+      years_to_next: parseInt(r.years_to_next, 10),
     });
   });
 
-  await batchInsert('career_paths', paths, 'from_role_id,to_role_id');
+  await batchInsert(
+    'career_paths',
+    paths,
+    'from_role_id,to_role_id'
+  );
 }
 
 /* ─────────────────────────────────────────────
@@ -210,11 +260,13 @@ if (require.main === module) {
   const sheet = args[args.indexOf('--sheet') + 1];
 
   if (!file || !sheet) {
-    console.error('Usage: node excelImporter.js --file <path> --sheet <sheet>');
+    console.error(
+      'Usage: node excelImporter.js --file <path> --sheet <sheet>'
+    );
     process.exit(1);
   }
 
-  run({ file, sheet }).catch(err => {
+  run({ file, sheet }).catch((err) => {
     console.error('❌ Import failed:', err);
     process.exit(1);
   });
