@@ -1041,6 +1041,26 @@ const leaseChaosState = {
   _workerTimer: null,
 };
 
+// =============================================================================
+// Wave 35 — PATCH 1: Rollback confidence scoring registry.
+// Tracks deterministic confidence evaluations, suppression windows, confirmed
+// rollbacks, and replayable severity lineage for the rollback engine.
+// Hot-reload safe: all values reset on clean process restart.
+// =============================================================================
+const rollbackConfidenceState = {
+  lastScore:               0,
+  lastSeverity:            'none',
+  totalEvaluations:        0,
+  suppressedRollbacks:     0,
+  confirmedRollbacks:      0,
+  falsePositiveWindows:    [],
+  severityHistory:         [],
+  minRollbackConfidence:   parseInt(
+    process.env.LEASE_MIN_ROLLBACK_CONFIDENCE || '70',
+    10
+  ),
+};
+
 // Wave 33 — PATCH 1: region-aware lease Redis client resolver.
 //
 // Returns the best available ioredis client for lease operations:
@@ -1191,22 +1211,56 @@ function startLeaseFailoverWatchdog() {
 
    const driftResult = detectLeaseRegionDrift();
 
-  if (driftResult.rollbackRequired) {
-    logger.warn(
-      '[Wave34] Lease region drift exceeded tolerance — executing local safety rollback',
-      {
-        nodeId: getLocalReplicaId(),
-        deltaMs: driftResult.deltaMs,
-        localEpoch:
-          driftResult.localEpoch ?? null,
-        persistedEpoch:
-          driftResult.persistedEpoch ?? null,
-      }
-    );
+  // Wave 35 — PATCH 4: confidence-scored rollback gate replaces binary branch.
+  // Every drift evaluation produces a deterministic score + severity classification.
+  // Low-confidence events are suppressed; critical events always execute.
+  const scoreResult = scoreLeaseRollbackConfidence(driftResult);
 
-    await rollbackLeaseRegionDrift(
-      getLocalReplicaId()
-    );
+  rollbackConfidenceState.lastScore    = scoreResult.score;
+  rollbackConfidenceState.lastSeverity = scoreResult.severity;
+
+  // Wave 35 — PATCH 5: append deterministic severity lineage entry (FIFO, max 500).
+  const lineageEntry = {
+    at:             Date.now(),
+    score:          scoreResult.score,
+    severity:       scoreResult.severity,
+    deltaMs:        driftResult.deltaMs,
+    localEpoch:     driftResult.localEpoch,
+    persistedEpoch: driftResult.persistedEpoch,
+    scenario:       leaseChaosState.activeScenario,
+    rollbackExecuted: false, // will be mutated below if rollback runs
+  };
+
+  rollbackConfidenceState.severityHistory.push(lineageEntry);
+  if (rollbackConfidenceState.severityHistory.length > 500) {
+    rollbackConfidenceState.severityHistory.shift();
+  }
+
+  if (shouldSuppressRollback(scoreResult, driftResult)) {
+    // Suppression already logged + recorded inside shouldSuppressRollback.
+    // No rollback execution for low-confidence events.
+  } else {
+    if (driftResult.rollbackRequired || scoreResult.rollbackRecommended) {
+      logger.warn(
+        '[Wave35] Lease region drift — confidence-gated rollback executing',
+        {
+          nodeId:         getLocalReplicaId(),
+          score:          scoreResult.score,
+          severity:       scoreResult.severity,
+          deltaMs:        driftResult.deltaMs,
+          localEpoch:     driftResult.localEpoch ?? null,
+          persistedEpoch: driftResult.persistedEpoch ?? null,
+          signals:        scoreResult.contributingSignals,
+        }
+      );
+
+      lineageEntry.rollbackExecuted = true;
+      rollbackConfidenceState.confirmedRollbacks += 1;
+
+      await rollbackLeaseRegionDrift(
+        getLocalReplicaId()
+      );
+    }
   }
 }
   }, leaseFailoverState.probeIntervalMs);
@@ -1434,6 +1488,201 @@ async function rollbackLeaseRegionDrift(nodeId) {
     usingFallback: leaseFailoverState.usingFallback,
     startupBarrierReleased: startupBarrier.isReleased,
   });
+}
+
+// =============================================================================
+// Wave 35 — PATCH 2: Deterministic rollback confidence scoring engine.
+// All inputs are derived deterministically from driftResult and in-memory state.
+// Never touches Redis keys. Returns { score, severity, rollbackRecommended,
+// contributingSignals }.
+// =============================================================================
+function scoreLeaseRollbackConfidence(driftResult) {
+  const {
+    deltaMs,
+    localEpoch,
+    persistedEpoch,
+  } = driftResult;
+
+  // Wave 35.1 hotfix — deterministic evaluation accounting
+  rollbackConfidenceState.totalEvaluations += 1;
+
+  let score = 0;
+  const contributingSignals = [];
+
+  // +25 — persisted epoch behind local epoch (authoritative ownership drift)
+  if (
+    persistedEpoch !== null &&
+    persistedEpoch !== undefined &&
+    localEpoch > 0 &&
+    persistedEpoch < localEpoch
+  ) {
+    score += 25;
+    contributingSignals.push('persistedEpoch < localEpoch (+25)');
+  }
+
+  // +20 — drift window exceeded configured tolerance
+  if (deltaMs > leaseChaosState.maxDriftToleranceMs) {
+    score += 20;
+    contributingSignals.push(`deltaMs ${deltaMs}ms > maxDriftToleranceMs ${leaseChaosState.maxDriftToleranceMs}ms (+20)`);
+  }
+
+  // +15 — fallback has been active longer than 2 watchdog probe cycles
+  const twoWatchdogCycles = leaseFailoverState.probeIntervalMs * 2;
+  if (leaseFailoverState.usingFallback && deltaMs > twoWatchdogCycles) {
+    score += 15;
+    contributingSignals.push(`fallback active > 2 watchdog cycles (${twoWatchdogCycles}ms) (+15)`);
+  }
+
+  // +15 — active chaos scenario is fallback epoch drift
+  if (leaseChaosState.activeScenario === 'fallback-epoch-drift') {
+    score += 15;
+    contributingSignals.push('chaos scenario = fallback-epoch-drift (+15)');
+  }
+
+  // +10 — 2 or more rollbacks recorded in the last 10 minutes
+  const tenMinutesAgo = Date.now() - 600000;
+  const recentRollbacks = rollbackConfidenceState.severityHistory.filter(
+    (entry) => entry.rollbackExecuted && entry.at >= tenMinutesAgo
+  ).length;
+  if (recentRollbacks >= 2) {
+    score += 10;
+    contributingSignals.push(`${recentRollbacks} rollbacks in last 10 min (+10)`);
+  }
+
+  // +15 — primary Redis still unreachable (consecutive failures above threshold)
+  if (leaseFailoverState.consecutiveFailures >= leaseFailoverState.failoverThreshold) {
+    score += 15;
+    contributingSignals.push(`primary Redis unreachable (${leaseFailoverState.consecutiveFailures} consecutive failures) (+15)`);
+  }
+
+  // Clamp to 0–100
+  score = Math.max(0, Math.min(100, score));
+
+  // Deterministic severity bands
+  let severity;
+  if (score >= 85)      severity = 'critical';
+  else if (score >= 65) severity = 'high';
+  else if (score >= 45) severity = 'moderate';
+  else                  severity = 'low';
+
+  const rollbackRecommended = score >= rollbackConfidenceState.minRollbackConfidence;
+
+  return {
+    score,
+    severity,
+    rollbackRecommended,
+    contributingSignals,
+  };
+}
+
+// =============================================================================
+// Wave 35 — PATCH 3: False-positive suppression window.
+// Suppresses rollback when confidence is too low or conditions indicate noise.
+// HARD INVARIANT: critical severity is NEVER suppressed.
+// Suppression events are appended to falsePositiveWindows for lineage replay.
+// =============================================================================
+function shouldSuppressRollback(scoreResult, driftResult) {
+  const { score, severity } = scoreResult;
+  const { localEpoch, persistedEpoch } = driftResult;
+
+  // HARD INVARIANT — critical severity must never be suppressed
+  if (severity === 'critical') {
+    return false;
+  }
+
+  // Suppression rule 1 — score below minimum confidence threshold
+  if (score < rollbackConfidenceState.minRollbackConfidence) {
+    _recordSuppression(scoreResult, driftResult, 'score-below-threshold');
+    return true;
+  }
+
+  // Suppression rule 2 — severity is low
+  if (severity === 'low') {
+    _recordSuppression(scoreResult, driftResult, 'low-severity');
+    return true;
+  }
+
+  // Suppression rule 3 — rollback happened within the last 60 s and severity is below critical
+  const lastRollbackAt = leaseChaosState.lastRollbackAt || 0;
+const msSinceLastRollback = Date.now() - lastRollbackAt;
+
+// Wave 35.2 hotfix — starvation prevention escalation
+const recentSuppressions = rollbackConfidenceState.falsePositiveWindows.filter(
+  (entry) => Date.now() - entry.at < 60000
+).length;
+
+if (
+  recentSuppressions >= 3 &&
+  driftResult.deltaMs >
+    leaseChaosState.maxDriftToleranceMs * 2
+) {
+  logger.warn(
+    '[Wave35] Suppression escalation override triggered — rollback starvation prevention',
+    {
+      recentSuppressions,
+      deltaMs: driftResult.deltaMs,
+    }
+  );
+
+  return false;
+}
+
+if (msSinceLastRollback < 60000 && severity !== 'critical') {
+  _recordSuppression(
+    scoreResult,
+    driftResult,
+    'too-soon-after-last-rollback'
+  );
+  return true;
+}
+
+  // Suppression rule 4 — epochs are identical (no real drift)
+  if (
+    persistedEpoch !== null &&
+    persistedEpoch !== undefined &&
+    localEpoch > 0 &&
+    persistedEpoch === localEpoch
+  ) {
+    _recordSuppression(scoreResult, driftResult, 'epochs-equal-no-drift');
+    return true;
+  }
+
+  return false;
+}
+
+// Internal helper — records a suppression event into lineage structures.
+// Never called externally.
+function _recordSuppression(scoreResult, driftResult, reason) {
+  rollbackConfidenceState.suppressedRollbacks += 1;
+
+  rollbackConfidenceState.falsePositiveWindows.push({
+    at: Date.now(),
+    reason,
+    score: scoreResult.score,
+    severity: scoreResult.severity,
+    deltaMs: driftResult.deltaMs,
+    localEpoch: driftResult.localEpoch,
+    persistedEpoch: driftResult.persistedEpoch,
+  });
+
+  // Wave 35.1 hotfix — bounded false-positive lineage retention
+  if (
+    rollbackConfidenceState.falsePositiveWindows.length > 500
+  ) {
+    rollbackConfidenceState.falsePositiveWindows.shift();
+  }
+
+  logger.info(
+    '[Wave35] Rollback suppressed — false-positive window recorded',
+    {
+      reason,
+      score: scoreResult.score,
+      severity: scoreResult.severity,
+      deltaMs: driftResult.deltaMs,
+      suppressedTotal:
+        rollbackConfidenceState.suppressedRollbacks,
+    }
+  );
 }
 
 function applyControlledDagMutation() {
@@ -2504,6 +2753,14 @@ distributedArbitration: {
   leaseChaosRollbackEvents:   leaseChaosState.rollbackEvents,
   leaseChaosLastRollbackAt:   leaseChaosState.lastRollbackAt,
   leaseMaxRegionDriftMs:      leaseChaosState.maxDriftToleranceMs,
+  // Wave 35 — rollback confidence scoring telemetry
+  rollbackConfidenceScore:       rollbackConfidenceState.lastScore,
+  rollbackConfidenceSeverity:    rollbackConfidenceState.lastSeverity,
+  rollbackConfidenceEvaluations: rollbackConfidenceState.totalEvaluations,
+  rollbackSuppressedCount:       rollbackConfidenceState.suppressedRollbacks,
+  rollbackConfirmedCount:        rollbackConfidenceState.confirmedRollbacks,
+  rollbackMinThreshold:          rollbackConfidenceState.minRollbackConfidence,
+  rollbackSeverityHistoryTail:   rollbackConfidenceState.severityHistory.slice(-10),
 },
 },
   });
@@ -3309,6 +3566,17 @@ if (distributedLeaseRenewalLoop) {
   distributedLeaseRenewalLoop = null;
 }
 
+// Wave 35 — PATCH 7 BOOTSTRAP: reset all confidence scoring counters and
+// stale suppression/lineage state on every clean process restart.
+// Ensures no cross-restart stale watchdog bleed.
+rollbackConfidenceState.lastScore            = 0;
+rollbackConfidenceState.lastSeverity         = 'none';
+rollbackConfidenceState.totalEvaluations     = 0;
+rollbackConfidenceState.suppressedRollbacks  = 0;
+rollbackConfidenceState.confirmedRollbacks   = 0;
+rollbackConfidenceState.falsePositiveWindows = [];
+rollbackConfidenceState.severityHistory      = [];
+
 const shutdownNodeId = getLocalReplicaId();
 
 const localHeldLease =
@@ -4090,6 +4358,17 @@ if (leaseChaosState._workerTimer) {
   leaseChaosState.enabled = false;
   logger.info('[Wave34] Lease chaos simulation worker stopped');
 }
+
+// Wave 35 — PATCH 7 SHUTDOWN: clear confidence scoring residue to guarantee
+// no cross-restart stale watchdog bleed or suppression state corruption.
+rollbackConfidenceState.lastScore            = 0;
+rollbackConfidenceState.lastSeverity         = 'none';
+rollbackConfidenceState.totalEvaluations     = 0;
+rollbackConfidenceState.suppressedRollbacks  = 0;
+rollbackConfidenceState.confirmedRollbacks   = 0;
+rollbackConfidenceState.falsePositiveWindows = [];
+rollbackConfidenceState.severityHistory      = [];
+logger.info('[Wave35] Rollback confidence state cleared on graceful shutdown');
 
 // Wave 33 — close fallback client if it was opened.
 if (leaseFailoverState._fallbackClient) {
