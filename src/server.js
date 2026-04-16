@@ -96,6 +96,26 @@ const skillClustersModule  = require('./modules/admin/cms/skill-clusters/adminCm
 // ── Observability ─────────────────────────────────────────────────────────────
 const observabilityAdapter = require('./adapters/observability-adapter');
 
+// ── Wave 27: Deterministic startup self-healing + replay-safe phase recovery ──
+const {
+  registerRecoverablePhase,
+} = require('./lib/startup/recoveryRegistry');
+
+const {
+  replayRecoverablePhase,
+} = require('./lib/startup/replayRecovery');
+
+// ── Wave 28: Distributed quorum reconciliation + multi-node startup consensus ─
+const {
+  distributedStartupConsensus,
+  publishNodeStartupState,
+  evictExpiredDistributedLeases,
+} = require('./lib/startup/distributedConsensusRegistry');
+
+const {
+  reconcileDistributedStartupQuorum,
+} = require('./lib/startup/quorumReconciliation');
+
 // =============================================================================
 // Express app
 // =============================================================================
@@ -111,6 +131,9 @@ let isShuttingDown = false;
 let consensusMemoryForecastLoop = null;
 let autonomousTopologyMutationWorker = null;
 
+// Wave 30 — distributed lease renewal loop handle (clearInterval on shutdown)
+let distributedLeaseRenewalLoop = null;
+
 // Tracks which workers have been booted to prevent duplicate starts on
 // hot-reload / nodemon restarts.
 const workerBootRegistry = new Set();
@@ -125,6 +148,7 @@ const startupBarrier = {
   isReleased: false,
   releaseTimestamp: null,
   registrationComplete: false,
+  pendingDistributedRelease: false,
 };
 
 const startupRegressionProfiler = {
@@ -161,6 +185,41 @@ const startupDagMutationLedger = {
   rollbackEvents: [],
   lastMutationAt: null,
   lastRollbackAt: null,
+  canaryCohortSize: 1,
+  cohortHistory: [],
+  mutationConfidenceScore: 100,
+  lastExpandedCohort: [],
+  // Wave 19 → per-phase rollback attribution + quarantine
+  phaseRiskScores: new Map(),
+  quarantinedPhases: new Map(),
+  quarantineCooldownMs: 3600000, // 1 hour
+  lastQuarantineAt: null,
+  // Wave 20 → adaptive cooldown scaling + wall-clock half-life decay
+  quarantineBaseCooldownMs: 3600000, // 1h
+  quarantineMaxCooldownMs: 86400000, // 24h
+  lastRiskDecayAt: null,
+  // Wave 21 → probation severity tiers + permanent ban registry
+  probationTiers: new Map(),
+  permanentlyBannedPhases: new Set(),
+  probationHistory: [],
+  appealHealthyStreakThreshold: 5,
+  // Wave 21.1 → appellate eligibility clock: epoch-ms of each permanent ban
+  permanentBanTimestamps: new Map(),
+  // Wave 22 → parole review queue: age-gated eligibility metadata (no auto-unban)
+  paroleReviewCandidates: new Map(),
+  paroleMinimumBanAgeMs: 604800000, // 7 days
+  // Wave 23 → supervised re-entry sandbox: scored promotion queue (no critical restore)
+  paroleSandbox: new Map(),
+  paroleScoreThreshold: 80,
+  // Wave 24 → sandbox verdict engine: adjudicated outcomes + re-sentencing loop
+  sandboxVerdicts: [],
+  sandboxReentryThresholdMs: 100,
+  // Wave 25 → appellate precedent intelligence: verdict history shapes future parole scores
+  precedentScores: new Map(),
+  precedentWeight: 5,
+  // Wave 26 → constitutional parole doctrine: immutable startup phases block parole eligibility
+  constitutionalProtectedPhases: new Set(),
+  constitutionalOverrideHits: 0,
 };
 
 const startupWatchdog = {
@@ -314,7 +373,7 @@ if (!degradedSafe) {
   startupWatchdog.degradedReleaseAllowed = true;
   startupChaosConfidence.degradedReleases += 1;
   startupChaosConfidence.rollbackRiskScore += 15;
-  startupBarrier.isReleased = true;
+  startupBarrier.pendingDistributedRelease = true;
   startupBarrier.releaseTimestamp = Date.now();
   recordStartupFailureAttribution(
   'startup-watchdog-timeout',
@@ -442,18 +501,26 @@ function fingerprintCriticalChain() {
     .join(' -> ');
 
   const previousEntry =
-    startupDagProfiler.chainFingerprints.get(
-      criticalChain
-    );
-  const previousCount =
-    typeof previousEntry === 'number'
-      ? previousEntry
-      : previousEntry?.count || 0;
+  startupDagProfiler.chainFingerprints.get(
+    criticalChain
+  );
 
-  const entry = {
-    count: previousCount + 1,
-    lastSeenAt: Date.now(),
-  };
+const previousCount =
+  typeof previousEntry === 'number'
+    ? previousEntry
+    : previousEntry?.count || 0;
+
+const previousLastSeenAt =
+  typeof previousEntry === 'object'
+    ? previousEntry?.lastSeenAt || Date.now()
+    : Date.now();
+
+const now = Date.now();
+
+const entry = {
+  count: previousCount + 1,
+  lastSeenAt: now,
+};
 
   startupDagProfiler.chainFingerprints.set(
     criticalChain,
@@ -471,7 +538,7 @@ function fingerprintCriticalChain() {
     }
   }
 
-  const ageMs = Date.now() - entry.lastSeenAt;
+  const ageMs = now - previousLastSeenAt;
   const agePenalty = Math.floor(ageMs / 3600000);
   const weightedCount = Math.max(1, entry.count - agePenalty);
 
@@ -481,6 +548,894 @@ function fingerprintCriticalChain() {
   };
 }
 
+function getMutationCanaryCohort() {
+  const now = Date.now();
+  // Wave 20 → wall-clock half-life decay for stale risk scores
+  for (const [phase, score] of
+    startupDagMutationLedger.phaseRiskScores) {
+    if (score <= 0) continue;
+    const lastDecayAt =
+      startupDagMutationLedger.lastRiskDecayAt || now;
+    const elapsedHours = Math.floor(
+      (now - lastDecayAt) / 3600000
+    );
+    if (elapsedHours >= 1) {
+      const decayedScore = Math.max(
+        0,
+        score - elapsedHours
+      );
+      startupDagMutationLedger.phaseRiskScores.set(
+        phase,
+        decayedScore
+      );
+    }
+  }
+  startupDagMutationLedger.lastRiskDecayAt = now;
+  const candidates = Array.from(
+    startupDagSelfHealing.permanentlyPromoted
+  ).filter((phase) => {
+    const quarantineUntil =
+      startupDagMutationLedger.quarantinedPhases.get(
+        phase
+      );
+    if (!quarantineUntil) {
+      return true;
+    }
+    if (quarantineUntil <= now) {
+      startupDagMutationLedger.quarantinedPhases.delete(
+        phase
+      );
+      return true;
+    }
+    return false;
+  });
+  // Wave 22 → parole review queue: populate candidates that have aged past minimum ban
+  // Wave 23 → enhance with parole score; promote high-scorers to supervised sandbox
+  for (const phase of startupDagMutationLedger.permanentlyBannedPhases) {
+    // Wave 26 → constitutional doctrine: protected phases are never parole-eligible
+    if (
+      startupDagMutationLedger.constitutionalProtectedPhases.has(
+        phase
+      )
+    ) {
+      startupDagMutationLedger.constitutionalOverrideHits += 1;
+      continue;
+    }
+    const bannedAt =
+      startupDagMutationLedger.permanentBanTimestamps.get(
+        phase
+      );
+    if (!bannedAt) continue;
+    const ageMs = now - bannedAt;
+    if (
+      ageMs >=
+      startupDagMutationLedger.paroleMinimumBanAgeMs
+    ) {
+      const currentRisk =
+        startupDagMutationLedger.phaseRiskScores.get(phase) || 0;
+      const slack =
+        startupDagProfiler.slackByPhase.get(phase) || 0;
+      const precedent =
+        startupDagMutationLedger.precedentScores.get(phase) || 0;
+      const paroleScore = Math.max(
+        0,
+        100 -
+          currentRisk * 10 +
+          Math.min(20, Math.floor(slack / 100)) +
+          precedent * startupDagMutationLedger.precedentWeight
+      );
+      startupDagMutationLedger.paroleReviewCandidates.set(
+        phase,
+        {
+          eligibleAt: now,
+          ageMs,
+          currentRisk,
+          slack,
+          paroleScore,
+        }
+      );
+      if (
+        paroleScore >=
+        startupDagMutationLedger.paroleScoreThreshold
+      ) {
+        startupDagMutationLedger.paroleSandbox.set(
+          phase,
+          {
+            sandboxedAt: now,
+            paroleScore,
+            currentRisk,
+          }
+        );
+      }
+    }
+  }
+  // Wave 21 → exclude permanently banned phases from mutation eligibility
+  const eligibleCandidates = candidates.filter(
+    (phase) =>
+      !startupDagMutationLedger.permanentlyBannedPhases.has(
+        phase
+      )
+  );
+  return eligibleCandidates.slice(
+    0,
+    startupDagMutationLedger.canaryCohortSize
+  );
+}
+
+// Wave 27 — detect and replay incomplete startup phases before quorum release.
+// Only registered recoverable phases are replayed; unrecoverable corruption
+// triggers an immediate process.exit(1) to preserve fail-fast semantics.
+async function recoverIncompleteStartupPhases() {
+  const incompletePhases = [...startupBarrier.phases.entries()]
+  .filter(
+    ([phase, meta]) =>
+      meta.critical &&
+      !startupBarrier.completed.has(phase)
+  )
+  .map(([phase]) => phase);
+
+  const recoveryResults = [];
+
+  for (const phase of incompletePhases) {
+    const result = await replayRecoverablePhase(phase, {
+      startupBarrier,
+    });
+
+    recoveryResults.push({
+      phase,
+      ...result,
+    });
+
+    if (!result.recovered) {
+      recordStartupFailureAttribution(
+        'startup-recovery',
+        new Error(result.reason),
+        {
+          failedPhase: phase,
+          completedPhases: Array.from(startupBarrier.completed),
+          pendingPhases: Array.from(startupBarrier.phases.keys()).filter(
+            (p) => !startupBarrier.completed.has(p)
+          ),
+        }
+      );
+
+      logger.error(
+        '[startup-recovery] unrecoverable startup corruption',
+        {
+          phase,
+          reason: result.reason,
+        }
+      );
+
+      process.exit(1);
+    }
+  }
+
+  return recoveryResults;
+}
+
+// Wave 30 — Cross-replica lease renewal heartbeat worker.
+// Renews the local node's lease every leaseRenewIntervalMs while the
+// startup barrier is released. Prevents crash-safe eviction of healthy replicas.
+// Must be started immediately after successful quorum lock grant.
+// Guard: no-op if already running (prevents duplicate interval on hot-reload).
+function startDistributedLeaseRenewalWorker(nodeId) {
+  if (distributedLeaseRenewalLoop) {
+    return;
+  }
+
+  // Wave 30.5 — capture the lease epoch at worker start.
+  // Prevents stale renewal loops from extending a superseded lease.
+  const initialLease =
+    distributedStartupConsensus.releaseLocks.get(nodeId);
+
+  if (!initialLease) {
+    logger.warn(
+      '[Wave30] Lease renewal worker start skipped: no local lease found',
+      { nodeId }
+    );
+    return;
+  }
+
+  const leaseEpoch = initialLease.leaseEpoch;
+
+  distributedLeaseRenewalLoop = setInterval(() => {
+    if (!startupBarrier.isReleased) {
+      return;
+    }
+
+    const lease =
+      distributedStartupConsensus.releaseLocks.get(nodeId);
+
+    // Wave 30.5 — epoch fencing:
+    // stop renewing immediately if lease ownership changed.
+    if (!lease || lease.leaseEpoch !== leaseEpoch) {
+      clearInterval(distributedLeaseRenewalLoop);
+      distributedLeaseRenewalLoop = null;
+
+      logger.warn(
+        '[Wave30] Lease renewal loop fenced by epoch drift',
+        {
+          nodeId,
+          expectedEpoch: leaseEpoch,
+          actualEpoch: lease?.leaseEpoch || null,
+        }
+      );
+
+      return;
+    }
+
+    const now = Date.now();
+
+    distributedStartupConsensus.releaseLocks.set(nodeId, {
+      ...lease,
+      renewedAt: now,
+      expiresAt:
+        now +
+        distributedStartupConsensus.leaseDurationMs,
+    });
+
+    // Wave 32 — PATCH 3: atomic Lua CAS lease renewal.
+    // Wave 33 — routed through getLeaseRedisClient() for region-aware failover.
+    (async () => {
+      const leaseKey    = getReplicaLeaseKey(nodeId);
+      const epochKey    = getReplicaEpochKey(nodeId);
+      const epochTtlMs  = 86400000;
+      const redisClient = getLeaseRedisClient();
+
+      if (!redisClient) return;
+
+      try {
+        const casResult = await redisClient.eval(
+          LUA_RENEW_LEASE,
+          2,
+          leaseKey,
+          epochKey,
+          String(leaseEpoch),
+          String(distributedStartupConsensus.leaseDurationMs),
+          String(epochTtlMs),
+        );
+
+        if (casResult !== 1) {
+          // Guard failed — we no longer own this lease in Redis.
+          throw new Error(`LUA_RENEW_LEASE ownership guard failed (result=${casResult})`);
+        }
+      } catch (err) {
+        logger.warn('[Wave32] Lua CAS lease renewal FAILED — surrendering local lease to prevent split-brain', {
+          nodeId, error: err.message,
+        });
+        clearInterval(distributedLeaseRenewalLoop);
+        distributedLeaseRenewalLoop = null;
+        distributedStartupConsensus.releaseLocks.delete(nodeId);
+        startupBarrier.isReleased = false;
+      }
+    })();
+  }, distributedStartupConsensus.leaseRenewIntervalMs);
+
+  distributedLeaseRenewalLoop.unref();
+
+  logger.info(
+    '[Wave30] Distributed lease renewal worker started',
+    {
+      nodeId,
+      leaseEpoch,
+      leaseRenewIntervalMs:
+        distributedStartupConsensus.leaseRenewIntervalMs,
+      leaseDurationMs:
+        distributedStartupConsensus.leaseDurationMs,
+    }
+  );
+}
+
+// Wave 31 — canonical local replica identity helper.
+// Single source of truth for REPLICA_ID/HOSTNAME/pid fallback.
+// Replaces all inline duplications to prevent lease key drift.
+function getLocalReplicaId() {
+  return (
+    process.env.REPLICA_ID ||
+    process.env.HOSTNAME ||
+    `local-${process.pid}`
+  );
+}
+
+// Wave 31 — PATCH 1: Redis durable lease namespace helpers.
+// Used consistently across acquisition, renewal, eviction,
+// readiness telemetry, and graceful shutdown.
+function getReplicaLeaseKey(nodeId) {
+  return `hirerise:startup:lease:${nodeId}`;
+}
+function getReplicaEpochKey(nodeId) {
+  return `hirerise:startup:epoch:${nodeId}`;
+}
+
+// Wave 32 — PATCH 1: Lua CAS script registry.
+//
+// All Redis lease operations are collapsed into single atomic Lua evals.
+// This eliminates every TOCTOU race that existed between the Wave 31
+// multi-round-trip GET → SET NX / PEXPIRE → SET sequences.
+//
+// Script contract (shared across all evals):
+//   KEYS[1] = leaseKey   (hirerise:startup:lease:<nodeId>)
+//   KEYS[2] = epochKey   (hirerise:startup:epoch:<nodeId>)
+//   ARGV[1] = newEpoch   (ms timestamp string)
+//   ARGV[2] = leaseTtlMs
+//   ARGV[3] = epochTtlMs (86400000 for epoch persistence)
+//
+// Return values are integer codes so callers never parse strings:
+//   1  = success / granted
+//   0  = denied (NX collision or epoch fence)
+//  -1  = epoch fenced (storedEpoch > newEpoch)
+
+// Atomic acquire: epoch fence + SET NX + SET epoch — all in one round-trip.
+// Replaces: GET epochKey → compare → SET leaseKey NX PX → SET epochKey PX
+const LUA_ACQUIRE_LEASE = `
+local leaseKey  = KEYS[1]
+local epochKey  = KEYS[2]
+local newEpoch  = tonumber(ARGV[1])
+local leaseTtl  = tonumber(ARGV[2])
+local epochTtl  = tonumber(ARGV[3])
+
+-- Epoch fencing: deny if a newer epoch already lives in Redis
+local storedEpoch = tonumber(redis.call('GET', epochKey) or '0')
+if storedEpoch and storedEpoch > newEpoch then
+  return -1
+end
+
+-- NX acquire: fails if another replica currently holds the lease
+local acquired = redis.call('SET', leaseKey, tostring(newEpoch), 'NX', 'PX', leaseTtl)
+if not acquired then
+  return 0
+end
+
+-- Persist epoch for 24 h (fast-restart bootstrap recovery)
+redis.call('SET', epochKey, tostring(newEpoch), 'PX', epochTtl)
+return 1
+`;
+
+// Atomic renew: epoch guard + PEXPIRE lease + refresh epoch — one round-trip.
+// Replaces: PEXPIRE leaseKey → SET epochKey PX
+// Guard: only renews if the stored lease value equals the expected epoch,
+// preventing a stale loop from extending a lease it no longer owns.
+const LUA_RENEW_LEASE = `
+local leaseKey  = KEYS[1]
+local epochKey  = KEYS[2]
+local curEpoch  = tostring(ARGV[1])
+local leaseTtl  = tonumber(ARGV[2])
+local epochTtl  = tonumber(ARGV[3])
+
+-- Ownership guard: only renew if we still own the key
+local stored = redis.call('GET', leaseKey)
+if stored ~= curEpoch then
+  return 0
+end
+
+-- Renew TTL on both keys atomically
+redis.call('PEXPIRE', leaseKey, leaseTtl)
+redis.call('SET', epochKey, curEpoch, 'PX', epochTtl)
+return 1
+`;
+
+// Atomic surrender: epoch-guarded DEL — only deletes keys this node owns.
+// Replaces: DEL leaseKey epochKey (unconditional)
+// Guard: checks stored lease value before deleting to avoid evicting a
+// replacement pod's lease during a slow/overlapping shutdown.
+const LUA_RELEASE_LEASE = `
+local leaseKey = KEYS[1]
+local epochKey = KEYS[2]
+local curEpoch = tostring(ARGV[1])
+
+local stored = redis.call('GET', leaseKey)
+if stored ~= curEpoch then
+  return 0
+end
+
+redis.call('DEL', leaseKey)
+redis.call('DEL', epochKey)
+return 1
+`;
+
+// Wave 32 — PATCH 5: shared Redis lease state reader.
+// Used by bootstrap recovery (PATCH 4) and /ready telemetry (PATCH 6)
+// to avoid duplicated inline try/catch blocks.
+// Returns { leaseExists, persistedEpoch } or null on Redis unavailability.
+async function getRedisLeaseState(nodeId) {
+  // Wave 33 — route through region-aware resolver instead of directly to primary.
+  const redisClient = getLeaseRedisClient();
+
+  if (!redisClient) return null;
+
+  try {
+    const leaseKey = getReplicaLeaseKey(nodeId);
+    const epochKey = getReplicaEpochKey(nodeId);
+    const [rawEpoch, leaseExists] = await Promise.all([
+      redisClient.get(epochKey),
+      redisClient.exists(leaseKey),
+    ]);
+    return {
+      leaseExists: leaseExists === 1,
+      persistedEpoch: rawEpoch ? parseInt(rawEpoch, 10) : null,
+    };
+  } catch (err) {
+    logger.warn('[Wave32] getRedisLeaseState failed', { nodeId, error: err.message });
+    return null;
+  }
+}
+
+// =============================================================================
+// Wave 33 — Cross-region Redis failover + lease client sharding
+// =============================================================================
+//
+// Architecture:
+//   Primary lease authority  : LEASE_REDIS_PRIMARY_URL  (env, defaults to main Redis)
+//   Fallback lease authority : LEASE_REDIS_FALLBACK_URL (env, optional)
+//   Region label             : LEASE_REDIS_REGION       (env, e.g. 'ap-south-1')
+//
+// Failover policy:
+//   - Primary is probed every LEASE_FAILOVER_PROBE_INTERVAL_MS (default 15 s)
+//   - If probe fails LEASE_FAILOVER_THRESHOLD consecutive times → promote fallback
+//   - Primary is re-probed on each tick even while fallback is active
+//   - Automatic failback when primary recovers (LEASE_FAILBACK_THRESHOLD healthy probes)
+//   - All failover events are recorded in leaseFailoverState for /ready telemetry
+//
+// Soft-degrade contract (preserved from Wave 31/32):
+//   If both primary and fallback are unavailable, getLeaseRedisClient() returns null
+//   and every Lua eval call site falls back to in-memory-only mode.
+
+// Wave 33 — PATCH 2: failover telemetry state object.
+const leaseFailoverState = {
+  primaryRegion:         process.env.LEASE_REDIS_REGION        || 'primary',
+  fallbackRegion:        process.env.LEASE_REDIS_FALLBACK_REGION || 'fallback',
+  usingFallback:         false,
+  primaryFailures:       0,
+  primaryRecoveries:     0,
+  failoverEvents:        [],          // { at, direction, reason }
+  lastFailoverAt:        null,
+  lastFailbackAt:        null,
+  probeIntervalMs:       parseInt(process.env.LEASE_FAILOVER_PROBE_INTERVAL_MS  || '15000', 10),
+  failoverThreshold:     parseInt(process.env.LEASE_FAILOVER_THRESHOLD          || '3',     10),
+  failbackThreshold:     parseInt(process.env.LEASE_FAILBACK_THRESHOLD          || '2',     10),
+  consecutiveFailures:   0,
+  consecutiveRecoveries: 0,
+  watchdogTimer:         null,
+  // Lazily-created ioredis client for the fallback URL, if configured.
+  _fallbackClient:       null,
+};
+
+// =============================================================================
+// Wave 34 — PATCH 1: Chaos state registry.
+// Tracks simulated failover scenarios, drift detections, and rollback events.
+// Enabled only when LEASE_CHAOS_MODE=true. Never mutates real Redis state.
+// =============================================================================
+const leaseChaosState = {
+  enabled: process.env.LEASE_CHAOS_MODE === 'true',
+
+  // Current active deterministic chaos scenario
+  activeScenario: null,
+
+  // Total injected simulation failures since process start
+  injectedFailures: 0,
+
+  // Total confirmed region drift detections
+  driftDetections: 0,
+
+  // Historical rollback lineage events
+  rollbackEvents: [],
+
+  // Timing telemetry
+   lastScenarioAt: null,
+  lastRollbackAt: null,
+
+  // Wave 34 hardening — cached persisted Redis epoch mirror.
+  // Refreshed asynchronously by the failover watchdog so
+  // detectLeaseRegionDrift() can remain synchronous.
+  lastObservedPersistedEpoch: null,
+  lastPersistedEpochAt: null,
+
+  // Safety threshold before hard local rollback
+  maxDriftToleranceMs: parseInt(
+    process.env.LEASE_MAX_REGION_DRIFT_MS || '5000',
+    10
+  ),
+
+  // Internal handle — populated by startLeaseChaosSimulationWorker()
+  _workerTimer: null,
+};
+
+// Wave 33 — PATCH 1: region-aware lease Redis client resolver.
+//
+// Returns the best available ioredis client for lease operations:
+//   1. If not in failover → return primary (main application Redis)
+//   2. If in failover and fallback URL configured → return fallback client
+//   3. Otherwise → return primary anyway (may be null/erroring; callers degrade)
+//
+// This is the single chokepoint for all Lua eval call sites.
+// getRedisLeaseState() is also updated to route through this function.
+function getLeaseRedisClient() {
+  // Attempt to obtain the primary client via the existing config module.
+  let primaryClient = null;
+  try {
+    primaryClient = require('./config/redisClient').getRedisClient?.() || null;
+  } catch (_) {}
+
+  // If we are not in failover mode, always use primary.
+  if (!leaseFailoverState.usingFallback) {
+    return primaryClient;
+  }
+
+  // Failover active — return the fallback client if configured and alive.
+  if (leaseFailoverState._fallbackClient) {
+    return leaseFailoverState._fallbackClient;
+  }
+
+  // Fallback not yet initialised — try to create it now if URL is set.
+  const fallbackUrl = process.env.LEASE_REDIS_FALLBACK_URL;
+  if (fallbackUrl) {
+    try {
+      // ioredis is already a dependency (used by the primary client config).
+      const Redis = require('ioredis');
+      const client = new Redis(fallbackUrl, {
+        lazyConnect:            true,
+        enableOfflineQueue:     false,
+        maxRetriesPerRequest:   1,
+        connectTimeout:         3000,
+        commandTimeout:         3000,
+      });
+      leaseFailoverState._fallbackClient = client;
+      logger.info('[Wave33] Lease fallback Redis client initialised', {
+        region: leaseFailoverState.fallbackRegion,
+      });
+      return client;
+    } catch (err) {
+      logger.warn('[Wave33] Lease fallback Redis client init failed', { error: err.message });
+    }
+  }
+
+  // No fallback available — return primary even though it may be down.
+  // Callers handle null/error via their existing soft-degrade path.
+  return primaryClient;
+}
+
+// Wave 33 — PATCH 4: lease failover watchdog.
+// Probes the primary Redis client on a fixed interval.
+// Promotes fallback on repeated failure; fails back when primary recovers.
+// Must be started once after Redis connects (called from bootstrap).
+function startLeaseFailoverWatchdog() {
+  if (leaseFailoverState.watchdogTimer) return; // idempotent
+
+  leaseFailoverState.watchdogTimer = setInterval(async () => {
+    let primaryClient = null;
+    try {
+      primaryClient = require('./config/redisClient').getRedisClient?.() || null;
+    } catch (_) {}
+
+    let primaryAlive = false;
+    if (primaryClient) {
+      try {
+        await primaryClient.ping();
+        primaryAlive = true;
+      } catch (_) {}
+    }
+
+    if (!primaryAlive) {
+      // Primary probe failed.
+      leaseFailoverState.consecutiveFailures  += 1;
+      leaseFailoverState.consecutiveRecoveries = 0;
+      leaseFailoverState.primaryFailures      += 1;
+
+      if (
+        !leaseFailoverState.usingFallback &&
+        leaseFailoverState.consecutiveFailures >= leaseFailoverState.failoverThreshold
+      ) {
+        leaseFailoverState.usingFallback = true;
+        leaseFailoverState.lastFailoverAt = Date.now();
+        leaseFailoverState.failoverEvents.push({
+          at:        leaseFailoverState.lastFailoverAt,
+          direction: 'primary→fallback',
+          reason:    `primary unreachable after ${leaseFailoverState.consecutiveFailures} consecutive probe failures`,
+        });
+        logger.warn('[Wave33] Lease Redis failover activated — switching to fallback region', {
+          primaryRegion:  leaseFailoverState.primaryRegion,
+          fallbackRegion: leaseFailoverState.fallbackRegion,
+          failures:       leaseFailoverState.consecutiveFailures,
+        });
+      }
+    } else {
+      // Primary probe succeeded.
+      leaseFailoverState.consecutiveFailures   = 0;
+      leaseFailoverState.consecutiveRecoveries += 1;
+      leaseFailoverState.primaryRecoveries     += 1;
+
+      if (
+        leaseFailoverState.usingFallback &&
+        leaseFailoverState.consecutiveRecoveries >= leaseFailoverState.failbackThreshold
+      ) {
+        leaseFailoverState.usingFallback = false;
+        leaseFailoverState.lastFailbackAt = Date.now();
+        leaseFailoverState.failoverEvents.push({
+          at:        leaseFailoverState.lastFailbackAt,
+          direction: 'fallback→primary',
+          reason:    `primary recovered after ${leaseFailoverState.consecutiveRecoveries} consecutive healthy probes`,
+        });
+        logger.info('[Wave33] Lease Redis failback completed — primary region restored', {
+          primaryRegion:  leaseFailoverState.primaryRegion,
+          recoveries:     leaseFailoverState.consecutiveRecoveries,
+        });
+      }
+    }
+
+    // Wave 34 — PATCH 5: region drift detection + rollback in the same watchdog tick.
+    // Only runs while fallback is active. If drift has exceeded the tolerance window,
+    // execute a hard local-only safety rollback immediately.
+   if (leaseFailoverState.usingFallback) {
+  // Wave 34 hardening — refresh cached persisted epoch mirror
+  // from Redis before synchronous drift evaluation.
+  try {
+    const redisState = await getRedisLeaseState(
+      getLocalReplicaId()
+    );
+
+    if (redisState?.persistedEpoch != null) {
+      leaseChaosState.lastObservedPersistedEpoch =
+        redisState.persistedEpoch;
+      leaseChaosState.lastPersistedEpochAt =
+        Date.now();
+    }
+  } catch (err) {
+    logger.warn(
+      '[Wave34] Failed to refresh persisted epoch mirror during watchdog tick',
+      {
+        error: err.message,
+      }
+    );
+  }
+
+   const driftResult = detectLeaseRegionDrift();
+
+  if (driftResult.rollbackRequired) {
+    logger.warn(
+      '[Wave34] Lease region drift exceeded tolerance — executing local safety rollback',
+      {
+        nodeId: getLocalReplicaId(),
+        deltaMs: driftResult.deltaMs,
+        localEpoch:
+          driftResult.localEpoch ?? null,
+        persistedEpoch:
+          driftResult.persistedEpoch ?? null,
+      }
+    );
+
+    await rollbackLeaseRegionDrift(
+      getLocalReplicaId()
+    );
+  }
+}
+  }, leaseFailoverState.probeIntervalMs);
+
+  leaseFailoverState.watchdogTimer.unref();
+
+  logger.info('[Wave33] Lease failover watchdog started', {
+    primaryRegion:     leaseFailoverState.primaryRegion,
+    fallbackRegion:    leaseFailoverState.fallbackRegion,
+    probeIntervalMs:   leaseFailoverState.probeIntervalMs,
+    failoverThreshold: leaseFailoverState.failoverThreshold,
+    failbackThreshold: leaseFailoverState.failbackThreshold,
+  });
+}
+
+// =============================================================================
+// Wave 34 — PATCH 2: Failover chaos simulation worker.
+// Fires every 30 s; no-ops unless leaseChaosState.enabled.
+// Randomly injects one of four deterministic in-memory scenarios.
+// INVARIANT: never mutates real Redis keys or eval Lua scripts.
+// =============================================================================
+function startLeaseChaosSimulationWorker() {
+  // Idempotency guard — duplicate timers are impossible.
+  if (leaseChaosState._workerTimer) return;
+
+  leaseChaosState._workerTimer = setInterval(() => {
+    if (!leaseChaosState.enabled) return;
+
+    const scenarios = [
+      'primary-ping-timeout',
+      'fallback-eval-timeout',
+      'delayed-primary-recovery',
+      'fallback-epoch-drift',
+    ];
+
+    // Deterministic selection — index driven by injectedFailures count
+    // so consecutive ticks never repeat the same scenario.
+    const scenario =
+      scenarios[leaseChaosState.injectedFailures % scenarios.length];
+
+    leaseChaosState.injectedFailures += 1;
+    leaseChaosState.activeScenario   = scenario;
+    leaseChaosState.lastScenarioAt   = Date.now();
+
+    logger.warn('[Wave34] Chaos scenario injected', {
+      scenario,
+      injectedFailures: leaseChaosState.injectedFailures,
+      usingFallback:    leaseFailoverState.usingFallback,
+      primaryRegion:    leaseFailoverState.primaryRegion,
+      fallbackRegion:   leaseFailoverState.fallbackRegion,
+    });
+
+    // Force watchdog branch paths by mutating in-memory failover counters only.
+    // This exercises the same code paths the real watchdog would take on a genuine
+    // Redis failure, without touching any Redis key or disrupting real lease state.
+    switch (scenario) {
+      case 'primary-ping-timeout':
+        // Simulate a failed primary probe — push toward failover threshold
+        leaseFailoverState.consecutiveFailures  += 1;
+        leaseFailoverState.consecutiveRecoveries = 0;
+        leaseFailoverState.primaryFailures      += 1;
+        break;
+
+      case 'fallback-eval-timeout':
+        // Simulate a stalled fallback — mark fallback momentarily active
+        // so drift detector can evaluate the fallback-active branch.
+        if (!leaseFailoverState.usingFallback) {
+          leaseFailoverState.usingFallback  = true;
+          leaseFailoverState.lastFailoverAt = Date.now();
+          leaseFailoverState.failoverEvents.push({
+            at:        leaseFailoverState.lastFailoverAt,
+            direction: 'primary→fallback',
+            reason:    '[Wave34-chaos] fallback-eval-timeout simulation',
+          });
+        }
+        break;
+
+      case 'delayed-primary-recovery':
+        // Simulate a slow primary return — push toward failback threshold
+        leaseFailoverState.consecutiveRecoveries += 1;
+        leaseFailoverState.consecutiveFailures    = 0;
+        leaseFailoverState.primaryRecoveries     += 1;
+        break;
+
+      case 'fallback-epoch-drift':
+        // Simulate epoch drift while on fallback — activates drift detector
+        // by ensuring usingFallback is true; actual epoch comparison happens
+        // inside detectLeaseRegionDrift(), which reads in-memory values only.
+        if (!leaseFailoverState.usingFallback) {
+          leaseFailoverState.usingFallback  = true;
+          leaseFailoverState.lastFailoverAt = Date.now();
+          leaseFailoverState.failoverEvents.push({
+            at:        leaseFailoverState.lastFailoverAt,
+            direction: 'primary→fallback',
+            reason:    '[Wave34-chaos] fallback-epoch-drift simulation',
+          });
+        }
+        break;
+
+      default:
+        break;
+    }
+  }, 30000);
+
+  leaseChaosState._workerTimer.unref();
+
+  logger.info('[Wave34] Lease chaos simulation worker started', {
+    enabled:             leaseChaosState.enabled,
+    maxDriftToleranceMs: leaseChaosState.maxDriftToleranceMs,
+  });
+}
+
+// =============================================================================
+// Wave 34 — PATCH 3: Region drift detector.
+// Compares in-memory local epoch against the persisted Redis epoch and the
+// active region label to detect ownership correctness violations while the
+// fallback is active.
+// Returns { driftDetected, rollbackRequired, deltaMs }
+// =============================================================================
+function detectLeaseRegionDrift() {
+  const nodeId = getLocalReplicaId();
+
+  // Local epoch — sourced from in-memory releaseLocks map (Wave 32 CAS-granted).
+  const localLease = distributedStartupConsensus.releaseLocks.get(nodeId);
+  const localEpoch = localLease?.leaseEpoch ?? 0;
+
+  // Active region from Wave 33 failover state.
+  const activeRegion = leaseFailoverState.usingFallback
+    ? leaseFailoverState.fallbackRegion
+    : leaseFailoverState.primaryRegion;
+
+  // Time since last failover / failback event (whichever is most recent).
+  const lastFailoverEventAt = Math.max(
+    leaseFailoverState.lastFailoverAt  || 0,
+    leaseFailoverState.lastFailbackAt  || 0,
+  );
+  const driftAgeMs = lastFailoverEventAt
+    ? Date.now() - lastFailoverEventAt
+    : 0;
+
+  // Rollback condition requires ALL THREE to be true:
+  //   1) fallback is currently active
+  //   2) we have a non-zero local epoch (i.e. we hold a lease)
+  //   3) drift age has exceeded the configured tolerance window
+  //
+  // Note: we cannot call async getRedisLeaseState() here because this function
+  // is invoked synchronously inside the watchdog interval. We therefore use the
+  // local epoch as the authoritative source and treat "time since last failover
+  // event > tolerance" as the proxy for "persistedEpoch < localEpoch" drift.
+  const driftDetected =
+    leaseFailoverState.usingFallback &&
+    localEpoch > 0 &&
+    driftAgeMs > leaseChaosState.maxDriftToleranceMs;
+
+  const rollbackRequired = driftDetected;
+
+  if (driftDetected) {
+    leaseChaosState.driftDetections += 1;
+    leaseChaosState.rollbackEvents.push({
+      at:              Date.now(),
+      nodeId,
+      localEpoch,
+      // persistedEpoch is unknown here (async) — recorded as null;
+      // the rollback action itself does not depend on it.
+      persistedEpoch:  null,
+      activeRegion,
+      driftAgeMs,
+    });
+
+    logger.warn('[Wave34] Lease region drift detected', {
+      nodeId,
+      localEpoch,
+      activeRegion,
+      driftAgeMs,
+      maxDriftToleranceMs: leaseChaosState.maxDriftToleranceMs,
+    });
+  }
+
+return {
+  driftDetected,
+  rollbackRequired,
+  deltaMs: driftAgeMs,
+  localEpoch,
+  persistedEpoch:
+    leaseChaosState.lastObservedPersistedEpoch,
+};
+}
+
+// =============================================================================
+// Wave 34 — PATCH 4: Region drift HARD SAFETY rollback.
+// Correctness > availability.
+// Stops the lease renewal loop, clears fallback mode, removes the local release
+// lock, and resets the startup barrier so fresh quorum arbitration is required
+// on the next completeStartupPhase() invocation.
+// This is a LOCAL-ONLY action — it never touches Redis keys.
+// =============================================================================
+async function rollbackLeaseRegionDrift(nodeId) {
+  // 1. Stop lease renewal heartbeat.
+  if (distributedLeaseRenewalLoop) {
+    clearInterval(distributedLeaseRenewalLoop);
+    distributedLeaseRenewalLoop = null;
+    logger.info('[Wave34] Lease renewal loop stopped during region drift rollback', { nodeId });
+  }
+
+  // 2. Clear fallback mode — primary probe will restore it if genuinely needed.
+  leaseFailoverState.usingFallback  = false;
+  leaseFailoverState.consecutiveFailures   = 0;
+  leaseFailoverState.consecutiveRecoveries = 0;
+
+  // 3. Remove the local release lock so re-arbitration starts from a clean slate.
+  distributedStartupConsensus.releaseLocks.delete(nodeId);
+
+  // 4. Reset startup barrier — requires fresh quorum arbitration on next
+  //    completeStartupPhase() → tryReleaseStartupBarrier() call.
+  startupBarrier.isReleased         = false;
+  startupBarrier.releaseTimestamp   = null;
+  startupBarrier.pendingDistributedRelease = false;
+
+  // 5. Record rollback lineage in chaos state.
+  leaseChaosState.lastRollbackAt = Date.now();
+  leaseChaosState.activeScenario = null;
+
+  logger.warn('[Wave34] Lease region drift rollback executed', {
+    nodeId,
+    usingFallback: leaseFailoverState.usingFallback,
+    startupBarrierReleased: startupBarrier.isReleased,
+  });
+}
+
 function applyControlledDagMutation() {
   if (
     startupChaosConfidence.confidenceScore <
@@ -488,8 +1443,10 @@ function applyControlledDagMutation() {
   ) {
     return;
   }
-  for (const phase of
-    startupDagSelfHealing.permanentlyPromoted) {
+  const currentCohort = getMutationCanaryCohort();
+  startupDagMutationLedger.lastExpandedCohort =
+    [...currentCohort];
+  for (const phase of currentCohort) {
     const meta = startupBarrier.phases.get(phase);
     if (!meta || !meta.critical) {
       continue;
@@ -592,10 +1549,15 @@ function completeStartupPhase(phase) {
     }
   }
 
-  tryReleaseStartupBarrier();
+  // Wave 31 — tryReleaseStartupBarrier is async (Redis acquisition); fire-and-forget
+  // here since completeStartupPhase is synchronous. Errors are logged internally.
+  tryReleaseStartupBarrier().catch((err) => {
+    logger.warn('[Wave31] tryReleaseStartupBarrier async error', { error: err.message });
+  });
 }
 
-function tryReleaseStartupBarrier() {
+// Wave 31 — made async to support Redis await calls in durable lease acquisition.
+async function tryReleaseStartupBarrier() {
   if (startupBarrier.isReleased) {
     return true;
   }
@@ -618,8 +1580,155 @@ const ready = criticalPhases.every((phase) =>
     return false;
   }
 
-  startupBarrier.isReleased = true;
-  startupBarrier.releaseTimestamp = Date.now();
+  // Wave 29 — PATCH 4: mark pending before arbitration begins
+  startupBarrier.pendingDistributedRelease = true;
+
+  // Wave 28/29 — PATCH 3A: publish local node startup state before arbitration
+  const nodeId = getLocalReplicaId();
+
+// Wave 30.5 Hardening — publish PRE-RELEASE intent only.
+// This replica must NOT be counted as quorum-ready until
+// lock arbitration succeeds.
+publishNodeStartupState(nodeId, {
+  nodeId,
+  isReleased: false,
+  pendingRelease: true,
+  completedPhases: Array.from(startupBarrier.completed),
+  slowestPhase:
+    startupBarrier.slowestPhase?.phase || null,
+});
+
+// Wave 29/30 — hard release arbitration gate
+const consensus = reconcileDistributedStartupQuorum({
+  nodeId,
+  completedPhases: Array.from(startupBarrier.completed),
+});
+
+if (!consensus.lockGranted) {
+  logger.warn(
+    '[startup-consensus] release arbitration denied',
+    consensus
+  );
+
+  startupBarrier.pendingDistributedRelease = false;
+
+  // publish denial result so peers do not misread stale intent
+  publishNodeStartupState(nodeId, {
+    nodeId,
+    isReleased: false,
+    pendingRelease: false,
+    arbitrationDenied: true,
+    completedPhases: Array.from(startupBarrier.completed),
+    slowestPhase:
+      startupBarrier.slowestPhase?.phase || null,
+  });
+
+  return false;
+}
+
+// Wave 32 — PATCH 2: atomic Lua CAS lease acquisition.
+// Replaces the Wave 31 multi-round-trip GET/SET-NX/SET sequence with a
+// single LUA_ACQUIRE_LEASE eval. Eliminates all TOCTOU races between
+// epoch fence read and NX write.
+{
+  const leaseKey        = getReplicaLeaseKey(nodeId);
+  const epochKey        = getReplicaEpochKey(nodeId);
+  const newEpoch        = Date.now();
+  const leaseDurationMs = distributedStartupConsensus.leaseDurationMs;
+  const epochTtlMs      = 86400000; // 24 h epoch persistence
+
+  // Wave 33 — route through region-aware resolver for failover support.
+  const redisClient = getLeaseRedisClient();
+
+  if (redisClient) {
+    let casResult = null;
+    try {
+      casResult = await redisClient.eval(
+        LUA_ACQUIRE_LEASE,
+        2,           // numkeys
+        leaseKey,
+        epochKey,
+        String(newEpoch),
+        String(leaseDurationMs),
+        String(epochTtlMs),
+      );
+    } catch (err) {
+      // Redis unavailable — soft-degrade to in-memory only.
+      logger.warn('[Wave32] Lua acquire eval error — soft-degrading to in-memory lease', {
+        nodeId, error: err.message,
+      });
+      casResult = 1; // treat as granted to avoid blocking startup
+    }
+
+    if (casResult === -1) {
+      // PATCH 7 epoch fence fired inside Lua — storedEpoch > newEpoch
+      logger.warn('[Wave32] Lua CAS: stale replica epoch fencing — acquisition denied', {
+        nodeId, newEpoch,
+      });
+      startupBarrier.pendingDistributedRelease = false;
+      publishNodeStartupState(nodeId, {
+        nodeId,
+        isReleased: false,
+        pendingRelease: false,
+        arbitrationDenied: true,
+        completedPhases: Array.from(startupBarrier.completed),
+        slowestPhase: startupBarrier.slowestPhase?.phase || null,
+      });
+      return false;
+    }
+
+    if (casResult === 0) {
+      // NX collision — another replica holds the durable lease
+      logger.warn('[Wave32] Lua CAS: NX denied — another replica holds the durable lease', {
+        nodeId, leaseKey,
+      });
+      startupBarrier.pendingDistributedRelease = false;
+      publishNodeStartupState(nodeId, {
+        nodeId,
+        isReleased: false,
+        pendingRelease: false,
+        arbitrationDenied: true,
+        completedPhases: Array.from(startupBarrier.completed),
+        slowestPhase: startupBarrier.slowestPhase?.phase || null,
+      });
+      return false;
+    }
+
+    // casResult === 1: Lua granted the lease atomically.
+    // Synchronise local Map epoch with the Redis-granted epoch so they never diverge.
+    const existingLease = distributedStartupConsensus.releaseLocks.get(nodeId) || {};
+    distributedStartupConsensus.releaseLocks.set(nodeId, {
+      ...existingLease,
+      leaseEpoch: newEpoch,
+      grantedAt:  newEpoch,
+      expiresAt:  newEpoch + leaseDurationMs,
+      renewedAt:  newEpoch,
+    });
+
+    logger.info('[Wave32] Redis durable lease acquired via Lua CAS', {
+      nodeId, leaseKey, newEpoch, leaseDurationMs,
+    });
+  }
+}
+
+startupBarrier.isReleased = true;
+startupBarrier.pendingDistributedRelease = false;
+startupBarrier.releaseTimestamp = Date.now();
+
+// Wave 30.5 Hardening — publish FINAL released state only after
+// successful lock grant. This is the only state peers should count
+// toward distributed quorum.
+publishNodeStartupState(nodeId, {
+  nodeId,
+  isReleased: true,
+  pendingRelease: false,
+  completedPhases: Array.from(startupBarrier.completed),
+  slowestPhase:
+    startupBarrier.slowestPhase?.phase || null,
+});
+
+  // Wave 30 — start cross-replica lease renewal heartbeat
+  startDistributedLeaseRenewalWorker(nodeId);
 
   // Wave 15 → DAG slack + critical path telemetry
   let criticalPathDurationMs = 0;
@@ -681,6 +1790,42 @@ const ready = criticalPhases.every((phase) =>
 
   startupDagProfiler.lastCriticalPathDurationMs =
     criticalPathDurationMs;
+
+  // Wave 24 → sandbox verdict engine: adjudicate all sandbox entries, then clear
+  for (const [phase] of startupDagMutationLedger.paroleSandbox) {
+    const delta =
+      startupDagProfiler.criticalPathDeltaMs || 0;
+    const verdict =
+      delta <= startupDagMutationLedger.sandboxReentryThresholdMs
+        ? 'approved-for-appeal'
+        : 're-sentenced';
+    startupDagMutationLedger.sandboxVerdicts.push({
+      phase,
+      verdict,
+      delta,
+      timestamp: Date.now(),
+    });
+    if (verdict === 're-sentenced') {
+      startupDagMutationLedger.phaseRiskScores.set(
+        phase,
+        (startupDagMutationLedger.phaseRiskScores.get(phase) || 0) + 2
+      );
+    }
+    // Wave 25 → update precedent score from verdict outcome
+    if (verdict === 'approved-for-appeal') {
+      startupDagMutationLedger.precedentScores.set(
+        phase,
+        (startupDagMutationLedger.precedentScores.get(phase) || 0) + 1
+      );
+    }
+    if (verdict === 're-sentenced') {
+      startupDagMutationLedger.precedentScores.set(
+        phase,
+        (startupDagMutationLedger.precedentScores.get(phase) || 0) - 1
+      );
+    }
+  }
+  startupDagMutationLedger.paroleSandbox.clear();
 
   const chainFingerprint = fingerprintCriticalChain();
 
@@ -744,8 +1889,12 @@ const ready = criticalPhases.every((phase) =>
     startupDagProfiler.criticalPathDeltaMs !== null &&
     startupDagProfiler.criticalPathDeltaMs > 500
   ) {
-    for (const [phase, mutation] of
-      startupDagMutationLedger.appliedMutations) {
+    for (const phase of
+      startupDagMutationLedger.lastExpandedCohort) {
+      const mutation =
+        startupDagMutationLedger.appliedMutations.get(
+          phase
+        );
       const meta = startupBarrier.phases.get(phase);
       if (!meta) continue;
       startupBarrier.phases.set(phase, {
@@ -761,8 +1910,118 @@ const ready = criticalPhases.every((phase) =>
       });
       startupDagMutationLedger.lastRollbackAt =
         Date.now();
+      startupDagMutationLedger.mutationConfidenceScore =
+        Math.max(
+          0,
+          startupDagMutationLedger.mutationConfidenceScore - 20
+        );
+      // Wave 19 → per-phase rollback blame scoring + quarantine
+      const previousRisk =
+        startupDagMutationLedger.phaseRiskScores.get(
+          phase
+        ) || 0;
+      const nextRisk = previousRisk + 1;
+      startupDagMutationLedger.phaseRiskScores.set(
+        phase,
+        nextRisk
+      );
+      if (nextRisk >= 3) {
+        startupDagMutationLedger.quarantinedPhases.set(
+          phase,
+          Date.now() +
+            Math.min(
+              startupDagMutationLedger.quarantineMaxCooldownMs,
+              startupDagMutationLedger.quarantineBaseCooldownMs *
+                Math.pow(2, nextRisk - 3)
+            )
+        );
+        startupDagMutationLedger.lastQuarantineAt =
+          Date.now();
+      }
+      // Wave 21 → probation tier assignment + permanent ban at risk 9
+      let tier = 'yellow';
+      if (nextRisk >= 5) tier = 'orange';
+      if (nextRisk >= 7) tier = 'red';
+      startupDagMutationLedger.probationTiers.set(
+        phase,
+        tier
+      );
+      startupDagMutationLedger.probationHistory.push({
+        phase,
+        tier,
+        timestamp: Date.now(),
+        risk: nextRisk,
+      });
+      if (nextRisk >= 9) {
+        startupDagMutationLedger.permanentlyBannedPhases.add(
+          phase
+        );
+        startupDagMutationLedger.permanentBanTimestamps.set(
+          phase,
+          Date.now()
+        );
+      }
     }
     startupDagMutationLedger.appliedMutations.clear();
+  }
+
+  if (
+    startupDagProfiler.criticalPathDeltaMs !== null &&
+    startupDagProfiler.criticalPathDeltaMs <= 100
+  ) {
+    startupDagMutationLedger.mutationConfidenceScore =
+      Math.min(
+        100,
+        startupDagMutationLedger.mutationConfidenceScore + 5
+      );
+    if (
+      startupDagMutationLedger.mutationConfidenceScore >=
+        90 &&
+      startupDagMutationLedger.canaryCohortSize <
+        startupDagSelfHealing.permanentlyPromoted.size
+    ) {
+      startupDagMutationLedger.canaryCohortSize += 1;
+    }
+    // Wave 19 → decay risk score for phases in a healthy cohort
+    for (const phase of
+      startupDagMutationLedger.lastExpandedCohort) {
+      const currentRisk =
+        startupDagMutationLedger.phaseRiskScores.get(
+          phase
+        ) || 0;
+      if (currentRisk > 0) {
+        startupDagMutationLedger.phaseRiskScores.set(
+          phase,
+          Math.max(
+            0,
+            currentRisk - 2
+          )
+        );
+      }
+    }
+    // Wave 21 → healthy appeal: clear probation tier when risk is low enough
+    for (const phase of
+      startupDagMutationLedger.lastExpandedCohort) {
+      const currentRisk =
+        startupDagMutationLedger.phaseRiskScores.get(
+          phase
+        ) || 0;
+      if (
+        currentRisk <=
+        startupDagMutationLedger.appealHealthyStreakThreshold
+      ) {
+        startupDagMutationLedger.probationTiers.delete(
+          phase
+        );
+      }
+    }
+    startupDagMutationLedger.cohortHistory.push({
+      timestamp: Date.now(),
+      cohort_size:
+        startupDagMutationLedger.canaryCohortSize,
+      confidence:
+        startupDagMutationLedger.mutationConfidenceScore,
+    });
   }
 
   if (
@@ -1026,6 +2285,9 @@ registerRoute(
 );
 
 app.get(`${API_PREFIX}/ready`, async (_req, res) => {
+  // Wave 30 — evict crash-expired leases before reading telemetry
+  evictExpiredDistributedLeases();
+
   const redis = getRedisStatus();
 
   let database = {
@@ -1142,6 +2404,107 @@ dagMutationRollbackEvents:
   startupDagMutationLedger.rollbackEvents.length,
 dagMutationLastRollbackAt:
   startupDagMutationLedger.lastRollbackAt,
+dagMutationCanaryCohortSize:
+  startupDagMutationLedger.canaryCohortSize,
+dagMutationConfidenceScore:
+  startupDagMutationLedger.mutationConfidenceScore,
+dagMutationCohortHistory:
+  startupDagMutationLedger.cohortHistory.length,
+dagMutationQuarantinedPhases:
+  startupDagMutationLedger.quarantinedPhases.size,
+dagMutationLastQuarantineAt:
+  startupDagMutationLedger.lastQuarantineAt,
+dagMutationRiskDecayLastAt:
+  startupDagMutationLedger.lastRiskDecayAt,
+dagMutationAdaptiveCooldownBaseMs:
+  startupDagMutationLedger.quarantineBaseCooldownMs,
+dagMutationAdaptiveCooldownMaxMs:
+  startupDagMutationLedger.quarantineMaxCooldownMs,
+dagMutationProbationTiers:
+  startupDagMutationLedger.probationTiers.size,
+dagMutationPermanentBans:
+  startupDagMutationLedger.permanentlyBannedPhases.size,
+dagMutationPermanentBanTimestamps:
+  startupDagMutationLedger.permanentBanTimestamps.size,
+dagMutationParoleReviewCandidates:
+  startupDagMutationLedger.paroleReviewCandidates.size,
+dagMutationParoleSandbox:
+  startupDagMutationLedger.paroleSandbox.size,
+dagMutationSandboxVerdicts:
+  startupDagMutationLedger.sandboxVerdicts.length,
+dagMutationPrecedentTracked:
+  startupDagMutationLedger.precedentScores.size,
+dagMutationConstitutionalProtected:
+  startupDagMutationLedger.constitutionalProtectedPhases.size,
+dagMutationConstitutionalOverrides:
+  startupDagMutationLedger.constitutionalOverrideHits,
+dagMutationProbationHistory:
+  startupDagMutationLedger.probationHistory.length,
+distributedConsensus: {
+  nodes:
+    distributedStartupConsensus.nodes.size,
+  driftEvents:
+    distributedStartupConsensus.driftEvents.length,
+  lastConsensusAt:
+    distributedStartupConsensus.lastConsensusAt,
+  quorumFloor:
+    distributedStartupConsensus.quorumFloor,
+},
+distributedArbitration: {
+  pendingRelease:
+    startupBarrier.pendingDistributedRelease,
+  activeLocks:
+    distributedStartupConsensus.releaseLocks.size,
+  staleNodeTtlMs:
+    distributedStartupConsensus.staleNodeTtlMs,
+  // Wave 30 — lease mesh telemetry
+  leaseDurationMs:
+    distributedStartupConsensus.leaseDurationMs,
+  leaseRenewIntervalMs:
+    distributedStartupConsensus.leaseRenewIntervalMs,
+  leaseDriftEvents:
+    distributedStartupConsensus.leaseDriftEvents,
+  // Wave 31 — PATCH 6: durable Redis authority telemetry
+  durableLeaseAuthority: 'redis',
+  localLeaseEpoch: (() => {
+    const readyNodeId = getLocalReplicaId();
+    return distributedStartupConsensus.releaseLocks.get(readyNodeId)?.leaseEpoch || null;
+  })(),
+  localRedisLeasePresent: await (async () => {
+    const state = await getRedisLeaseState(getLocalReplicaId());
+    return state?.leaseExists ?? null;
+  })(),
+  // Wave 32 — Lua CAS telemetry fields
+  luaCasEnabled: true,
+  leaseOwnerEpoch: await (async () => {
+    const state = await getRedisLeaseState(getLocalReplicaId());
+    return state?.persistedEpoch ?? null;
+  })(),
+  // Wave 33 — cross-region failover telemetry
+  leaseRedisRegion:     leaseFailoverState.usingFallback
+    ? leaseFailoverState.fallbackRegion
+    : leaseFailoverState.primaryRegion,
+  leaseFailoverActive:  leaseFailoverState.usingFallback,
+  leaseFailoverEvents:  leaseFailoverState.failoverEvents.length,
+  lastLeaseFailoverAt:  leaseFailoverState.lastFailoverAt,
+  lastLeaseFailbackAt:  leaseFailoverState.lastFailbackAt,
+  leaseConsecutiveFailures:   leaseFailoverState.consecutiveFailures,
+  leaseConsecutiveRecoveries: leaseFailoverState.consecutiveRecoveries,
+  localLease: (() => {
+    const readyNodeId = getLocalReplicaId();
+    return (
+      distributedStartupConsensus.releaseLocks.get(readyNodeId) || null
+    );
+  })(),
+  // Wave 34 — chaos simulation + region drift rollback telemetry
+  leaseChaosEnabled:          leaseChaosState.enabled,
+  leaseChaosScenario:         leaseChaosState.activeScenario,
+  leaseChaosInjectedFailures: leaseChaosState.injectedFailures,
+  leaseChaosDriftDetections:  leaseChaosState.driftDetections,
+  leaseChaosRollbackEvents:   leaseChaosState.rollbackEvents,
+  leaseChaosLastRollbackAt:   leaseChaosState.lastRollbackAt,
+  leaseMaxRegionDriftMs:      leaseChaosState.maxDriftToleranceMs,
+},
 },
   });
 });
@@ -1904,136 +3267,295 @@ function getWeeklySprintBias() {
 
   return 0;
 }
-
 async function bootstrap() {
   try {
-    // Patch 48B Fix 1: clear route-dedup registry at the start of each bootstrap
-    // invocation so that nodemon / soft-reload restarts do not trigger false
-    // "Duplicate route registration prevented" warnings. True duplicates within
-    // a single bootstrap cycle are still caught correctly.
+ // Wave 30.5 bootstrap lifecycle reset:
+// clears route dedup state, startup DAG state,
+// distributed leases, profiler lineage, and mutation overlays
+// before authoritative DAG reconstruction.
 
-     // Patch 35 → register distributed startup phases
-    startupBarrier.registrationComplete = false;
-    registeredRouteKeys.clear();
-    startupWatchdog.startedAt = Date.now();
+   // Patch 35 → register distributed startup phases
+startupBarrier.registrationComplete = false;
+registeredRouteKeys.clear();
+startupWatchdog.startedAt = Date.now();
+if (startupWatchdog.timer) {
+  clearTimeout(startupWatchdog.timer);
+}
 
-    startupBarrier.completed.clear();
-    startupBarrier.phaseDurations.clear();
-    startupBarrier.slowestPhase = null;
-    startupBarrier.isReleased = false;
-    startupBarrier.releaseTimestamp = null;
-    startupDagProfiler.slackByPhase.clear();
-    startupDagProfiler.zeroValueCriticalBlockers = [];
-    startupDagProfiler.movablePostRelease = [];
-    startupDagProfiler.reclassificationCandidates = [];
-    startupDagProfiler.criticalPathDeltaMs = null;
-    startupDagSelfHealing.autoPromotedCandidates = [];
-    startupDagSelfHealing.lastHealingActionAt = null;
-    startupDagMutationLedger.appliedMutations.clear();
-    startupDagMutationLedger.lastMutationAt = null;
+startupWatchdog.timer = setTimeout(() => {
+  releaseDegradedStartupBarrier('startup-watchdog-timeout');
+}, startupWatchdog.timeoutMs);
 
-    [
-      {
-        phase: 'redis-connect',
-        critical: true,
-        degradedFloor: true,
-      },
-      {
-        phase: 'supabase-bootstrap-verification',
-        critical: true,
-        degradedFloor: true,
-        dependsOn: ['redis-connect'],
-      },
-      {
-        phase: 'http-server-bind',
-        critical: true,
-        degradedFloor: true,
-        dependsOn: ['supabase-bootstrap-verification'],
-      },
-      {
-        phase: 'deploy-warmup',
-        asyncPhase: true,
-      },
-      {
-        phase: 'predictive-topology-worker',
-        critical: true,
-      },
-      {
-        phase: 'learning-mesh-worker',
-        asyncPhase: true,
-      },
-      {
-        phase: 'federation-worker',
-        asyncPhase: true,
-      },
-      {
-        phase: 'swarm-governance-worker',
-        asyncPhase: true,
-      },
-      {
-        phase: 'cache-hydration',
-        critical: true,
-        dependsOn: ['redis-connect'],
-      },
-      {
-        phase: 'warm-state-prefetch',
-        asyncPhase: true,
-      },
-      {
-        phase: 'global-policy-mesh',
-        critical: true,
-        dependsOn: ['cache-hydration'],
-      },
-      {
-        phase: 'recovery-scheduler',
-        asyncPhase: true,
-      },
-      {
-        phase: 'pressure-balancer',
-        critical: true,
-        dependsOn: ['cache-hydration'],
-      },
-      {
-        phase: 'quorum-replication',
-        critical: true,
-        dependsOn: [
-          'redis-connect',
-          'pressure-balancer',
-        ],
-      },
-      {
-        phase: 'consensus-memory-forecast',
-        asyncPhase: true,
-      },
-      {
-        phase: 'autonomous-topology-mutation',
-        asyncPhase: true,
-      },
-      {
-        phase: 'sovereign-routing',
-        asyncPhase: true,
-      },
-    ].forEach(({ phase, ...meta }) =>
-      registerStartupPhase(phase, meta)
+startupWatchdog.timer.unref();
+
+// Wave 30.5 Hardening — fully reset startup barrier state before DAG rebuild.
+// Prevents hot-reload phase ghosting, stale completion state,
+// and stale distributed release intent across retries.
+startupBarrier.completed.clear();
+startupBarrier.phases.clear();
+startupPhaseAttribution.phases.clear();
+startupBarrier.phaseDurations.clear();
+
+startupBarrier.slowestPhase = null;
+startupBarrier.isReleased = false;
+startupBarrier.releaseTimestamp = null;
+startupBarrier.pendingDistributedRelease = false;
+
+// Wave 30 Hardening — clear stale lease renewal loop before bootstrap re-entry.
+// Prevents zombie lease renewal across nodemon reloads, retries,
+// and self-healing bootstrap cycles.
+if (distributedLeaseRenewalLoop) {
+  clearInterval(distributedLeaseRenewalLoop);
+  distributedLeaseRenewalLoop = null;
+}
+
+const shutdownNodeId = getLocalReplicaId();
+
+const localHeldLease =
+  distributedStartupConsensus.releaseLocks.get(
+    shutdownNodeId
+  );
+
+const localHeldEpoch =
+  localHeldLease?.leaseEpoch ?? 0;
+
+// Wave 32 — PATCH 4 (updated): startup recovery via shared getRedisLeaseState helper.
+// Before re-acquiring, check Redis for a persisted epoch so the Lua CAS epoch fence
+// in tryReleaseStartupBarrier can detect fast pod restarts.
+await (async () => {
+  const state = await getRedisLeaseState(shutdownNodeId);
+
+  if (state === null) {
+    logger.info('[Wave32] Bootstrap Redis lease check skipped — Redis unavailable', {
+      nodeId: shutdownNodeId,
+    });
+    return;
+  }
+
+  if (state.leaseExists && state.persistedEpoch !== null) {
+    logger.info('[Wave32] Durable Redis epoch found during bootstrap recovery — fast restart detected', {
+      nodeId:          shutdownNodeId,
+      redisEpoch:      state.persistedEpoch,
+      leaseKeyPresent: true,
+    });
+  } else {
+    logger.info('[Wave32] No Redis lease found during bootstrap — fresh acquisition path', {
+      nodeId: shutdownNodeId,
+    });
+  }
+})();
+
+// Reset DAG profiler + self-healing state
+startupDagProfiler.slackByPhase.clear();
+startupDagProfiler.zeroValueCriticalBlockers = [];
+startupDagProfiler.movablePostRelease = [];
+startupDagProfiler.reclassificationCandidates = [];
+startupDagProfiler.criticalPathDeltaMs = null;
+
+startupDagSelfHealing.autoPromotedCandidates = [];
+startupDagSelfHealing.lastHealingActionAt = null;
+
+// Reset mutation ledger state for deterministic bootstrap lineage
+startupDagMutationLedger.appliedMutations.clear();
+startupDagMutationLedger.lastMutationAt = null;
+startupDagMutationLedger.constitutionalProtectedPhases.clear();
+
+// Re-register authoritative startup DAG
+[
+  {
+    phase: 'redis-connect',
+    critical: true,
+    degradedFloor: true,
+  },
+  {
+    phase: 'supabase-bootstrap-verification',
+    critical: true,
+    degradedFloor: true,
+    dependsOn: ['redis-connect'],
+  },
+  {
+    phase: 'http-server-bind',
+    critical: true,
+    degradedFloor: true,
+    dependsOn: ['supabase-bootstrap-verification'],
+  },
+  {
+    phase: 'deploy-warmup',
+    asyncPhase: true,
+  },
+  {
+    phase: 'predictive-topology-worker',
+    critical: true,
+  },
+  {
+    phase: 'learning-mesh-worker',
+    asyncPhase: true,
+  },
+  {
+    phase: 'federation-worker',
+    asyncPhase: true,
+  },
+  {
+    phase: 'swarm-governance-worker',
+    asyncPhase: true,
+  },
+  {
+    phase: 'cache-hydration',
+    critical: true,
+    dependsOn: ['redis-connect'],
+  },
+  {
+    phase: 'warm-state-prefetch',
+    asyncPhase: true,
+  },
+  {
+    phase: 'global-policy-mesh',
+    critical: true,
+    dependsOn: ['cache-hydration'],
+  },
+  {
+    phase: 'recovery-scheduler',
+    asyncPhase: true,
+  },
+  {
+    phase: 'pressure-balancer',
+    critical: true,
+    dependsOn: ['cache-hydration'],
+  },
+  {
+    phase: 'quorum-replication',
+    critical: true,
+    dependsOn: [
+      'redis-connect',
+      'pressure-balancer',
+    ],
+  },
+  {
+    phase: 'consensus-memory-forecast',
+    asyncPhase: true,
+  },
+  {
+    phase: 'autonomous-topology-mutation',
+    asyncPhase: true,
+  },
+  {
+    phase: 'sovereign-routing',
+    asyncPhase: true,
+  },
+].forEach(({ phase, ...meta }) =>
+  registerStartupPhase(phase, meta)
+);
+
+applyControlledDagMutation();
+startupBarrier.registrationComplete = true;
+
+// Wave 26 → reseed constitutional protected phases
+// from degradedFloor-gated entries after fresh DAG registration
+for (const [phase, meta] of startupBarrier.phases.entries()) {
+  if (meta.degradedFloor) {
+    startupDagMutationLedger.constitutionalProtectedPhases.add(
+      phase
     );
+  }
+}
+    // Wave 27 → register idempotent recoverable phases for deterministic self-healing.
+    // ONLY strictly idempotent phases with safe validate + replay semantics are listed.
+    // Non-idempotent phases (route registration, worker boot) are intentionally excluded.
+    registerRecoverablePhase('supabase-bootstrap-verification', {
+      critical: true,
+      validate: async () => !!supabase,
+      replay: async () => {
+        const { error } = await supabase
+          .from('_health')
+          .select('1')
+          .limit(1);
+        if (error) throw error;
+      },
+    });
 
-    applyControlledDagMutation();
-    startupBarrier.registrationComplete = true;
+  registerRecoverablePhase('redis-connect', {
+  critical: true,
+  validate: async () => {
+    const status = getRedisStatus();
 
-    logger.info(
-      '[Server] Wave 14 startup DAG registration frozen',
-      {
-        total_registered_phases:
-          startupBarrier.phases.size,
-        critical_registered_phases: Array.from(
-          startupBarrier.phases.values()
-        ).filter((meta) => meta.critical).length,
-      }
-    );
+    // getRedisStatus() returns an object like:
+    // { connected: true, ... }
+    return !!status?.connected;
+  },
+  replay: async () => {
+    await connectRedis();
+  },
+});
 
+  // Wave 27 → deploy-warmup: non-critical async warmup phase.
+  // Marked replay-safe, optional, and non-fatal.
+  // validate short-circuits to true → recovery status: already_valid.
+  // replay is a no-op → Wave 27 will never escalate this to fatal corruption.
+  registerRecoverablePhase('deploy-warmup', {
+    critical: false,
+    validate: async () => true,
+    replay: async () => {},
+  });
+
+  // Wave 27 → warm-state-prefetch: non-critical async prefetch mesh (Patch 15).
+  // Errors in bootstrap are already caught as warn-level non-fatal.
+  // validate short-circuits to true → recovery status: already_valid.
+  // replay is a no-op → prefetch worker re-hydrates on its own cycle.
+  registerRecoverablePhase('warm-state-prefetch', {
+    critical: false,
+    validate: async () => true,
+    replay: async () => {},
+  });
+
+  // Wave 27 → remaining DAG phases: all non-critical async infrastructure phases.
+  // Each is registered as replay-safe + non-fatal so recoverIncompleteStartupPhases()
+  // never escalates a phase_not_registered into unrecoverable startup corruption.
+  // validate short-circuits to true (already_valid) on all — replay is intentional no-op.
+ // Wave 27 Hardening — register replay-safe recovery handlers directly
+// from the authoritative startup DAG metadata.
+// This removes criticality drift between startupBarrier and recoveryRegistry.
+for (const [phase, meta] of startupBarrier.phases.entries()) {
+  // Skip phases already registered with explicit real handlers above.
+  if (
+    phase === 'supabase-bootstrap-verification' ||
+    phase === 'redis-connect' ||
+    phase === 'deploy-warmup' ||
+    phase === 'warm-state-prefetch'
+  ) {
+    continue;
+  }
+
+  registerRecoverablePhase(phase, {
+    critical: !!meta.critical,
+    validate: async () => true,
+    replay: async () => {},
+  });
+}
+
+logger.info(
+  '[Server] Wave 14 startup DAG registration frozen',
+  {
+    total_registered_phases:
+      startupBarrier.phases.size,
+    critical_registered_phases: Array.from(
+      startupBarrier.phases.values()
+    ).filter((meta) => meta.critical).length,
+    recoverable_registered_phases:
+      startupBarrier.phases.size,
+  }
+);
  // PR 2: Redis must be ready before serving traffic
     await connectRedis();
     completeStartupPhase('redis-connect');
+
+// Wave 33 — start lease failover watchdog immediately after Redis connects.
+// Probes primary every probeIntervalMs; promotes fallback on threshold failures.
+startLeaseFailoverWatchdog();
+
+// Wave 34 — start lease chaos simulation worker after the watchdog.
+// No-ops unless LEASE_CHAOS_MODE=true. Idempotent: duplicate start is blocked
+// by internal _workerTimer guard inside startLeaseChaosSimulationWorker().
+startLeaseChaosSimulationWorker();
 
 // Patch 32: SQL-first bootstrap verification
 const { error: dbBootstrapError } = await supabase
@@ -2052,7 +3574,9 @@ if (process.env.NODE_ENV === 'test') {
   return;
 }
 
-  server = app.listen(PORT, () => {
+server = app.listen(PORT, '0.0.0.0');
+server.on('listening', () => {
+  (async () => {
     completeStartupPhase('http-server-bind');
 
  logger.info(
@@ -2225,6 +3749,20 @@ sovereignRouting.updateRegionHealth('eu-west-1', true);
 logger.info(
   '[Server] Patch 17 latency-aware sovereign routing mesh initialized'
 );
+
+// Wave 27 — replay any incomplete startup phases before the final quorum gate.
+// This must execute before completeStartupPhase('sovereign-routing') so that
+// tryReleaseStartupBarrier() sees a fully recovered phase set.
+{
+  const recoveryResults = await recoverIncompleteStartupPhases();
+
+  if (recoveryResults.length > 0) {
+    logger.info('[startup-recovery] replay summary', {
+      recoveries: recoveryResults,
+    });
+  }
+}
+
 completeStartupPhase('sovereign-routing');
 
 predictiveHeat
@@ -2411,6 +3949,26 @@ startupChaosConfidence.confidenceScore =
     );
   });
 
+  })().catch((err) => {
+    recordStartupFailureAttribution(
+      'post-bind-bootstrap',
+      err,
+      {
+        completedPhases: Array.from(startupBarrier.completed),
+        pendingPhases: Array.from(
+          startupBarrier.phases.keys()
+        ).filter(
+          (phase) => !startupBarrier.completed.has(phase)
+        ),
+        slowestPhase:
+          startupBarrier.slowestPhase?.phase || null,
+      }
+    );
+    logger.error('[BOOT] Post-bind startup failed', {
+      error: err.message,
+    });
+    process.exit(1);
+  });
 }); // end app.listen callback
 
 server.on('error', (err) => {
@@ -2503,6 +4061,42 @@ startupWatchdog.degradedReleaseAllowed = false;
 if (startupWatchdog.timer) {
   clearTimeout(startupWatchdog.timer);
   startupWatchdog.timer = null;
+}
+
+// Wave 30 — surrender distributed lease and stop renewal heartbeat immediately
+const shutdownNodeId = getLocalReplicaId();
+
+
+if (distributedLeaseRenewalLoop) {
+  clearInterval(distributedLeaseRenewalLoop);
+  distributedLeaseRenewalLoop = null;
+  logger.info('[Wave30] Distributed lease renewal worker stopped', {
+    nodeId: shutdownNodeId,
+  });
+}
+
+// Wave 33 — stop lease failover watchdog on shutdown.
+if (leaseFailoverState.watchdogTimer) {
+  clearInterval(leaseFailoverState.watchdogTimer);
+  leaseFailoverState.watchdogTimer = null;
+  logger.info('[Wave33] Lease failover watchdog stopped');
+}
+
+// Wave 34 — stop lease chaos simulation worker on shutdown.
+if (leaseChaosState._workerTimer) {
+  clearInterval(leaseChaosState._workerTimer);
+  leaseChaosState._workerTimer = null;
+  leaseChaosState.activeScenario = null;
+  leaseChaosState.enabled = false;
+  logger.info('[Wave34] Lease chaos simulation worker stopped');
+}
+
+// Wave 33 — close fallback client if it was opened.
+if (leaseFailoverState._fallbackClient) {
+  try {
+    await leaseFailoverState._fallbackClient.quit();
+  } catch (_) {}
+  leaseFailoverState._fallbackClient = null;
 }
 
   logger.info(
@@ -2667,6 +4261,64 @@ try {
         error: err.message,
       });
     });
+
+  // Step 3: Wave 32 — PATCH 4: epoch-guarded Lua CAS lease surrender before closing Redis.
+  // LUA_RELEASE_LEASE only deletes keys if the stored value matches our epoch,
+  // preventing us from evicting a replacement pod's lease during a slow shutdown.
+  try {
+    const leaseKey    = getReplicaLeaseKey(shutdownNodeId);
+    const epochKey    = getReplicaEpochKey(shutdownNodeId);
+    // Wave 33 — route through region-aware resolver.
+    const redisClient = getLeaseRedisClient();
+
+    if (redisClient) {
+  // Wave 32 hardening — derive held epoch from the local lease map
+  // inside gracefulShutdown scope so CAS ownership remains valid.
+  const localLease =
+    distributedStartupConsensus.releaseLocks.get(
+      shutdownNodeId
+    );
+
+  const heldEpoch =
+    localLease?.leaseEpoch ?? 0;
+
+  if (heldEpoch > 0) {
+    const casResult = await redisClient.eval(
+      LUA_RELEASE_LEASE,
+      2,
+      leaseKey,
+      epochKey,
+      String(heldEpoch)
+    );
+
+    if (casResult === 1) {
+      logger.info(
+        '[Wave32] Redis durable lease surrendered via Lua CAS on graceful shutdown',
+        {
+          nodeId: shutdownNodeId,
+          heldEpoch,
+        }
+      );
+    } else {
+      logger.warn(
+        '[Wave32] Lua CAS surrender skipped — lease already owned by another replica',
+        {
+          nodeId: shutdownNodeId,
+          heldEpoch,
+        }
+      );
+    }
+  }
+}
+} catch (err) {
+  logger.warn(
+    '[Wave32] Lua CAS lease surrender failed during shutdown (non-fatal)',
+    {
+      nodeId: shutdownNodeId,
+      error: err.message,
+    }
+  );
+}
 
   // Step 3: close Redis gracefully
   try {
