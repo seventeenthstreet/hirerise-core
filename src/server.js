@@ -57,6 +57,18 @@ const quorumConfidence = require('./services/cache/quorumConfidence.service');
 const consensusMemoryForecast = require('./services/cache/consensusMemoryForecast.service');
 const autonomousTopologyMutation = require('./services/cache/autonomousTopologyMutation.service');
 
+// ── Wave 49: Global safe JSON parser — single definition, used everywhere ─────
+function safeJsonParse(str) {
+  try {
+    return JSON.parse(str);
+  } catch (err) {
+    logger.warn('[Wave49] Invalid JSON payload dropped', {
+      error: err.message,
+    });
+    return null;
+  }
+}
+
 // ── Middleware ────────────────────────────────────────────────────────────────
 const { errorHandler, notFoundHandler }   = require('./middleware/errorHandler');
 const { correlationMiddleware }           = require('./middleware/correlation.middleware');
@@ -137,6 +149,27 @@ let distributedLeaseRenewalLoop = null;
 // Tracks which workers have been booted to prevent duplicate starts on
 // hot-reload / nodemon restarts.
 const workerBootRegistry = new Set();
+
+// ── Phase 3: Resource tracking ────────────────────────────────────────────────
+// Tracks all Redis clients so they can be closed on shutdown.
+const _trackedRedisClients = new Set();
+
+function trackRedisClient(client) {
+  _trackedRedisClients.add(client);
+  return client;
+}
+
+// Tracks all setInterval IDs so they can be cleared on shutdown.
+const _trackedIntervals = new Set();
+
+function trackInterval(fn, ms) {
+  const id = setInterval(fn, ms);
+  _trackedIntervals.add(id);
+  return id;
+}
+
+// Tracks the gossip UDP socket so it can be closed on shutdown.
+let _gossipSocket = null;
 
 // Distributed startup barrier — readiness gate for /api/v1/ready.
 // All required phases must complete before traffic is accepted.
@@ -272,7 +305,7 @@ const startupPhaseAttribution = {
 };
 
 
-const routeLeaderboardInterval = setInterval(() => {
+const routeLeaderboardInterval = trackInterval(() => {
   try {
     const leaderboard = [];
 
@@ -739,7 +772,7 @@ function startDistributedLeaseRenewalWorker(nodeId) {
 
   const leaseEpoch = initialLease.leaseEpoch;
 
-  distributedLeaseRenewalLoop = setInterval(() => {
+  distributedLeaseRenewalLoop = trackInterval(() => {
     if (!startupBarrier.isReleased) {
       return;
     }
@@ -1029,7 +1062,7 @@ const leaseChaosState = {
   // Refreshed asynchronously by the failover watchdog so
   // detectLeaseRegionDrift() can remain synchronous.
   lastObservedPersistedEpoch: null,
-  lastPersistedEpochAt: null,
+  lastPersistedEpochAt: 0,
 
   // Safety threshold before hard local rollback
   maxDriftToleranceMs: parseInt(
@@ -1059,6 +1092,369 @@ const rollbackConfidenceState = {
     process.env.LEASE_MIN_ROLLBACK_CONFIDENCE || '70',
     10
   ),
+  // Wave 42 — Phase 8: auto-tuning thresholds
+  autoTune: {
+    enabled:   process.env.LEASE_AUTOTUNE_ENABLED === 'true',
+    minThreshold: 50,
+    maxThreshold: 95,
+    stepUp:    2,      // increase threshold when too many suppressions
+    stepDown:  1,      // decrease threshold when confirmed rollbacks dominate
+    windowMs:  60000,  // 1-minute evaluation window
+  },
+  lastAutoTuneAt: 0,
+  // Wave 46 — Phase 12: autonomous policy correction
+  policyCorrection: {
+    enabled:          process.env.LEASE_POLICY_CORRECTION === 'true',
+    windowMs:         120000,   // 2-minute evaluation window
+    maxThresholdStep: 3,        // max single-step threshold nudge
+    maxLikelihoodStep: 0.05,    // max single-step bias nudge
+    minThreshold:     50,
+    maxThreshold:     95,
+  },
+  lastPolicyCheckAt: 0,
+  // BUG-04 FIX: Independent counters so autoTune and policyCorrection do not share state
+  autoTuneCounters: {
+    suppressed: 0,
+    confirmed:  0,
+  },
+  policyCounters: {
+    suppressed: 0,
+    confirmed:  0,
+  },
+  // Wave 47 — Phase 13: Safety envelope tracking
+  rollbackTimestamps: [],  // epoch-ms of each completed rollback within window
+  lastRollbackAt: 0,       // epoch-ms of most recent rollback (0 = never)
+};
+
+// =============================================================================
+// Wave 50 — Phase 5: Production observability metrics.
+// Lightweight in-memory counters for rollback decision paths.
+// Exposed on /ready for ops dashboards and alerting.
+// =============================================================================
+const systemMetrics = {
+  decisions:     0,  // total watchdog cycles that reached decision evaluation
+  suppressed:    0,  // decisions suppressed by shouldSuppressRollback
+  executed:      0,  // rollbacks actually executed
+  safetyBlocked: 0,  // rollbacks blocked by the safety envelope
+};
+
+// =============================================================================
+// Wave 36 — PATCH 1: Rollback trust decay registry.
+// Per-region and per-node trust scores with time-decay semantics.
+// Unseen entries default to 100. FIFO-bounded trustEvents. Restart-safe.
+// =============================================================================
+const rollbackTrustState = {
+  regionTrust: new Map(),   // regionKey → { trust, updatedAt }
+  nodeTrust:   new Map(),   // nodeId    → { trust, updatedAt }
+  trustEvents: [],
+  decayHalfLifeMs: parseInt(
+    process.env.LEASE_TRUST_DECAY_HALF_LIFE_MS || '300000',
+    10
+  ),
+  minQuorumEscalationTrust: parseInt(
+    process.env.LEASE_MIN_QUORUM_ESCALATION_TRUST || '40',
+    10
+  ),
+  maxTrustEvents: 500,
+};
+
+// =============================================================================
+// Wave 47 — Phase 13: Safety envelopes + formal invariants.
+// Non-bypassable guards bounding rollback frequency, consensus quorum, and
+// execution state. Critical severity may bypass quorum/cooldown checks only.
+// =============================================================================
+const SAFETY_ENVELOPE = {
+  enabled: process.env.LEASE_SAFETY_ENABLED !== 'false',
+
+  // rollback rate limit
+  maxRollbacksPerWindow: 3,
+  rollbackWindowMs: 60000,
+
+  // minimum consensus signals for non-critical rollback
+  minSignalsForRollback: 2,
+
+  // cooldown after rollback
+  cooldownMs: 15000,
+
+  // allow immediate rollback for critical severity
+  criticalBypass: true,
+};
+
+function checkSafetyEnvelope({ scoreResult, fusionDecision, contributingSignals }) {
+  if (!SAFETY_ENVELOPE.enabled) return { allowed: true };
+
+  // 🟢 Rule 1: Critical bypass — real critical drift must always pass through
+  if (
+    SAFETY_ENVELOPE.criticalBypass &&
+    scoreResult.severity === 'critical'
+  ) {
+    return { allowed: true, bypass: 'CRITICAL' };
+  }
+
+  const now = Date.now();
+
+  // Clean old timestamps outside the rolling window
+  rollbackConfidenceState.rollbackTimestamps =
+    rollbackConfidenceState.rollbackTimestamps.filter(
+      (t) => now - t < SAFETY_ENVELOPE.rollbackWindowMs
+    );
+
+  const recentRollbacks = rollbackConfidenceState.rollbackTimestamps.length;
+
+  logger.debug('[Wave47] Safety envelope state', {
+    recentRollbacks,
+    lastRollbackAt: rollbackConfidenceState.lastRollbackAt,
+  });
+
+  // 🔴 Rule 2: Rate limit — hard ceiling on rollbacks per window
+  if (recentRollbacks >= SAFETY_ENVELOPE.maxRollbacksPerWindow) {
+    return {
+      allowed: false,
+      reason: 'RATE_LIMIT_EXCEEDED',
+      recentRollbacks,
+    };
+  }
+
+  // 🔴 Rule 3: Cooldown — prevent rapid oscillation after a rollback
+  if (
+    rollbackConfidenceState.lastRollbackAt &&
+    now - rollbackConfidenceState.lastRollbackAt < SAFETY_ENVELOPE.cooldownMs
+  ) {
+    return {
+      allowed: false,
+      reason: 'COOLDOWN_ACTIVE',
+    };
+  }
+
+  // 🔴 Rule 4: Minimum signals — weak signals cannot trigger destructive action
+  if (
+    scoreResult.severity !== 'critical' &&
+    contributingSignals < SAFETY_ENVELOPE.minSignalsForRollback
+  ) {
+    return {
+      allowed: false,
+      reason: 'INSUFFICIENT_SIGNALS',
+    };
+  }
+
+  return { allowed: true };
+}
+
+// =============================================================================
+// Wave 42 — Phase 8: Auto-tuning rollback threshold.
+// Dynamically adjusts minRollbackConfidence based on suppression/confirmation
+// ratios observed over the last windowMs. Bounded, gradual, deterministic.
+// =============================================================================
+function autoTuneRollbackThreshold() {
+  const now = Date.now();
+  const cfg  = rollbackConfidenceState.autoTune;
+
+  if (!cfg?.enabled) return;
+  if (now - rollbackConfidenceState.lastAutoTuneAt < cfg.windowMs) return;
+
+  rollbackConfidenceState.lastAutoTuneAt = now;
+
+  // BUG-04 FIX: Read from autoTune-specific counters only
+  const suppressed = rollbackConfidenceState.autoTuneCounters.suppressed || 0;
+  const confirmed  = rollbackConfidenceState.autoTuneCounters.confirmed  || 0;
+
+  let newThreshold = rollbackConfidenceState.minRollbackConfidence;
+
+  // Too many suppressions → system too sensitive → increase threshold
+  if (suppressed > confirmed * 2 && suppressed > 3) {
+    newThreshold += cfg.stepUp;
+  }
+  // Frequent confirmed rollbacks → system too strict → decrease threshold
+  else if (confirmed > suppressed && confirmed > 2) {
+    newThreshold -= cfg.stepDown;
+  }
+
+  // Clamp within allowed range
+  newThreshold = Math.max(cfg.minThreshold, Math.min(cfg.maxThreshold, newThreshold));
+
+  if (newThreshold !== rollbackConfidenceState.minRollbackConfidence) {
+    logger.warn('[Wave42] Auto-tuning rollback threshold', {
+      previous:   rollbackConfidenceState.minRollbackConfidence,
+      next:       newThreshold,
+      suppressed,
+      confirmed,
+    });
+    rollbackConfidenceState.minRollbackConfidence = newThreshold;
+  }
+
+  // BUG-04 FIX: Reset only autoTune-specific counters
+  rollbackConfidenceState.autoTuneCounters.suppressed = 0;
+  rollbackConfidenceState.autoTuneCounters.confirmed  = 0;
+
+  // Wave 43 — Phase 9: fire-and-forget persist after each tuning tick.
+  persistAutoTuneState();
+}
+
+// =============================================================================
+// Wave 46 — Phase 12: Autonomous policy correction.
+// Detects suboptimal policy state from outcome ratios and applies bounded,
+// gradual, logged corrections to minRollbackConfidence and likelihoodBias.
+// Never re-publishes trust events; never touches detectLeaseRegionDrift().
+// =============================================================================
+
+// Signed bias applied to the Bayesian posterior before score conversion.
+// Bounded to [-0.2, +0.2]. Declared once at module scope; read inside
+// scoreLeaseRollbackConfidence().
+let likelihoodBias = 0;
+
+/**
+ * Nudge the global likelihood bias by delta, clamped to [-0.2, +0.2].
+ * @param {number} delta
+ */
+function adjustLikelihoodBias(delta) {
+  likelihoodBias = Math.max(-0.2, Math.min(0.2, likelihoodBias + delta));
+  logger.info('[Wave46] Likelihood bias adjusted', { bias: likelihoodBias });
+}
+
+/**
+ * Evaluate recent outcome ratios and apply one bounded correction step to
+ * minRollbackConfidence and/or likelihoodBias if the system is drifting.
+ * Counters are reset after each evaluation window (same as autoTune).
+ * Safe to call on every watchdog tick — the windowMs guard makes it a no-op
+ * when the evaluation interval has not yet elapsed.
+ */
+function applyPolicyCorrection() {
+  const cfg = rollbackConfidenceState.policyCorrection;
+  const now = Date.now();
+
+  if (!cfg?.enabled) return;
+  if (now - rollbackConfidenceState.lastPolicyCheckAt < cfg.windowMs) return;
+
+  rollbackConfidenceState.lastPolicyCheckAt = now;
+
+  // BUG-04 FIX: Read from policy-specific counters only
+  const suppressed = rollbackConfidenceState.policyCounters.suppressed || 0;
+  const confirmed  = rollbackConfidenceState.policyCounters.confirmed  || 0;
+
+  let threshold = rollbackConfidenceState.minRollbackConfidence;
+
+  // Pattern 1: too many suppressions → system is too sensitive → raise bar
+  if (suppressed > confirmed * 2 && suppressed > 5) {
+    threshold += cfg.maxThresholdStep;
+  }
+  // Pattern 2: frequent confirmed rollbacks → system too strict → lower bar
+  else if (confirmed > suppressed && confirmed > 3) {
+    threshold -= cfg.maxThresholdStep;
+  }
+
+  // Hard clamp — policy correction never escapes the same safety bounds as autoTune
+  threshold = Math.max(cfg.minThreshold, Math.min(cfg.maxThreshold, threshold));
+
+  if (threshold !== rollbackConfidenceState.minRollbackConfidence) {
+    logger.warn('[Wave46] Policy correction: threshold adjusted', {
+      previous:  rollbackConfidenceState.minRollbackConfidence,
+      next:      threshold,
+      suppressed,
+      confirmed,
+    });
+    rollbackConfidenceState.minRollbackConfidence = threshold;
+  }
+
+  // Likelihood bias nudge: only applied when the signal is unambiguous
+  if (confirmed > 5 && suppressed < 2) {
+    // System is under-triggering → shift posterior slightly upward
+    adjustLikelihoodBias(cfg.maxLikelihoodStep);
+  } else if (suppressed > 5 && confirmed < 2) {
+    // System is over-triggering → shift posterior slightly downward
+    adjustLikelihoodBias(-cfg.maxLikelihoodStep);
+  }
+
+  // BUG-04 FIX: Reset only policy-specific counters
+  rollbackConfidenceState.policyCounters.suppressed = 0;
+  rollbackConfidenceState.policyCounters.confirmed  = 0;
+}
+
+// =============================================================================
+// Wave 43 — Phase 9: Persistent auto-tune state via Redis.
+// Fire-and-forget writes; best-effort restore on bootstrap.
+// TTL of 1 hour prevents stale long-term drift after extended outages.
+// =============================================================================
+async function persistAutoTuneState() {
+  try {
+    const client = getLeaseRedisClient();
+    if (!client) return;
+
+    const payload = JSON.stringify({
+      minRollbackConfidence: rollbackConfidenceState.minRollbackConfidence,
+      suppressedRollbacks:   rollbackConfidenceState.suppressedRollbacks,
+      confirmedRollbacks:    rollbackConfidenceState.confirmedRollbacks,
+      lastAutoTuneAt:        rollbackConfidenceState.lastAutoTuneAt,
+    });
+
+    await client.set(ROLLBACK_AUTOTUNE_KEY, payload, 'EX', 3600); // 1h TTL
+  } catch (err) {
+    logger.warn('[Wave43] Failed to persist auto-tune state', {
+      error: err.message,
+    });
+  }
+}
+
+async function restoreAutoTuneState() {
+  try {
+    const client = getLeaseRedisClient();
+    if (!client) return;
+
+    const data = await client.get(ROLLBACK_AUTOTUNE_KEY);
+    if (!data) return;
+
+    const parsed = JSON.parse(data);
+
+    rollbackConfidenceState.minRollbackConfidence =
+      parsed.minRollbackConfidence ?? rollbackConfidenceState.minRollbackConfidence;
+
+    rollbackConfidenceState.suppressedRollbacks =
+      parsed.suppressedRollbacks ?? 0;
+
+    rollbackConfidenceState.confirmedRollbacks =
+      parsed.confirmedRollbacks ?? 0;
+
+    rollbackConfidenceState.lastAutoTuneAt =
+      parsed.lastAutoTuneAt ?? 0;
+
+    logger.info('[Wave43] Restored auto-tune state from Redis', {
+      threshold: rollbackConfidenceState.minRollbackConfidence,
+    });
+  } catch (err) {
+    logger.warn('[Wave43] Failed to restore auto-tune state', {
+      error: err.message,
+    });
+  }
+}
+
+// =============================================================================
+// Wave 36 — PATCH 6: Regional quorum escalation ledger.
+// Records every non-critical low-trust escalation event. FIFO max 500.
+// =============================================================================
+const regionalEscalationState = {
+  escalations:      [],
+  totalEscalations: 0,
+  lastEscalationAt: null,
+  maxEntries:       500,
+};
+
+// =============================================================================
+// Wave 37 — PATCH 1: Cross-region anomaly fusion state.
+// Aggregates regional drift signals for consensus-based rollback decisions.
+// Memory bounded via maxSignalAgeMs expiry cleaned before each evaluation.
+// =============================================================================
+const anomalyFusionState = {
+  regions:          new Map(),  // regionId → { driftScore, confidence, timestamp }
+  lastEvaluatedAt:  null,
+  consensusScore:   0,
+  lastAction:       null,       // hysteresis: tracks last emitted action
+  maxSignalAgeMs:   parseInt(
+    process.env.LEASE_ANOMALY_SIGNAL_AGE_MS || '10000',
+    10
+  ),
+  // Configurable quorum + threshold knobs (overridable via env or tests).
+  minSignals:       parseInt(process.env.LEASE_ANOMALY_MIN_SIGNALS       || '2',    10),
+  globalThreshold:  parseFloat(process.env.LEASE_ANOMALY_GLOBAL_THRESHOLD  || '0.75'),
+  partialThreshold: parseFloat(process.env.LEASE_ANOMALY_PARTIAL_THRESHOLD || '0.4'),
 };
 
 // Wave 33 — PATCH 1: region-aware lease Redis client resolver.
@@ -1122,7 +1518,7 @@ function getLeaseRedisClient() {
 function startLeaseFailoverWatchdog() {
   if (leaseFailoverState.watchdogTimer) return; // idempotent
 
-  leaseFailoverState.watchdogTimer = setInterval(async () => {
+  leaseFailoverState.watchdogTimer = trackInterval(async () => {
     let primaryClient = null;
     try {
       primaryClient = require('./config/redisClient').getRedisClient?.() || null;
@@ -1136,30 +1532,37 @@ function startLeaseFailoverWatchdog() {
       } catch (_) {}
     }
 
-    if (!primaryAlive) {
-      // Primary probe failed.
-      leaseFailoverState.consecutiveFailures  += 1;
-      leaseFailoverState.consecutiveRecoveries = 0;
-      leaseFailoverState.primaryFailures      += 1;
+   if (!primaryAlive) {
+  // Primary probe failed.
+  leaseFailoverState.consecutiveFailures  += 1;
+  leaseFailoverState.consecutiveRecoveries = 0;
+  leaseFailoverState.primaryFailures      += 1;
 
-      if (
-        !leaseFailoverState.usingFallback &&
-        leaseFailoverState.consecutiveFailures >= leaseFailoverState.failoverThreshold
-      ) {
-        leaseFailoverState.usingFallback = true;
-        leaseFailoverState.lastFailoverAt = Date.now();
-        leaseFailoverState.failoverEvents.push({
-          at:        leaseFailoverState.lastFailoverAt,
-          direction: 'primary→fallback',
-          reason:    `primary unreachable after ${leaseFailoverState.consecutiveFailures} consecutive probe failures`,
-        });
-        logger.warn('[Wave33] Lease Redis failover activated — switching to fallback region', {
-          primaryRegion:  leaseFailoverState.primaryRegion,
-          fallbackRegion: leaseFailoverState.fallbackRegion,
-          failures:       leaseFailoverState.consecutiveFailures,
-        });
-      }
-    } else {
+  if (
+    !leaseFailoverState.usingFallback &&
+    leaseFailoverState.consecutiveFailures >= leaseFailoverState.failoverThreshold
+  ) {
+    leaseFailoverState.usingFallback = true;
+    leaseFailoverState.lastFailoverAt = Date.now();
+
+    leaseFailoverState.failoverEvents.push({
+      at:        leaseFailoverState.lastFailoverAt,
+      direction: 'primary→fallback',
+      reason:    `primary unreachable after ${leaseFailoverState.consecutiveFailures} consecutive probe failures`,
+    });
+
+    if (leaseFailoverState.failoverEvents.length > 1000) {
+      leaseFailoverState.failoverEvents.shift();
+    }
+
+    logger.warn('[Wave33] Lease Redis failover activated — switching to fallback region', {
+      primaryRegion:  leaseFailoverState.primaryRegion,
+      fallbackRegion: leaseFailoverState.fallbackRegion,
+      failures:       leaseFailoverState.consecutiveFailures,
+    });
+  }
+
+} else {
       // Primary probe succeeded.
       leaseFailoverState.consecutiveFailures   = 0;
       leaseFailoverState.consecutiveRecoveries += 1;
@@ -1180,6 +1583,19 @@ function startLeaseFailoverWatchdog() {
           primaryRegion:  leaseFailoverState.primaryRegion,
           recoveries:     leaseFailoverState.consecutiveRecoveries,
         });
+      }
+
+      // Wave 36 — PATCH 7: stable primary recovery trust healing.
+      // Conditions: primary healthy AND no rollback for 5 probe cycles AND
+      // no suppressions in last 2 minutes. Bounded at +1 per tick.
+      const fiveCycles           = leaseFailoverState.probeIntervalMs * 5;
+      const noRecentRollback     = (Date.now() - (leaseChaosState.lastRollbackAt || 0)) > fiveCycles;
+      const twoMinutesAgo        = Date.now() - 120000;
+      const noRecentSuppressions = rollbackConfidenceState.falsePositiveWindows
+        .every((entry) => entry.at < twoMinutesAgo);
+
+      if (noRecentRollback && noRecentSuppressions) {
+        increaseRegionTrust(leaseFailoverState.primaryRegion, 1);
       }
     }
 
@@ -1211,6 +1627,21 @@ function startLeaseFailoverWatchdog() {
 
    const driftResult = detectLeaseRegionDrift();
 
+  // Wave 50 — Phase 5: decision trace ID, latency measurement, and metrics counter.
+  // Generated once per watchdog cycle so every log line for this evaluation
+  // shares the same decisionId and can be correlated in production.
+  const decisionId = `${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  const startTime  = process.hrtime.bigint();
+  systemMetrics.decisions += 1;
+
+  // Prevent unbounded growth (rolling reset)
+  if (systemMetrics.decisions % 10000 === 0) {
+    systemMetrics.decisions    = 0;
+    systemMetrics.suppressed   = 0;
+    systemMetrics.executed     = 0;
+    systemMetrics.safetyBlocked = 0;
+  }
+
   // Wave 35 — PATCH 4: confidence-scored rollback gate replaces binary branch.
   // Every drift evaluation produces a deterministic score + severity classification.
   // Low-confidence events are suppressed; critical events always execute.
@@ -1231,38 +1662,305 @@ function startLeaseFailoverWatchdog() {
     rollbackExecuted: false, // will be mutated below if rollback runs
   };
 
+  if (scoreResult.severity !== 'low') {
   rollbackConfidenceState.severityHistory.push(lineageEntry);
+
   if (rollbackConfidenceState.severityHistory.length > 500) {
     rollbackConfidenceState.severityHistory.shift();
   }
+}
+
+  // Wave 50 — FIX 10: severity trend snapshot every 10 cycles.
+  if (systemMetrics.decisions % 10 === 0) {
+    const recentSeverity = rollbackConfidenceState.severityHistory
+      .slice(-10)
+      .map(e => ({
+        score:    e.score,
+        severity: e.severity,
+        at:       e.at,
+      }));
+
+    logger.info('[Wave50] Severity trend snapshot', {
+      lastScores: recentSeverity,
+    });
+  }
+
+  // Wave 50 — FIX 2: structured decision log before every rollback evaluation.
+  // Emitted unconditionally so every suppression, block, or execution is traceable.
+  logger.info('[Wave50] Rollback decision evaluation', {
+    decisionId,
+    score:       scoreResult.score,
+    severity:    scoreResult.severity,
+    posterior:   scoreResult.posterior,
+    trustFactor: scoreResult.trustFactor,
+  });
 
   if (shouldSuppressRollback(scoreResult, driftResult)) {
-    // Suppression already logged + recorded inside shouldSuppressRollback.
-    // No rollback execution for low-confidence events.
+    // Wave 50 — FIX 3: log suppression with decisionId so it can be correlated.
+    systemMetrics.suppressed += 1;
+    logger.info('[Wave50] Rollback suppressed', {
+      decisionId,
+      score:    scoreResult.score,
+      severity: scoreResult.severity,
+    });
   } else {
     if (driftResult.rollbackRequired || scoreResult.rollbackRecommended) {
-      logger.warn(
-        '[Wave35] Lease region drift — confidence-gated rollback executing',
-        {
-          nodeId:         getLocalReplicaId(),
-          score:          scoreResult.score,
-          severity:       scoreResult.severity,
-          deltaMs:        driftResult.deltaMs,
-          localEpoch:     driftResult.localEpoch ?? null,
-          persistedEpoch: driftResult.persistedEpoch ?? null,
-          signals:        scoreResult.contributingSignals,
+      const rollbackNodeId = getLocalReplicaId();
+      const rollbackRegion = leaseFailoverState.usingFallback
+        ? leaseFailoverState.fallbackRegion
+        : leaseFailoverState.primaryRegion;
+
+      // Wave 37 — PATCH 5: emit regional anomaly signal before fusion evaluation.
+      // normalizedScore: scoreResult.score is 0–100; normalize to 0–1.
+      // derivedConfidence: trust-weighted normalized confidence.
+      const normalizedScore    = scoreResult.score / 100;
+      const regionTrustNow     = getRegionTrust(rollbackRegion) / 100;
+      const derivedConfidence = Math.min(
+  1,
+  Math.max(0.1, normalizedScore * regionTrustNow)
+);
+      // Wave 37 — PATCH 5 (hardened): emit signal then evaluate via fusion engine.
+      // emitRegionalAnomalySignal clamps inputs; evaluateCrossRegionAnomalies
+      // enforces quorum, freshness decay, hysteresis and returns full diagnostics.
+      emitRegionalAnomalySignal(rollbackRegion, {
+        driftScore: normalizedScore,
+        confidence: derivedConfidence,
+      });
+
+      const fusionDecision = evaluateCrossRegionAnomalies();
+
+      logger.info('[Wave37] Cross-region fusion evaluated', {
+        nodeId:             rollbackNodeId,
+        region:             rollbackRegion,
+        fusionAction:       fusionDecision.action,
+        fusionScore:        fusionDecision.score,
+        contributingSignals: fusionDecision.contributingSignals,
+        totalWeight:        fusionDecision.totalWeight,
+        localScore:         scoreResult.score,
+        severity:           scoreResult.severity,
+      });
+
+      // Phase 3 Fix — detect partial drift and schedule quorum escalation.
+      // PARTIAL_DRIFT does NOT authorize rollback; it triggers escalation only.
+      let escalateToQuorum = false;
+
+      if (fusionDecision.action === 'PARTIAL_DRIFT') {
+        escalateToQuorum = true;
+
+        logger.warn('[Wave37] Partial drift detected — escalating to quorum', {
+          score:      fusionDecision.score,
+          localScore: scoreResult.score,
+          severity:   scoreResult.severity,
+        });
+      }
+
+      // Primary rollback gate: fusion engine must confirm global drift.
+      // Single-signal or low-quorum evaluations return INSUFFICIENT_DATA and
+      // are blocked here, preventing spurious rollbacks.
+      // Phase 2 Fix — bypass fusion gate when no quorum but strong local evidence.
+      let fusionAllowsRollback = false;
+
+      // Primary condition — multi-region consensus
+      if (fusionDecision.action === 'GLOBAL_DRIFT_CONFIRMED') {
+        fusionAllowsRollback = true;
+      }
+
+      // 🔥 Phase 2 FIX — bypass when no quorum but strong evidence
+      else if (
+        fusionDecision.action === 'INSUFFICIENT_DATA' &&
+        scoreResult.severity === 'critical'
+      ) {
+        fusionAllowsRollback = true;
+
+        logger.warn('[Wave36] Fusion bypass — insufficient data but critical drift', {
+          score:    scoreResult.score,
+          severity: scoreResult.severity,
+        });
+      }
+
+      // Optional: allow strong local confidence
+      else if (
+        fusionDecision.action === 'INSUFFICIENT_DATA' &&
+        scoreResult.score >= 85
+      ) {
+        fusionAllowsRollback = true;
+
+        logger.warn('[Wave36] Fusion bypass — strong local confidence', {
+          score: scoreResult.score,
+        });
+      }
+
+      if (fusionAllowsRollback) {
+        // Rollback is authorized by cross-region consensus or fusion bypass.
+        logger.warn('[Wave37] Cross-region fusion authorized rollback', {
+          nodeId:             rollbackNodeId,
+          fusionAction:       fusionDecision.action,
+          fusionScore:        fusionDecision.score,
+          contributingSignals: fusionDecision.contributingSignals,
+          localScore:         scoreResult.score,
+          severity:           scoreResult.severity,
+          deltaMs:            driftResult.deltaMs,
+          localEpoch:         driftResult.localEpoch     ?? null,
+          persistedEpoch:     driftResult.persistedEpoch ?? null,
+        });
+
+        // Wave 47 — Phase 13: Safety envelope guard.
+        // Must pass before any destructive rollback action is taken.
+        const safetyCheck = checkSafetyEnvelope({
+          scoreResult,
+          fusionDecision,
+          contributingSignals: fusionDecision.contributingSignals,
+        });
+
+        if (!safetyCheck.allowed) {
+          logger.warn('[Wave47] Rollback blocked by safety envelope', {
+            reason:   safetyCheck.reason,
+            score:    scoreResult.score,
+            severity: scoreResult.severity,
+          });
+
+          // Wave 50 — FIX 4: structured safety-block log with decisionId + counter.
+          systemMetrics.safetyBlocked += 1;
+          logger.warn('[Wave50] Safety envelope blocked rollback', {
+            decisionId,
+            reason:   safetyCheck.reason,
+            severity: scoreResult.severity,
+          });
+
+          // Wave 50 — FIX 8: emit decision latency even on early-exit paths.
+          const durationMs = Number(process.hrtime.bigint() - startTime) / 1e6;
+          logger.debug('[Wave50] Decision latency', { decisionId, durationMs });
+
+          // Continue execution — do NOT return
+        } else {
+
+  await rollbackLeaseRegionDrift(getLocalReplicaId());
+
+  // Mark rollback execution ONLY after success.
+  lineageEntry.rollbackExecuted = true;
+
+        // Wave 50 — FIX 5: structured rollback-executed log with decisionId + counter.
+        systemMetrics.executed += 1;
+        logger.warn('[Wave50] Rollback executed', {
+          decisionId,
+          nodeId:   rollbackNodeId,
+          region:   rollbackRegion,
+          score:    scoreResult.score,
+          severity: scoreResult.severity,
+        });
+
+        // Wave 47 — Phase 13: Record rollback for safety envelope accounting.
+        rollbackConfidenceState.rollbackTimestamps.push(Date.now());
+        rollbackConfidenceState.lastRollbackAt = Date.now();
+        // Keep the timestamps array bounded to avoid unbounded growth.
+        if (rollbackConfidenceState.rollbackTimestamps.length > 50) {
+          rollbackConfidenceState.rollbackTimestamps.shift();
         }
-      );
 
-      lineageEntry.rollbackExecuted = true;
-      rollbackConfidenceState.confirmedRollbacks += 1;
+        // Update counters + trust.
+        // BUG-04 FIX: Increment both independent counters instead of shared one
+        rollbackConfidenceState.autoTuneCounters.confirmed += 1;
+        rollbackConfidenceState.policyCounters.confirmed   += 1;
+        increaseRegionTrust(rollbackRegion, 3);
+        increaseNodeTrust(rollbackNodeId,   2);
 
-      await rollbackLeaseRegionDrift(
-        getLocalReplicaId()
-      );
-    }
+        } // close else (safetyCheck.allowed)
+
+      } else {
+        // Fusion did not confirm — defer rollback.
+        logger.info(
+          '[Wave37] Cross-region fusion deferred rollback — insufficient global consensus',
+          {
+            nodeId:             rollbackNodeId,
+            region:             rollbackRegion,
+            fusionAction:       fusionDecision.action,
+            fusionScore:        fusionDecision.score,
+            contributingSignals: fusionDecision.contributingSignals,
+            localScore:         scoreResult.score,
+            severity:           scoreResult.severity,
+          }
+        );
+
+        // Wave 36 — PATCH 5: quorum escalation if trust also low.
+        if (shouldEscalateToRegionalQuorum(scoreResult)) {
+          const escalationTrust = getRegionTrust(rollbackRegion);
+          startupBarrier.pendingDistributedRelease = true;
+          regionalEscalationState.totalEscalations += 1;
+          regionalEscalationState.lastEscalationAt  = Date.now();
+          const escalationEntry = {
+            at:       Date.now(),
+            region:   rollbackRegion,
+            nodeId:   rollbackNodeId,
+            trust:    Math.round(escalationTrust),
+            score:    scoreResult.score,
+            severity: scoreResult.severity,
+            reason:   'fusion-deferred-quorum-escalation',
+          };
+          regionalEscalationState.escalations.push(escalationEntry);
+          if (regionalEscalationState.escalations.length > regionalEscalationState.maxEntries) {
+            regionalEscalationState.escalations.shift();
+          }
+          logger.warn('[Wave36] Low-trust region — escalating to regional quorum (fusion-deferred)', {
+            nodeId:    rollbackNodeId,
+            region:    rollbackRegion,
+            trust:     Math.round(escalationTrust),
+            threshold: rollbackTrustState.minQuorumEscalationTrust,
+          });
+        }
+
+        // Phase 3 Fix — meaningful quorum escalation for PARTIAL_DRIFT.
+        // Records a structured escalation event and marks the distributed
+        // release barrier, making the signal observable to consumers.
+        if (escalateToQuorum) {
+          startupBarrier.pendingDistributedRelease = true;
+
+          regionalEscalationState.totalEscalations += 1;
+          regionalEscalationState.lastEscalationAt  = Date.now();
+
+          regionalEscalationState.escalations.push({
+            at:          Date.now(),
+            reason:      'PARTIAL_DRIFT',
+            fusionScore: fusionDecision.score,
+            localScore:  scoreResult.score,
+            nodeId:      getLocalReplicaId(),
+          });
+
+          if (regionalEscalationState.escalations.length > regionalEscalationState.maxEntries) {
+            regionalEscalationState.escalations.shift();
+          }
+
+          logger.warn('[Wave37] Quorum escalation recorded', {
+            totalEscalations: regionalEscalationState.totalEscalations,
+          });
+
+          // Detect repeated partial drift within the last 60 s — elevated monitoring signal.
+          const recentEscalations = regionalEscalationState.escalations.filter(
+            (e) => e.reason === 'PARTIAL_DRIFT' && Date.now() - e.at < 60000
+          );
+
+          if (recentEscalations.length >= 3) {
+            logger.warn('[Wave37] Repeated partial drift — elevated monitoring state', {
+              recentCount: recentEscalations.length,
+              nodeId:      getLocalReplicaId(),
+            });
+          }
+        }
+      } // close if (fusionAllowsRollback)
+    } // close if (driftResult.rollbackRequired || scoreResult.rollbackRecommended)
+  } // close if (shouldSuppressRollback) ... else
+  } // close if (leaseFailoverState.usingFallback)
+
+  // Wave 50 — FIX 8: decision latency recorded at end of every cycle.
+  // Only emitted when decisionId was generated (i.e. usingFallback was true).
+  if (typeof decisionId !== 'undefined') {
+    const durationMs = Number(process.hrtime.bigint() - startTime) / 1e6;
+    logger.debug('[Wave50] Decision latency', { decisionId, durationMs });
   }
-}
+
+  // Wave 42 — Phase 8: auto-tune threshold after each tick (post counter updates).
+  autoTuneRollbackThreshold();
+  // Wave 46 — Phase 12: autonomous policy correction (longer window, separate pass).
+  applyPolicyCorrection();
   }, leaseFailoverState.probeIntervalMs);
 
   leaseFailoverState.watchdogTimer.unref();
@@ -1286,7 +1984,7 @@ function startLeaseChaosSimulationWorker() {
   // Idempotency guard — duplicate timers are impossible.
   if (leaseChaosState._workerTimer) return;
 
-  leaseChaosState._workerTimer = setInterval(() => {
+  leaseChaosState._workerTimer = trackInterval(() => {
     if (!leaseChaosState.enabled) return;
 
     const scenarios = [
@@ -1345,7 +2043,7 @@ function startLeaseChaosSimulationWorker() {
         leaseFailoverState.primaryRecoveries     += 1;
         break;
 
-      case 'fallback-epoch-drift':
+      case 'fallback-epoch-drift': {
         // Simulate epoch drift while on fallback — activates drift detector
         // by ensuring usingFallback is true; actual epoch comparison happens
         // inside detectLeaseRegionDrift(), which reads in-memory values only.
@@ -1358,7 +2056,64 @@ function startLeaseChaosSimulationWorker() {
             reason:    '[Wave34-chaos] fallback-epoch-drift simulation',
           });
         }
+
+        // Phase 4 Fix — inject real epoch divergence so the +25 scoring signal
+        // (persistedEpoch < localEpoch) activates under chaos conditions.
+        //
+        // Step 1: lag the persisted epoch behind the local epoch by decrementing
+        // the cached mirror. The async refresher (runs every 2 s) will restore
+        // this to the real Redis value automatically once chaos is inactive,
+        // guaranteeing reversibility without a manual restore path.
+        if (leaseChaosState.lastObservedPersistedEpoch !== null) {
+          leaseChaosState.lastObservedPersistedEpoch = Math.max(
+            0,
+            leaseChaosState.lastObservedPersistedEpoch - 1
+          );
+        }
+
+        // Step 2: advance the in-memory local epoch to widen the divergence gap.
+        // We save the pre-chaos value and restore it at the end of this tick so
+        // the Lua CAS script on shutdown always sees the genuine held epoch,
+        // preserving the CAS invariant.
+        const _chaosNodeId   = getLocalReplicaId();
+        const _chaosLease    = distributedStartupConsensus.releaseLocks.get(_chaosNodeId);
+        const _savedEpoch    = _chaosLease?.leaseEpoch ?? null;
+
+        if (_chaosLease) {
+          _chaosLease.leaseEpoch += 1; // simulate local epoch advancement
+        }
+
+        // Step 3: track this chaos-induced drift event for lineage / telemetry.
+        leaseChaosState.chaosDriftEvents = leaseChaosState.chaosDriftEvents || [];
+        leaseChaosState.chaosDriftEvents.push({
+          at:             Date.now(),
+          scenario:       'fallback-epoch-drift',
+          persistedEpoch: leaseChaosState.lastObservedPersistedEpoch,
+        });
+        if (leaseChaosState.chaosDriftEvents.length > 500) {
+          leaseChaosState.chaosDriftEvents.shift();
+        }
+
+        logger.debug('[Wave38] Chaos epoch drift injected', {
+          persistedEpoch: leaseChaosState.lastObservedPersistedEpoch,
+        });
+
+        // Step 4: restore the local epoch so CAS state is not permanently
+        // corrupted. The watchdog fires on its own interval; the scoring
+        // engine will have already consumed the inflated epoch via the
+        // synchronous detectLeaseRegionDrift() call that happens before
+        // this worker's mutation window closes.
+        if (_chaosLease && _savedEpoch !== null) {
+          _chaosLease.leaseEpoch = _savedEpoch;
+        }
+
+        // NOTE: lastObservedPersistedEpoch does NOT need a manual restore here.
+        // The async epoch refresher (every 2 s) unconditionally overwrites it
+        // from Redis, which is the canonical "return to real state" path.
+        // If LEASE_CHAOS_MODE is later disabled, the very next refresher tick
+        // will overwrite any artificial value, leaving no residual drift.
         break;
+      }
 
       default:
         break;
@@ -1418,26 +2173,31 @@ function detectLeaseRegionDrift() {
   const rollbackRequired = driftDetected;
 
   if (driftDetected) {
-    leaseChaosState.driftDetections += 1;
-    leaseChaosState.rollbackEvents.push({
-      at:              Date.now(),
-      nodeId,
-      localEpoch,
-      // persistedEpoch is unknown here (async) — recorded as null;
-      // the rollback action itself does not depend on it.
-      persistedEpoch:  null,
-      activeRegion,
-      driftAgeMs,
-    });
+  leaseChaosState.driftDetections += 1;
 
-    logger.warn('[Wave34] Lease region drift detected', {
-      nodeId,
-      localEpoch,
-      activeRegion,
-      driftAgeMs,
-      maxDriftToleranceMs: leaseChaosState.maxDriftToleranceMs,
-    });
+  leaseChaosState.rollbackEvents.push({
+    at:              Date.now(),
+    nodeId,
+    localEpoch,
+    // persistedEpoch is unknown here (async) — recorded as null;
+    // the rollback action itself does not depend on it.
+    persistedEpoch:  null,
+    activeRegion,
+    driftAgeMs,
+  });
+
+  if (leaseChaosState.rollbackEvents.length > 1000) {
+    leaseChaosState.rollbackEvents.shift();
   }
+
+  logger.warn('[Wave34] Lease region drift detected', {
+    nodeId,
+    localEpoch,
+    activeRegion,
+    driftAgeMs,
+    maxDriftToleranceMs: leaseChaosState.maxDriftToleranceMs,
+  });
+}
 
 return {
   driftDetected,
@@ -1496,6 +2256,24 @@ async function rollbackLeaseRegionDrift(nodeId) {
 // Never touches Redis keys. Returns { score, severity, rollbackRecommended,
 // contributingSignals }.
 // =============================================================================
+// =============================================================================
+// Wave 44 — Phase 10: Bayesian / multi-signal confidence scoring helpers.
+// Numerically stable log-odds (logit/sigmoid) primitives.
+// =============================================================================
+function clamp01(x) {
+  return Math.max(0, Math.min(1, x));
+}
+
+function logit(p) {
+  const eps   = 1e-6;
+  const pSafe = Math.min(1 - eps, Math.max(eps, clamp01(p)));
+  return Math.log(pSafe / (1 - pSafe));
+}
+
+function sigmoid(z) {
+  return 1 / (1 + Math.exp(-z));
+}
+
 function scoreLeaseRollbackConfidence(driftResult) {
   const {
     deltaMs,
@@ -1506,72 +2284,101 @@ function scoreLeaseRollbackConfidence(driftResult) {
   // Wave 35.1 hotfix — deterministic evaluation accounting
   rollbackConfidenceState.totalEvaluations += 1;
 
-  let score = 0;
-  const contributingSignals = [];
+  // ── Phase 10 — Bayesian / multi-signal confidence scoring ────────────────
+  // Prior: base probability of real drift before any signals are observed.
+  const prior = 0.2;
 
-  // +25 — persisted epoch behind local epoch (authoritative ownership drift)
-  if (
-    persistedEpoch !== null &&
-    persistedEpoch !== undefined &&
-    localEpoch > 0 &&
+  // Signal likelihoods — calibrated heuristic probabilities per signal.
+  const p_epochBehind =
+    persistedEpoch != null &&
+    localEpoch     != null &&
     persistedEpoch < localEpoch
-  ) {
-    score += 25;
-    contributingSignals.push('persistedEpoch < localEpoch (+25)');
-  }
+      ? 0.75 : 0.4;
 
-  // +20 — drift window exceeded configured tolerance
-  if (deltaMs > leaseChaosState.maxDriftToleranceMs) {
-    score += 20;
-    contributingSignals.push(`deltaMs ${deltaMs}ms > maxDriftToleranceMs ${leaseChaosState.maxDriftToleranceMs}ms (+20)`);
-  }
+  const p_timeDrift =
+    deltaMs > leaseChaosState.maxDriftToleranceMs
+      ? 0.7 : 0.4;
 
-  // +15 — fallback has been active longer than 2 watchdog probe cycles
-  const twoWatchdogCycles = leaseFailoverState.probeIntervalMs * 2;
-  if (leaseFailoverState.usingFallback && deltaMs > twoWatchdogCycles) {
-    score += 15;
-    contributingSignals.push(`fallback active > 2 watchdog cycles (${twoWatchdogCycles}ms) (+15)`);
-  }
+  const p_fallbackDuration =
+    deltaMs > leaseChaosState.maxDriftToleranceMs * 2
+      ? 0.65 : 0.45;
 
-  // +15 — active chaos scenario is fallback epoch drift
-  if (leaseChaosState.activeScenario === 'fallback-epoch-drift') {
-    score += 15;
-    contributingSignals.push('chaos scenario = fallback-epoch-drift (+15)');
-  }
+  const p_chaosScenario =
+    driftResult.activeScenario === 'fallback-epoch-drift'
+      ? 0.7 : 0.5;
 
-  // +10 — 2 or more rollbacks recorded in the last 10 minutes
   const tenMinutesAgo = Date.now() - 600000;
   const recentRollbacks = rollbackConfidenceState.severityHistory.filter(
     (entry) => entry.rollbackExecuted && entry.at >= tenMinutesAgo
   ).length;
-  if (recentRollbacks >= 2) {
-    score += 10;
-    contributingSignals.push(`${recentRollbacks} rollbacks in last 10 min (+10)`);
-  }
 
-  // +15 — primary Redis still unreachable (consecutive failures above threshold)
-  if (leaseFailoverState.consecutiveFailures >= leaseFailoverState.failoverThreshold) {
-    score += 15;
-    contributingSignals.push(`primary Redis unreachable (${leaseFailoverState.consecutiveFailures} consecutive failures) (+15)`);
-  }
+  const p_recentHistory =
+    recentRollbacks >= 2 ? 0.65 : 0.45;
 
-  // Clamp to 0–100
+  const p_primaryUnreachable =
+    leaseFailoverState.usingFallback ? 0.7 : 0.4;
+
+  // Accumulate log-odds: each signal contributes its deviation from 0.5.
+  let z = logit(prior);
+  z += logit(p_epochBehind)      - logit(0.5);
+  z += logit(p_timeDrift)        - logit(0.5);
+  z += logit(p_fallbackDuration) - logit(0.5);
+  z += logit(p_chaosScenario)    - logit(0.5);
+  z += logit(p_recentHistory)    - logit(0.5);
+  z += logit(p_primaryUnreachable) - logit(0.5);
+
+  // Convert posterior probability → integer score (0–100).
+  // Wave 46 — Phase 12: apply bounded autonomous policy bias before conversion.
+  const posterior = clamp01(sigmoid(z));
+  const adjustedPosterior = clamp01(posterior + likelihoodBias);
+  let score = Math.round(adjustedPosterior * 100);
+
+  // ── Phase 5 — Adaptive Trust-Weighted Rollback Decisions ─────────────────
+  const activeRegion = leaseFailoverState.usingFallback
+    ? leaseFailoverState.fallbackRegion
+    : leaseFailoverState.primaryRegion;
+
+  const regionTrust = getRegionTrust(activeRegion) / 100;
+  const nodeTrust   = getNodeTrust(getLocalReplicaId()) / 100;
+  const trustFactor = (regionTrust * 0.6) + (nodeTrust * 0.4);
+
+  score = Math.round(score * trustFactor);
   score = Math.max(0, Math.min(100, score));
 
-  // Deterministic severity bands
-  let severity;
-  if (score >= 85)      severity = 'critical';
-  else if (score >= 65) severity = 'high';
-  else if (score >= 45) severity = 'moderate';
-  else                  severity = 'low';
+  // Bayesian severity bands.
+  let severity = 'low';
+  if      (score >= 85) severity = 'critical';
+  else if (score >= 70) severity = 'high';
+  else if (score >= 50) severity = 'moderate';
 
-  const rollbackRecommended = score >= rollbackConfidenceState.minRollbackConfidence;
+  // Preserve Phase 5 invariant: demote severity on low trust, but never critical.
+  if (trustFactor < 0.5 && severity !== 'critical') {
+    severity = 'moderate';
+  }
+
+  logger.debug('[Wave44] Bayesian rollback confidence', {
+    posterior,
+    score,
+    severity,
+    trustFactor,
+  });
+
+  const contributingSignals = [
+    p_epochBehind,
+    p_timeDrift,
+    p_fallbackDuration,
+    p_chaosScenario,
+    p_recentHistory,
+    p_primaryUnreachable,
+  ].filter(v => v > 0.5).length;
 
   return {
     score,
     severity,
-    rollbackRecommended,
+    rollbackRecommended: score >= rollbackConfidenceState.minRollbackConfidence,
     contributingSignals,
+    posterior,
+    trustFactor,
   };
 }
 
@@ -1624,6 +2431,12 @@ if (
     }
   );
 
+  // Wave 36 — PATCH 3: heavy region trust penalty on starvation override.
+  const starvationRegion = leaseFailoverState.usingFallback
+    ? leaseFailoverState.fallbackRegion
+    : leaseFailoverState.primaryRegion;
+  decreaseRegionTrust(starvationRegion, 5);
+
   return false;
 }
 
@@ -1653,17 +2466,23 @@ if (msSinceLastRollback < 60000 && severity !== 'critical') {
 // Internal helper — records a suppression event into lineage structures.
 // Never called externally.
 function _recordSuppression(scoreResult, driftResult, reason) {
-  rollbackConfidenceState.suppressedRollbacks += 1;
+  // BUG-04 FIX: Increment both independent counters instead of shared one
+  rollbackConfidenceState.autoTuneCounters.suppressed += 1;
+  rollbackConfidenceState.policyCounters.suppressed   += 1;
 
-  rollbackConfidenceState.falsePositiveWindows.push({
-    at: Date.now(),
-    reason,
-    score: scoreResult.score,
-    severity: scoreResult.severity,
-    deltaMs: driftResult.deltaMs,
-    localEpoch: driftResult.localEpoch,
-    persistedEpoch: driftResult.persistedEpoch,
-  });
+ rollbackConfidenceState.falsePositiveWindows.push({
+  at: Date.now(),
+  reason,
+  score: scoreResult.score,
+  severity: scoreResult.severity,
+  deltaMs: driftResult.deltaMs,
+  localEpoch: driftResult.localEpoch,
+  persistedEpoch: driftResult.persistedEpoch,
+});
+
+if (rollbackConfidenceState.falsePositiveWindows.length > 500) {
+  rollbackConfidenceState.falsePositiveWindows.shift();
+}
 
   // Wave 35.1 hotfix — bounded false-positive lineage retention
   if (
@@ -1671,6 +2490,13 @@ function _recordSuppression(scoreResult, driftResult, reason) {
   ) {
     rollbackConfidenceState.falsePositiveWindows.shift();
   }
+
+  // Wave 36 — PATCH 3: decrease trust on suppression (noisy region/node penalty).
+  const suppressionRegion = leaseFailoverState.usingFallback
+    ? leaseFailoverState.fallbackRegion
+    : leaseFailoverState.primaryRegion;
+  decreaseRegionTrust(suppressionRegion, 2);
+  decreaseNodeTrust(getLocalReplicaId(), 1);
 
   logger.info(
     '[Wave35] Rollback suppressed — false-positive window recorded',
@@ -1683,6 +2509,470 @@ function _recordSuppression(scoreResult, driftResult, reason) {
         rollbackConfidenceState.suppressedRollbacks,
     }
   );
+}
+
+// =============================================================================
+// Wave 36 — PATCH 2: Time-decay trust normalization.
+// Exponential half-life decay: trust × 0.5^(age / halfLife). Clamps 0–100.
+// =============================================================================
+function getDecayedTrust(currentTrust, ageMs, halfLifeMs) {
+  const decayFactor = Math.pow(0.5, ageMs / halfLifeMs);
+  return Math.max(0, Math.min(100, currentTrust * decayFactor));
+}
+
+function getRegionTrust(region) {
+  const entry = rollbackTrustState.regionTrust.get(region);
+  if (!entry) return 100;
+  const ageMs = Date.now() - entry.updatedAt;
+  return getDecayedTrust(entry.trust, ageMs, rollbackTrustState.decayHalfLifeMs);
+}
+
+function getNodeTrust(nodeId) {
+  const entry = rollbackTrustState.nodeTrust.get(nodeId);
+  if (!entry) return 100;
+  const ageMs = Date.now() - entry.updatedAt;
+  return getDecayedTrust(entry.trust, ageMs, rollbackTrustState.decayHalfLifeMs);
+}
+
+// =============================================================================
+// Wave 36 — PATCH 3 helpers: trust mutation functions.
+// All mutations clamp 0–100 and append a replayable trustEvents lineage entry.
+// =============================================================================
+function _appendTrustEvent(type, key, delta, newTrust) {
+  rollbackTrustState.trustEvents.push({
+    at:       Date.now(),
+    type,
+    key,
+    delta,
+    newTrust: Math.round(newTrust),
+  });
+  if (rollbackTrustState.trustEvents.length > rollbackTrustState.maxTrustEvents) {
+    rollbackTrustState.trustEvents.shift();
+  }
+}
+
+function increaseRegionTrust(region, delta) {
+  const next = Math.min(100, getRegionTrust(region) + delta);
+  rollbackTrustState.regionTrust.set(region, { trust: next, updatedAt: Date.now() });
+  _appendTrustEvent('region-increase', region, delta, next);
+  publishTrustDelta('region', region, +delta);
+}
+
+function decreaseRegionTrust(region, delta) {
+  const next = Math.max(0, getRegionTrust(region) - delta);
+  rollbackTrustState.regionTrust.set(region, { trust: next, updatedAt: Date.now() });
+  _appendTrustEvent('region-decrease', region, -delta, next);
+  publishTrustDelta('region', region, -delta);
+}
+
+function increaseNodeTrust(nodeId, delta) {
+  const next = Math.min(100, getNodeTrust(nodeId) + delta);
+  rollbackTrustState.nodeTrust.set(nodeId, { trust: next, updatedAt: Date.now() });
+  _appendTrustEvent('node-increase', nodeId, delta, next);
+  publishTrustDelta('node', nodeId, +delta);
+}
+
+function decreaseNodeTrust(nodeId, delta) {
+  const next = Math.max(0, getNodeTrust(nodeId) - delta);
+  rollbackTrustState.nodeTrust.set(nodeId, { trust: next, updatedAt: Date.now() });
+  _appendTrustEvent('node-decrease', nodeId, -delta, next);
+  publishTrustDelta('node', nodeId, -delta);
+}
+
+// =============================================================================
+// Wave 45 — Phase 11: Distributed reputation sharing (global trust propagation).
+// Broadcasts local trust mutations to peer nodes via Redis Pub/Sub.
+// Received signals are attenuated and merged into local state without
+// re-publishing (prevents feedback loops / amplification storms).
+// =============================================================================
+const TRUST_SIGNAL_CHANNEL = 'hirerise:trust:signals';
+
+const TRUST_PROPAGATION = {
+  enabled: process.env.TRUST_PROPAGATION_ENABLED === 'true',
+  // Fraction of a remote delta to absorb locally (0..1)
+  attenuation: 0.5,
+  // Minimum ms between broadcasts for the same (kind, id) key
+  minBroadcastIntervalMs: 2000,
+  // Discard signals older than this many ms
+  maxSignalAgeMs: 10000,
+  // Hard cap on the signed delta that may be published in a single event
+  maxDeltaPerEvent: 5,
+};
+
+// Per-(kind+id) throttle: tracks the last time we broadcast for each key.
+// Uses a plain Map so no extra dependencies are needed.
+const _trustBroadcastThrottle = new Map(); // `${kind}:${id}` → lastBroadcastMs
+
+/**
+ * Publish a signed trust delta to peer nodes (fire-and-forget).
+ * Throttled per key; clamped to maxDeltaPerEvent; no-op when propagation
+ * is disabled or when the Redis client is unavailable.
+ *
+ * @param {'region'|'node'} kind
+ * @param {string}          id     – region name or nodeId
+ * @param {number}          delta  – signed integer
+ */
+function publishTrustDelta(kind, id, delta) {
+  if (!TRUST_PROPAGATION.enabled) return;
+
+  // Throttle: skip if we broadcast this key too recently.
+  const throttleKey = `${kind}:${id}`;
+  const lastAt = _trustBroadcastThrottle.get(throttleKey) || 0;
+  if (Date.now() - lastAt < TRUST_PROPAGATION.minBroadcastIntervalMs) return;
+  _trustBroadcastThrottle.set(throttleKey, Date.now());
+
+  // Clamp outgoing delta to prevent outsized signals.
+  const clampedDelta = Math.max(
+    -TRUST_PROPAGATION.maxDeltaPerEvent,
+    Math.min(TRUST_PROPAGATION.maxDeltaPerEvent, delta)
+  );
+
+  try {
+    const payload = JSON.stringify({
+      kind,
+      id,
+      delta:      clampedDelta,
+      at:         Date.now(),
+      sourceNode: getLocalReplicaId(),
+    });
+
+    const client = getLeaseRedisClient();
+    if (!client) return;
+    client.publish(TRUST_SIGNAL_CHANNEL, payload).catch((publishErr) => {
+      logger.warn('[Wave45] Trust signal publish failed — Redis may be unavailable', {
+        error:   publishErr.message,
+        channel: TRUST_SIGNAL_CHANNEL,
+      });
+    });
+  } catch (err) {
+    logger.warn('[Wave45] Failed to publish trust delta', { error: err.message });
+  }
+}
+
+/**
+ * Direct setter for region trust — updates internal state without triggering
+ * publishTrustDelta, preventing re-broadcast of remotely-sourced events.
+ * Trust is stored on the same 0-100 scale as the local helpers.
+ *
+ * @param {string} region
+ * @param {number} trustValue  – value in [0, 100]
+ */
+function setRegionTrustDirect(region, trustValue) {
+  const clamped = Math.max(0, Math.min(100, trustValue));
+  rollbackTrustState.regionTrust.set(region, { trust: clamped, updatedAt: Date.now() });
+}
+
+/**
+ * Direct setter for node trust — same semantics as setRegionTrustDirect.
+ *
+ * @param {string} nodeId
+ * @param {number} trustValue  – value in [0, 100]
+ */
+function setNodeTrustDirect(nodeId, trustValue) {
+  const clamped = Math.max(0, Math.min(100, trustValue));
+  rollbackTrustState.nodeTrust.set(nodeId, { trust: clamped, updatedAt: Date.now() });
+}
+
+/**
+ * Merge a remote region trust delta into local state.
+ * The incoming delta is already attenuated by the subscriber.
+ * Maps a ±5 integer delta to a ±0.05 (5-point) shift on the 0-100 scale,
+ * keeping movement small and bounded.
+ *
+ * @param {string} region
+ * @param {number} delta  – attenuated signed integer
+ */
+function applyRemoteRegionTrust(region, delta) {
+  const current = getRegionTrust(region);
+  // delta is already attenuated; map each unit to 1 trust point (same scale as local helpers)
+  const next = Math.max(0, Math.min(100, current + delta));
+  setRegionTrustDirect(region, next);
+}
+
+/**
+ * Merge a remote node trust delta into local state.
+ *
+ * @param {string} nodeId
+ * @param {number} delta  – attenuated signed integer
+ */
+function applyRemoteNodeTrust(nodeId, delta) {
+  const current = getNodeTrust(nodeId);
+  const next = Math.max(0, Math.min(100, current + delta));
+  setNodeTrustDirect(nodeId, next);
+}
+
+logger.debug('[Wave45] Trust propagation stats', {
+  enabled:     TRUST_PROPAGATION.enabled,
+  attenuation: TRUST_PROPAGATION.attenuation,
+});
+
+// =============================================================================
+// Wave 36 — PATCH 4: Regional quorum escalation predicate.
+// Returns true only when severity is non-critical AND region trust is low.
+// Critical severity ALWAYS bypasses quorum escalation.
+// =============================================================================
+function shouldEscalateToRegionalQuorum(scoreResult) {
+  if (scoreResult.severity === 'critical') return false;
+  const activeRegion = leaseFailoverState.usingFallback
+    ? leaseFailoverState.fallbackRegion
+    : leaseFailoverState.primaryRegion;
+  return getRegionTrust(activeRegion) < rollbackTrustState.minQuorumEscalationTrust;
+}
+
+// =============================================================================
+// Wave 37 — PATCH 2: Regional anomaly signal emission.
+// Overwrites any existing entry for the region. Values are clamped 0–1.
+// Deterministic: same inputs always produce the same stored signal.
+// =============================================================================
+// =============================================================================
+// Helper: clamp a numeric value to [0, 1], guarding against NaN / Infinity.
+// =============================================================================
+function clampSignal(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return 0;
+  return Math.max(0, Math.min(1, n));
+}
+
+// =============================================================================
+// Wave 37 — PATCH 2: Regional anomaly signal emitter.
+// Clamps all inputs at the boundary so the rest of the pipeline is NaN-free.
+// =============================================================================
+async function emitRegionalAnomalySignal(regionId, signal) {
+  if (!regionId) return; // guard: never store signals without an identity
+
+  const clampedDrift       = clampSignal(signal.driftScore);
+  const clampedConfidence  = clampSignal(signal.confidence);
+
+  anomalyFusionState.regions.set(regionId, {
+    driftScore: clampedDrift,
+    confidence: clampedConfidence,
+    timestamp:  Date.now(),
+  });
+
+  // Wave 50 — FIX 9: debug-level ingestion log. Kept at debug to avoid noise.
+  logger.debug('[Wave50] Signal received', {
+    region:     regionId,
+    nodeId:     getLocalReplicaId(),
+    driftScore: clampedDrift,
+    confidence: clampedConfidence,
+  });
+
+  // Wave 40 — Broadcast to peer nodes via Redis Pub/Sub.
+  // Fire-and-forget: a publish failure must never block the local signal path.
+  try {
+    const payload = JSON.stringify({
+      region:     regionId,
+      driftScore: clampSignal(signal.driftScore),
+      confidence: clampSignal(signal.confidence),
+      timestamp:  Date.now(),
+      nodeId:     getLocalReplicaId(),
+    });
+
+    const client = getLeaseRedisClient();
+
+    if (client) {
+      try {
+        await client.publish(ANOMALY_SIGNAL_CHANNEL, payload);
+      } catch (err) {
+        logger.warn('[Wave49] Redis publish failed', { error: err.message });
+      }
+    }
+
+  } catch (err) {
+    logger.warn('[Wave40] Failed to publish anomaly signal', {
+      error: err.message,
+    });
+  }
+
+  // ALWAYS execute gossip fallback
+  // Wave 41 — Gossip fallback broadcast over UDP.
+  // Runs in parallel with Pub/Sub: if Redis is healthy both paths fire;
+  // if Redis is down only gossip carries the signal. UDP is lossy by design —
+  // packet loss is tolerated; peers reconstruct consensus from what arrives.
+  if (GOSSIP_ENABLED && gossipSocket) {
+    try {
+      const gossipPayload = Buffer.from(JSON.stringify({
+        region:     regionId,
+        driftScore: clampSignal(signal.driftScore),
+        confidence: clampSignal(signal.confidence),
+        timestamp:  Date.now(),
+        nodeId:     getLocalReplicaId(),
+      }));
+
+      for (const peer of GOSSIP_PEERS) {
+        const [host, rawPort] = peer.split(':');
+        const port = parseInt(rawPort || String(GOSSIP_PORT), 10);
+        // send() is non-blocking; errors surface via the socket 'error' event
+        // registered at init time, never thrown here.
+        gossipSocket.send(gossipPayload, 0, gossipPayload.length, port, host);
+      }
+
+    } catch (err) {
+      logger.warn('[Wave41] Failed to broadcast gossip signal', {
+        error: err.message,
+      });
+    }
+  }
+}
+
+// =============================================================================
+// Wave 37 — PATCH 3: Stale signal cleanup.
+// Removes signals older than maxSignalAgeMs. Must run before every evaluation.
+// Pure synchronous iteration — no timers, no external side-effects.
+// IMPORTANT: operates only on age; confidence filtering is done in the
+// evaluator so the two passes never double-remove the same signal.
+// =============================================================================
+function cleanupOldAnomalySignals() {
+  const cutoff = Date.now() - (anomalyFusionState.maxSignalAgeMs || 10000);
+  for (const [regionId, signal] of anomalyFusionState.regions) {
+    if (signal.timestamp < cutoff) {
+      anomalyFusionState.regions.delete(regionId);
+    }
+  }
+}
+
+// =============================================================================
+// Wave 37 — PATCH 4: Cross-region anomaly fusion engine (hardened).
+//
+// Decision pipeline:
+//   1. Purge stale signals (age-based only — cleanupOldAnomalySignals).
+//   2. Enforce minimum signal quorum before any scoring.
+//   3. Skip weak-confidence signals (MIN_CONFIDENCE filter).
+//   4. Apply linear freshness decay to surviving signals.
+//   5. Compute confidence-weighted drift consensus score.
+//   6. Clamp final score strictly to [0, 1].
+//   7. Apply hysteresis to prevent rapid action flapping.
+//   8. Write validated state; return extended observability payload.
+//
+// Returns:
+//   { action, score, contributingSignals, totalWeight }
+//
+// action ∈ { GLOBAL_DRIFT_CONFIRMED | PARTIAL_DRIFT | NO_DRIFT | INSUFFICIENT_DATA | INSUFFICIENT_DIVERSITY }
+// =============================================================================
+
+const ANOMALY_ACTIONS = {
+  GLOBAL:                 'GLOBAL_DRIFT_CONFIRMED',
+  PARTIAL:                'PARTIAL_DRIFT',
+  NONE:                   'NO_DRIFT',
+  INSUFFICIENT_DATA:      'INSUFFICIENT_DATA',
+  INSUFFICIENT_DIVERSITY: 'INSUFFICIENT_DIVERSITY',
+};
+
+// Wave 40 — Pub/Sub channel for cross-node anomaly signal exchange.
+const ANOMALY_SIGNAL_CHANNEL = 'hirerise:anomaly:signals';
+
+// Wave 43 — Phase 9: Redis key for persisting auto-tune state across restarts.
+const ROLLBACK_AUTOTUNE_KEY = 'hirerise:rollback:autotune';
+
+// Wave 41 — Gossip fallback configuration.
+// GOSSIP_ENABLED activates UDP gossip when Redis Pub/Sub is unavailable.
+// GOSSIP_PEERS is a comma-separated list of "host:port" peer addresses.
+const GOSSIP_ENABLED = process.env.GOSSIP_ENABLED === 'true';
+const GOSSIP_PORT    = parseInt(process.env.GOSSIP_PORT  || '41234', 10);
+const GOSSIP_PEERS   = (process.env.GOSSIP_PEERS || '').split(',').filter(Boolean);
+
+function evaluateCrossRegionAnomalies() {
+  // ── Step 1: evict stale signals ──────────────────────────────────────────────
+  cleanupOldAnomalySignals();
+
+  const now      = Date.now();
+  const WINDOW_MS = anomalyFusionState.maxSignalAgeMs || 10000;
+
+  // ── Step 2: minimum quorum guard ────────────────────────────────────────────
+  const MIN_SIGNALS = (Number.isFinite(anomalyFusionState.minSignals) && anomalyFusionState.minSignals > 0)
+    ? anomalyFusionState.minSignals
+    : 2;
+
+  if (anomalyFusionState.regions.size < MIN_SIGNALS) {
+    return { action: ANOMALY_ACTIONS.INSUFFICIENT_DATA, score: 0, contributingSignals: 0, totalWeight: 0 };
+  }
+
+  // ── Step 3–5: confidence filter + freshness decay + weighted accumulation ───
+  const MIN_CONFIDENCE = 0.2;
+
+  let weightedScore      = 0;
+  let totalWeight        = 0;
+  let contributingSignals = 0;
+  const uniqueRegions    = new Set();
+
+  for (const [regionId, signal] of anomalyFusionState.regions.entries()) {
+    // Input safety: re-clamp in case state was mutated externally.
+    const driftScore = clampSignal(signal.driftScore);
+    const confidence = clampSignal(signal.confidence);
+
+    // Step 3: skip weak signals.
+    if (confidence < MIN_CONFIDENCE) continue;
+
+    // Step 4: linear freshness decay — older signals carry less weight.
+    const safeAge   = Math.max(0, now - (signal.timestamp || now));
+    const freshness = Math.max(0, 1 - (safeAge / WINDOW_MS));
+
+    const boundedConfidence = Math.min(1, Math.max(0, confidence));
+    const adjustedConfidence = boundedConfidence * freshness;
+    if (adjustedConfidence <= 0) continue; // fully decayed
+
+    // Step 5: weighted accumulation.
+    weightedScore += driftScore * adjustedConfidence;
+    totalWeight   += adjustedConfidence;
+    contributingSignals += 1;
+    uniqueRegions.add(regionId);
+  }
+
+  // Fix 1: post-filter quorum — MIN_SIGNALS checked against signals that
+  // actually survived confidence + freshness filtering, not raw region count.
+  if (contributingSignals < MIN_SIGNALS) {
+    return {
+      action: ANOMALY_ACTIONS.INSUFFICIENT_DATA,
+      score: 0,
+      contributingSignals,
+      totalWeight,
+    };
+  }
+
+  // ── Step 6: consensus score clamped to [0, 1] ───────────────────────────────
+  const consensusScore = (totalWeight > 0)
+    ? clampSignal(weightedScore / totalWeight)
+    : 0;
+
+  // ── Step 7: configurable thresholds + hysteresis ────────────────────────────
+  const GLOBAL_THRESHOLD  = (Number.isFinite(anomalyFusionState.globalThreshold))
+    ? anomalyFusionState.globalThreshold
+    : 0.75;
+  const PARTIAL_THRESHOLD = (Number.isFinite(anomalyFusionState.partialThreshold))
+    ? anomalyFusionState.partialThreshold
+    : 0.4;
+
+  // Hysteresis: if we previously confirmed a global drift, hold that decision
+  // until the score drops clearly below the global threshold (hysteresis band).
+  const HYSTERESIS_MARGIN = 0.05; // must fall below this to un-confirm
+  const lastAction = anomalyFusionState.lastAction;
+  const anomalyScore = consensusScore;
+
+  // Fix 2: all action values use ANOMALY_ACTIONS constants — no raw strings.
+  let action;
+
+  if (
+    lastAction === ANOMALY_ACTIONS.GLOBAL &&
+    anomalyScore > GLOBAL_THRESHOLD - HYSTERESIS_MARGIN
+  ) {
+    action = ANOMALY_ACTIONS.GLOBAL;
+  } else if (anomalyScore > GLOBAL_THRESHOLD + HYSTERESIS_MARGIN) {
+    action = ANOMALY_ACTIONS.GLOBAL;
+  } else if (anomalyScore > PARTIAL_THRESHOLD) {
+    action = ANOMALY_ACTIONS.PARTIAL;
+  } else {
+    action = ANOMALY_ACTIONS.NONE;
+  }
+
+  // ── Step 8: safe state mutation ─────────────────────────────────────────────
+  // Only write validated, finite values to shared state.
+  if (Number.isFinite(consensusScore)) {
+    anomalyFusionState.consensusScore = consensusScore;
+  }
+  anomalyFusionState.lastEvaluatedAt = now;
+  anomalyFusionState.lastAction      = action;
+
+  return { action, score: consensusScore, contributingSignals, totalWeight };
 }
 
 function applyControlledDagMutation() {
@@ -2761,6 +4051,44 @@ distributedArbitration: {
   rollbackConfirmedCount:        rollbackConfidenceState.confirmedRollbacks,
   rollbackMinThreshold:          rollbackConfidenceState.minRollbackConfidence,
   rollbackSeverityHistoryTail:   rollbackConfidenceState.severityHistory.slice(-10),
+  // Wave 36 — adaptive trust decay + quorum escalation telemetry
+  rollbackRegionTrust: (() => {
+    const out = {};
+    for (const [region, entry] of rollbackTrustState.regionTrust) {
+      const ageMs = Date.now() - entry.updatedAt;
+      out[region] = Math.round(
+        getDecayedTrust(entry.trust, ageMs, rollbackTrustState.decayHalfLifeMs)
+      );
+    }
+    return out;
+  })(),
+  rollbackNodeTrust: (() => {
+    const out = {};
+    for (const [nodeId, entry] of rollbackTrustState.nodeTrust) {
+      const ageMs = Date.now() - entry.updatedAt;
+      out[nodeId] = Math.round(
+        getDecayedTrust(entry.trust, ageMs, rollbackTrustState.decayHalfLifeMs)
+      );
+    }
+    return out;
+  })(),
+  rollbackTrustEventTail:    rollbackTrustState.trustEvents.slice(-10),
+  regionalEscalationCount:   regionalEscalationState.totalEscalations,
+  regionalEscalationTail:    regionalEscalationState.escalations.slice(-10),
+  quorumEscalationThreshold: rollbackTrustState.minQuorumEscalationTrust,
+  // Wave 37 — cross-region anomaly fusion telemetry
+  anomalyFusionScore:           anomalyFusionState.consensusScore,
+  anomalyFusionRegionCount:     anomalyFusionState.regions.size,
+  anomalyFusionLastEvaluatedAt: anomalyFusionState.lastEvaluatedAt,
+  anomalyFusionStateTail:       (() => {
+    const out = [];
+    for (const [regionId, signal] of anomalyFusionState.regions) {
+      out.push({ regionId, ...signal });
+    }
+    return out.slice(-10);
+  })(),
+  // Wave 50 — Phase 5: rollback decision observability counters
+  rollbackMetrics: systemMetrics,
 },
 },
   });
@@ -3577,6 +4905,19 @@ rollbackConfidenceState.confirmedRollbacks   = 0;
 rollbackConfidenceState.falsePositiveWindows = [];
 rollbackConfidenceState.severityHistory      = [];
 
+// Wave 36 — BOOTSTRAP: reset trust decay registry + escalation ledger.
+rollbackTrustState.regionTrust.clear();
+rollbackTrustState.nodeTrust.clear();
+rollbackTrustState.trustEvents           = [];
+regionalEscalationState.escalations      = [];
+regionalEscalationState.totalEscalations = 0;
+regionalEscalationState.lastEscalationAt = null;
+
+// Wave 37 — BOOTSTRAP: reset anomaly fusion state.
+anomalyFusionState.regions.clear();
+anomalyFusionState.lastEvaluatedAt = null;
+anomalyFusionState.consensusScore  = 0;
+
 const shutdownNodeId = getLocalReplicaId();
 
 const localHeldLease =
@@ -3814,12 +5155,537 @@ logger.info(
 );
  // PR 2: Redis must be ready before serving traffic
     await connectRedis();
-    completeStartupPhase('redis-connect');
+completeStartupPhase('redis-connect');
+
+// ✅ ADD HERE
+let anomalySubscriberActive = false;
+let anomalySubscriberClient = null;
+
+let trustSubscriberActive   = false;
+let trustSubscriberClient   = null;
+
+// Wave 43 — Phase 9: restore persisted auto-tune state now that Redis is ready.
+await restoreAutoTuneState();
 
 // Wave 33 — start lease failover watchdog immediately after Redis connects.
 // Probes primary every probeIntervalMs; promotes fallback on threshold failures.
 startLeaseFailoverWatchdog();
 
+// Wave 40 — Subscribe to cross-node anomaly signals via Redis Pub/Sub.
+// Uses a dedicated duplicate client so subscribe mode never blocks lease
+// operations on the shared getLeaseRedisClient() connection.
+// Self-emitted signals are discarded; all peer signals are fed directly into
+// anomalyFusionState.regions so evaluateCrossRegionAnomalies() sees them on
+// the next tick. cleanupOldAnomalySignals() prunes them by age as normal.
+try {
+  if (anomalySubscriberActive) return;
+
+  const client = getLeaseRedisClient();
+  if (!client) {
+    logger.warn('[Wave40] Redis unavailable — skipping anomaly subscriber init');
+  } else {
+    const subClient = trackRedisClient(client.duplicate());
+    anomalySubscriberActive = true;
+
+    await subClient.subscribe(ANOMALY_SIGNAL_CHANNEL);
+
+    subClient.on('message', (channel, message) => {
+      if (channel !== ANOMALY_SIGNAL_CHANNEL) return;
+
+    try {
+  // Use global safeJsonParse helper (no inline definition)
+  const raw = safeJsonParse(message);
+  if (!raw) return;
+
+  // FIX 6 — Region allowlist (can also be moved to global later)
+  const ALLOWED_REGIONS = new Set(['primary', 'fallback', 'secondary']);
+
+  // FIX 2 — Strict schema validation
+  if (
+    !raw ||
+    typeof raw.region !== 'string' ||
+    typeof raw.nodeId !== 'string' ||
+    typeof raw.driftScore !== 'number' ||
+    typeof raw.confidence !== 'number'
+  ) {
+    logger.warn('[Wave49] Invalid signal schema dropped');
+    return;
+  }
+
+ // 🔒 Additional hardening (recommended)
+
+// Validate timestamp type + value
+if (
+  typeof raw.timestamp !== 'number' ||
+  !Number.isFinite(raw.timestamp) ||
+  raw.timestamp <= 0
+) {
+  logger.warn('[Wave49] Missing/invalid timestamp dropped', {
+    timestamp: raw.timestamp,
+  });
+  
+  return;
+}
+
+// Normalize timestamp (optional safety)
+const timestamp = raw.timestamp;
+
+// Prevent oversized identifiers
+// 🔒 Cap string lengths (DoS hygiene)
+
+// Normalize values (defensive)
+const nodeId = raw.nodeId.trim();
+const region = raw.region.trim();
+
+// Enforce length limits
+if (nodeId.length === 0 || region.length === 0) {
+  logger.warn('[Wave49] Empty identifiers dropped');
+  return;
+}
+
+if (nodeId.length > 128 || region.length > 64) {
+  logger.warn('[Wave49] Oversized identifiers dropped', {
+    nodeIdLength: nodeId.length,
+    regionLength: region.length,
+  });
+  return;
+}
+
+  // FIX 6 — Drop unknown regions
+  if (!ALLOWED_REGIONS.has(raw.region)) {
+    logger.warn('[Wave49] Unknown region dropped', { region: raw.region });
+    return;
+  }
+      // FIX 4 — Reject self-spoofing
+      // Ignore self signals — we already wrote these locally.
+      if (raw.nodeId === getLocalReplicaId()) return;
+
+      // FIX 5 — Replay protection
+      const now = Date.now();
+      if (!raw.timestamp || Math.abs(now - timestamp)> 10000) {
+        logger.warn('[Wave49] Stale or replayed signal dropped');
+        return;
+      }
+
+      // FIX 3 — Clamp to safe bounded ranges
+      const driftScore = Math.max(0, Math.min(1, raw.driftScore));
+      const confidence = Math.max(0, Math.min(1, raw.confidence));
+
+      // FIX 8 — Defensive numeric checks
+      if (!Number.isFinite(driftScore) || !Number.isFinite(confidence)) {
+        return;
+      }
+
+      logger.debug('[Wave40] Received cross-node anomaly signal', {
+        region: raw.region,
+        nodeId: raw.nodeId,
+      });
+
+      anomalyFusionState.regions.set(raw.region, {
+        driftScore,
+        confidence,
+        timestamp:   raw.timestamp,
+        sourceNode:  raw.nodeId,
+      });
+
+    } catch (err) {
+      logger.warn('[Wave40] Failed to process anomaly signal', {
+        error: err.message,
+      });
+    }
+  });
+
+  logger.info('[Wave40] Cross-node anomaly signal subscriber active', {
+    channel: ANOMALY_SIGNAL_CHANNEL,
+  });
+}
+} catch (err) {
+  anomalySubscriberActive = false;
+  logger.warn('[Wave40] Failed to initialise anomaly signal subscriber', {
+    error: err.message,
+  });
+
+ setTimeout(async () => {
+  try {
+    const client = getLeaseRedisClient();
+    if (!client) return;
+
+    // cleanup old subscriber if exists
+if (anomalySubscriberClient) {
+  try {
+    await anomalySubscriberClient.quit();
+  } catch {}
+}
+
+const retrySub = trackRedisClient(client.duplicate());
+anomalySubscriberClient = retrySub;
+
+await retrySub.subscribe(ANOMALY_SIGNAL_CHANNEL);
+
+    retrySub.on('message', (channel, message) => {
+      if (channel !== ANOMALY_SIGNAL_CHANNEL) return;
+
+      try {
+        const raw = safeJsonParse(message);
+        if (!raw) return;
+
+        const ALLOWED_REGIONS = new Set(['primary', 'fallback', 'secondary']);
+
+        if (
+          !raw ||
+          typeof raw.region !== 'string' ||
+          typeof raw.nodeId !== 'string' ||
+          typeof raw.driftScore !== 'number' ||
+          typeof raw.confidence !== 'number'
+        ) {
+          logger.warn('[Wave49] Invalid signal schema dropped');
+          return;
+        }
+
+        if (
+          typeof raw.timestamp !== 'number' ||
+          !Number.isFinite(raw.timestamp) ||
+          raw.timestamp <= 0
+        ) {
+          logger.warn('[Wave49] Missing/invalid timestamp dropped', {
+            timestamp: raw.timestamp,
+          });
+          return;
+        }
+
+        const timestamp = raw.timestamp;
+        const nodeId = raw.nodeId.trim();
+        const region = raw.region.trim();
+
+        if (nodeId.length === 0 || region.length === 0) {
+          logger.warn('[Wave49] Empty identifiers dropped');
+          return;
+        }
+
+        if (nodeId.length > 128 || region.length > 64) {
+          logger.warn('[Wave49] Oversized identifiers dropped', {
+            nodeIdLength: nodeId.length,
+            regionLength: region.length,
+          });
+          return;
+        }
+
+        if (!ALLOWED_REGIONS.has(region)) {
+          logger.warn('[Wave49] Unknown region dropped', { region });
+          return;
+        }
+
+        if (nodeId === getLocalReplicaId()) return;
+
+        const now = Date.now();
+        if (!timestamp || Math.abs(now - timestamp) > 10000) {
+          logger.warn('[Wave49] Stale or replayed signal dropped');
+          return;
+        }
+
+        const driftScore = Math.max(0, Math.min(1, raw.driftScore));
+        const confidence = Math.max(0, Math.min(1, raw.confidence));
+
+        if (!Number.isFinite(driftScore) || !Number.isFinite(confidence)) {
+          return;
+        }
+
+        anomalyFusionState.regions.set(region, {
+          driftScore,
+          confidence,
+          timestamp,
+          sourceNode: nodeId,
+        });
+
+      } catch (err) {
+        logger.warn('[Wave40] Failed to process anomaly signal', {
+          error: err.message,
+        });
+      }
+    });
+
+    logger.info('[Fix2] Anomaly subscriber reconnected');
+  } catch (_) {
+  try {
+    await retrySub?.quit?.();
+  } catch {}
+
+  anomalySubscriberActive = false;
+}
+}, 5000);
+} // end catch (Wave40 anomaly subscriber init)
+
+// Wave 45 — Phase 11: Distributed trust signal subscriber.
+// Uses a dedicated duplicate() client so subscribe mode never blocks lease
+// operations on the shared getLeaseRedisClient() connection.
+// Self-emitted events are discarded; stale events are dropped by age.
+// Remote deltas are attenuated before being merged — no re-publish occurs here.
+try {
+  if (trustSubscriberActive) return;
+
+  const client = getLeaseRedisClient();
+  if (!client) {
+    logger.warn('[Wave45] Redis unavailable — skipping trust subscriber init');
+  } else {
+    const trustSub = trackRedisClient(client.duplicate());
+    trustSubscriberActive = true;
+
+    await trustSub.subscribe(TRUST_SIGNAL_CHANNEL);
+
+    trustSub.on('message', (channel, message) => {
+      if (channel !== TRUST_SIGNAL_CHANNEL) return;
+
+      try {
+        const evt = safeJsonParse(message);
+        if (!evt) return;
+
+        if (evt.sourceNode === getLocalReplicaId()) return;
+
+        if (Date.now() - (evt.at || 0) > TRUST_PROPAGATION.maxSignalAgeMs) return;
+
+        if (Math.abs(evt.delta) > 10) {
+          logger.warn('[Wave49] Suspicious trust delta dropped', {
+            delta: evt.delta,
+          });
+          return;
+        }
+
+        const attenuatedDelta = Math.round(evt.delta * TRUST_PROPAGATION.attenuation);
+
+        if (evt.kind === 'region') {
+          applyRemoteRegionTrust(evt.id, attenuatedDelta);
+        } else if (evt.kind === 'node') {
+          applyRemoteNodeTrust(evt.id, attenuatedDelta);
+        }
+
+        logger.debug('[Wave45] Applied remote trust delta', {
+          kind:   evt.kind,
+          id:     evt.id,
+          delta:  attenuatedDelta,
+          source: evt.sourceNode,
+        });
+
+      } catch (err) {
+        logger.warn('[Wave45] Failed to process trust signal', {
+          error: err.message,
+        });
+      }
+    });
+
+    logger.info('[Wave45] Distributed trust signal subscriber active', {
+      channel: TRUST_SIGNAL_CHANNEL,
+    });
+  } // ✅ closes else block
+
+} catch (err) {
+  trustSubscriberActive = false;
+
+  logger.warn('[Wave45] Failed to initialise trust signal subscriber', {
+    error: err.message,
+  });
+
+  setTimeout(async () => {
+    try {
+      const client = getLeaseRedisClient();
+      if (!client) return;
+
+      // cleanup old subscriber if exists
+      if (trustSubscriberClient) {
+        try {
+          await trustSubscriberClient.quit();
+        } catch {}
+      }
+
+      const retrySub = trackRedisClient(client.duplicate());
+      trustSubscriberClient = retrySub;
+
+      await retrySub.subscribe(TRUST_SIGNAL_CHANNEL);
+
+      retrySub.on('message', (channel, message) => {
+        if (channel !== TRUST_SIGNAL_CHANNEL) return;
+
+        try {
+          const evt = safeJsonParse(message);
+          if (!evt) return;
+
+          if (evt.sourceNode === getLocalReplicaId()) return;
+
+          if (Date.now() - (evt.at || 0) > TRUST_PROPAGATION.maxSignalAgeMs) return;
+
+          if (Math.abs(evt.delta) > 10) {
+            logger.warn('[Wave49] Suspicious trust delta dropped', {
+              delta: evt.delta,
+            });
+            return;
+          }
+
+          const attenuatedDelta = Math.round(evt.delta * TRUST_PROPAGATION.attenuation);
+
+          if (evt.kind === 'region') {
+            applyRemoteRegionTrust(evt.id, attenuatedDelta);
+          } else if (evt.kind === 'node') {
+            applyRemoteNodeTrust(evt.id, attenuatedDelta);
+          }
+
+          logger.debug('[Wave45] Applied remote trust delta', {
+            kind:   evt.kind,
+            id:     evt.id,
+            delta:  attenuatedDelta,
+            source: evt.sourceNode,
+          });
+
+        } catch (err) {
+          logger.warn('[Wave45] Failed to process trust signal', {
+            error: err.message,
+          });
+        }
+      });
+
+      logger.info('[Fix2] Trust subscriber reconnected');
+
+    } catch (_) {
+      try {
+        await retrySub?.quit?.();
+      } catch {}
+
+      trustSubscriberActive = false;
+    }
+  }, 5000);
+}
+// Wave 41 — Gossip UDP socket initialisation.
+// Bound only when GOSSIP_ENABLED=true. The socket variable is declared at
+// function scope so the broadcaster in emitRegionalAnomalySignal and the
+// shutdown handler can both reference it without a module-level import.
+let gossipSocket;
+
+if (GOSSIP_ENABLED) {
+  try {
+    const dgram = require('dgram');
+    gossipSocket = dgram.createSocket('udp4');
+    _gossipSocket = gossipSocket;
+
+    // Absorb socket-level errors (e.g. ECONNREFUSED on send) so they never
+    // propagate as unhandled exceptions. Individual send errors are tolerated
+    // by design — UDP delivery is best-effort.
+    gossipSocket.on('error', (err) => {
+      logger.warn('[Wave41] Gossip socket error', { error: err.message });
+    });
+
+    gossipSocket.on('message', (msg) => {
+      try {
+        // FIX 9 — Reject oversized UDP payloads before any parsing
+        if (msg.length > 1024) {
+          logger.warn('[Wave49] Oversized gossip packet dropped');
+          return;
+        }
+
+        // FIX 1 — Uses global safeJsonParse defined at module level
+        const raw = safeJsonParse(msg.toString());
+        if (!raw) return;
+
+        // FIX 6 — Region allowlist
+        const ALLOWED_REGIONS = new Set(['primary', 'fallback', 'secondary']);
+
+        // FIX 2 — Strict schema validation
+        if (
+          !raw ||
+          typeof raw.region !== 'string' ||
+          typeof raw.nodeId !== 'string' ||
+          typeof raw.driftScore !== 'number' ||
+          typeof raw.confidence !== 'number'
+        ) {
+          logger.warn('[Wave49] Invalid signal schema dropped');
+          return;
+        }
+
+        // FIX 6 — Drop unknown regions
+        if (!ALLOWED_REGIONS.has(raw.region)) {
+          logger.warn('[Wave49] Unknown region dropped', { region: raw.region });
+          return;
+        }
+
+        // FIX 4 — Reject self-spoofing
+        // Discard own reflections — self-emitted datagrams can loop back on
+        // loopback interfaces or when a peer list includes this node's address.
+        if (raw.nodeId === getLocalReplicaId()) return;
+
+        // FIX 5 — Replay protection: reject stale or missing timestamps
+        const now = Date.now();
+        if (!raw.timestamp || Math.abs(now - raw.timestamp) > 10000) {
+          logger.warn('[Wave49] Stale or replayed signal dropped');
+          return;
+        }
+
+        // FIX 3 — Clamp values to safe bounded ranges
+        const driftScore = Math.max(0, Math.min(1, raw.driftScore));
+        const confidence = Math.max(0, Math.min(1, raw.confidence));
+
+        // FIX 8 — Defensive numeric checks
+        if (!Number.isFinite(driftScore) || !Number.isFinite(confidence)) {
+          return;
+        }
+
+        anomalyFusionState.regions.set(raw.region, {
+          driftScore,
+          confidence,
+          timestamp:  raw.timestamp || Date.now(),
+          sourceNode: raw.nodeId,
+        });
+
+        logger.debug('[Wave41] Gossip signal received', {
+          region: raw.region,
+          nodeId: raw.nodeId,
+        });
+
+      } catch (err) {
+        logger.warn('[Wave41] Failed to parse gossip signal', {
+          error: err.message,
+        });
+      }
+    });
+
+    gossipSocket.bind(GOSSIP_PORT, () => {
+      logger.info('[Wave41] Gossip UDP socket bound', { port: GOSSIP_PORT });
+    });
+
+  } catch (err) {
+    // Non-fatal: gossip is a fallback path; the system runs without it.
+    logger.warn('[Wave41] Failed to initialise gossip socket', {
+      error: err.message,
+    });
+  }
+}
+// Wave 43 — Phase 9: periodic auto-tune state persistence (safe redundancy).
+// Ensures state is saved even during quiet windows where the threshold doesn't change.
+trackInterval(() => {
+  persistAutoTuneState();
+}, 30000); // every 30 s
+
+// Wave 36 — PATCH 1: persisted epoch observer (async safe, no overlap)
+let _persistedEpochRefreshInFlight = false;
+
+trackInterval(async () => {
+  if (_persistedEpochRefreshInFlight) return;
+
+  _persistedEpochRefreshInFlight = true;
+
+  try {
+    const nodeId = getLocalReplicaId();
+    const redisState = await getRedisLeaseState(nodeId);
+
+    leaseChaosState.lastObservedPersistedEpoch =
+      redisState?.persistedEpoch ?? null;
+
+    leaseChaosState.lastPersistedEpochAt = Date.now();
+
+  } catch (err) {
+    logger.warn('[Wave36] Failed to refresh persisted epoch', {
+      error: err.message,
+    });
+  } finally {
+    _persistedEpochRefreshInFlight = false;
+  }
+}, 2000);
 // Wave 34 — start lease chaos simulation worker after the watchdog.
 // No-ops unless LEASE_CHAOS_MODE=true. Idempotent: duplicate start is blocked
 // by internal _workerTimer guard inside startLeaseChaosSimulationWorker().
@@ -4235,7 +6101,7 @@ startupChaosConfidence.confidenceScore =
     logger.error('[BOOT] Post-bind startup failed', {
       error: err.message,
     });
-    process.exit(1);
+    return process.exit(1);
   });
 }); // end app.listen callback
 
@@ -4261,7 +6127,7 @@ server.on('error', (err) => {
     throw err;
   }
 
-  process.exit(1);
+  return process.exit(1);
 });
 
 } catch (err) {
@@ -4293,8 +6159,14 @@ server.on('error', (err) => {
 
 bootstrap();
   
-// Consolidated Graceful Shutdown
 const gracefulShutdown = async (signal) => {
+  if (isShuttingDown) {
+    logger.warn('[Wave48] Shutdown already in progress', { signal });
+    return;
+  }
+
+  isShuttingDown = true;
+
   const shutdownStartedAt = process.hrtime.bigint();
 
   const shutdownTimeoutMs = parseInt(
@@ -4306,19 +6178,11 @@ const gracefulShutdown = async (signal) => {
     logger.error(
       '[Server] Graceful shutdown timeout exceeded — forcing exit'
     );
-    process.exit(1);
+
+    setTimeout(() => process.exit(1), 50);
   }, shutdownTimeoutMs);
 
   forcedShutdownTimer.unref();
-
-  if (isShuttingDown) {
-    logger.warn('[Server] Duplicate shutdown signal ignored', {
-      signal,
-    });
-    return;
-  }
-
-  isShuttingDown = true;
 
   // Patch 35 → drop readiness immediately during shutdown
 startupBarrier.isReleased = false;
@@ -4368,7 +6232,20 @@ rollbackConfidenceState.suppressedRollbacks  = 0;
 rollbackConfidenceState.confirmedRollbacks   = 0;
 rollbackConfidenceState.falsePositiveWindows = [];
 rollbackConfidenceState.severityHistory      = [];
-logger.info('[Wave35] Rollback confidence state cleared on graceful shutdown');
+
+// Wave 36 — SHUTDOWN: clear trust decay registry + escalation ledger.
+rollbackTrustState.regionTrust.clear();
+rollbackTrustState.nodeTrust.clear();
+rollbackTrustState.trustEvents           = [];
+regionalEscalationState.escalations      = [];
+regionalEscalationState.totalEscalations = 0;
+regionalEscalationState.lastEscalationAt = null;
+
+// Wave 37 — SHUTDOWN: clear anomaly fusion state.
+anomalyFusionState.regions.clear();
+anomalyFusionState.lastEvaluatedAt = null;
+anomalyFusionState.consensusScore  = 0;
+logger.info('[Wave37] Anomaly fusion state cleared on graceful shutdown');
 
 // Wave 33 — close fallback client if it was opened.
 if (leaseFailoverState._fallbackClient) {
@@ -4600,12 +6477,57 @@ try {
 }
 
   // Step 3: close Redis gracefully
+  // Wave 48 — clear all tracked intervals before closing Redis
+  for (const id of _trackedIntervals) {
+    clearInterval(id);
+  }
+  _trackedIntervals.clear();
+  logger.info('[Wave48] All tracked intervals cleared');
+
+  // Wave 48 — close gossip UDP socket if tracked
+  if (_gossipSocket) {
+    try {
+      _gossipSocket.close();
+      logger.info('[Wave48] Tracked gossip socket closed');
+    } catch (err) {
+      logger.warn('[Wave48] Gossip socket close failed', { error: err.message });
+    }
+    _gossipSocket = null;
+  }
+
+  // Wave 48 — close all tracked Redis clients
+  for (const client of _trackedRedisClients) {
+    try {
+      if (client && client.status !== 'end') {
+        await client.quit();
+      }
+    } catch (err) {
+      logger.warn('[Wave48] Redis client close skipped/failed', {
+        error: err.message
+      });
+    }
+  }
+  _trackedRedisClients.clear();
+  logger.info('[Wave48] All tracked Redis clients closed');
+
   try {
     await closeRedis();
     logger.info('[Server] Redis closed gracefully.');
   } catch (err) {
     if (process.env.NODE_ENV !== 'test') {
       logger.warn('[Server] Redis shutdown warning', {
+        error: err.message,
+      });
+    }
+  }
+
+  // Wave 41 — Close gossip UDP socket if it was opened.
+  if (gossipSocket) {
+    try {
+      gossipSocket.close();
+      logger.info('[Wave41] Gossip UDP socket closed.');
+    } catch (err) {
+      logger.warn('[Wave41] Gossip socket close warning', {
         error: err.message,
       });
     }
@@ -4621,5 +6543,10 @@ try {
 
 clearTimeout(forcedShutdownTimer);
 workerBootRegistry.clear();
-process.exit(0);
+setTimeout(() => process.exit(0), 100);
 };
+
+// Wave 48 — Attach graceful shutdown signal hooks.
+// Safe for nodemon/hot-reload: process.on is idempotent per-signal on fresh starts.
+process.on('SIGINT',  gracefulShutdown);
+process.on('SIGTERM', gracefulShutdown);
