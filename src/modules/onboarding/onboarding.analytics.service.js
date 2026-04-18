@@ -331,7 +331,78 @@ async function getFunnelAnalytics({
   }
 }
 
+// ───────────────────────────────────────────────────────────────────────────────
+// getProgress
+// Returns the current onboarding step, completed steps history, and whether
+// onboarding is fully completed.  Used by the frontend init() on page load to
+// restore progress for returning users.
+// ───────────────────────────────────────────────────────────────────────────────
+
+async function getProgress(userId) {
+  if (!userId) {
+    throw new AppError(
+      'userId is required',
+      400,
+      {},
+      ErrorCodes.VALIDATION_ERROR
+    );
+  }
+
+  try {
+    // Read both tables in parallel — same pattern used by getChiReady
+    const [progressRes, usersRes] = await Promise.all([
+      supabase
+        .from(TABLE_ONBOARDING_PROGRESS)
+        .select('step, step_history, completed_at, updated_at')
+        .eq('id', userId)
+        .maybeSingle(),
+
+      supabase
+        .from('users')
+        .select('onboarding_completed, onboarding_completed_at')
+        .eq('id', userId)
+        .maybeSingle(),
+    ]);
+
+    if (progressRes.error) throw progressRes.error;
+
+    const progress = progressRes.data;
+    const user     = usersRes.data;
+
+    // New user — no progress row yet.  Return a safe empty default so the
+    // frontend can start fresh without treating this as an error.
+    if (!progress) {
+      return {
+        userId,
+        step:               null,
+        completedSteps:     [],
+        onboardingCompleted: user?.onboarding_completed ?? false,
+      };
+    }
+
+    const stepHistory = Array.isArray(progress.step_history)
+      ? progress.step_history.map((h) => (typeof h === 'string' ? h : h?.step)).filter(Boolean)
+      : [];
+
+    return {
+      userId,
+      step:               progress.step ?? null,
+      completedSteps:     stepHistory,
+      onboardingCompleted: user?.onboarding_completed ?? (progress.step === 'completed'),
+      completedAt:        progress.completed_at ?? null,
+      updatedAt:          progress.updated_at ?? null,
+    };
+  } catch (err) {
+    logger.error('[OnboardingAnalytics] getProgress failed', {
+      userId,
+      err: err.message,
+    });
+    throw err;
+  }
+}
+
 module.exports = {
+  getProgress,
   getChiReady,
   getTeaserChi,
   getChiExplainer,

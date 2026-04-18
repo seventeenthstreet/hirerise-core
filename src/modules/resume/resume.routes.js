@@ -91,27 +91,8 @@ const uploadResumeMiddleware = multer({
 });
 
 // ─────────────────────────────────────────────────────────────
-// CRUD routes
-// ─────────────────────────────────────────────────────────────
-
-// POST /api/v1/resumes
-router.post(
-  '/',
-  uploadResumeMiddleware.single('resume'),
-  uploadResume
-);
-
-// GET /api/v1/resumes
-router.get('/', listResumes);
-
-// GET /api/v1/resumes/:id
-router.get('/:id', getResume);
-
-// DELETE /api/v1/resumes/:id
-router.delete('/:id', deleteResume);
-
-// ─────────────────────────────────────────────────────────────
-// AI routes
+// AI routes — must come BEFORE param routes to avoid
+// Express matching 'score', 'growth', 'set-active' as /:id
 // ─────────────────────────────────────────────────────────────
 
 // Must stay before param routes
@@ -130,6 +111,26 @@ router.post(
 );
 
 router.post('/set-active', setActiveResume);
+
+// ─────────────────────────────────────────────────────────────
+// CRUD routes
+// ─────────────────────────────────────────────────────────────
+
+// POST /api/v1/resumes
+router.post(
+  '/',
+  uploadResumeMiddleware.single('resume'),
+  uploadResume
+);
+
+// GET /api/v1/resumes
+router.get('/', listResumes);
+
+// GET /api/v1/resumes/:id
+router.get('/:id', getResume);
+
+// DELETE /api/v1/resumes/:id
+router.delete('/:id', deleteResume);
 
 // Param routes last
 router.post('/:resumeId/refresh-url', refreshSignedUrl);

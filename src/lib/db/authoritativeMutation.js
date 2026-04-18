@@ -63,11 +63,8 @@ async function authoritativeUpsert({
 
   for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
     try {
-      const mutationSeq = currentSeq + 1;
-
       const finalPayload = {
         ...payload,
-        mutation_seq: mutationSeq,
         updated_at: new Date().toISOString(),
       };
 

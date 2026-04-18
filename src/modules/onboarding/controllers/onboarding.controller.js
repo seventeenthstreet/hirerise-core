@@ -64,9 +64,13 @@ async function extractTextFromUpload(file) {
     ?.toLowerCase();
 
   if (ext === 'pdf' || file?.mimetype === 'application/pdf') {
-    const pdfParse = require('pdf-parse');
-    const parsed = await pdfParse(file.buffer);
-    return parsed?.text || '';
+    const mupdf = (await import('mupdf')).default;
+    const doc = mupdf.Document.openDocument(file.buffer, 'application/pdf');
+    let text = '';
+    for (let i = 0; i < doc.countPages(); i++) {
+      text += doc.loadPage(i).toStructuredText('preserve-whitespace').asText() + '\n';
+    }
+    return text;
   }
 
   const mammoth = require('mammoth');
@@ -308,6 +312,86 @@ const getFunnelAnalytics = async (req, res, next) => {
   }
 };
 
+/**
+ * Map the internal parsed shape → the frontend ResumeData contract.
+ *
+ * Frontend expects:
+ *   {
+ *     personal_info: { name, email, phone, location },
+ *     summary:       string,
+ *     skills:        string[],
+ *     experience:    { id, title, company, start_date, end_date, description }[],
+ *     education:     { id, degree, institution, year }[],
+ *     certifications: string[],
+ *     projects:      string[],
+ *   }
+ */
+function mapParsedToFrontendShape(parsed, onboardingShape) {
+  const pd = onboardingShape?.personalDetails ?? {};
+
+  // Build location string from city/country
+  const locationParts = [pd.city, pd.country].filter(Boolean);
+  const location = locationParts.join(', ');
+
+  // Skills: flat string array
+  const skills = (onboardingShape?.skills ?? []).map((s) =>
+    typeof s === 'string' ? s : s.name
+  );
+
+  // Experience: use structured entries from the parser when available;
+  // fall back to a stub entry seeded from the top detected role.
+  const rawExperience = onboardingShape?.parsedResume?.experience ?? [];
+  let experience;
+  if (rawExperience.length > 0) {
+    experience = rawExperience.map((e, i) => ({
+      id:          e.id          ?? `exp-${i}-${Date.now()}`,
+      title:       e.title       ?? '',
+      company:     e.company     ?? '',
+      start_date:  e.start_date  ?? '',
+      end_date:    e.end_date    ?? '',
+      description: e.description ?? '',
+    }));
+  } else {
+    // Fallback: seed one stub entry from the top detected role
+    experience = [];
+    const detectedRole = parsed?.detectedRoles?.[0] ?? null;
+    if (detectedRole) {
+      experience.push({
+        id:          `exp-0-${Date.now()}`,
+        title:       detectedRole,
+        company:     '',
+        start_date:  '',
+        end_date:    '',
+        description: '',
+      });
+    }
+  }
+
+  // Education: map from the degree-label array produced by regexUtils
+  const rawEducation = onboardingShape?.parsedResume?.education ?? [];
+  const education = rawEducation.map((label, i) => ({
+    id:          `edu-${i}`,
+    degree:      typeof label === 'string' ? label : (label.degree ?? ''),
+    institution: typeof label === 'object' ? (label.institution ?? '') : '',
+    year:        typeof label === 'object' ? String(label.year ?? '') : '',
+  }));
+
+  return {
+    personal_info: {
+      name:     pd.fullName     ?? '',
+      email:    pd.email        ?? '',
+      phone:    pd.phone        ?? '',
+      location: location        ?? '',
+    },
+    summary:        pd.professionalSummary ?? '',
+    skills,
+    experience,
+    education,
+    certifications: onboardingShape?.parsedResume?.certifications ?? [],
+    projects:       [],
+  };
+}
+
 const uploadCvDuringOnboarding = withAuth(
   async (req, res, _next, userId) => {
     if (!req.file) {
@@ -317,26 +401,56 @@ const uploadCvDuringOnboarding = withAuth(
       });
     }
 
+    // ── 1. Upload file to storage + get raw text back ─────────────────────
     const uploadResult = await uploadResume(userId, req.file);
     const nowISO = new Date().toISOString();
 
-    const stepHistory = await mergeStepHistory(
-      userId,
-      'cv_uploaded'
-    );
+    // ── 2. Parse the resume text into structured data ─────────────────────
+    let parsedData = null;
+    try {
+      const resumeText = uploadResult.resumeText;
+      if (resumeText && resumeText.trim().length >= 30) {
+        const parsed         = parseResumeText(resumeText);
+        const onboardingShape = mapParsedToOnboardingShape(parsed);
+        parsedData           = mapParsedToFrontendShape(parsed, onboardingShape);
+
+        logger.info('[OnboardingController] Resume parsed successfully', {
+          userId,
+          resumeId:        uploadResult.resumeId,
+          confidenceScore: parsed.confidenceScore,
+          skillsFound:     (onboardingShape.skills ?? []).length,
+        });
+      } else {
+        logger.warn('[OnboardingController] Resume text too short to parse', {
+          userId,
+          resumeId: uploadResult.resumeId,
+          textLen:  resumeText?.trim().length ?? 0,
+        });
+      }
+    } catch (parseErr) {
+      // Parsing failure must NOT break the upload — UI degrades gracefully
+      logger.warn('[OnboardingController] Resume parsing failed (non-fatal)', {
+        userId,
+        resumeId: uploadResult.resumeId,
+        error:    parseErr?.message,
+      });
+    }
+
+    // ── 3. Update onboarding progress ────────────────────────────────────
+    const stepHistory = await mergeStepHistory(userId, 'cv_uploaded');
 
     const progressUpdate = {
-      id: userId,
-      step: 'cv_uploaded',
+      id:           userId,
+      step:         'cv_uploaded',
       cv_resume_id: uploadResult.resumeId,
-      wants_cv: true,
+      wants_cv:     true,
       step_history: stepHistory,
-      updated_at: nowISO,
+      updated_at:   nowISO,
     };
 
     await authoritativeUpsert({
-      table: 'onboarding_progress',
-      payload: progressUpdate,
+      table:       'onboarding_progress',
+      payload:     progressUpdate,
       conflictKey: 'id',
     });
 
@@ -360,13 +474,15 @@ const uploadCvDuringOnboarding = withAuth(
       profileRow || {}
     );
 
+    // ── 4. Return resumeId + parsedData ──────────────────────────────────
     return res.status(201).json({
       success: true,
       data: {
         userId,
-        resumeId: uploadResult.resumeId,
-        fileUrl: uploadResult.fileUrl ?? null,
-        step: 'cv_uploaded',
+        resumeId:   uploadResult.resumeId,
+        fileUrl:    uploadResult.fileUrl ?? null,
+        step:       'cv_uploaded',
+        parsedData,          // ← NOW POPULATED: mapped to frontend ResumeData shape
       },
     });
   }

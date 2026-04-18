@@ -104,9 +104,15 @@ async function extractTextFromBuffer(buffer, mimetype, originalname) {
   }
 
   if (mimetype === 'application/pdf' || ext === '.pdf') {
-    const pdfParse = require('pdf-parse');
-    const result = await pdfParse(buffer, { version: 'v1.10.100' });
-    return result.text || '';
+    // mupdf handles malformed/compressed XRef tables that pdf-parse crashes on.
+    // It is an ESM-only package so must be imported with dynamic import().
+    const mupdf = (await import('mupdf')).default;
+    const doc = mupdf.Document.openDocument(buffer, 'application/pdf');
+    let text = '';
+    for (let i = 0; i < doc.countPages(); i++) {
+      text += doc.loadPage(i).toStructuredText('preserve-whitespace').asText() + '\n';
+    }
+    return text;
   }
 
   if (

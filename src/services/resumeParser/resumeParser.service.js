@@ -18,6 +18,7 @@ const {
   extractLocation,
   extractYearsOfExperience,
   extractEducation,
+  extractExperience,
   extractIndustry,
   extractEducationLevel,
 } = require('./regexUtils');
@@ -200,6 +201,7 @@ function computeConfidence(parsed) {
   else if (parsed.skills.length >= 1) score += 5;
 
   if (parsed.yearsExperience !== null) score += 10;
+  if (parsed.experience?.length) score += 10;
   if (parsed.education.length) score += 10;
   if (parsed.detectedRoles.length) score += 5;
   if (parsed.professionalSummary) score += 5;
@@ -234,6 +236,7 @@ function parseResumeText(resumeText) {
     detectedRoles: detectRoles(text),
     yearsExperience: extractYearsOfExperience(text),
     education: extractEducation(text),
+    experience: extractExperience(text),
     certifications: extractCertifications(text),
     professionalSummary: extractSummary(text),
     industry: extractIndustry(text),
@@ -275,6 +278,7 @@ function mapParsedToOnboardingShape(parsed) {
 
     parsedResume: {
       education: parsed?.education || [],
+      experience: parsed?.experience || [],
       certifications: parsed?.certifications || [],
       detectedRoles: parsed?.detectedRoles || [],
       yearsExperience: parsed?.yearsExperience ?? null,
@@ -304,6 +308,7 @@ function emptyResult(reason) {
     detectedRoles: [],
     yearsExperience: null,
     education: [],
+    experience: [],
     certifications: [],
     professionalSummary: null,
     industry: null,

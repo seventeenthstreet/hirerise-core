@@ -346,6 +346,178 @@ function extractEducationLevel(input) {
   return null;
 }
 
+// ───────────────────────────────────────────────────────────────────────────────
+// Experience Extraction
+// Produces structured { id, title, company, start_date, end_date, description }[]
+// by scanning for common work-history section headers and date patterns.
+// ───────────────────────────────────────────────────────────────────────────────
+
+const EXPERIENCE_SECTION_HEADERS = new Set([
+  'experience',
+  'work experience',
+  'professional experience',
+  'employment history',
+  'work history',
+  'career history',
+  'positions held',
+  'employment',
+]);
+
+const EDUCATION_SECTION_HEADERS_EXP = new Set([
+  'education',
+  'academic background',
+  'qualifications',
+  'certifications',
+  'skills',
+  'projects',
+  'references',
+  'awards',
+  'publications',
+  'summary',
+  'profile',
+  'objective',
+]);
+
+// Matches: Jan 2020 – Mar 2022 / 2018 - Present / 01/2019 – 12/2021
+const DATE_RANGE_RE =
+  /(?:(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?\s+)?\d{4}\s*[–\-—to]+\s*(?:(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?\s+)?(?:\d{4}|present|current|now)/gi;
+
+// Matches a line that looks like "Job Title  |  Company Name" or "Job Title at Company"
+const TITLE_COMPANY_AT_RE = /^(.+?)\s+at\s+(.+)$/i;
+const TITLE_COMPANY_PIPE_RE = /^(.+?)\s*[\|·•]\s*(.+)$/;
+
+function extractExperience(input) {
+  const text = normalizeText(input);
+  const lines = text.split('\n').map(l => l.trim());
+
+  // Find the start of the experience section
+  let sectionStart = -1;
+  for (let i = 0; i < lines.length; i++) {
+    const lower = lines[i].toLowerCase().replace(/:$/, '');
+    if (EXPERIENCE_SECTION_HEADERS.has(lower)) {
+      sectionStart = i + 1;
+      break;
+    }
+  }
+
+  if (sectionStart === -1) return [];
+
+  // Find the end of the experience section (next major section header)
+  let sectionEnd = lines.length;
+  for (let i = sectionStart; i < lines.length; i++) {
+    const lower = lines[i].toLowerCase().replace(/:$/, '');
+    if (EDUCATION_SECTION_HEADERS_EXP.has(lower) && i > sectionStart + 2) {
+      sectionEnd = i;
+      break;
+    }
+  }
+
+  const sectionLines = lines.slice(sectionStart, sectionEnd).filter(Boolean);
+
+  // ── Pass 1: find anchor indices where a date range appears ──────────────
+  // Each anchor marks the rough start of a new job entry.
+  const anchors = []; // { lineIdx, startDate, endDate }
+  for (let i = 0; i < sectionLines.length; i++) {
+    const line = sectionLines[i];
+    // Reset regex before each test (global flag)
+    DATE_RANGE_RE.lastIndex = 0;
+    const m = DATE_RANGE_RE.exec(line);
+    if (m) {
+      DATE_RANGE_RE.lastIndex = 0;
+      const parts = m[0].split(/[–\-—]|(?:\bto\b)/i).map(s => s.trim());
+      anchors.push({
+        lineIdx:   i,
+        startDate: parts[0] ?? '',
+        endDate:   (parts[1] ?? '').replace(/^(present|current|now)$/i, 'Present'),
+      });
+    }
+  }
+
+  if (anchors.length === 0) return [];
+
+  const entries = [];
+
+  for (let a = 0; a < anchors.length && entries.length < 6; a++) {
+    const { lineIdx, startDate, endDate } = anchors[a];
+    const nextAnchorLine = anchors[a + 1]?.lineIdx ?? sectionLines.length;
+
+    // The date line itself — look 1-2 lines *before* for Title / Company
+    let title   = '';
+    let company = '';
+
+    // Lines before the date line (within this block)
+    const blockStart = a === 0 ? 0 : anchors[a - 1].lineIdx + 1;
+    const preLines   = sectionLines.slice(blockStart, lineIdx).filter(Boolean);
+
+    if (preLines.length >= 2) {
+      // Last two non-empty lines before the date: typically Title then Company
+      const last  = preLines[preLines.length - 1];
+      const prev  = preLines[preLines.length - 2];
+      // Heuristic: shorter of the two is more likely a company name
+      title   = prev;
+      company = last;
+    } else if (preLines.length === 1) {
+      // Try to split "Title at Company" or "Title | Company"
+      const single = preLines[0];
+      const atM    = TITLE_COMPANY_AT_RE.exec(single);
+      const pipeM  = TITLE_COMPANY_PIPE_RE.exec(single);
+      if (atM)        { title = atM[1].trim();   company = atM[2].trim(); }
+      else if (pipeM) { title = pipeM[1].trim(); company = pipeM[2].trim(); }
+      else            { title = single; }
+    } else {
+      // No pre-lines — title might be on the same line as the date, stripped out
+      const dateLine = sectionLines[lineIdx];
+      DATE_RANGE_RE.lastIndex = 0;
+      const stripped = dateLine.replace(DATE_RANGE_RE, '').replace(/[–\-—|·•,]+/g, '').trim();
+      DATE_RANGE_RE.lastIndex = 0;
+      if (stripped.length > 1) title = stripped;
+    }
+
+    // Skip entries where we couldn't resolve a sensible title
+    if (!title || title.length < 2 || title.length > 120) continue;
+    // Skip if the title looks like it IS a date (mis-parsed)
+    if (/^\d{4}/.test(title) || /(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)/i.test(title)) continue;
+
+    // Description: bullet lines between the date line and the next anchor.
+    // Stop early if we hit what looks like the next entry's title or company
+    // (the pre-date lines of the next anchor block).
+    const nextBlockPreStart = anchors[a + 1]
+      ? (a + 1 === 0 ? 0 : anchors[a].lineIdx + 1)
+      : sectionLines.length;
+    const nextPreLines = new Set(
+      anchors[a + 1]
+        ? sectionLines.slice(lineIdx + 1, anchors[a + 1].lineIdx).filter(Boolean).slice(-2)
+        : []
+    );
+
+    const descLines = sectionLines
+      .slice(lineIdx + 1, nextAnchorLine)
+      .filter(dl => {
+        if (!dl) return false;
+        // Skip lines that are the next entry's title or company header
+        if (nextPreLines.has(dl)) return false;
+        // Skip lines that look like a date range
+        DATE_RANGE_RE.lastIndex = 0;
+        const hasDate = DATE_RANGE_RE.test(dl);
+        DATE_RANGE_RE.lastIndex = 0;
+        return !hasDate;
+      })
+      .slice(0, 6)
+      .map(dl => dl.replace(/^[-•·]\s*/, ''));
+
+    entries.push({
+      id:          `exp-${entries.length}-${Date.now()}`,
+      title:       title.replace(/^[-•·]\s*/, ''),
+      company:     company.replace(/^[-•·]\s*/, ''),
+      start_date:  startDate,
+      end_date:    endDate,
+      description: descLines.join(' ').slice(0, 400),
+    });
+  }
+
+  return entries;
+}
+
 module.exports = Object.freeze({
   extractEmail,
   extractPhone,
@@ -355,6 +527,7 @@ module.exports = Object.freeze({
   extractLocation,
   extractYearsOfExperience,
   extractEducation,
+  extractExperience,
   extractIndustry,
   extractEducationLevel,
   CITIES,
