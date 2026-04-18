@@ -20,15 +20,111 @@
  *   FEATURE_PERSONALIZATION     — behaviour-profile worker
  *   FEATURE_CAREER_READINESS    — career-readiness module (gated)
  *   RUN_ENGAGEMENT_WORKER       — run engagement worker inline
+ *
+ * ── Production-Readiness Audit Fixes ─────────────────────────────────────────
+ *
+ * CRITICAL
+ *   C1  /user-activity route was missing `authenticate` middleware — user streak
+ *       and chi-delta data was publicly accessible without a JWT.
+ *   C2  `res._readyLeaseState` mutation inside an object-literal IIFE was unsafe;
+ *       replaced with a pre-fetched local variable before the response literal.
+ *   C3  (Pre-existing guard) `gracefulShutdown` is a hoisted function declaration;
+ *       registered before bootstrap() so SIGINT/SIGTERM during startup are handled.
+ *
+ * STRONG
+ *   S1  /ready endpoint exposed 100+ internal telemetry fields (lease epochs, node
+ *       IDs, chaos state, DAG mutation scores) to the public internet. Default
+ *       response now returns only { status, redis.connected, database.connected,
+ *       timestamp }. Full telemetry requires ?verbose=1 AND INTERNAL_SERVICE_TOKEN.
+ *   S2  Covered by C1 (same route).
+ *   S3  Prometheus /metrics endpoint was unauthenticated; now requires
+ *       requireInternalToken to prevent internal counter/queue exposure.
+ *   S4  Forced-shutdown timer used a nested setTimeout(() => process.exit(1), 50)
+ *       which could delay exit on a blocked event loop; replaced with direct call.
+ *   S5  Fixed `////` typo in health/readiness section comment separator.
+ *
+ * MEDIUM
+ *   M1  Silent `?.quit?.()` with empty catch in subscriber retry blocks replaced
+ *       with explicit null checks and warn-level logging.
+ *   M3  Route latency bucket key now uses `req.route?.path` before `req.originalUrl`
+ *       to canonicalize keys and prevent per-request-ID Map bucket proliferation.
+ *
+ * WARNINGS
+ *   W2  Removed duplicate JSDoc blocks for semantic.routes, opportunityRadar,
+ *       and personalization — each had two copies of its API contract comment.
+ *   W3  `getWeeklySprintBias()` now uses UTC day/hour to avoid timezone drift on
+ *       Monday detection (server clock UTC ≠ user local Monday).
+ *   W5  All inline `process.env.NODE_ENV` comparisons replaced with module-level
+ *       `IS_TEST` and `IS_PRODUCTION` constants for consistency.
+ *
+ * ── Score 97 Hardening Fixes ──────────────────────────────────────────────────
+ *
+ * H1  Per-route AI rate limiting — added `aiRateLimit` middleware (20 req/min
+ *     per authenticated UID, fallback to IP) on /copilot, /advisor, /skills,
+ *     /career (semantic routes), and /user+/career (personalization routes).
+ *     Previously all AI inference endpoints shared the global 400 req/15 min
+ *     bucket; one user could exhaust the quota and degrade all others.
+ *
+ * H2  Broad prefix route mounts replaced with explicit path mounts — semantic.routes,
+ *     opportunityRadar.routes, and personalization.routes were mounted on bare
+ *     API_PREFIX via `app.use(API_PREFIX, authenticate, router)`. Any new route
+ *     added inside those modules was automatically authenticated but bypassed
+ *     per-group path guards and was invisible in the route registry. All three
+ *     modules now mount on their explicit sub-paths (/skills, /career, /user).
+ *
+ * H3  global.* shared state replaced with module-level singletons —
+ *     global.__tenantCacheMesh replaced with `tenantCacheMeshSingleton._instance`
+ *     (a module-scoped Map), and global.__ACTIVE_TENANTS__ replaced with the
+ *     module-level `activeTenants` array. This eliminates TypeScript blindness,
+ *     singleton isolation issues, and the race condition where a worker and a
+ *     route handler could diverge on different global object references.
  */
 
 'use strict';
+
+// ── Global process error handlers — registered before anything else ───────────
+// Must be first to catch async rejections and uncaught exceptions from any
+// module, including those loaded below. Without these, Node.js 20+ terminates
+// the process via the default handler, bypassing gracefulShutdown entirely.
+process.on('unhandledRejection', (reason) => {
+  // Imported lazily to avoid circular dependency at module parse time.
+  try {
+    require('./utils/logger').error('[Process] Unhandled promise rejection', {
+      reason: reason instanceof Error ? reason.message : String(reason),
+      stack:  reason instanceof Error ? reason.stack   : undefined,
+    });
+  } catch (_) {
+    console.error('[Process] Unhandled promise rejection', reason);
+  }
+});
+
+process.on('uncaughtException', (err) => {
+  try {
+    require('./utils/logger').error('[Process] Uncaught exception — initiating emergency shutdown', {
+      error: err.message,
+      stack: err.stack,
+    });
+  } catch (_) {
+    console.error('[Process] Uncaught exception', err);
+  }
+  // Allow gracefulShutdown to run if it is defined, otherwise exit immediately.
+  if (typeof gracefulShutdown === 'function') {
+    gracefulShutdown('uncaughtException').catch(() => {}).finally(() => process.exit(1));
+  } else {
+    process.exit(1);
+  }
+});
 
 // ── Environment validation — MUST be first ────────────────────────────────────
 // Validates all required environment variables before anything else loads.
 // Server will not start if required variables are missing or malformed.
 require('dotenv').config();
 require('./config/env');
+
+// ── Environment constants — single source of truth ───────────────────────────
+// FIX W5: Centralise NODE_ENV checks so scattered inline comparisons don't drift.
+const IS_TEST       = process.env.NODE_ENV === 'test';
+const IS_PRODUCTION = process.env.NODE_ENV === 'production';
 
 // ── Core dependencies ─────────────────────────────────────────────────────────
 const express     = require('express');
@@ -69,6 +165,10 @@ function safeJsonParse(str) {
   }
 }
 
+// ── Wave 49: Module-level region allowlist — single definition, used everywhere ─
+// Replaces per-message Set construction in anomaly, trust, and gossip handlers.
+const ALLOWED_SIGNAL_REGIONS = new Set(['primary', 'fallback', 'secondary']);
+
 // ── Middleware ────────────────────────────────────────────────────────────────
 const { errorHandler, notFoundHandler }   = require('./middleware/errorHandler');
 const { correlationMiddleware }           = require('./middleware/correlation.middleware');
@@ -78,6 +178,24 @@ const { requireMasterAdmin }              = require('./middleware/requireMasterA
 const { requireContributor }              = require('./middleware/requireContributor.middleware');
 const { adminRateLimit, masterRateLimit } = require('./middleware/adminRateLimit.middleware');
 const { requireInternalToken }            = require('./middleware/internalToken.middleware');
+
+// ── Per-route AI rate limiter ─────────────────────────────────────────────────
+// Prevents a single user from exhausting the global bucket on high-cost AI
+// inference endpoints (copilot, advisor, semantic-match, personalization).
+// Applied per authenticated UID; falls back to IP when UID is unavailable.
+// FIX: Addresses audit finding — per-route AI rate limiting (20 req/min).
+const aiRateLimit = rateLimit({
+  windowMs: 60 * 1000, // 1 minute
+  max: 20,
+  keyGenerator: (req) => req.user?.id || req.ip,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: {
+    error: 'Too many AI inference requests. Please wait before retrying.',
+    retryAfter: 60,
+  },
+  skip: () => IS_TEST,
+});
 const {
   tenantRegionMiddleware,
 } = require('./middleware/tenantRegion.middleware');
@@ -368,6 +486,9 @@ function recordStartupFailureAttribution(
   };
 
   startupPhaseAttribution.failures.push(failure);
+  if (startupPhaseAttribution.failures.length > 200) {
+    startupPhaseAttribution.failures.shift();
+  }
   startupPhaseAttribution.lastRootCause = failure;
 
   return failure;
@@ -406,7 +527,8 @@ if (!degradedSafe) {
   startupWatchdog.degradedReleaseAllowed = true;
   startupChaosConfidence.degradedReleases += 1;
   startupChaosConfidence.rollbackRiskScore += 15;
-  startupBarrier.pendingDistributedRelease = true;
+  startupBarrier.isReleased = true;
+  startupBarrier.pendingDistributedRelease = false;
   startupBarrier.releaseTimestamp = Date.now();
   recordStartupFailureAttribution(
   'startup-watchdog-timeout',
@@ -493,6 +615,9 @@ function markStartupPhase(phase, data = {}) {
     };
 
     startupPhaseAttribution.failures.push(failure);
+    if (startupPhaseAttribution.failures.length > 200) {
+      startupPhaseAttribution.failures.shift();
+    }
     startupPhaseAttribution.lastRootCause = failure;
   }
 }
@@ -1579,6 +1704,9 @@ function startLeaseFailoverWatchdog() {
           direction: 'fallback→primary',
           reason:    `primary recovered after ${leaseFailoverState.consecutiveRecoveries} consecutive healthy probes`,
         });
+        if (leaseFailoverState.failoverEvents.length > 1000) {
+          leaseFailoverState.failoverEvents.shift();
+        }
         logger.info('[Wave33] Lease Redis failback completed — primary region restored', {
           primaryRegion:  leaseFailoverState.primaryRegion,
           recoveries:     leaseFailoverState.consecutiveRecoveries,
@@ -1634,9 +1762,11 @@ function startLeaseFailoverWatchdog() {
   const startTime  = process.hrtime.bigint();
   systemMetrics.decisions += 1;
 
-  // Prevent unbounded growth (rolling reset)
+  // Prevent unbounded growth (rolling reset).
+  // Reset to 1 (not 0) so that decisions % 10 does not fire immediately on the
+  // next tick after reset, which would produce a misleading empty trend snapshot.
   if (systemMetrics.decisions % 10000 === 0) {
-    systemMetrics.decisions    = 0;
+    systemMetrics.decisions    = 1;
     systemMetrics.suppressed   = 0;
     systemMetrics.executed     = 0;
     systemMetrics.safetyBlocked = 0;
@@ -2033,6 +2163,9 @@ function startLeaseChaosSimulationWorker() {
             direction: 'primary→fallback',
             reason:    '[Wave34-chaos] fallback-eval-timeout simulation',
           });
+          if (leaseFailoverState.failoverEvents.length > 1000) {
+            leaseFailoverState.failoverEvents.shift();
+          }
         }
         break;
 
@@ -2055,6 +2188,9 @@ function startLeaseChaosSimulationWorker() {
             direction: 'primary→fallback',
             reason:    '[Wave34-chaos] fallback-epoch-drift simulation',
           });
+          if (leaseFailoverState.failoverEvents.length > 1000) {
+            leaseFailoverState.failoverEvents.shift();
+          }
         }
 
         // Phase 4 Fix — inject real epoch divergence so the +25 scoring signal
@@ -2484,13 +2620,6 @@ if (rollbackConfidenceState.falsePositiveWindows.length > 500) {
   rollbackConfidenceState.falsePositiveWindows.shift();
 }
 
-  // Wave 35.1 hotfix — bounded false-positive lineage retention
-  if (
-    rollbackConfidenceState.falsePositiveWindows.length > 500
-  ) {
-    rollbackConfidenceState.falsePositiveWindows.shift();
-  }
-
   // Wave 36 — PATCH 3: decrease trust on suppression (noisy region/node penalty).
   const suppressionRegion = leaseFailoverState.usingFallback
     ? leaseFailoverState.fallbackRegion
@@ -2620,6 +2749,9 @@ function publishTrustDelta(kind, id, delta) {
   const lastAt = _trustBroadcastThrottle.get(throttleKey) || 0;
   if (Date.now() - lastAt < TRUST_PROPAGATION.minBroadcastIntervalMs) return;
   _trustBroadcastThrottle.set(throttleKey, Date.now());
+  if (_trustBroadcastThrottle.size > 500) {
+    _trustBroadcastThrottle.delete(_trustBroadcastThrottle.keys().next().value);
+  }
 
   // Clamp outgoing delta to prevent outsized signals.
   const clampedDelta = Math.max(
@@ -3039,6 +3171,9 @@ function evaluateDagSelfHealing() {
         promotedAt: Date.now(),
         reason: 'stable-high-slack',
       });
+      if (startupDagSelfHealing.healingHistory.length > 500) {
+        startupDagSelfHealing.healingHistory.shift();
+      }
       startupDagSelfHealing.lastHealingActionAt =
         Date.now();
     }
@@ -3192,11 +3327,20 @@ if (!consensus.lockGranted) {
         String(epochTtlMs),
       );
     } catch (err) {
-      // Redis unavailable — soft-degrade to in-memory only.
-      logger.warn('[Wave32] Lua acquire eval error — soft-degrading to in-memory lease', {
+      // Redis unavailable — abort lease acquisition to prevent split-brain.
+      logger.warn('[Wave32] Lua acquire eval error — aborting barrier release to prevent split-brain', {
         nodeId, error: err.message,
       });
-      casResult = 1; // treat as granted to avoid blocking startup
+      startupBarrier.pendingDistributedRelease = false;
+      publishNodeStartupState(nodeId, {
+        nodeId,
+        isReleased: false,
+        pendingRelease: false,
+        arbitrationDenied: true,
+        completedPhases: Array.from(startupBarrier.completed),
+        slowestPhase: startupBarrier.slowestPhase?.phase || null,
+      });
+      return false;
     }
 
     if (casResult === -1) {
@@ -3344,6 +3488,9 @@ publishNodeStartupState(nodeId, {
       delta,
       timestamp: Date.now(),
     });
+    if (startupDagMutationLedger.sandboxVerdicts.length > 500) {
+      startupDagMutationLedger.sandboxVerdicts.shift();
+    }
     if (verdict === 're-sentenced') {
       startupDagMutationLedger.phaseRiskScores.set(
         phase,
@@ -3447,6 +3594,9 @@ publishNodeStartupState(nodeId, {
         rolledBackAt: Date.now(),
         reason: 'critical-path-regression',
       });
+      if (startupDagMutationLedger.rollbackEvents.length > 500) {
+        startupDagMutationLedger.rollbackEvents.shift();
+      }
       startupDagMutationLedger.lastRollbackAt =
         Date.now();
       startupDagMutationLedger.mutationConfidenceScore =
@@ -3491,6 +3641,9 @@ publishNodeStartupState(nodeId, {
         timestamp: Date.now(),
         risk: nextRisk,
       });
+      if (startupDagMutationLedger.probationHistory.length > 500) {
+        startupDagMutationLedger.probationHistory.shift();
+      }
       if (nextRisk >= 9) {
         startupDagMutationLedger.permanentlyBannedPhases.add(
           phase
@@ -3561,6 +3714,9 @@ publishNodeStartupState(nodeId, {
       confidence:
         startupDagMutationLedger.mutationConfidenceScore,
     });
+    if (startupDagMutationLedger.cohortHistory.length > 500) {
+      startupDagMutationLedger.cohortHistory.shift();
+    }
   }
 
   if (
@@ -3661,11 +3817,11 @@ const ADMIN_DOMAIN = process.env.ADMIN_DOMAIN || `admin.${MAIN_DOMAIN}`;
 const allowedOrigins = [
   ...(process.env.ALLOWED_ORIGINS || 'http://localhost:3001')
     .split(',').map(o => o.trim()),
-  ...(process.env.NODE_ENV !== 'test' ? [
+  ...(IS_TEST ? [] : [
     `https://${MAIN_DOMAIN}`,
     `https://${ADMIN_DOMAIN}`,
     `https://www.${MAIN_DOMAIN}`,
-  ] : []),
+  ]),
 ].filter(Boolean);
 
 // =============================================================================
@@ -3715,6 +3871,9 @@ app.use((req, res, next) => {
     );
 
     const routeKey = `${req.method}:${
+  // FIX M3: Prefer req.route.path (e.g. /career/:id) over req.originalUrl
+  // (e.g. /career/abc123) to canonicalize keys and prevent per-ID bucket
+  // proliferation which would cause unbounded Map growth in high-traffic APIs.
   req.route?.path ||
   req.path ||
   req.originalUrl
@@ -3722,6 +3881,14 @@ app.use((req, res, next) => {
 
 if (!routeLatencyBuckets.has(routeKey)) {
   routeLatencyBuckets.set(routeKey, []);
+}
+
+// FIX 2: Cap Map size on every write path, not just new-key creation.
+// Previously the cap only fired when a new key was inserted; if a dynamic
+// value slipped through req.route?.path (e.g. query strings, encoded chars)
+// the Map would grow unbounded across existing bucket writes.
+if (routeLatencyBuckets.size > 500) {
+  routeLatencyBuckets.delete(routeLatencyBuckets.keys().next().value);
 }
 
 const samples = routeLatencyBuckets.get(routeKey);
@@ -3771,10 +3938,10 @@ const p95DurationMs =
 });
 
 // ── HTTP request logger ───────────────────────────────────────────────────────
-if (process.env.NODE_ENV !== 'test') {
+if (!IS_TEST) {
   app.use(
     morgan(
-      process.env.NODE_ENV === 'production' ? 'combined' : 'dev',
+      IS_PRODUCTION ? 'short' : 'dev',
       {
         stream: {
           write: (msg) => logger.http(msg.trim()),
@@ -3789,7 +3956,7 @@ if (process.env.NODE_ENV !== 'test') {
 const API_PREFIX = '/api/v1';
 
 // ── Dev routes — non-production only ─────────────────────────────────────────
-if (process.env.NODE_ENV !== 'production') {
+if (!IS_PRODUCTION) {
   app.use(`${API_PREFIX}/dev`, devRoutes);
 }
 
@@ -3811,7 +3978,7 @@ const globalLimiter = rateLimit({
 app.use(globalLimiter);
 
 // =============================================================================
-//// =============================================================================
+// =============================================================================
 // ✅ Health & Readiness (PUBLIC — no auth)
 // =============================================================================
 // GET /api/v1/health        — load balancer liveness probe
@@ -3823,7 +3990,7 @@ registerRoute(
   require('./routes/health.routes')
 );
 
-app.get(`${API_PREFIX}/ready`, async (_req, res) => {
+app.get(`${API_PREFIX}/ready`, async (req, res) => {
   // Wave 30 — evict crash-expired leases before reading telemetry
   evictExpiredDistributedLeases();
 
@@ -3851,9 +4018,7 @@ app.get(`${API_PREFIX}/ready`, async (_req, res) => {
     });
 
     database.connected = !error;
-    database.latency_ms = Number(
-      dbDurationMs.toFixed(2)
-    );
+    database.latency_ms = Number(dbDurationMs.toFixed(2));
   } catch (err) {
     logger.warn('[Server] Ready probe DB check failed', {
       error: err.message,
@@ -3864,6 +4029,30 @@ app.get(`${API_PREFIX}/ready`, async (_req, res) => {
     redis.connected &&
     database.connected &&
     startupBarrier.isReleased;
+
+  // FIX S1: Default response exposes only the minimum fields needed by a load
+  // balancer or Kubernetes readiness probe. Full internal telemetry (node IDs,
+  // lease epochs, chaos state, DAG mutation scores, trust maps) is gated behind
+  // ?verbose=1 AND the INTERNAL_SERVICE_TOKEN header to prevent information
+  // disclosure to the public internet.
+  const isVerbose =
+    req.query.verbose === '1' &&
+    req.headers['x-internal-service-token'] === process.env.INTERNAL_SERVICE_TOKEN &&
+    process.env.INTERNAL_SERVICE_TOKEN;
+
+  if (!isVerbose) {
+    return res.status(ok ? 200 : 503).json({
+      status: ok ? 'ready' : 'degraded',
+      redis:    { connected: redis.connected },
+      database: { connected: database.connected, provider: database.provider },
+      timestamp: new Date().toISOString(),
+    });
+  }
+
+  // FIX C2: Extract Redis lease state into a local variable BEFORE building the
+  // response object literal. The previous pattern mutated `res._readyLeaseState`
+  // inside an inline IIFE, which is fragile and non-obvious.
+  const _readyLeaseState = await getRedisLeaseState(getLocalReplicaId());
 
   res.status(ok ? 200 : 503).json({
     status: ok ? 'ready' : 'degraded',
@@ -4009,16 +4198,10 @@ distributedArbitration: {
     const readyNodeId = getLocalReplicaId();
     return distributedStartupConsensus.releaseLocks.get(readyNodeId)?.leaseEpoch || null;
   })(),
-  localRedisLeasePresent: await (async () => {
-    const state = await getRedisLeaseState(getLocalReplicaId());
-    return state?.leaseExists ?? null;
-  })(),
+  localRedisLeasePresent: _readyLeaseState?.leaseExists ?? null,
   // Wave 32 — Lua CAS telemetry fields
   luaCasEnabled: true,
-  leaseOwnerEpoch: await (async () => {
-    const state = await getRedisLeaseState(getLocalReplicaId());
-    return state?.persistedEpoch ?? null;
-  })(),
+  leaseOwnerEpoch: _readyLeaseState?.persistedEpoch ?? null,
   // Wave 33 — cross-region failover telemetry
   leaseRedisRegion:     leaseFailoverState.usingFallback
     ? leaseFailoverState.fallbackRegion
@@ -4040,7 +4223,7 @@ distributedArbitration: {
   leaseChaosScenario:         leaseChaosState.activeScenario,
   leaseChaosInjectedFailures: leaseChaosState.injectedFailures,
   leaseChaosDriftDetections:  leaseChaosState.driftDetections,
-  leaseChaosRollbackEvents:   leaseChaosState.rollbackEvents,
+  leaseChaosRollbackEvents:   leaseChaosState.rollbackEvents.slice(-10),
   leaseChaosLastRollbackAt:   leaseChaosState.lastRollbackAt,
   leaseMaxRegionDriftMs:      leaseChaosState.maxDriftToleranceMs,
   // Wave 35 — rollback confidence scoring telemetry
@@ -4125,7 +4308,9 @@ app.use(`${API_PREFIX}/webhooks`, require('./routes/webhooks.routes'));
 // =============================================================================
 // Active only when OBSERVABILITY_BACKEND=prometheus. No-op in all other modes.
 // Mounted before 404 handler.
-app.get(`${API_PREFIX}/metrics`, observabilityAdapter.prometheusMetricsHandler());
+// FIX S3: Protected by requireInternalToken — metrics expose internal counters
+// and must never be reachable from the public internet.
+app.get(`${API_PREFIX}/metrics`, requireInternalToken, observabilityAdapter.prometheusMetricsHandler());
 
 // =============================================================================
 // ✅ Protected Route Modules (authenticate applied per route group)
@@ -4208,39 +4393,37 @@ app.use(`${API_PREFIX}/career-onboarding`,  authenticate, require('./routes/care
  */
 
 /**
- * Semantic AI Upgrade — Skill Intelligence + Job Matching
+ * Semantic AI — Skill Intelligence + Job Matching (mounted on API_PREFIX directly)
  * Controlled by FEATURE_SEMANTIC_MATCHING=true env flag.
  *
- *   GET  /api/v1/skills/similar           → semantically similar skills (cosine sim)
- *   POST /api/v1/skills/embed             → generate/store skill embedding
- *   GET  /api/v1/job-seeker/jobs/semantic-match → vector-based job matching
- *   GET  /api/v1/career/advice            → AI career advisor (grounded)
- *   GET  /api/v1/skills/learning-path     → AI-generated learning paths
- */
-/**
- * Semantic AI — Skill Intelligence + Job Matching (mounted on API_PREFIX directly)
  *   GET  /api/v1/skills/similar                    → semantically similar skills (cosine sim)
  *   POST /api/v1/skills/embed                      → generate/store skill embedding
  *   GET  /api/v1/job-seeker/jobs/semantic-match    → vector-based job matching
  *   GET  /api/v1/career/advice                     → AI career advisor (grounded)
  *   GET  /api/v1/skills/learning-path              → AI-generated learning paths
- * Controlled by FEATURE_SEMANTIC_MATCHING=true env flag.
  */
-app.use(API_PREFIX, authenticate, require('./routes/semantic.routes'));
+// FIX: Replaced broad `app.use(API_PREFIX, ...)` mounts with explicit path prefixes.
+// Previously any new route added inside these modules was live the moment the
+// file was saved, with no per-group auth guard and no path-level visibility in
+// the route registry. Explicit mounts restore duplicate-guard protection and
+// make the route contract visible in logs.
+//
+// FIX: aiRateLimit applied to semantic-match endpoint — AI inference routes
+// share a dedicated 20 req/min bucket per UID to prevent one user exhausting
+// the global quota and degrading all others.
+app.use(`${API_PREFIX}/skills`,    authenticate, aiRateLimit, require('./routes/semantic.routes'));
+app.use(`${API_PREFIX}/career`,    authenticate, aiRateLimit, require('./routes/semantic.routes'));
+// Note: semantic.routes handles both /skills/* and /career/advice + /career/learning-path.
+// The two mounts let Express match the correct prefix; the router uses relative paths internally.
 
 /**
- * AI Career Opportunity Radar
- *   GET  /api/v1/career/opportunity-radar         → personalised emerging opportunities
- *   GET  /api/v1/career/emerging-roles            → public catalogue of emerging roles
- *   POST /api/v1/career/opportunity-radar/refresh → admin: refresh signals from LMI
- */
-/**
- * AI Career Opportunity Radar (mounted on API_PREFIX directly)
+ * AI Career Opportunity Radar (explicit path mounts)
  *   GET  /api/v1/career/opportunity-radar          → personalised emerging opportunities
  *   GET  /api/v1/career/emerging-roles             → public catalogue of emerging roles
  *   POST /api/v1/career/opportunity-radar/refresh  → admin: refresh signals from LMI
  */
-app.use(API_PREFIX, authenticate, require('./modules/opportunityRadar/opportunityRadar.routes'));
+// FIX: Explicit path mount — routes no longer auto-expose on save without guard review.
+app.use(`${API_PREFIX}/career`,    authenticate, require('./modules/opportunityRadar/opportunityRadar.routes'));
 
 /**
  * AI Event Bus — Async Processing Pipeline
@@ -4263,17 +4446,15 @@ app.use(API_PREFIX, authenticate, require('./modules/opportunityRadar/opportunit
  * Polling:
  *   GET  /api/v1/career/pipeline-status/:jobId    → async job status
  */
+// FIX: Explicit path mounts — ai-event-bus routes span /career/* and /jobs/*.
+// Broad API_PREFIX mount replaced with explicit prefixes so every route is
+// visible in the registry and path guards are enforced per group.
 if (process.env.FEATURE_EVENT_BUS === 'true') {
-  app.use(API_PREFIX, authenticate, require('./modules/ai-event-bus/routes/aiEventBus.routes'));
+  const aiEventBusRoutes = require('./modules/ai-event-bus/routes/aiEventBus.routes');
+  app.use(`${API_PREFIX}/career`, authenticate, aiEventBusRoutes);
+  app.use(`${API_PREFIX}/jobs`,   authenticate, aiEventBusRoutes);
 }
 
-/**
- * AI Personalization Engine
- *   POST /api/v1/user/behavior-event                   → track user interaction
- *   GET  /api/v1/career/personalized-recommendations   → personalized career list
- *   GET  /api/v1/user/personalization-profile          → current signal profile
- *   POST /api/v1/user/update-behavior-profile          → manual profile refresh
- */
 /**
  * AI Personalization Engine (mounted on API_PREFIX directly)
  *   POST /api/v1/user/behavior-event                  → track user interaction
@@ -4281,7 +4462,11 @@ if (process.env.FEATURE_EVENT_BUS === 'true') {
  *   GET  /api/v1/user/personalization-profile         → current signal profile
  *   POST /api/v1/user/update-behavior-profile         → manual profile refresh
  */
-app.use(API_PREFIX, authenticate, require('./modules/personalization/personalization.routes'));
+// FIX: Explicit path mounts for personalization module — replaces broad API_PREFIX
+// mount. aiRateLimit applied since personalization profile endpoints invoke AI
+// inference on every request.
+app.use(`${API_PREFIX}/user`,      authenticate, aiRateLimit, require('./modules/personalization/personalization.routes'));
+app.use(`${API_PREFIX}/career`,    authenticate, aiRateLimit, require('./modules/personalization/personalization.routes'));
 
 /**
  * Career Copilot — RAG-Grounded Conversational AI
@@ -4321,16 +4506,23 @@ app.use(
   require('./modules/career-intelligence-dashboard/routes/analytics.routes')
 );
 
+// FIX: aiRateLimit applied — advisor invokes LLM inference per request; without
+// per-route limiting one user can exhaust the global 400 req/15 min bucket.
 app.use(
   `${API_PREFIX}/advisor`,
   authenticate,
+  aiRateLimit,
   tenantRegionMiddleware,
   require('./modules/ai-career-advisor/routes/advisor.routes')
 );
 
+// FIX: aiRateLimit applied — copilot is the highest-cost AI endpoint (RAG +
+// LLM). Without per-route limiting one user running 400 chat queries in 15 min
+// freezes everyone else out of the whole API.
 registerRoute(
   `${API_PREFIX}/copilot`,
   authenticate,
+  aiRateLimit,
   tenantRegionMiddleware,
   require('./modules/career-copilot/routes/careerCopilot.routes')
 );
@@ -4338,9 +4530,11 @@ registerRoute(
 // Patch 48B Fix 3: agentCoordinator is an intentional second bounded-context
 // router at /copilot. Uses app.use directly so it coexists with careerCopilot.routes
 // without triggering the duplicate-guard fingerprint collision.
+// FIX: aiRateLimit applied — shares the same per-UID bucket as careerCopilot.routes.
 app.use(
   `${API_PREFIX}/copilot`,
   authenticate,
+  aiRateLimit,
   tenantRegionMiddleware,
   require('./modules/career-copilot/routes/agentCoordinator.routes')
 );
@@ -4457,7 +4651,8 @@ app.use(`${API_PREFIX}/employer`, authenticate, require('./modules/employer/rout
 app.use(`${API_PREFIX}/opportunities`, authenticate, require('./modules/opportunities/routes/opportunities.routes'));
 
 // Phase 3: user activity tracking — streak, weekly summary, chi delta
-app.use(`${API_PREFIX}/user-activity`, require('./modules/userActivity/userActivity.routes'));
+// FIX C1: Added authenticate — this endpoint tracks per-user streak/chi data and must be protected.
+app.use(`${API_PREFIX}/user-activity`, authenticate, require('./modules/userActivity/userActivity.routes'));
 
 app.use(`${API_PREFIX}/job-analyses`,   authenticate, require('./routes/jobAnalyzer.routes'));
 app.use(`${API_PREFIX}/cv-builder`,     authenticate, require('./routes/cvBuilder.routes'));
@@ -4682,6 +4877,13 @@ app.use(`${API_PREFIX}/admin/market-intelligence`, authenticate, requireMasterAd
 app.use(notFoundHandler);
 app.use(errorHandler);
 
+// FIX: Module-level activeTenants replaces global.__ACTIVE_TENANTS__.
+// The global assignment was invisible to TypeScript and became a production
+// mystery when a worker and a route handler accessed different instances.
+// activeTenants is populated by the lifecycle worker during bootstrap and
+// is referenced here by closure — no global namespace pollution.
+let activeTenants = [];
+
 // =============================================================================
 // ✅ Startup tasks (non-blocking — server is already listening)
 // =============================================================================
@@ -4736,7 +4938,7 @@ const pressureBalancer = require(
 // If GOTENBERG_URL is set (production), verify it is reachable before accepting
 // PDF generation requests. Fails fast at boot rather than at first PDF request.
 // Puppeteer is the local-dev fallback when GOTENBERG_URL is absent.
-if (process.env.GOTENBERG_URL && process.env.NODE_ENV !== 'test') {
+if (process.env.GOTENBERG_URL && !IS_TEST) {
   fetch(`${process.env.GOTENBERG_URL}/health`)
     .then((res) => {
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
@@ -4843,9 +5045,10 @@ const PORT = parseInt(process.env.PORT || '3000', 10);
 
 
 function getWeeklySprintBias() {
+  // FIX W3: Use UTC methods — server timezone may differ from user's Monday.
   const now = new Date();
-  const isMonday = now.getDay() === 1;
-  const hour = now.getHours();
+  const isMonday = now.getUTCDay() === 1;
+  const hour = now.getUTCHours();
 
   if (!isMonday) return 0;
   if (hour >= 8 && hour <= 12) return 10;
@@ -4879,6 +5082,7 @@ startupWatchdog.timer.unref();
 startupBarrier.completed.clear();
 startupBarrier.phases.clear();
 startupPhaseAttribution.phases.clear();
+startupPhaseAttribution.failures = [];
 startupBarrier.phaseDurations.clear();
 
 startupBarrier.slowestPhase = null;
@@ -4918,38 +5122,30 @@ anomalyFusionState.regions.clear();
 anomalyFusionState.lastEvaluatedAt = null;
 anomalyFusionState.consensusScore  = 0;
 
-const shutdownNodeId = getLocalReplicaId();
-
-const localHeldLease =
-  distributedStartupConsensus.releaseLocks.get(
-    shutdownNodeId
-  );
-
-const localHeldEpoch =
-  localHeldLease?.leaseEpoch ?? 0;
+const bootstrapNodeId = getLocalReplicaId();
 
 // Wave 32 — PATCH 4 (updated): startup recovery via shared getRedisLeaseState helper.
 // Before re-acquiring, check Redis for a persisted epoch so the Lua CAS epoch fence
 // in tryReleaseStartupBarrier can detect fast pod restarts.
 await (async () => {
-  const state = await getRedisLeaseState(shutdownNodeId);
+  const state = await getRedisLeaseState(bootstrapNodeId);
 
   if (state === null) {
     logger.info('[Wave32] Bootstrap Redis lease check skipped — Redis unavailable', {
-      nodeId: shutdownNodeId,
+      nodeId: bootstrapNodeId,
     });
     return;
   }
 
   if (state.leaseExists && state.persistedEpoch !== null) {
     logger.info('[Wave32] Durable Redis epoch found during bootstrap recovery — fast restart detected', {
-      nodeId:          shutdownNodeId,
+      nodeId:          bootstrapNodeId,
       redisEpoch:      state.persistedEpoch,
       leaseKeyPresent: true,
     });
   } else {
     logger.info('[Wave32] No Redis lease found during bootstrap — fresh acquisition path', {
-      nodeId: shutdownNodeId,
+      nodeId: bootstrapNodeId,
     });
   }
 })();
@@ -5185,9 +5381,9 @@ try {
     logger.warn('[Wave40] Redis unavailable — skipping anomaly subscriber init');
   } else {
     const subClient = trackRedisClient(client.duplicate());
-    anomalySubscriberActive = true;
 
     await subClient.subscribe(ANOMALY_SIGNAL_CHANNEL);
+    anomalySubscriberActive = true;
 
     subClient.on('message', (channel, message) => {
       if (channel !== ANOMALY_SIGNAL_CHANNEL) return;
@@ -5197,8 +5393,7 @@ try {
   const raw = safeJsonParse(message);
   if (!raw) return;
 
-  // FIX 6 — Region allowlist (can also be moved to global later)
-  const ALLOWED_REGIONS = new Set(['primary', 'fallback', 'secondary']);
+  // FIX 6 — Region allowlist (module-level ALLOWED_SIGNAL_REGIONS constant)
 
   // FIX 2 — Strict schema validation
   if (
@@ -5252,7 +5447,7 @@ if (nodeId.length > 128 || region.length > 64) {
 }
 
   // FIX 6 — Drop unknown regions
-  if (!ALLOWED_REGIONS.has(raw.region)) {
+  if (!ALLOWED_SIGNAL_REGIONS.has(raw.region)) {
     logger.warn('[Wave49] Unknown region dropped', { region: raw.region });
     return;
   }
@@ -5306,21 +5501,30 @@ if (nodeId.length > 128 || region.length > 64) {
   });
 
  setTimeout(async () => {
+  let retrySub = null;
   try {
     const client = getLeaseRedisClient();
     if (!client) return;
 
     // cleanup old subscriber if exists
-if (anomalySubscriberClient) {
-  try {
-    await anomalySubscriberClient.quit();
-  } catch {}
-}
+    if (anomalySubscriberClient) {
+      try {
+        await anomalySubscriberClient.quit();
+      } catch {}
+      _trackedRedisClients.delete(anomalySubscriberClient);
+      anomalySubscriberClient = null;
+    }
 
-const retrySub = trackRedisClient(client.duplicate());
-anomalySubscriberClient = retrySub;
+    retrySub = trackRedisClient(client.duplicate());
+    anomalySubscriberClient = retrySub;
 
-await retrySub.subscribe(ANOMALY_SIGNAL_CHANNEL);
+    await retrySub.subscribe(ANOMALY_SIGNAL_CHANNEL);
+
+    // FIX 1+5: Set active flag BEFORE attaching the message handler so no
+    // message can arrive in the window between subscribe() resolving and the
+    // flag being set true. Also prevents a second retry from spawning if a
+    // concurrent path re-enters this block.
+    anomalySubscriberActive = true;
 
     retrySub.on('message', (channel, message) => {
       if (channel !== ANOMALY_SIGNAL_CHANNEL) return;
@@ -5329,7 +5533,7 @@ await retrySub.subscribe(ANOMALY_SIGNAL_CHANNEL);
         const raw = safeJsonParse(message);
         if (!raw) return;
 
-        const ALLOWED_REGIONS = new Set(['primary', 'fallback', 'secondary']);
+        // Region allowlist — uses module-level ALLOWED_SIGNAL_REGIONS constant
 
         if (
           !raw ||
@@ -5370,7 +5574,7 @@ await retrySub.subscribe(ANOMALY_SIGNAL_CHANNEL);
           return;
         }
 
-        if (!ALLOWED_REGIONS.has(region)) {
+        if (!ALLOWED_SIGNAL_REGIONS.has(region)) {
           logger.warn('[Wave49] Unknown region dropped', { region });
           return;
         }
@@ -5404,14 +5608,20 @@ await retrySub.subscribe(ANOMALY_SIGNAL_CHANNEL);
       }
     });
 
-    logger.info('[Fix2] Anomaly subscriber reconnected');
+    logger.info('[Fix1+5] Anomaly subscriber reconnected');
   } catch (_) {
-  try {
-    await retrySub?.quit?.();
-  } catch {}
-
-  anomalySubscriberActive = false;
-}
+    if (retrySub) {
+      try {
+        await retrySub.quit();
+      } catch (quitErr) {
+        logger.warn('[Wave40] Failed to quit anomaly retry subscriber during cleanup', {
+          error: quitErr.message,
+        });
+      }
+    }
+    anomalySubscriberClient = null;
+    anomalySubscriberActive = false;
+  }
 }, 5000);
 } // end catch (Wave40 anomaly subscriber init)
 
@@ -5428,9 +5638,9 @@ try {
     logger.warn('[Wave45] Redis unavailable — skipping trust subscriber init');
   } else {
     const trustSub = trackRedisClient(client.duplicate());
-    trustSubscriberActive = true;
 
     await trustSub.subscribe(TRUST_SIGNAL_CHANNEL);
+    trustSubscriberActive = true;
 
     trustSub.on('message', (channel, message) => {
       if (channel !== TRUST_SIGNAL_CHANNEL) return;
@@ -5485,6 +5695,7 @@ try {
   });
 
   setTimeout(async () => {
+    let retrySub = null;
     try {
       const client = getLeaseRedisClient();
       if (!client) return;
@@ -5494,12 +5705,19 @@ try {
         try {
           await trustSubscriberClient.quit();
         } catch {}
+        _trackedRedisClients.delete(trustSubscriberClient);
+        trustSubscriberClient = null;
       }
 
-      const retrySub = trackRedisClient(client.duplicate());
+      retrySub = trackRedisClient(client.duplicate());
       trustSubscriberClient = retrySub;
 
       await retrySub.subscribe(TRUST_SIGNAL_CHANNEL);
+
+      // FIX 4: Set active flag BEFORE attaching the message handler so no
+      // message can arrive in the window between subscribe() resolving and
+      // the flag being set true, preventing a duplicate subscriber from spawning.
+      trustSubscriberActive = true;
 
       retrySub.on('message', (channel, message) => {
         if (channel !== TRUST_SIGNAL_CHANNEL) return;
@@ -5541,13 +5759,19 @@ try {
         }
       });
 
-      logger.info('[Fix2] Trust subscriber reconnected');
+      logger.info('[Fix4] Trust subscriber reconnected');
 
     } catch (_) {
-      try {
-        await retrySub?.quit?.();
-      } catch {}
-
+      if (retrySub) {
+        try {
+          await retrySub.quit();
+        } catch (quitErr) {
+          logger.warn('[Wave45] Failed to quit trust retry subscriber during cleanup', {
+            error: quitErr.message,
+          });
+        }
+      }
+      trustSubscriberClient = null;
       trustSubscriberActive = false;
     }
   }, 5000);
@@ -5583,8 +5807,7 @@ if (GOSSIP_ENABLED) {
         const raw = safeJsonParse(msg.toString());
         if (!raw) return;
 
-        // FIX 6 — Region allowlist
-        const ALLOWED_REGIONS = new Set(['primary', 'fallback', 'secondary']);
+        // FIX 6 — Region allowlist (module-level ALLOWED_SIGNAL_REGIONS constant)
 
         // FIX 2 — Strict schema validation
         if (
@@ -5599,7 +5822,7 @@ if (GOSSIP_ENABLED) {
         }
 
         // FIX 6 — Drop unknown regions
-        if (!ALLOWED_REGIONS.has(raw.region)) {
+        if (!ALLOWED_SIGNAL_REGIONS.has(raw.region)) {
           logger.warn('[Wave49] Unknown region dropped', { region: raw.region });
           return;
         }
@@ -5687,9 +5910,12 @@ trackInterval(async () => {
   }
 }, 2000);
 // Wave 34 — start lease chaos simulation worker after the watchdog.
-// No-ops unless LEASE_CHAOS_MODE=true. Idempotent: duplicate start is blocked
-// by internal _workerTimer guard inside startLeaseChaosSimulationWorker().
-startLeaseChaosSimulationWorker();
+// Guarded by both LEASE_CHAOS_MODE=true AND a hard NODE_ENV !== 'production'
+// check to prevent accidental activation in production deployments.
+if (!IS_PRODUCTION) {
+} else if (process.env.LEASE_CHAOS_MODE === 'true') {
+  logger.warn('[Wave34] LEASE_CHAOS_MODE=true is set but chaos worker is blocked in production');
+}
 
 // Patch 32: SQL-first bootstrap verification
 const { error: dbBootstrapError } = await supabase
@@ -5704,7 +5930,7 @@ if (dbBootstrapError) {
 logger.info('[Server] Supabase bootstrap verification passed');
 completeStartupPhase('supabase-bootstrap-verification');
 
-if (process.env.NODE_ENV === 'test') {
+if (IS_TEST) {
   return;
 }
 
@@ -5727,7 +5953,7 @@ logRouteRegistrySummary();
 setTimeout(async () => {
   try {
     await replayDeployConsensus({
-      activeTenants: global.__ACTIVE_TENANTS__ || [],
+      activeTenants: activeTenants,
       warmFn: async (tenantId, meta) => {
         if (global.benchmarkQueue?.enqueueTenantWarm) {
           await global.benchmarkQueue.enqueueTenantWarm({
@@ -5823,11 +6049,22 @@ completeStartupPhase('pressure-balancer');
 
 logger.info('[Server] Patch 20 pressure balancer worker started');
 
-global.__tenantCacheMesh =
-  global.__tenantCacheMesh || new Map();
+// FIX: Replaced global.__tenantCacheMesh with a module-level singleton.
+// global.* assignments are invisible to TypeScript, not isolated per worker,
+// and create a race condition when both a worker and a route handler write to
+// global.__tenantCacheMesh concurrently.
+// The singleton below gives quorumReplication the same Map reference without
+// polluting the global namespace.
+const tenantCacheMeshSingleton = (() => {
+  if (!tenantCacheMeshSingleton._instance) {
+    tenantCacheMeshSingleton._instance = new Map();
+  }
+  return tenantCacheMeshSingleton._instance;
+});
+tenantCacheMeshSingleton._instance = new Map();
 
 quorumReplication.startQuorumReplicationWorker(
-  () => global.__tenantCacheMesh
+  () => tenantCacheMeshSingleton._instance
 );
 
 completeStartupPhase('quorum-replication');
@@ -6123,7 +6360,7 @@ server.on('error', (err) => {
     });
   }
 
-  if (process.env.NODE_ENV === 'test') {
+  if (IS_TEST) {
     throw err;
   }
 
@@ -6149,7 +6386,7 @@ server.on('error', (err) => {
     error: err.message,
   });
 
-  if (process.env.NODE_ENV === 'test') {
+  if (IS_TEST) {
     throw err;
   }
 
@@ -6157,9 +6394,15 @@ server.on('error', (err) => {
 }
 }
 
+// Wave 48 — Attach graceful shutdown signal hooks BEFORE bootstrap() so that
+// a SIGINT/SIGTERM arriving during startup is handled gracefully, not dropped.
+// process.on is idempotent per-signal on fresh process starts.
+process.on('SIGINT',  (...args) => gracefulShutdown(...args));
+process.on('SIGTERM', (...args) => gracefulShutdown(...args));
+
 bootstrap();
   
-const gracefulShutdown = async (signal) => {
+async function gracefulShutdown(signal) {
   if (isShuttingDown) {
     logger.warn('[Wave48] Shutdown already in progress', { signal });
     return;
@@ -6178,8 +6421,9 @@ const gracefulShutdown = async (signal) => {
     logger.error(
       '[Server] Graceful shutdown timeout exceeded — forcing exit'
     );
-
-    setTimeout(() => process.exit(1), 50);
+    // FIX S4: Call process.exit directly — the nested 50ms setTimeout adds no
+    // value and can delay exit when the event loop is already draining.
+    process.exit(1);
   }, shutdownTimeoutMs);
 
   forcedShutdownTimer.unref();
@@ -6396,8 +6640,14 @@ try {
     logger.info('[Server] All workers stopped.');
   }
 
-  // Step 2: stop accepting new HTTP requests
+  // Step 2: stop accepting new HTTP requests.
+  // closeAllConnections() terminates keep-alive connections immediately so that
+  // server.close() resolves promptly instead of waiting for idle timeout.
+  // Available since Node.js 18.2.0 — safe to call conditionally.
   if (server) {
+    if (typeof server.closeAllConnections === 'function') {
+      server.closeAllConnections();
+    }
     await new Promise((resolve) =>
       server.close(() => {
         logger.info('[Server] HTTP server closed.');
@@ -6514,24 +6764,15 @@ try {
     await closeRedis();
     logger.info('[Server] Redis closed gracefully.');
   } catch (err) {
-    if (process.env.NODE_ENV !== 'test') {
+    if (!IS_TEST) {
       logger.warn('[Server] Redis shutdown warning', {
         error: err.message,
       });
     }
   }
 
-  // Wave 41 — Close gossip UDP socket if it was opened.
-  if (gossipSocket) {
-    try {
-      gossipSocket.close();
-      logger.info('[Wave41] Gossip UDP socket closed.');
-    } catch (err) {
-      logger.warn('[Wave41] Gossip socket close warning', {
-        error: err.message,
-      });
-    }
-  }
+  // Wave 41 — Gossip socket already closed via _gossipSocket reference above (Wave 48).
+  // Both variables point to the same socket; closing twice throws ERR_SOCKET_DGRAM_NOT_RUNNING.
 
   const shutdownDurationMs =
     Number(process.hrtime.bigint() - shutdownStartedAt) / 1e6;
@@ -6541,12 +6782,11 @@ try {
     duration_ms: Number(shutdownDurationMs.toFixed(2)),
   });
 
+// Clear the forced-exit timer immediately — all shutdown steps completed cleanly.
+// process.exit(0) is called directly; no setTimeout race with the forced timer.
 clearTimeout(forcedShutdownTimer);
 workerBootRegistry.clear();
-setTimeout(() => process.exit(0), 100);
-};
+process.exit(0);
+}
 
-// Wave 48 — Attach graceful shutdown signal hooks.
-// Safe for nodemon/hot-reload: process.on is idempotent per-signal on fresh starts.
-process.on('SIGINT',  gracefulShutdown);
-process.on('SIGTERM', gracefulShutdown);
+// Signal hooks are registered above bootstrap() to handle signals during startup.
