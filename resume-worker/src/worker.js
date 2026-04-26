@@ -1,5 +1,6 @@
 import { loadConfig } from '../../shared/config/index.js';
 import { logger } from '../../shared/logger/index.js';
+import { sendAlert, SEVERITY } from '../../shared/monitoring/alerts.js';
 import { createSubscriber } from '../../shared/pubsub/index.js';
 import { handleResumeSubmitted } from './handlers/resume-submitted.handler.js';
 
@@ -7,6 +8,39 @@ process.env.SERVICE_NAME = 'resume-worker';
 
 let subscription = null;
 let isShuttingDown = false;
+
+// ─────────────────────────────────────────────────────────────
+// PROCESS-LEVEL ERROR HANDLING
+// ─────────────────────────────────────────────────────────────
+
+process.once('unhandledRejection', async (reason) => {
+  const error = reason instanceof Error ? reason : new Error(String(reason));
+  logger.error('Unhandled promise rejection', { error: error.message, stack: error.stack });
+  await sendAlert({
+    message: 'resume-worker: Unhandled rejection — process will exit',
+    severity: SEVERITY.CRITICAL,
+    error,
+    alertKey: 'resume-worker:unhandledRejection',
+    context: { pid: process.pid },
+  }).catch(() => {});
+  shutdown('unhandledRejection');
+});
+
+process.once('uncaughtException', async (err) => {
+  logger.error('Uncaught exception', { error: err?.message, stack: err?.stack });
+  await sendAlert({
+    message: 'resume-worker: Uncaught exception — process will exit',
+    severity: SEVERITY.CRITICAL,
+    error: err,
+    alertKey: 'resume-worker:uncaughtException',
+    context: { pid: process.pid },
+  }).catch(() => {});
+  shutdown('uncaughtException');
+});
+
+// ─────────────────────────────────────────────────────────────
+// BOOTSTRAP
+// ─────────────────────────────────────────────────────────────
 
 async function bootstrap() {
   try {
@@ -24,8 +58,7 @@ async function bootstrap() {
       handleResumeSubmitted,
       {
         maxMessages: 5,
-        ackDeadlineSeconds:
-          config.pubsub.ackDeadlineSeconds,
+        ackDeadlineSeconds: config.pubsub.ackDeadlineSeconds,
       }
     );
 
@@ -37,9 +70,21 @@ async function bootstrap() {
       stack: err?.stack,
     });
 
+    await sendAlert({
+      message: 'resume-worker: Bootstrap failed — worker did not start',
+      severity: SEVERITY.CRITICAL,
+      error: err,
+      alertKey: 'resume-worker:bootstrap-failed',
+      context: { pid: process.pid },
+    }).catch(() => {});
+
     process.exit(1);
   }
 }
+
+// ─────────────────────────────────────────────────────────────
+// GRACEFUL SHUTDOWN
+// ─────────────────────────────────────────────────────────────
 
 async function shutdown(signal) {
   if (isShuttingDown) return;
@@ -48,42 +93,16 @@ async function shutdown(signal) {
   logger.info(`${signal} received, shutting down worker`);
 
   try {
-    if (subscription?.close) {
-      await subscription.close();
-    }
-
+    if (subscription?.close) await subscription.close();
     logger.info('Worker shutdown complete');
     process.exit(0);
   } catch (err) {
-    logger.error('Error during shutdown', {
-      error: err?.message ?? 'Unknown shutdown error',
-    });
-
+    logger.error('Error during shutdown', { error: err?.message ?? 'Unknown shutdown error' });
     process.exit(1);
   }
 }
 
 process.on('SIGTERM', () => shutdown('SIGTERM'));
 process.on('SIGINT', () => shutdown('SIGINT'));
-
-process.on('unhandledRejection', (reason) => {
-  logger.error('Unhandled promise rejection', {
-    error:
-      reason instanceof Error
-        ? reason.message
-        : String(reason),
-  });
-
-  shutdown('unhandledRejection');
-});
-
-process.on('uncaughtException', (err) => {
-  logger.error('Uncaught exception', {
-    error: err?.message ?? 'Unknown exception',
-    stack: err?.stack,
-  });
-
-  shutdown('uncaughtException');
-});
 
 await bootstrap();

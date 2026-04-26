@@ -7,7 +7,7 @@
     "node": ">=20 <21",
     "npm": ">=10"
   },
-  "packageManager": "npm@10",
+  "packageManager": "npm@10.9.2",
   "scripts": {
     "start": "node src/server.js",
     "dev": "nodemon --signal SIGTERM src/server.js",
@@ -23,10 +23,9 @@
   "dependencies": {
     "@anthropic-ai/sdk": "^0.78.0",
     "@extractus/article-extractor": "^8.0.20",
-    "@google-cloud/tasks": "^5.3.0",
     "@google/generative-ai": "^0.24.1",
     "@supabase/supabase-js": "^2.99.2",
-    "axios": "^1.14.0",
+    "axios": "^1.15.0",
     "compression": "^1.7.4",
     "cors": "^2.8.5",
     "csv-parser": "^3.2.0",
@@ -39,11 +38,12 @@
     "ioredis": "^5.9.3",
     "mammoth": "^1.11.0",
     "morgan": "^1.10.0",
-    "multer": "^2.0.2",
+    "multer": "^2.1.1",
     "mupdf": "^1.27.0",
-    "natural": "^6.10.4",
+    "natural": "^8.1.1",
     "node-cache": "^5.1.2",
     "openai": "^6.33.0",
+    "pdf-lib": "^1.17.1",
     "pdf-parse": "^1.1.4",
     "pdf2json": "^4.0.3",
     "pdfjs-dist": "^5.6.205",
@@ -51,7 +51,6 @@
     "stopword": "^2.0.8",
     "stripe": "^20.4.0",
     "unpdf": "^1.6.0",
-    "uuid": "^9.0.1",
     "winston": "^3.11.0",
     "zod": "^3.25.76"
   },
@@ -84,5 +83,17 @@
   },
   "optionalDependencies": {
     "puppeteer": "^24.37.5"
+  },
+  "overrides": {
+    "follow-redirects": ">=1.15.12",
+    "brace-expansion": ">=1.1.13",
+    "protobufjs": ">=7.5.5",
+    "path-to-regexp": ">=0.1.13",
+    "lodash": ">=4.17.24",
+    "flatted": ">=3.4.0",
+    "basic-ftp": ">=5.2.3",
+    "@xmldom/xmldom": ">=0.8.13",
+    "picomatch": ">=2.3.2",
+    "minimatch": ">=3.1.4"
   }
 }

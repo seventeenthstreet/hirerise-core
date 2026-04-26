@@ -17,7 +17,8 @@ const logger = require('../utils/logger');
 
 const { supabase } = require('../config/supabase');
 
-const cache = cacheManager.getClient();
+// Phase 2: lazy getter — resolves Redis post-bootstrap on each call
+const getCache = () => cacheManager.getClient();
 
 // ── CONFIG ────────────────────────────────────────────────────────────────
 const CACHE_TTL_SECONDS = 300;
@@ -181,13 +182,48 @@ function computeScoreFromParsedData(parsedData, userId) {
     )
   );
 
-  const topRole = parsedData.detectedRoles?.[0];
+  // ── roleFit: experience section is the authoritative source ─────────────
+  //
+  // detectedRoles is a keyword-frequency scorer over the whole document and
+  // routinely fires on incidental words (e.g. "accounts receivable" → Accountant).
+  // It must NEVER override an actual job title from the experience section.
+  //
+  // Priority:
+  //   1. experience[0].title   (most specific, from the structured experience block)
+  //   2. experience[0].role    (alternate field name used by some parsers)
+  //   3. detectedRoles[0]      ONLY when no experience section exists at all
+  //   4. 'unknown'             hard fallback
+  const experienceTitle =
+    parsedData.experience?.[0]?.title ??
+    parsedData.experience?.[0]?.role  ??
+    null;
 
-  const roleFit = topRole
-    ? typeof topRole === 'object'
-      ? topRole.canonical || topRole.role
-      : String(topRole)
-    : 'unknown';
+  const hasExperience = (parsedData.experience?.length ?? 0) > 0;
+
+  let roleFit;
+  if (experienceTitle) {
+    // Primary: real job title from the experience section
+    roleFit = String(experienceTitle).trim() || 'unknown';
+  } else if (hasExperience) {
+    // Experience entries exist but no title — leave as unknown rather than
+    // fabricating a wrong label from keyword matching
+    roleFit = 'unknown';
+  } else {
+    // Last resort: no experience at all — use detectedRoles keyword match
+    const topRole = parsedData.detectedRoles?.[0];
+    roleFit = topRole
+      ? typeof topRole === 'object'
+        ? topRole.canonical || topRole.role || 'unknown'
+        : String(topRole)
+      : 'unknown';
+  }
+
+  /* DEBUG – remove before go-live */
+  if (process.env.RESUME_PARSER_DEBUG === 'true') {
+    console.debug('[resumeScore] detectedRoles:', parsedData.detectedRoles);
+    console.debug('[resumeScore] experience[0]:', parsedData.experience?.[0]);
+    console.debug('[resumeScore] resolved roleFit:', roleFit);
+  }
 
   return {
     isMockData: false,
@@ -272,7 +308,7 @@ async function calculate(userId) {
 
   const cacheKey = `resumeScore:${userId}`;
 
-  const cached = await cache.get(cacheKey);
+  const cached = await getCache().get(cacheKey);
   if (cached) {
     return cached;
   }
@@ -280,14 +316,14 @@ async function calculate(userId) {
   return lockService.executeWithLock(
     `lock:${userId}`,
     async () => {
-      const cachedAgain = await cache.get(cacheKey);
+      const cachedAgain = await getCache().get(cacheKey);
       if (cachedAgain) {
         return cachedAgain;
       }
 
       const result = await performScoring(userId);
 
-      await cache.set(
+      await getCache().set(
         cacheKey,
         result,
         CACHE_TTL_SECONDS
@@ -304,7 +340,7 @@ async function invalidate(userId) {
     return;
   }
 
-  await cache.delete(`resumeScore:${userId}`);
+  await getCache().delete(`resumeScore:${userId}`);
 }
 
 module.exports = {

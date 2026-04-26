@@ -18,17 +18,71 @@ const MAX_PATH_LENGTH = 1024;
 const MAX_FILENAME_LENGTH = 255;
 const MAX_MIME_LENGTH = 100;
 
+/**
+ * Builds the standard meta block for every response.
+ * Kept as a local helper because this service uses ESM and can't
+ * easily import the CJS shared/response helper without a wrapper.
+ */
 function responseMeta(req) {
   return {
     requestId: req.requestId,
-    timestamp: new Date().toISOString()
+    timestamp: new Date().toISOString(),
   };
+}
+
+/**
+ * sendSuccess — local ESM wrapper matching the shared helper contract.
+ * ADDITIVE: spreads `legacy` fields to top level so existing clients are unaffected.
+ *
+ * { success, data, meta, ...legacy }
+ */
+function sendSuccess(res, status, data, legacy = {}) {
+  return res.status(status).json({
+    success: true,
+    data,
+    meta: responseMeta(res.req ?? res),
+    // Backward compat: old clients reading flat fields keep working
+    ...legacy,
+  });
+}
+
+/**
+ * sendError — local ESM wrapper matching the shared helper contract.
+ * ADDITIVE: includes both `error` (new) and `message` (legacy).
+ *
+ * { success, error, message, code?, meta, ...legacy }
+ */
+function sendError(res, status, message, code = null, legacy = {}) {
+  const body = {
+    success: false,
+    error: message,     // new top-level string field
+    message,            // backward compat
+    meta: responseMeta(res.req ?? res),
+    ...legacy,
+  };
+  if (code) body.code = code;
+  return res.status(status).json(body);
 }
 
 function buildResumeJobKey(userId, path) {
   return createHash('sha256')
     .update(`${userId}:${path}`)
     .digest('hex');
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Status normalization
+//
+// DB stores processing_status as 'complete' (internal value, must not change).
+// The public API contract exposes 'done' as the ONLY completion state.
+// This function translates at the response boundary — never at the DB layer.
+//
+// Allowed public values:  pending | processing | done | failed
+// Deprecated public value: 'complete' → mapped to 'done'
+// ─────────────────────────────────────────────────────────────────────────────
+function normalizeStatus(rawStatus) {
+  if (rawStatus === 'complete') return 'done';
+  return rawStatus ?? 'pending';
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -40,10 +94,10 @@ export async function submitResume(req, res, next) {
     const userId = req.user?.uid;
 
     if (!userId) {
-      return res.status(401).json({
-        error: 'UNAUTHORIZED',
-        message: 'User authentication required',
-        ...responseMeta(req)
+      // BEFORE: { error:'UNAUTHORIZED', message:'...', requestId, timestamp }
+      // AFTER:  { success:false, error:'...', message:'...', code:'UNAUTHORIZED', meta:{...}, error:'UNAUTHORIZED' }
+      return sendError(res, 401, 'User authentication required', 'UNAUTHORIZED', {
+        error: 'UNAUTHORIZED', // backward compat: old field shape preserved
       });
     }
 
@@ -54,10 +108,10 @@ export async function submitResume(req, res, next) {
 
     const validation = validateResumeSubmission(req.body);
     if (!validation.valid) {
-      return res.status(400).json({
-        error: 'VALIDATION_ERROR',
-        message: validation.error,
-        ...responseMeta(req)
+      // BEFORE: { error:'VALIDATION_ERROR', message:validation.error, ...meta }
+      // AFTER:  { success:false, error:msg, message:msg, code, meta, error:'VALIDATION_ERROR' }
+      return sendError(res, 400, validation.error, 'VALIDATION_ERROR', {
+        error: 'VALIDATION_ERROR', // backward compat
       });
     }
 
@@ -91,13 +145,23 @@ export async function submitResume(req, res, next) {
         requestId: req.requestId
       });
 
-      return res.status(202).json({
-        message: 'Resume already submitted for processing',
-        resumeId: existingJob.resumeId,
-        jobId: existingJob.id,
-        statusUrl: `/v1/resume/${existingJob.resumeId}/score`,
-        ...responseMeta(req)
-      });
+      // BEFORE: { message, resumeId, jobId, statusUrl, requestId, timestamp }
+      // AFTER:  { success:true, data:{...}, meta:{...}, message, resumeId, jobId, statusUrl }
+      return sendSuccess(res, 202,
+        {
+          message:   'Resume already submitted for processing',
+          resumeId:  existingJob.resumeId,
+          jobId:     existingJob.id,
+          statusUrl: `/v1/resume/${existingJob.resumeId}/score`,
+        },
+        // backward compat: flat fields preserved at top level
+        {
+          message:   'Resume already submitted for processing',
+          resumeId:  existingJob.resumeId,
+          jobId:     existingJob.id,
+          statusUrl: `/v1/resume/${existingJob.resumeId}/score`,
+        }
+      );
     }
 
     const resumeId = randomUUID();
@@ -139,13 +203,12 @@ export async function submitResume(req, res, next) {
       requestId: req.requestId
     });
 
-    return res.status(202).json({
-      message: 'Resume submitted for processing',
-      resumeId,
-      jobId,
-      statusUrl: `/v1/resume/${resumeId}/score`,
-      ...responseMeta(req)
-    });
+    // BEFORE: { message, resumeId, jobId, statusUrl, requestId, timestamp }
+    // AFTER:  { success:true, data:{...}, meta:{...}, message, resumeId, jobId, statusUrl }
+    return sendSuccess(res, 202,
+      { message: 'Resume submitted for processing', resumeId, jobId, statusUrl: `/v1/resume/${resumeId}/score` },
+      { message: 'Resume submitted for processing', resumeId, jobId, statusUrl: `/v1/resume/${resumeId}/score` }
+    );
   } catch (error) {
     next(error);
   }
@@ -161,57 +224,63 @@ export async function getResumeScore(req, res, next) {
     const { resumeId } = req.params;
 
     if (!userId) {
-      return res.status(401).json({
+      // BEFORE: { error:'UNAUTHORIZED', message:'...', ...meta }
+      // AFTER:  { success:false, error:'...', message:'...', code, meta, error:'UNAUTHORIZED' }
+      return sendError(res, 401, 'User authentication required', 'UNAUTHORIZED', {
         error: 'UNAUTHORIZED',
-        message: 'User authentication required',
-        ...responseMeta(req)
       });
     }
 
     const resume = await resumeRepo.findById(resumeId);
 
     if (!resume || resume.userId !== userId) {
-      return res.status(404).json({
+      // BEFORE: { error:'NOT_FOUND', message:'...', ...meta }
+      // AFTER:  { success:false, error:'...', message:'...', code:'NOT_FOUND', meta }
+      return sendError(res, 404, 'Resume not found', 'NOT_FOUND', {
         error: 'NOT_FOUND',
-        message: 'Resume not found',
-        ...responseMeta(req)
       });
     }
 
     if (resume.processingStatus === 'failed') {
-      return res.status(200).json({
+      const failMsg = resume.processingError || 'Resume scoring failed';
+      // BEFORE: { resumeId, status:'failed', error:msg, ...meta }
+      // AFTER:  { success:false, error:msg, message:msg, data:{ resumeId, status }, meta, resumeId, status }
+      return sendError(res, 200, failMsg, 'SCORING_FAILED', {
         resumeId,
         status: 'failed',
-        error: resume.processingError || 'Resume scoring failed',
-        ...responseMeta(req)
+        error: failMsg, // backward compat — old clients read body.error
       });
     }
 
-    if (resume.processingStatus !== 'complete') {
-      return res.status(202).json({
-        resumeId,
-        status: resume.processingStatus,
-        message: 'Score not yet available',
-        ...responseMeta(req)
-      });
+    // Guard: treat DB-internal 'complete' and canonical 'done' identically.
+    // normalizeStatus() maps 'complete' → 'done' for all API responses.
+    if (resume.processingStatus !== 'complete' && resume.processingStatus !== 'done') {
+      // BEFORE: { resumeId, status, message, ...meta }
+      // AFTER:  { success:true, data:{ resumeId, status, message }, meta, resumeId, status, message }
+      const pendingMsg = 'Score not yet available';
+      const publicStatus = normalizeStatus(resume.processingStatus);
+      return sendSuccess(res, 202,
+        { resumeId, status: publicStatus, message: pendingMsg },
+        { resumeId, status: publicStatus, message: pendingMsg }
+      );
     }
 
     const score = await scoreRepo.getLatestScore(userId, resumeId);
 
     if (!score) {
-      return res.status(404).json({
+      return sendError(res, 404, 'Score not found', 'NOT_FOUND', {
         error: 'NOT_FOUND',
-        message: 'Score not found',
-        ...responseMeta(req)
       });
     }
 
-    return res.status(200).json({
-      resumeId,
-      status: 'complete',
-      score,
-      ...responseMeta(req)
-    });
+    // BEFORE: { resumeId, status:'complete', score, ...meta }
+    // AFTER:  { resumeId, status:'done', score, ...meta }
+    // 'complete' is deprecated. All API responses now use 'done'.
+    // Backward-compat: flat legacy fields preserved at top level for old clients.
+    return sendSuccess(res, 200,
+      { resumeId, status: 'done', score },
+      { resumeId, status: 'done', score }
+    );
   } catch (error) {
     next(error);
   }

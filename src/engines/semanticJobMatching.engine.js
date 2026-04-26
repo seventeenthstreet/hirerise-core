@@ -2,6 +2,8 @@
 
 const crypto = require('crypto');
 const cacheManager = require('../core/cache/cache.manager');
+// Phase 2: lazy getter — resolves Redis post-bootstrap on each call
+const getCache = () => cacheManager?.getClient?.() || null;
 const { supabase } = require('../config/supabase');
 const logger = require('../utils/logger');
 const { getUserVector } = require('../services/userVector.service');
@@ -16,7 +18,6 @@ const WEIGHTS = Object.freeze({
   location: 0.1,
 });
 
-const cache = cacheManager?.getClient?.();
 
 function hashProfile(profile = {}) {
   return crypto
@@ -70,7 +71,7 @@ async function getSemanticJobRecommendations(userProfile = {}, opts = {}) {
 
   if (cache) {
     try {
-      const cached = await cache.get(cacheKey);
+      const cached = await getCache()?.get(cacheKey);
       if (cached) {
         try {
           return normalizeResponse(JSON.parse(cached));
@@ -216,7 +217,7 @@ async function getSemanticJobRecommendations(userProfile = {}, opts = {}) {
 
   if (cache) {
     try {
-      await cache.set(cacheKey, JSON.stringify(response), 'EX', CACHE_TTL);
+      await getCache()?.set(cacheKey, JSON.stringify(response), 'EX', CACHE_TTL);
     } catch (err) {
       logger.warn('[Semantic] cache write failed', {
         userId,

@@ -9,6 +9,12 @@ const logger = require('../utils/logger');
 const { supabase } = require('../config/supabase'); // ✅ optimized import
 
 const HARDENING_ENABLED = process.env.ADMIN_HARDENING_ENABLED === 'true';
+const IS_PRODUCTION_ADMIN = process.env.NODE_ENV === 'production';
+// DB verification is ALWAYS on in production. ADMIN_HARDENING_ENABLED is only
+// consulted in non-production (dev/staging) so test environments can opt out.
+// A misconfigured flag can NEVER disable protection in production.
+const SHOULD_VERIFY_DB = IS_PRODUCTION_ADMIN || HARDENING_ENABLED;
+
 const ADMIN_SESSION_TTL_MS = 24 * 60 * 60 * 1000; // 24h
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -98,7 +104,7 @@ const requireAdmin = async (req, res, next) => {
   }
 
   // ── Supabase verification (hardening) ─────────────────
-  if (HARDENING_ENABLED && process.env.NODE_ENV !== 'test') {
+  if (SHOULD_VERIFY_DB) {
     try {
       const { data, error } = await safeVerify(user.uid);
 

@@ -22,20 +22,31 @@ const logger = require('../utils/logger');
 
 const router = express.Router();
 
+/**
+ * Safely extract the authenticated user ID from req.user.
+ *
+ * Returns null instead of throwing so every call site can issue
+ * a direct 401 response — never routing through the error handler
+ * where a misconfiguration could accidentally map it to a 500.
+ *
+ * req.user is populated by authenticate() in auth.middleware.js
+ * via buildClaimSet() which always sets { id, sub, uid }.
+ */
 function getUserId(req) {
+  // DEBUG — remove after confirming auth is working in staging
+  console.log('[UsersRoute] AUTH HEADER:', req.headers.authorization ? 'Bearer [present]' : '[missing]');
+  console.log('[UsersRoute] REQ.USER:', req.user);
+
   const userId =
     req.user?.id ||
+    req.user?.sub ||
+    req.user?.uid ||
     req.auth?.userId ||
     req.user?.user_id ||
-    req.user?.uid;
+    null;
 
   if (!userId || typeof userId !== 'string') {
-    throw new AppError(
-      'Unauthorized',
-      401,
-      {},
-      ErrorCodes.UNAUTHORIZED,
-    );
+    return null;
   }
 
   return userId;
@@ -100,6 +111,17 @@ router.get(
   '/me',
   asyncHandler(async (req, res) => {
     const userId = getUserId(req);
+
+    // Direct 401 — never passes through the error handler,
+    // so a misconfigured error pipeline cannot turn this into a 500.
+    if (!userId) {
+      return res.status(401).json({
+        success: false,
+        errorCode: 'UNAUTHORIZED',
+        message: 'Authentication required. Provide a valid Bearer token.',
+        timestamp: new Date().toISOString(),
+      });
+    }
 
     let { data: row, error } = await supabase
       .from('users')
@@ -185,10 +207,17 @@ router.get(
       );
     }
 
-    const quota = await Promise.race([
-      getRemainingQuota(req).catch(() => null),
-      new Promise((resolve) => setTimeout(() => resolve(null), 3000)),
-    ]);
+    // getRemainingQuota may throw synchronously if req.user fields
+    // are missing — wrap in try/catch so it can never produce a 500.
+    let quota = null;
+    try {
+      quota = await Promise.race([
+        Promise.resolve(getRemainingQuota(req)).catch(() => null),
+        new Promise((resolve) => setTimeout(() => resolve(null), 3000)),
+      ]);
+    } catch {
+      quota = null;
+    }
 
     return res.json({
       success: true,
@@ -256,6 +285,15 @@ router.patch(
   asyncHandler(async (req, res) => {
     const userId = getUserId(req);
 
+    if (!userId) {
+      return res.status(401).json({
+        success: false,
+        errorCode: 'UNAUTHORIZED',
+        message: 'Authentication required. Provide a valid Bearer token.',
+        timestamp: new Date().toISOString(),
+      });
+    }
+
     logger.info('[UsersRoute] PATCH /me', {
       userId,
       fields: Object.keys(req.body),
@@ -277,6 +315,15 @@ router.get(
   '/me/subscription',
   asyncHandler(async (req, res) => {
     const userId = getUserId(req);
+
+    if (!userId) {
+      return res.status(401).json({
+        success: false,
+        errorCode: 'UNAUTHORIZED',
+        message: 'Authentication required. Provide a valid Bearer token.',
+        timestamp: new Date().toISOString(),
+      });
+    }
 
     const { data, error } = await supabase
       .from('subscriptions')

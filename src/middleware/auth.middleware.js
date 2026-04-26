@@ -3,7 +3,7 @@
 /**
  * src/middleware/auth.middleware.js
  *
- * Wave 4 — Patch 40
+ * Wave 4 — Patch 41
  *
  * Final production auth authority
  * ✅ singleton Supabase admin client
@@ -13,6 +13,37 @@
  * ✅ tier micro-cache fallback
  * ✅ DB fallback only when JWT lacks plan
  * ✅ stable downstream req.user contract
+ * ✅ mount-aware isPublicPath (works per-route AND global mounts)
+ *
+ * Patch 41 — isPublicPath rewrite
+ *   Previously compared req.path against full '/api/v1/health' strings.
+ *   When authenticate is mounted globally at app.use('/api/v1', authenticate),
+ *   Express strips the prefix so req.path arrives as '/health' — the old check
+ *   never matched and health/ready probes were incorrectly challenged for a JWT.
+ *   The new implementation normalises both forms to a bare suffix before matching.
+ *
+ * Public path policy (no JWT required):
+ *   /health          — load balancer liveness probe
+ *   /health/*        — deep probe variants
+ *   /ready           — Kubernetes readiness probe
+ *   /webhooks        — Stripe/Razorpay (signature-verified inside handler)
+ *   /webhooks/*      — same
+ *   /internal/*      — Cloud Tasks (protected by requireInternalToken, not JWT)
+ *   /metrics         — Prometheus (protected by requireInternalToken, not JWT)
+ *
+ * req.user contract (always set on every authenticated request):
+ *   {
+ *     id:            string   — Supabase user UUID (primary key)
+ *     sub:           string   — alias for id (JWT 'sub' claim)
+ *     uid:           string   — alias for id (legacy consumers)
+ *     email:         string|null
+ *     emailVerified: boolean
+ *     role:          string   — 'user' | 'admin' | 'super_admin' | ...
+ *     roles:         string[] — all roles (for multi-role checks)
+ *     admin:         boolean  — true when role === 'admin' or app_metadata.admin
+ *     plan:          string   — 'free' | 'pro' | 'enterprise' | ...
+ *     planAmount:    number|null
+ *   }
  */
 
 const { createClient } = require('@supabase/supabase-js');
@@ -61,13 +92,56 @@ function decodeJwtPayload(rawToken) {
   }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Public path registry
+// ─────────────────────────────────────────────────────────────────────────────
+// Exact-match suffixes that never require a JWT.
+// These are compared against the NORMALISED path (see isPublicPath below).
+const PUBLIC_EXACT = new Set([
+  '/health',
+  '/ready',
+  '/metrics',
+  '/webhooks',
+]);
+
+// Prefix-match suffixes — any sub-path under these is also public.
+const PUBLIC_PREFIXES = [
+  '/health/',
+  '/webhooks/',
+  '/internal/',
+];
+
+/**
+ * Returns true when the request path should bypass JWT verification.
+ *
+ * Mount-aware: Express strips the mount prefix before setting req.path, so
+ * this function normalises both the full form ('/api/v1/health') and the
+ * stripped form ('/health') to a bare suffix before matching.
+ *
+ * Examples that all return true:
+ *   isPublicPath('/health')           ← per-route mount, stripped path
+ *   isPublicPath('/api/v1/health')    ← edge-case where full path is passed
+ *   isPublicPath('/health/deep')
+ *   isPublicPath('/webhooks/stripe')
+ *   isPublicPath('/internal/ai-job')
+ */
 function isPublicPath(reqPath = '') {
-  return (
-    reqPath === `${API_PREFIX}/health` ||
-    reqPath.startsWith(`${API_PREFIX}/health/`) ||
-    reqPath === `${API_PREFIX}/ready`
-  );
+  // Normalise: strip /api/v1 prefix when present so both forms resolve
+  // to a bare '/suffix' and the same Set/prefix checks apply regardless
+  // of whether authenticate is mounted globally or per-route.
+  const suffix = reqPath.startsWith(API_PREFIX)
+    ? reqPath.slice(API_PREFIX.length) || '/'
+    : reqPath;
+
+  if (PUBLIC_EXACT.has(suffix)) return true;
+
+  for (const prefix of PUBLIC_PREFIXES) {
+    if (suffix.startsWith(prefix)) return true;
+  }
+
+  return false;
 }
+
 
 function buildClaimSet(user, plan) {
   const appMeta = user.app_metadata ?? {};
@@ -207,19 +281,6 @@ function cacheVerifiedToken(rawToken, claimSet) {
 
 async function authenticate(req, res, next) {
   try {
-    if (process.env.NODE_ENV === 'test') {
-      req.user = buildClaimSet(
-        {
-          id: 'test-user',
-          email: 'test@example.com',
-          email_confirmed_at: new Date().toISOString(),
-          app_metadata: { role: 'user' },
-        },
-        'free'
-      );
-      return next();
-    }
-
     if (isPublicPath(req.path)) {
       return next();
     }

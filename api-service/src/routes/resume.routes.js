@@ -17,29 +17,9 @@ export const resumeRouter = Router();
 resumeRouter.use(authenticate);
 
 // ─────────────────────────────────────────────────────────────────────────────
-// POST /v1/resume/submit
-// ─────────────────────────────────────────────────────────────────────────────
-
-resumeRouter.post(
-  '/submit',
-  resumeSubmitRateLimit,
-  pendingJobLimitMiddleware,
-  submitResume,
-);
-
-// ─────────────────────────────────────────────────────────────────────────────
-// GET /v1/resume/:resumeId/score
-// ─────────────────────────────────────────────────────────────────────────────
-
-resumeRouter.get(
-  '/:resumeId/score',
-  globalRequestRateLimit,
-  validateResumeIdParam,
-  getResumeScore,
-);
-
-// ─────────────────────────────────────────────────────────────────────────────
 // PARAM VALIDATION
+// FIX: Defined before use — previously declared after the route that referenced
+// it, causing a TDZ crash if the file is ever converted to const/arrow style.
 // ─────────────────────────────────────────────────────────────────────────────
 
 function validateResumeIdParam(req, res, next) {
@@ -60,3 +40,25 @@ function validateResumeIdParam(req, res, next) {
 
   next();
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// POST /v1/resume/submit
+// ─────────────────────────────────────────────────────────────────────────────
+
+resumeRouter.post(
+  '/submit',
+  resumeSubmitRateLimit,
+  pendingJobLimitMiddleware,
+  submitResume,
+);
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /v1/resume/:resumeId/score
+// ─────────────────────────────────────────────────────────────────────────────
+
+resumeRouter.get(
+  '/:resumeId/score',
+  globalRequestRateLimit,
+  validateResumeIdParam,
+  getResumeScore,
+);

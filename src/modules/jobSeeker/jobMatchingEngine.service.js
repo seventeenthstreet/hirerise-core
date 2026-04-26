@@ -20,7 +20,8 @@ const CACHE_TTL_SECONDS = 600;
 const ROLES_CACHE_KEY = 'job-matching:roles';
 const ROLES_CACHE_TTL_SECONDS = 1800;
 
-const cache = cacheManager.getClient();
+// Phase 2: lazy getter — resolves Redis post-bootstrap on each call
+const getCache = () => cacheManager.getClient();
 
 // ─────────────────────────────────────────────────────────────
 // HELPERS
@@ -148,7 +149,7 @@ async function loadUserProfile(userId) {
 
 async function fetchRolesWithSkills() {
   try {
-    const cached = await cache.get(ROLES_CACHE_KEY);
+    const cached = await getCache().get(ROLES_CACHE_KEY);
     if (cached) return JSON.parse(cached);
   } catch (error) {
     logger.warn('[JobMatching] Roles cache read failed', {
@@ -196,7 +197,7 @@ async function fetchRolesWithSkills() {
     }));
 
     try {
-      await cache.set(
+      await getCache().set(
         ROLES_CACHE_KEY,
         JSON.stringify(roles),
         'EX',
@@ -265,7 +266,7 @@ async function getJobMatches(userId) {
   const cacheKey = `job-match:${userId}`;
 
   try {
-    const cached = await cache.get(cacheKey);
+    const cached = await getCache().get(cacheKey);
     if (cached) return JSON.parse(cached);
   } catch (error) {
     logger.warn('[JobMatching] Match cache read failed', {
@@ -288,7 +289,7 @@ async function getJobMatches(userId) {
     .slice(0, 10);
 
   try {
-    await cache.set(
+    await getCache().set(
       cacheKey,
       JSON.stringify(sorted),
       'EX',
@@ -324,7 +325,7 @@ async function getRecommendations(userId) {
 
 async function invalidateUserMatchCache(userId) {
   try {
-    await cache.del(`job-match:${userId}`);
+    await getCache().del(`job-match:${userId}`);
   } catch (error) {
     logger.warn('[JobMatching] Cache invalidation failed', {
       userId,

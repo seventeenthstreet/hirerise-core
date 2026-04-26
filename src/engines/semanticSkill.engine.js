@@ -8,11 +8,12 @@
  */
 
 const cacheManager = require('../core/cache/cache.manager');
+// Phase 2: lazy getter — resolves Redis post-bootstrap on each call
+const getCache = () => cacheManager?.getClient?.() || null;
 const { supabase } = require('../config/supabase');
 const logger = require('../utils/logger');
 
 const CACHE_TTL = 600;
-const cache = cacheManager?.getClient?.();
 
 // ─────────────────────────────────────────────────────────────
 // Helpers
@@ -73,7 +74,7 @@ async function findSimilarSkills(input, opts = {}) {
   // ───────────────────────────────────────────────────────────
   if (cache) {
     try {
-      const cached = await cache.get(cacheKey);
+      const cached = await getCache()?.get(cacheKey);
       if (cached) {
         return JSON.parse(cached);
       }
@@ -138,7 +139,7 @@ async function findSimilarSkills(input, opts = {}) {
   // ───────────────────────────────────────────────────────────
   if (cache) {
     try {
-      await cache.set(
+      await getCache()?.set(
         cacheKey,
         JSON.stringify(response),
         'EX',

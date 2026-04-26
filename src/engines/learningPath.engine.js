@@ -5,6 +5,8 @@
  */
 
 const cacheManager = require('../core/cache/cache.manager');
+// Phase 2: lazy getter — resolves Redis post-bootstrap on each call
+const getCache = () => cacheManager?.getClient?.() || null;
 const { supabase } = require('../config/supabase');
 const logger = require('../utils/logger');
 const { getUserVector } = require('../services/userVector.service'); // ✅ NEW
@@ -12,7 +14,6 @@ const { getUserVector } = require('../services/userVector.service'); // ✅ NEW
 const CACHE_TTL = 600;
 const MODEL = process.env.ANTHROPIC_MODEL || 'claude-sonnet-4-20250514';
 
-const cache = cacheManager?.getClient?.();
 
 function getAnthropic() {
   return require('../config/anthropic.client');
@@ -46,7 +47,7 @@ async function generateLearningPath({ skill, userSkills = [], targetRole = '', u
 
   // 🔹 Redis cache
   if (cache) {
-    const cached = await cache.get(cacheKey);
+    const cached = await getCache()?.get(cacheKey);
     if (cached) return JSON.parse(cached);
   }
 
@@ -73,7 +74,7 @@ async function generateLearningPath({ skill, userSkills = [], targetRole = '', u
 
     if (data?.path) {
       if (cache) {
-        await cache.set(cacheKey, JSON.stringify(data.path), 'EX', CACHE_TTL);
+        await getCache()?.set(cacheKey, JSON.stringify(data.path), 'EX', CACHE_TTL);
       }
       return data.path;
     }
@@ -122,7 +123,7 @@ Return strict JSON with steps, duration, and outcome.`;
 
   // 🔹 Cache write
   if (cache) {
-    await cache.set(cacheKey, JSON.stringify(result), 'EX', CACHE_TTL);
+    await getCache()?.set(cacheKey, JSON.stringify(result), 'EX', CACHE_TTL);
   }
 
   // 🔹 Save to Supabase (async)

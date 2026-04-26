@@ -17,12 +17,13 @@ const cacheManager = require('../../core/cache/cache.manager');
 const logger = require('../../../utils/logger');
 
 const CACHE_TTL = 600;
-const cache = cacheManager.getClient();
+// Phase 2: lazy getter — resolves Redis post-bootstrap on each call
+const getCache = () => cacheManager.getClient();
 const now = () => new Date().toISOString();
 
 async function fromCacheOrDB(cacheKey, dbFn) {
   try {
-    const cached = await cache.get(cacheKey);
+    const cached = await getCache().get(cacheKey);
     if (cached) return { ...JSON.parse(cached), _cached: true };
   } catch (error) {
     logger.debug('[IntelligenceResults] Cache read miss', { cacheKey });
@@ -32,7 +33,7 @@ async function fromCacheOrDB(cacheKey, dbFn) {
 
   if (result) {
     try {
-      await cache.set(cacheKey, JSON.stringify(result), 'EX', CACHE_TTL);
+      await getCache().set(cacheKey, JSON.stringify(result), 'EX', CACHE_TTL);
     } catch (error) {
       logger.debug('[IntelligenceResults] Cache write skipped', { cacheKey });
     }

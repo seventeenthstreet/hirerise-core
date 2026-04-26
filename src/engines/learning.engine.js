@@ -6,10 +6,11 @@
 
 const { supabase } = require('../config/supabase');
 const cacheManager = require('../core/cache/cache.manager');
+// Phase 2: lazy getter — resolves Redis post-bootstrap on each call
+const getCache = () => cacheManager?.getClient?.() || null;
 const logger = require('../utils/logger');
 const { getUserVector } = require('../services/userVector.service'); // ✅ NEW
 
-const cache = cacheManager?.getClient?.();
 const CACHE_TTL = 600;
 
 // ─────────────────────────────────────────────
@@ -66,7 +67,7 @@ async function recommendLearning(userProfile, skillGaps) {
     // ───────────── Redis Cache ─────────────
     if (cache) {
       try {
-        const cached = await cache.get(cacheKey);
+        const cached = await getCache()?.get(cacheKey);
         if (cached) return JSON.parse(cached);
       } catch (err) {
         logger.warn('[Learning] Redis read failed', { err: err.message });
@@ -177,7 +178,7 @@ async function recommendLearning(userProfile, skillGaps) {
     // ───────────── Cache Write ─────────────
     if (cache) {
       try {
-        await cache.set(cacheKey, JSON.stringify(response), 'EX', CACHE_TTL);
+        await getCache()?.set(cacheKey, JSON.stringify(response), 'EX', CACHE_TTL);
       } catch (err) {
         logger.warn('[Learning] Redis write failed', { err: err.message });
       }

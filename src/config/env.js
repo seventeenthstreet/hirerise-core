@@ -95,12 +95,17 @@ const env = {
   ),
 
   // Internal service auth
+  // In production this is required (enforced above).
+  // In non-production it defaults to a well-known dev placeholder — this is
+  // intentional for local development but is NEVER usable in production
+  // because: (a) the token is publicly known, (b) production guards above
+  // require it to be explicitly set and ≥32 chars.
   INTERNAL_SERVICE_TOKEN:
     nodeEnv === 'production'
       ? safe(() => required('INTERNAL_SERVICE_TOKEN'))
       : optional(
           'INTERNAL_SERVICE_TOKEN',
-          'dev-internal-token'
+          'dev-internal-token-replace-in-staging'
         ),
 
   // AI providers
@@ -153,6 +158,30 @@ if (env.SUPABASE_URL) {
   } catch (e) {
     errors.push(e.message);
   }
+}
+
+// Stripe key validation
+// Runs on every startup — catches misconfiguration before any payment
+// request is attempted rather than failing deep inside a checkout flow.
+if (env.STRIPE_SECRET_KEY) {
+  if (env.STRIPE_SECRET_KEY.startsWith('pk_')) {
+    errors.push(
+      '[env] STRIPE_SECRET_KEY is a publishable key (pk_). ' +
+      'Only secret keys (sk_live_ or sk_test_) are valid on the server. ' +
+      'Set the correct key and redeploy.'
+    );
+  } else if (!env.STRIPE_SECRET_KEY.startsWith('sk_')) {
+    errors.push(
+      '[env] STRIPE_SECRET_KEY has an unrecognised format. ' +
+      'Expected sk_live_... or sk_test_...'
+    );
+  }
+}
+// In production, Stripe is required — no silent degradation.
+if (env.NODE_ENV === 'production' && !env.STRIPE_SECRET_KEY) {
+  errors.push(
+    '[env] STRIPE_SECRET_KEY is required in production'
+  );
 }
 
 // PORT validation
@@ -218,6 +247,24 @@ if (env.NODE_ENV === 'production') {
     );
   }
 
+  // SECURITY: ALLOW_TEST_AUTH must NEVER be set in production.
+  // It disables auth on all routes when combined with NODE_ENV=test.
+  // If someone accidentally copies a test .env to production, fail fast.
+  if (process.env.ALLOW_TEST_AUTH === 'true') {
+    errors.push(
+      '[env] ALLOW_TEST_AUTH=true is FORBIDDEN in production — remove it immediately'
+    );
+  }
+
+  // SECURITY: ADMIN_HARDENING_ENABLED should always be true in production.
+  // Not a hard error but emit a loud warning so it isn't silently missed.
+  if (process.env.ADMIN_HARDENING_ENABLED !== 'true') {
+    console.warn(
+      '[env] WARNING: ADMIN_HARDENING_ENABLED is not set to "true" in production. ' +
+      'DB-backed admin verification is still enforced, but set the flag explicitly.'
+    );
+  }
+
   if (!env.REDIS_URL) {
     errors.push('[env] REDIS_URL is required in production');
   }
@@ -262,8 +309,10 @@ if (errors.length && env.NODE_ENV !== 'test') {
 }
 
 // ── Safe Debug Summary ───────────────────────────────────────
-
-if (env.NODE_ENV !== 'test') {
+// Only emit in development — never in production, where stdout may
+// be scraped by log aggregators or visible in crash reports.
+if (env.NODE_ENV === 'development') {
+  // Values are boolean presence-checks only — no secret values are logged.
   console.log('[env] Loaded config:', {
     NODE_ENV: env.NODE_ENV,
     PORT: env.PORT,

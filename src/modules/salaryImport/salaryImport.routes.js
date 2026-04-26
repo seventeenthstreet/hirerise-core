@@ -46,7 +46,7 @@ function csvFileFilter(req, file, cb) {
   const fileName = String(file?.originalname || '').toLowerCase();
   const mimeType = String(file?.mimetype || '').toLowerCase();
 
-  const isCsv = CSV_MIME_TYPES.has(mimeType) || fileName.endsWith('.csv');
+  const isCsv = CSV_MIME_TYPES.has(mimeType) && fileName.endsWith('.csv');
 
   if (!isCsv) {
     return cb(

@@ -7,11 +7,12 @@
  *  - auth contract drift safe (id + uid)
  *  - RPC return-shape tolerance
  *  - schema drift observability
- *  - timeout fail-open preserved
+ *  - Redis incr fallback when Supabase RPC is unavailable (fail-closed)
  *  - stronger config validation
  */
 
 const { supabase } = require('../config/supabase');
+const redisClient = require('../config/redisClient');
 const logger = require('../utils/logger');
 
 const RATE_LIMIT_RPC = 'check_rate_limit';
@@ -56,6 +57,26 @@ function isAllowed(data) {
   );
 }
 
+/**
+ * Redis fallback rate limiter.
+ * Used when the Supabase RPC is unavailable. Increments a counter in Redis
+ * and enforces the same limit — fail-closed, not fail-open.
+ * Returns true if the request is allowed, false if the limit is exceeded.
+ */
+async function redisFallbackCheck(key, limit, windowSeconds) {
+  try {
+    const count = await redisClient.incr(`ratelimit:fallback:${key}`, windowSeconds);
+    return count <= limit;
+  } catch (redisErr) {
+    // Redis also unavailable — log and deny to stay fail-closed
+    logger.error('RateLimit Redis fallback also failed — denying request', {
+      key,
+      error: redisErr.message,
+    });
+    return false;
+  }
+}
+
 function createRateLimiter({ limit, windowSeconds, prefix }) {
   if (
     !Number.isFinite(limit) ||
@@ -89,7 +110,7 @@ function createRateLimiter({ limit, windowSeconds, prefix }) {
       if (error) {
         const logLevel = isRpcDrift(error) ? 'warn' : 'error';
 
-        logger[logLevel]('RateLimit RPC Error', {
+        logger[logLevel]('RateLimit RPC Error — using Redis fallback', {
           key,
           rpc: RATE_LIMIT_RPC,
           limit,
@@ -98,7 +119,13 @@ function createRateLimiter({ limit, windowSeconds, prefix }) {
           error: error.message,
         });
 
-        return next(); // fail-open preserved
+        const allowed = await redisFallbackCheck(key, limit, windowSeconds);
+        if (!allowed) {
+          return res.status(429).json(
+            RATE_LIMIT_RESPONSE('RATE_LIMIT_EXCEEDED', 'Too many requests. Please try again later.')
+          );
+        }
+        return next();
       }
 
       if (!isAllowed(data)) {
@@ -120,7 +147,7 @@ function createRateLimiter({ limit, windowSeconds, prefix }) {
     } catch (err) {
       const logLevel = isRpcDrift(err) ? 'warn' : 'error';
 
-      logger[logLevel]('RateLimit Middleware Failure', {
+      logger[logLevel]('RateLimit Middleware Failure — using Redis fallback', {
         key,
         rpc: RATE_LIMIT_RPC,
         limit,
@@ -128,7 +155,13 @@ function createRateLimiter({ limit, windowSeconds, prefix }) {
         error: err.message,
       });
 
-      return next(); // fail-open preserved
+      const allowed = await redisFallbackCheck(key, limit, windowSeconds);
+      if (!allowed) {
+        return res.status(429).json(
+          RATE_LIMIT_RESPONSE('RATE_LIMIT_EXCEEDED', 'Too many requests. Please try again later.')
+        );
+      }
+      return next();
     }
   };
 }

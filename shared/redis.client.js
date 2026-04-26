@@ -41,11 +41,7 @@ function buildDisabledClient() {
     expire: async () => 0,
     quit: async () => null,
 
-    safeExec: async () => {
-      const err = new Error('REDIS_DISABLED');
-      err.code = 'REDIS_DISABLED';
-      throw err;
-    },
+    safeExec: async (_fn, fallbackValue = null) => fallbackValue,
   };
 }
 
@@ -71,7 +67,11 @@ if (!ENABLED) {
           enableReadyCheck: true,
           lazyConnect: false,
           retryStrategy(times) {
-            const delay = Math.min(times * 100, 2000);
+            if (times > 20) {
+              logger.error('[redis] max reconnect attempts reached, stopping', { attempt: times });
+              return null;
+            }
+            const delay = Math.min(times * 200, 5000);
             logger.warn('[redis] retrying connection', {
               attempt: times,
               delay,
@@ -92,7 +92,11 @@ if (!ENABLED) {
           enableReadyCheck: true,
           lazyConnect: false,
           retryStrategy(times) {
-            const delay = Math.min(times * 100, 2000);
+            if (times > 20) {
+              logger.error('[redis] max reconnect attempts reached, stopping', { attempt: times });
+              return null;
+            }
+            const delay = Math.min(times * 200, 5000);
             logger.warn('[redis] retrying connection', {
               attempt: times,
               delay,
@@ -141,13 +145,17 @@ if (!ENABLED) {
     });
   });
 
-  redis.isReady = () => isConnected;
 
-  redis.safeExec = async (fn, timeoutMs = 5000) => {
+  // PATCH 3: dual-check — local flag AND ioredis client.status to close race window
+  // where isConnected could be true while client has already transitioned away from 'ready'.
+  redis.isReady = () => isConnected && redis.status === 'ready';
+
+  // PATCH 2: safeExec now returns fallbackValue instead of throwing.
+  // Contract is now consistent with redis.singleton.js — callers never need try/catch.
+  redis.safeExec = async (fn, fallbackValue = null, timeoutMs = 5000) => {
     if (!redis.isReady()) {
-      const err = new Error('REDIS_NOT_READY');
-      err.code = 'REDIS_NOT_READY';
-      throw err;
+      logger.warn('[Redis] Not ready — using fallback');
+      return fallbackValue;
     }
 
     let timeoutId;
@@ -167,7 +175,8 @@ if (!ENABLED) {
       return result;
     } catch (error) {
       clearTimeout(timeoutId);
-      throw error;
+      logger.warn('[Redis] safeExec failed', { error: error.message });
+      return fallbackValue;
     }
   };
 

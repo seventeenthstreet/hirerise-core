@@ -2,7 +2,23 @@
 
 /**
  * src/modules/onboarding/onboarding.routes.js
- * Final production-safe onboarding route layer
+ *
+ * ─────────────────────────────────────────────────────────────────────────────
+ * UPLOAD FLOW OVERVIEW
+ * ─────────────────────────────────────────────────────────────────────────────
+ *
+ * This router owns the SYNC upload path for CV processing during onboarding.
+ *
+ *   POST /api/v1/onboarding/upload-cv          ← canonical route
+ *   POST /api/v1/onboarding/upload-cv-sync     ← alias (identical behaviour)
+ *
+ *   MODE: sync
+ *   • File is parsed immediately in-request.
+ *   • parsedData is returned in the response body.
+ *   • No polling required — result is available instantly.
+ *   • Contrast with POST /api/v1/resumes (async, returns jobId for polling).
+ *
+ * ─────────────────────────────────────────────────────────────────────────────
  */
 
 const { Router } = require('express');
@@ -12,8 +28,9 @@ const { body } = require('express-validator');
 const { validate } = require('../../middleware/requestValidator');
 const { creditGuard } = require('../../middleware/creditGuard.middleware');
 const { tierQuota } = require('../../middleware/tierquota.middleware');
-const { aiRateLimit } = require('../../middleware/aiRateLimit.middleware');
+const { aiRateLimitByPlan } = require('../../middleware/aiRateLimitByPlan.middleware');
 const { verifyAdmin } = require('../../middleware/verifyAdmin.middleware');
+const logger = require('../../utils/logger');
 
 const {
   saveConsent,
@@ -45,26 +62,77 @@ const {
 
 const router = Router();
 
+const path = require('path');
+
+const ALLOWED_ONBOARDING_MIMES = new Set([
+  'application/pdf',
+  'application/msword',
+  'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+  'application/json',
+  'text/plain',
+]);
+
+const ALLOWED_ONBOARDING_EXTS = new Set(['.pdf', '.doc', '.docx', '.json', '.txt']);
+
+// FIX: Use multer.MulterError so the error handler returns 400, not 500.
+//      Previously: cb(new Error('Unsupported file type')) → no statusCode → falls
+//      through to global errorHandler as a 500.
+//      Now: cb(new multer.MulterError('LIMIT_UNEXPECTED_FILE', message)) → caught
+//      by the inline multerErrorMiddleware below → clean 400 response.
 const upload = multer({
   storage: multer.memoryStorage(),
   limits: {
-    fileSize: 10 * 1024 * 1024,
+    fileSize: 10 * 1024 * 1024, // 10 MB
+    files: 1,
   },
   fileFilter: (_req, file, cb) => {
-    const allowed = [
-      'application/pdf',
-      'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
-      'application/json',
-      'text/plain',
-    ];
-
-    if (!allowed.includes(file.mimetype)) {
-      return cb(new Error('Unsupported file type'));
+    const ext = path.extname(file.originalname || '').toLowerCase();
+    if (!ALLOWED_ONBOARDING_MIMES.has(file.mimetype) || !ALLOWED_ONBOARDING_EXTS.has(ext)) {
+      // Task 4: standardized message — matches VALIDATION_MESSAGES.INVALID_FORMAT
+      return cb(
+        new multer.MulterError(
+          'LIMIT_UNEXPECTED_FILE',
+          `Unsupported file type "${ext || file.mimetype}". Upload a PDF, DOCX, or TXT file.`
+        )
+      );
     }
-
     cb(null, true);
   },
 });
+
+// ─────────────────────────────────────────────────────────────
+// Task 4: Standardized validation message constants
+// Single source of truth — used by multerErrorMiddleware and
+// any handler that needs to surface a file-validation error.
+// ─────────────────────────────────────────────────────────────
+const VALIDATION_MESSAGES = Object.freeze({
+  MISSING_FILE:   'No resume file provided.',
+  INVALID_FORMAT: 'Unsupported file type. Upload a PDF, DOC, DOCX, or TXT file.',
+  FILE_TOO_LARGE: 'File exceeds 10MB limit.',
+  TOO_MANY_FILES: 'Too many files. Upload one file at a time.',
+});
+
+// FIX: Inline multer error middleware — must be placed after every multer route
+// that can throw. Converts MulterError → structured 400 JSON so clients get
+// actionable error messages instead of a raw 500.
+function multerErrorMiddleware(err, req, res, next) {
+  if (err instanceof multer.MulterError) {
+    // Task 4: all multer errors map to standardized messages
+    const messageMap = {
+      LIMIT_FILE_SIZE:       VALIDATION_MESSAGES.FILE_TOO_LARGE,
+      LIMIT_UNEXPECTED_FILE: VALIDATION_MESSAGES.INVALID_FORMAT,
+      LIMIT_FILE_COUNT:      VALIDATION_MESSAGES.TOO_MANY_FILES,
+    };
+    return res.status(400).json({
+      success: false,
+      error: {
+        code:    'VALIDATION_ERROR',
+        message: messageMap[err.code] ?? `Upload error: ${err.message}`,
+      },
+    });
+  }
+  return next(err);
+}
 
 // ─────────────────────────────────────────────────────────────
 // PUBLIC ROUTES
@@ -107,7 +175,8 @@ router.post('/education-experience', saveEducationAndExperience);
 router.post(
   '/import-linkedin',
   upload.single('linkedinProfile'),
-  importLinkedIn
+  importLinkedIn,
+  multerErrorMiddleware
 );
 
 router.post(
@@ -123,7 +192,7 @@ router.get('/suggest-roles', suggestRoles);
 
 router.post(
   '/career-report',
-  aiRateLimit,
+  aiRateLimitByPlan,
   tierQuota('careerReport'),
   creditGuard('careerReport'),
   generateCareerReport
@@ -133,7 +202,7 @@ router.post('/personal-details', savePersonalDetails);
 
 router.post(
   '/generate-cv',
-  aiRateLimit,
+  aiRateLimitByPlan,
   tierQuota('generateCV'),
   creditGuard('generateCV'),
   generateCV
@@ -144,13 +213,55 @@ router.post('/skip-cv', skipCv);
 router.post(
   '/validate-cv',
   upload.single('resume'),
-  validateCvFileEndpoint
+  validateCvFileEndpoint,
+  multerErrorMiddleware
 );
 
+// ─────────────────────────────────────────────────────────────
+// SYNC CV UPLOAD
+//
+// POST /api/v1/onboarding/upload-cv          ← canonical
+// POST /api/v1/onboarding/upload-cv-sync     ← alias (Task 3)
+//
+// MODE: sync
+// • Parses the CV immediately during the request.
+// • Returns parsedData + structuredResume in the response body.
+// • No polling required — result is available in this response.
+// • Contrast: POST /api/v1/resumes is ASYNC and returns a jobId
+//   that must be polled at GET /api/v1/resumes/:id/status.
+//
+// Form-data field: resume (PDF | DOC | DOCX | TXT, max 10 MB)
+// ─────────────────────────────────────────────────────────────
+
+// Task 6: UPLOAD FLOW log injected via lightweight middleware so it
+// fires before the controller regardless of which alias is used.
+function logSyncUpload(req, _res, next) {
+  logger.info('[UPLOAD FLOW] Sync onboarding upload triggered', {
+    route:    req.originalUrl,
+    userId:   req.user?.id ?? req.user?.uid ?? null,
+    fileName: req.file?.originalname ?? null,
+  });
+  next();
+}
+
+// Canonical route
 router.post(
   '/upload-cv',
   upload.single('resume'),
-  uploadCvDuringOnboarding
+  logSyncUpload,
+  uploadCvDuringOnboarding,
+  multerErrorMiddleware
+);
+
+// Task 3: Alias — identical middleware stack, zero logic duplication.
+// Maps directly to the same controller function; clients may use
+// either URL interchangeably.
+router.post(
+  '/upload-cv-sync',
+  upload.single('resume'),
+  logSyncUpload,
+  uploadCvDuringOnboarding,
+  multerErrorMiddleware
 );
 
 // ─────────────────────────────────────────────────────────────

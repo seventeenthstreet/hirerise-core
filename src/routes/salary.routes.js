@@ -13,7 +13,7 @@ const { body, param, query } = require('express-validator');
 
 const { validate } = require('../middleware/requestValidator');
 const salaryController = require('../controllers/salary.controller');
-const { aiRateLimit } = require('../middleware/aiRateLimit.middleware');
+const { aiRateLimitByPlan } = require('../middleware/aiRateLimitByPlan.middleware');
 
 const router = express.Router();
 
@@ -36,7 +36,7 @@ const VALID_LOCATIONS = Object.freeze([
 // ─────────────────────────────────────────────────────────────
 router.post(
   '/benchmark',
-  aiRateLimit,
+  aiRateLimitByPlan,
   validate([
     body('roleId')
       .isString()
@@ -71,7 +71,7 @@ router.post(
 // ─────────────────────────────────────────────────────────────
 router.post(
   '/intelligence',
-  aiRateLimit,
+  aiRateLimitByPlan,
   validate([
     body('roleId')
       .isString()

@@ -8,9 +8,11 @@
  * ✅ Async-safe with asyncHandler
  * ✅ Input validation added
  * ✅ Production-grade logging + error safety
+ * ✅ Standardized response envelope (sendSuccess / sendError) — Phase 3
  */
 
 const { asyncHandler } = require('../utils/helpers');
+const { sendSuccess, sendError } = require('../shared/response');
 
 const careerPathService = require('../services/careerPath.service');
 const jdMatchingService = require('../services/jdMatching.service');
@@ -24,19 +26,19 @@ const getCareerPaths = asyncHandler(async (req, res) => {
   const { currentRoleId } = req.params;
 
   if (!currentRoleId) {
-    return res.status(400).json({
-      success: false,
+    // BEFORE: { success:false, errorCode:'INVALID_INPUT', message:'...' }
+    // AFTER:  { success:false, error:'...', message:'...', code:'INVALID_INPUT', meta:{...} }
+    // Old field `errorCode` preserved via extra spread for backward compat.
+    return sendError(res, 400, 'currentRoleId is required', 'INVALID_INPUT', {
       errorCode: 'INVALID_INPUT',
-      message: 'currentRoleId is required',
     });
   }
 
   const result = await careerPathService.getCareerPath(currentRoleId);
 
-  res.status(200).json({
-    success: true,
-    data: result,
-  });
+  // BEFORE: { success:true, data:result }
+  // AFTER:  { success:true, data:result, meta:{ timestamp, requestId } }
+  return sendSuccess(res, result);
 });
 
 /**
@@ -51,10 +53,8 @@ const getCareerPathsWithGap = asyncHandler(async (req, res) => {
   } = req.body || {};
 
   if (!currentRoleId) {
-    return res.status(400).json({
-      success: false,
+    return sendError(res, 400, 'currentRoleId is required', 'INVALID_INPUT', {
       errorCode: 'INVALID_INPUT',
-      message: 'currentRoleId is required',
     });
   }
 
@@ -63,13 +63,12 @@ const getCareerPathsWithGap = asyncHandler(async (req, res) => {
     filters,
   });
 
-  res.status(200).json({
-    success: true,
-    data: result,
-    meta: {
-      skillsIncludedInAnalysis: userSkills.length,
-      requestedAt: new Date().toISOString(),
-    },
+  // BEFORE: { success:true, data:result, meta:{ skillsIncludedInAnalysis, requestedAt } }
+  // AFTER:  same data shape + meta gains timestamp + requestId (requestedAt preserved)
+  return sendSuccess(res, result, {}, {
+    skillsIncludedInAnalysis: Array.isArray(userSkills) ? userSkills.length : 0,
+    // backward compat: old meta key kept
+    requestedAt: new Date().toISOString(),
   });
 });
 
@@ -81,11 +80,12 @@ const matchJobDescription = asyncHandler(async (req, res) => {
   const { userProfile, rawJobDescription } = req.body || {};
 
   if (!userProfile || !rawJobDescription) {
-    return res.status(400).json({
-      success: false,
-      errorCode: 'INVALID_INPUT',
-      message: 'userProfile and rawJobDescription are required',
-    });
+    return sendError(
+      res, 400,
+      'userProfile and rawJobDescription are required',
+      'INVALID_INPUT',
+      { errorCode: 'INVALID_INPUT' }
+    );
   }
 
   const safeSkills = Array.isArray(userProfile.skills)
@@ -102,20 +102,15 @@ const matchJobDescription = asyncHandler(async (req, res) => {
   );
 
   const result = await jdMatchingService.matchJD({
-    userProfile: {
-      ...userProfile,
-      skills: normalizedSkills,
-    },
+    userProfile: { ...userProfile, skills: normalizedSkills },
     rawJobDescription,
   });
 
-  res.status(200).json({
-    success: true,
-    data: result,
-    meta: {
-      jdCharacterCount: rawJobDescription.length,
-      requestedAt: new Date().toISOString(),
-    },
+  // BEFORE: { success:true, data:result, meta:{ jdCharacterCount, requestedAt } }
+  // AFTER:  adds timestamp + requestId to meta; jdCharacterCount + requestedAt preserved
+  return sendSuccess(res, result, {}, {
+    jdCharacterCount: rawJobDescription.length,
+    requestedAt: new Date().toISOString(),
   });
 });
 

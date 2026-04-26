@@ -16,7 +16,8 @@ const { supabase } = require('../config/supabase');
 const cacheManager = require('../core/cache/cache.manager');
 const logger = require('../utils/logger');
 
-const cache = cacheManager.getClient();
+// Phase 2: lazy getter — resolves Redis post-bootstrap on each call
+const getCache = () => cacheManager.getClient();
 
 const CACHE_TTL_SECONDS = 300;
 const CACHE_PREFIX = 'radar:skills:';
@@ -28,7 +29,7 @@ function buildCacheKey(userId) {
 
 async function getCachedRadar(cacheKey) {
   try {
-    const cached = await cache.get(cacheKey);
+    const cached = await getCache().get(cacheKey);
     return cached ? JSON.parse(cached) : null;
   } catch (error) {
     logger.warn('[Radar] Cache read failed', {
@@ -41,7 +42,7 @@ async function getCachedRadar(cacheKey) {
 
 async function setCachedRadar(cacheKey, payload) {
   try {
-    await cache.set(
+    await getCache().set(
       cacheKey,
       JSON.stringify(payload),
       CACHE_TTL_SECONDS

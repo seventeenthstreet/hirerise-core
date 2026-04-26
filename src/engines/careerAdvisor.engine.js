@@ -6,6 +6,8 @@
 
 const crypto       = require('crypto');
 const cacheManager = require('../core/cache/cache.manager');
+// Phase 2: lazy getter — resolves Redis post-bootstrap on each call
+const getCache = () => cacheManager?.getClient?.() || null;
 const supabase     = require('../config/supabase');
 const logger       = require('../utils/logger');
 const { getUserVector } = require('../services/userVector.service'); // ✅ NEW
@@ -16,7 +18,6 @@ const MODEL       = process.env.ANTHROPIC_MODEL || 'claude-sonnet-4-20250514';
 const MAX_TOKENS  = 800;
 const TEMPERATURE = 0.4;
 
-const cache = cacheManager?.getClient?.();
 
 // ─────────────────────────────────────────────
 // Anthropic
@@ -135,7 +136,7 @@ async function generateCareerAdvice({
 
   if (cache) {
     try {
-      const cached = await cache.get(cacheKey);
+      const cached = await getCache()?.get(cacheKey);
       if (cached) {
         const parsed = JSON.parse(cached);
         if (parsed._profile_hash === hash) {
@@ -167,7 +168,7 @@ async function generateCareerAdvice({
         parsed._profile_hash = hash;
 
         if (cache) {
-          await cache.set(cacheKey, JSON.stringify(parsed), 'EX', CACHE_TTL_SECONDS);
+          await getCache()?.set(cacheKey, JSON.stringify(parsed), 'EX', CACHE_TTL_SECONDS);
         }
 
         logger.debug('[CareerAdvisor] Supabase cache hit', { userId });
@@ -227,7 +228,7 @@ async function generateCareerAdvice({
 
   if (cache) {
     try {
-      await cache.set(cacheKey, JSON.stringify(result), 'EX', CACHE_TTL_SECONDS);
+      await getCache()?.set(cacheKey, JSON.stringify(result), 'EX', CACHE_TTL_SECONDS);
     } catch (err) {
       logger.warn('[Cache] Redis write failed', { err: err.message });
     }

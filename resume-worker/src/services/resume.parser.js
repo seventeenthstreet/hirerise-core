@@ -92,6 +92,14 @@ function extractStructure(text, mimeType) {
 
   const sections = classifySections(lines);
   const skills = extractSkills(sections.skills ?? []);
+
+  // ── Debug logs ────────────────────────────────────────────────────────────
+  console.log('[ResumeWorker] SECTIONS DETECTED:', Object.keys(sections).reduce((acc, k) => {
+    acc[k] = sections[k]?.length ?? 0;
+    return acc;
+  }, {}));
+  console.log('[ResumeWorker] EXTRACTED SKILLS:', skills);
+  console.log('[ResumeWorker] EXTRACTED EXPERIENCE:', sections.experience ?? []);
   const wordCount = safeText.trim()
     ? safeText.trim().split(/\s+/).length
     : 0;
@@ -115,20 +123,32 @@ function extractStructure(text, mimeType) {
 }
 
 const SECTION_HEADERS = Object.freeze({
+  // Matches: "experience", "work experience", "professional experience",
+  // "clinical experience", "internship", "internships", "internship experience",
+  // "compulsory rotating internship", "employment history", "work history", etc.
   experience:
-    /^(?:(?:work\s+)?experience|employment|work\s+history)$/i,
+    /^(?:(?:work\s+|professional\s+|clinical\s+|medical\s+|hospital\s+)?experience|employment(?:\s+history)?|work\s+history|career\s+history|positions?\s+held|internships?(?:\s+experience)?|(?:compulsory\s+)?(?:rotating\s+)?internship|clinical\s+(?:work|training)|practical\s+training|industrial\s+training|field\s+training)$/i,
+
   education:
-    /^(?:education|academic|qualifications)$/i,
+    /^(?:education(?:al)?(?:\s+(?:background|qualifications?|history))?|academic\s+(?:background|qualifications?|profile)|qualifications?|scholastic\s+details?)$/i,
+
+  // Matches: "skills", "technical skills", "core skills", "key skills",
+  // "professional skills", "software skills", "computer skills", "it skills",
+  // "skills & competencies", "tools & software", "competencies", "expertise", etc.
   skills:
-    /^(?:(?:technical\s+)?skills|competencies|technologies)$/i,
+    /^(?:(?:technical\s+|core\s+|key\s+|professional\s+|software\s+|computer\s+|digital\s+|it\s+)?skills?(?:\s*[&]\s*(?:competencies|software|tools))?|competencies|technologies|areas?\s+of\s+expertise|expertise|abilities|tools?\s+(?:and\s+|[&]\s+)?software)$/i,
+
   summary:
-    /^(?:summary|objective|profile|about)$/i,
+    /^(?:(?:professional\s+|career\s+|executive\s+|profile\s+)?summary|objective|(?:professional\s+)?profile|about(?:\s+me)?|overview)$/i,
+
   certifications:
-    /^(?:certifications?|licenses?|credentials)$/i,
+    /^(?:certifications?|licenses?|credentials|professional\s+development)$/i,
+
   projects:
-    /^(?:projects?|portfolio)$/i,
+    /^(?:projects?|portfolio|key\s+projects?)$/i,
+
   contact:
-    /^(?:contact|personal\s+info)$/i,
+    /^(?:contact(?:\s+(?:info(?:rmation)?|details?))?|personal\s+(?:info(?:rmation)?|details?))$/i,
 });
 
 function classifySections(lines) {
@@ -162,17 +182,20 @@ function classifySections(lines) {
 
 function extractSkills(skillLines) {
   const normalized = new Set();
+  // Strip leading bullet/dash characters (-, –, —, •, ·, *, ►, ▪, ▸)
+  const BULLET_RE = /^[-\u2013\u2014\u2022\u00b7*\u25ba\u25aa\u25b8]\s*/;
 
   for (const line of skillLines) {
     const tokens = String(line)
+      .replace(BULLET_RE, '')           // strip leading bullet from the whole line
       .split(/[,|•·/\n]+/)
-      .map((skill) => skill.trim().toLowerCase())
+      .map((skill) => skill.trim().replace(BULLET_RE, ''))   // strip from each fragment
       .filter(
         (skill) => skill.length > 1 && skill.length < 60
       );
 
     for (const token of tokens) {
-      normalized.add(token);
+      normalized.add(token);            // preserve original casing
       if (normalized.size >= MAX_SKILLS) break;
     }
 

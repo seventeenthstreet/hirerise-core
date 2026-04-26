@@ -6,6 +6,8 @@
 
 const crypto       = require('crypto');
 const cacheManager = require('../core/cache/cache.manager');
+// Phase 2: lazy getter — resolves Redis post-bootstrap on each call
+const getCache = () => cacheManager?.getClient?.() || null;
 const supabase     = require('../config/supabase');
 const logger       = require('../utils/logger');
 const { getUserVector } = require('../services/userVector.service'); // ✅ NEW
@@ -15,7 +17,6 @@ const opportunityEngine = require('./career-opportunity.engine');
 
 const CACHE_TTL_SECONDS = 900;
 
-const cache = cacheManager?.getClient?.();
 
 // ─────────────────────────────────────────────
 // HASH (for cache invalidation)
@@ -62,7 +63,7 @@ async function simulateCareerPaths(userProfile, marketData = {}) {
 
   if (cache) {
     try {
-      const cached = await cache.get(cacheKey);
+      const cached = await getCache()?.get(cacheKey);
       if (cached) {
         logger.debug('[DigitalTwin] Redis hit');
         return JSON.parse(cached);
@@ -85,7 +86,7 @@ async function simulateCareerPaths(userProfile, marketData = {}) {
       const parsed = JSON.parse(data.result);
 
       if (cache) {
-        await cache.set(cacheKey, JSON.stringify(parsed), 'EX', CACHE_TTL_SECONDS);
+        await getCache()?.set(cacheKey, JSON.stringify(parsed), 'EX', CACHE_TTL_SECONDS);
       }
 
       logger.debug('[DigitalTwin] Supabase hit');
@@ -162,7 +163,7 @@ async function simulateCareerPaths(userProfile, marketData = {}) {
 
   if (cache) {
     try {
-      await cache.set(cacheKey, JSON.stringify(result), 'EX', CACHE_TTL_SECONDS);
+      await getCache()?.set(cacheKey, JSON.stringify(result), 'EX', CACHE_TTL_SECONDS);
     } catch (err) {
       logger.warn('[Cache] Redis write failed', { err: err.message });
     }

@@ -45,11 +45,11 @@ const upload = multer({
       typeof file?.originalname === 'string' &&
       file.originalname.toLowerCase().endsWith('.csv');
 
-    if (isCsvMime || isCsvExt) {
-      return cb(null, true);
+    if (!isCsvMime || !isCsvExt) {
+      return cb(new Error('Only CSV files are accepted.'), false);
     }
 
-    return cb(new Error('Only CSV files are accepted.'), false);
+    return cb(null, true);
   },
 });
 

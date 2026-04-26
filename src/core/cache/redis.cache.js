@@ -1,118 +1,55 @@
 'use strict';
 
-const Redis  = require('ioredis');
+/**
+ * src/core/cache/redis.cache.js  — Phase 2 Refactor
+ *
+ * CHANGES (Phase 2):
+ *  - Accepts an injected ioredis client in the constructor (DI)
+ *  - Removed all Redis client creation logic (_createSingleClient,
+ *    _createClusterClient) — that is now the singleton's responsibility
+ *  - isReady / getReady() delegates to the injected client's status
+ *  - All existing ICache methods (get/set/delete/clearByPrefix/ping)
+ *    are preserved unchanged
+ *
+ * NOTE: Cluster mode detection (for clearByPrefix) is preserved via
+ * checking client.constructor.name === 'Cluster'.
+ */
+
 const ICache = require('./cache.interface');
-const logger = require('../../utils/logger');
-
-// ─────────────────────────────────────────────
-// Helpers
-// ─────────────────────────────────────────────
-
-function parseClusterNodes(envStr) {
-  return envStr
-    .split(',')
-    .map(s => s.trim())
-    .filter(Boolean)
-    .map(entry => {
-      const [host, portStr] = entry.split(':');
-      return { host: host.trim(), port: parseInt(portStr || '6379', 10) };
-    });
-}
-
-function sharedOpts() {
-  return {
-    password: process.env.REDIS_PASSWORD || undefined,
-    tls: process.env.REDIS_TLS === 'true' ? {} : undefined,
-  };
-}
-
-// ─────────────────────────────────────────────
-// RedisCache
-// ─────────────────────────────────────────────
+const logger  = require('../../utils/logger');
 
 class RedisCache extends ICache {
-  constructor() {
+  /**
+   * @param {import('ioredis').Redis | import('ioredis').Cluster} client
+   *   The already-connected ioredis (or Cluster) client from the singleton.
+   */
+  constructor(client) {
     super();
 
-    this.isReady = false;
-    this._mode = 'single';
-
-    const clusterNodes = process.env.REDIS_CLUSTER_NODES;
-
-    if (clusterNodes) {
-      this._mode = 'cluster';
-      this.client = this._createClusterClient(clusterNodes);
-    } else {
-      this.client = this._createSingleClient();
+    if (!client) {
+      throw new Error('[RedisCache] A Redis client must be injected via constructor');
     }
+
+    this.client = client;
+
+    // Detect cluster mode without creating any new connections
+    this._mode = client.constructor && client.constructor.name === 'Cluster'
+      ? 'cluster'
+      : 'single';
+
+    logger.info(`[RedisCache] Initialized with injected client (mode=${this._mode})`);
   }
 
   // ─────────────────────────────────────────────
-  // CLIENT FACTORY
+  // READY STATE
   // ─────────────────────────────────────────────
 
-  _createSingleClient() {
-    const client = new Redis({
-      host: process.env.REDIS_HOST || '127.0.0.1',
-      port: parseInt(process.env.REDIS_PORT || '6379', 10),
-      ...sharedOpts(),
-      maxRetriesPerRequest: 3,
-      enableReadyCheck: true,
-      retryStrategy(times) {
-        if (times > 3) return null;
-        return Math.min(times * 200, 2000);
-      },
-    });
-
-    client.on('connect', () => {
-      this.isReady = true;
-      logger.info('[RedisCache] Connected (single)');
-    });
-
-    client.on('close', () => {
-      this.isReady = false;
-      logger.warn('[RedisCache] Disconnected (single)');
-    });
-
-    client.on('error', (err) => {
-      logger.error('[RedisCache] Error (single)', { error: err.message });
-    });
-
-    return client;
-  }
-
-  _createClusterClient(clusterNodesEnv) {
-    const nodes = parseClusterNodes(clusterNodesEnv);
-
-    const client = new Redis.Cluster(nodes, {
-      redisOptions: {
-        ...sharedOpts(),
-        maxRetriesPerRequest: 3,
-        enableReadyCheck: true,
-      },
-      clusterRetryStrategy(times) {
-        if (times > 5) return null;
-        return Math.min(times * 300, 3000);
-      },
-      enableOfflineQueue: true,
-      scaleReads: 'slave',
-    });
-
-    client.on('ready', () => {
-      this.isReady = true;
-      logger.info('[RedisCache] Connected (cluster)');
-    });
-
-    client.on('close', () => {
-      this.isReady = false;
-      logger.warn('[RedisCache] Disconnected (cluster)');
-    });
-
-    client.on('error', (err) => {
-      logger.error('[RedisCache] Error (cluster)', { error: err.message });
-    });
-
-    return client;
+  /**
+   * Returns true when the underlying ioredis client is connected and ready.
+   * ioredis exposes this via client.status === 'ready'.
+   */
+  get isReady() {
+    return this.client.status === 'ready';
   }
 
   // ─────────────────────────────────────────────
@@ -243,11 +180,11 @@ class RedisCache extends ICache {
     if (this._mode !== 'cluster') return null;
 
     try {
-      const masters = this.client.nodes('master');
+      const masters  = this.client.nodes('master');
       const replicas = this.client.nodes('slave');
 
       return {
-        masters: masters.length,
+        masters:  masters.length,
         replicas: replicas.length,
       };
     } catch {

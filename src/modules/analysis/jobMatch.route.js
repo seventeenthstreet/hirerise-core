@@ -86,6 +86,11 @@ router.post(
           async: true,
           data: {
             jobId,
+            // NOTE: This pollUrl points at GET /api/v1/ai-jobs/:jobId.
+            // It is INTERNAL — used here because this is an AI analysis job,
+            // not a resume upload. Frontend polling for RESUME processing
+            // must use GET /api/v1/resumes/:resumeId/status instead.
+            // See docs/frontend-contract.md.
             pollUrl,
             message:
               'Job-specific CV generation queued. Poll the pollUrl for results.',

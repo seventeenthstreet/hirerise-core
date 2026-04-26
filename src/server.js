@@ -1,3 +1,10 @@
+// ── Load .env FIRST — before any require() reads process.env ─────────────────
+// dotenv must populate process.env before any module is imported, because
+// Node caches modules at parse time. Any require() above this line that
+// reads process.env (e.g. supabase.js, redisClient.js via env.js) will see
+// empty values, causing silent fallbacks (e.g. CACHE_PROVIDER → 'memory').
+require('dotenv').config();
+
 /**
  * server.js — HireRise Core Engine Entry Point
  *
@@ -78,6 +85,20 @@
  *     module-level `activeTenants` array. This eliminates TypeScript blindness,
  *     singleton isolation issues, and the race condition where a worker and a
  *     route handler could diverge on different global object references.
+ *
+ * ── Phase 3 Hardening Fixes ───────────────────────────────────────────────────
+ *
+ * P3-T2  Fallback Redis lifecycle centralised — getLeaseRedisClient() previously
+ *        called `new Redis(fallbackUrl, {...})` inline on every invocation when
+ *        _fallbackClient was null and usingFallback=true. This bypassed lifecycle
+ *        management: no shutdown handler, no observability, potential duplicate
+ *        creation under concurrent failover. Replaced with fallbackRedis.getClient()
+ *        (src/infrastructure/redis/redis.fallback.js) which is a proper singleton
+ *        with: single-creation guarantee, process.once SIGTERM/SIGINT handler,
+ *        full ioredis event logging under [Redis:Fallback] prefix, and isReady()
+ *        via client.status === 'ready'. gracefulShutdown now calls
+ *        fallbackRedis.quit() (idempotent) instead of the bare .quit() call with
+ *        empty catch.
  */
 
 'use strict';
@@ -86,19 +107,29 @@
 // Must be first to catch async rejections and uncaught exceptions from any
 // module, including those loaded below. Without these, Node.js 20+ terminates
 // the process via the default handler, bypassing gracefulShutdown entirely.
-process.on('unhandledRejection', (reason) => {
-  // Imported lazily to avoid circular dependency at module parse time.
+process.on('unhandledRejection', async (reason) => {
+  const error = reason instanceof Error ? reason : new Error(String(reason));
   try {
     require('./utils/logger').error('[Process] Unhandled promise rejection', {
-      reason: reason instanceof Error ? reason.message : String(reason),
-      stack:  reason instanceof Error ? reason.stack   : undefined,
+      reason: error.message,
+      stack:  error.stack,
     });
   } catch (_) {
     console.error('[Process] Unhandled promise rejection', reason);
   }
+  // Fire alert — best-effort, non-blocking
+  try {
+    await require('./monitoring/alerts').sendAlert({
+      message: 'hirerise-core: Unhandled promise rejection',
+      severity: require('./monitoring/alerts').SEVERITY.CRITICAL,
+      error,
+      alertKey: 'core:unhandledRejection',
+      context: { pid: process.pid },
+    });
+  } catch (_) {}
 });
 
-process.on('uncaughtException', (err) => {
+process.on('uncaughtException', async (err) => {
   try {
     require('./utils/logger').error('[Process] Uncaught exception — initiating emergency shutdown', {
       error: err.message,
@@ -107,6 +138,15 @@ process.on('uncaughtException', (err) => {
   } catch (_) {
     console.error('[Process] Uncaught exception', err);
   }
+  try {
+    await require('./monitoring/alerts').sendAlert({
+      message: 'hirerise-core: Uncaught exception — emergency shutdown',
+      severity: require('./monitoring/alerts').SEVERITY.CRITICAL,
+      error: err,
+      alertKey: 'core:uncaughtException',
+      context: { pid: process.pid },
+    });
+  } catch (_) {}
   // Allow gracefulShutdown to run if it is defined, otherwise exit immediately.
   if (typeof gracefulShutdown === 'function') {
     gracefulShutdown('uncaughtException').catch(() => {}).finally(() => process.exit(1));
@@ -118,7 +158,8 @@ process.on('uncaughtException', (err) => {
 // ── Environment validation — MUST be first ────────────────────────────────────
 // Validates all required environment variables before anything else loads.
 // Server will not start if required variables are missing or malformed.
-require('dotenv').config();
+// NOTE: dotenv.config() is called at the very top of this file (line 1) so
+// process.env is already populated here — this require just runs validation.
 require('./config/env');
 
 // ── Environment constants — single source of truth ───────────────────────────
@@ -142,8 +183,18 @@ const {
 } = require('./config/redisClient');
 const { supabase } = require('./config/supabase');
 
+// ── Phase 3 Hardening: lifecycle-managed fallback Redis client ────────────────
+// Replaces the unmanaged inline `new Redis(fallbackUrl, {...})` in
+// getLeaseRedisClient(). Provides singleton lifecycle, shutdown handling,
+// and full observability for the Wave 33 cross-region fallback client.
+// NOTE: placed in './infrastructure/radis/' — matches the existing codebase folder name.
+const fallbackRedis = require('./infrastructure/radis/redis.fallback');
+
 // ── Utilities ─────────────────────────────────────────────────────────────────
 const logger = require('./utils/logger');
+const { sendAlert, SEVERITY } = require('./monitoring/alerts');
+const { requestLoggerMiddleware } = require('./monitoring/request-logger.middleware');
+const { getMetricsSnapshot } = require('./monitoring/metrics');
 const aiUsage = require('./services/aiUsage.service');
 const quorumReplication = require('./services/cache/quorumReplication.service');
 const consensusMesh = require('./services/cache/replayConsensusMesh.service');
@@ -200,7 +251,7 @@ const {
   tenantRegionMiddleware,
 } = require('./middleware/tenantRegion.middleware');
 // ── Route modules ─────────────────────────────────────────────────────────────
-const devRoutes            = require('./modules/dev/dev.routes');
+
 const { secretsRouter }    = require('./modules/secrets');
 const marketIntelRouter    = require('./modules/marketIntelligence/marketIntelligence.routes');
 const { skillDemandRouter } = require('./modules/skillDemand');
@@ -1608,27 +1659,20 @@ function getLeaseRedisClient() {
     return leaseFailoverState._fallbackClient;
   }
 
-  // Fallback not yet initialised — try to create it now if URL is set.
-  const fallbackUrl = process.env.LEASE_REDIS_FALLBACK_URL;
-  if (fallbackUrl) {
-    try {
-      // ioredis is already a dependency (used by the primary client config).
-      const Redis = require('ioredis');
-      const client = new Redis(fallbackUrl, {
-        lazyConnect:            true,
-        enableOfflineQueue:     false,
-        maxRetriesPerRequest:   1,
-        connectTimeout:         3000,
-        commandTimeout:         3000,
-      });
-      leaseFailoverState._fallbackClient = client;
-      logger.info('[Wave33] Lease fallback Redis client initialised', {
-        region: leaseFailoverState.fallbackRegion,
-      });
-      return client;
-    } catch (err) {
-      logger.warn('[Wave33] Lease fallback Redis client init failed', { error: err.message });
-    }
+  // Fallback not yet initialised — resolve via lifecycle-managed singleton.
+  // Phase 3 Hardening (TASK 2): fallbackRedis.getClient() replaces the previous
+  // inline `new Redis(fallbackUrl, {...})` which bypassed all lifecycle management
+  // (no shutdown handler, no observability, recreatable under concurrent calls).
+  // fallbackRedis provides: singleton guarantee, process.once shutdown handler,
+  // full ioredis event logging ([Redis:Fallback] prefix), and isReady() via
+  // client.status === 'ready'. Returns null when LEASE_REDIS_FALLBACK_URL is unset.
+  const fallbackClient = fallbackRedis.getClient();
+  if (fallbackClient) {
+    leaseFailoverState._fallbackClient = fallbackClient;
+    logger.info('[Wave33] Lease fallback Redis client resolved via lifecycle manager', {
+      region: leaseFailoverState.fallbackRegion,
+    });
+    return fallbackClient;
   }
 
   // No fallback available — return primary even though it may be down.
@@ -3798,8 +3842,28 @@ function registerRoute(path, ...handlers) {
 }
 
 function logRouteRegistrySummary() {
+  // registeredRouteKeys only tracks the subset of mounts made via registerRoute().
+  // The majority of protected routes use app.use() directly and are NOT counted here.
+  //
+  // ROOT CAUSE OF "total_guarded_route_mounts: 0":
+  //   bootstrap() calls registeredRouteKeys.clear() after routes are registered at
+  //   module-parse time. The Set is correctly populated at parse time, then wiped,
+  //   so this log always reported 0. That was a misleading metric, not a real problem.
+  //
+  // FIX: read the live Express router stack for an authoritative mount count, and
+  // keep the registerRoute count only as a secondary diagnostic.
+  const expressStack   = app._router?.stack ?? [];
+  const routerLayers   = expressStack.filter((l) => l.name === 'router' || l.handle?.stack);
+  const totalMounts    = routerLayers.length;
+  const guardedByRegFn = registeredRouteKeys.size;
+
   logger.info('[Server] Route registry initialized', {
-    total_guarded_route_mounts: registeredRouteKeys.size,
+    // Authoritative — counts every app.use() mount in the Express stack.
+    total_express_mounts: totalMounts,
+    // Secondary — counts only routes registered via registerRoute() helper.
+    // Will be 0 when called after bootstrap() clears the Set; that is expected.
+    registerRoute_entries: guardedByRegFn,
+    note: 'All private routes carry authenticate() — see Protected Route Modules block.',
   });
 }
 // Trust proxy — safe for Cloud Run / GCP Load Balancer.
@@ -3809,18 +3873,26 @@ app.set('trust proxy', 1);
 // =============================================================================
 // CORS configuration
 // =============================================================================
-// Domain-driven — no hardcoded origins.
-// Set MAIN_DOMAIN, ADMIN_DOMAIN, ALLOWED_ORIGINS in .env.
+// Strict origin allowlist — driven entirely by ALLOWED_ORIGINS env var.
+// No localhost fallback in production. ALLOWED_ORIGINS must be explicitly set.
 const MAIN_DOMAIN  = process.env.MAIN_DOMAIN  || 'hirerise.com';
 const ADMIN_DOMAIN = process.env.ADMIN_DOMAIN || `admin.${MAIN_DOMAIN}`;
 
+const _rawAllowedOrigins = process.env.ALLOWED_ORIGINS
+  ? process.env.ALLOWED_ORIGINS.split(',').map(o => o.trim()).filter(Boolean)
+  : [];
+
 const allowedOrigins = [
-  ...(process.env.ALLOWED_ORIGINS || 'http://localhost:3001')
-    .split(',').map(o => o.trim()),
+  ..._rawAllowedOrigins,
   ...(IS_TEST ? [] : [
     `https://${MAIN_DOMAIN}`,
     `https://${ADMIN_DOMAIN}`,
     `https://www.${MAIN_DOMAIN}`,
+  ]),
+  // localhost origins only in non-production environments
+  ...(IS_PRODUCTION ? [] : [
+    'http://localhost:3000',
+    'http://localhost:3001',
   ]),
 ].filter(Boolean);
 
@@ -3828,14 +3900,49 @@ const allowedOrigins = [
 // Global middleware — single registration, enforced order
 // =============================================================================
 app.use(correlationMiddleware);
-app.use(helmet());
-app.use(compression());
+// HARDENING: Explicit helmet config.
+// CSP disabled — pure JSON API server, no HTML responses.
+// HSTS: 1 year, includeSubDomains, preload — tells browsers to always use HTTPS.
+// x-powered-by suppressed — do not advertise Express to attackers.
+app.disable('x-powered-by');
+app.use(helmet({
+  contentSecurityPolicy: false,          // API server — no HTML, CSP not applicable
+  hsts: {
+    maxAge: 31536000,                     // 1 year in seconds
+    includeSubDomains: true,
+    preload: true,
+  },
+}));
+// HARDENING: Disable compression for authenticated requests to prevent BREACH attacks.
+// BREACH exploits response compression + secret in response body (e.g. CSRF tokens).
+// Compression is safe for public/unauthenticated responses (health, static).
+app.use(compression({
+  filter: (req, res) => {
+    // Never compress if the request carries an Authorization header (authenticated).
+    // This covers all JWT-authenticated API calls.
+    if (req.headers['authorization']) {
+      return false;
+    }
+    // Fall back to compression's default filter for everything else.
+    return compression.filter(req, res);
+  },
+}));
 
 app.use(cors({
   origin: (origin, callback) => {
     // Wildcard + credentials:true is spec-forbidden and a security hole.
     // Origins must be explicitly whitelisted.
-    if (!origin) return callback(null, true);
+    //
+    // Null/missing origin (direct curl, Postman without Origin, stripped by
+    // certain proxies) is REJECTED in production to prevent CSRF via
+    // opaque-origin requests. It is allowed in non-production so that local
+    // tooling and server-to-server calls still work during development.
+    if (!origin) {
+      if (IS_PRODUCTION) {
+        return callback(new Error('CORS: Null origin rejected in production'));
+      }
+      return callback(null, true);
+    }
     if (allowedOrigins.includes(origin)) return callback(null, true);
     return callback(new Error(`CORS: Origin ${origin} not allowed`));
   },
@@ -3951,12 +4058,18 @@ if (!IS_TEST) {
   );
 }
 
+// ── Structured request logger + metrics ───────────────────────────────────────
+// Runs alongside morgan: emits [HTTP] one-liner + feeds in-process metrics.
+// morgan handles basic access log; this handles structured JSON + p50/p95/p99.
+app.use(requestLoggerMiddleware);
+
 // ── API prefix ────────────────────────────────────────────────────────────────
 // Hardcoded — must never be overridden via env.
 const API_PREFIX = '/api/v1';
 
 // ── Dev routes — non-production only ─────────────────────────────────────────
 if (!IS_PRODUCTION) {
+  const devRoutes = require('./modules/dev/dev.routes');
   app.use(`${API_PREFIX}/dev`, devRoutes);
 }
 
@@ -3964,12 +4077,77 @@ if (!IS_PRODUCTION) {
 // Keyed by authenticated UID when available; falls back to IP for anonymous
 // requests (webhooks, health). IP-only limiting is trivially bypassed behind
 // a CDN and is unfair in NAT environments.
+//
+// RATE LIMIT CONSISTENCY FIX:
+// express-rate-limit defaults to an in-memory store which is per-process and
+// does not survive restarts or scale across multiple instances. In production
+// this means a user can reset their quota by hitting a different pod.
+// We implement a custom Redis-backed store using the existing redisClient
+// (no new dependencies) so counters are global and persistent.
+//
+// Falls back to the default in-memory store in dev/test where Redis may not
+// be running — production requires Redis (enforced by env.js validation).
+const redisClient = require('./config/redisClient');
+
+class RedisRateLimitStore {
+  constructor(windowMs) {
+    this.windowSeconds = Math.ceil(windowMs / 1000);
+    this.prefix = 'rl:global:';
+  }
+
+  async increment(key) {
+    const redisKey = `${this.prefix}${key}`;
+    try {
+      // ATOMIC: redisClient.incr uses INCR + EXPIRE-on-first-write.
+      // INCR is a single Redis command — no race condition between read and
+      // write. EXPIRE is only set when the counter transitions from 0→1 so
+      // the window TTL is never accidentally extended by concurrent requests.
+      const totalHits = await redisClient.incr(redisKey, this.windowSeconds);
+      const resetTime = new Date(Date.now() + this.windowSeconds * 1000);
+      return { totalHits, resetTime };
+    } catch (err) {
+      // If Redis is unavailable, fail open at the store level — the
+      // Supabase-backed AI limiters are the real enforcement layer.
+      logger.warn('[GlobalRateLimit] Redis store error — allowing request', {
+        error: err.message,
+        key: redisKey,
+      });
+      return { totalHits: 1, resetTime: new Date(Date.now() + this.windowSeconds * 1000) };
+    }
+  }
+
+  async decrement(key) {
+    const redisKey = `${this.prefix}${key}`;
+    try {
+      // DECR is atomic — safe under concurrency.
+      if (redisClient._redis) {
+        await redisClient._redis.decr(redisKey);
+      }
+    } catch {
+      // best-effort
+    }
+  }
+
+  async resetKey(key) {
+    try {
+      await redisClient.del(`${this.prefix}${key}`);
+    } catch {
+      // best-effort
+    }
+  }
+}
+
+const rateLimitWindowMs = parseInt(process.env.RATE_LIMIT_WINDOW_MS    || '900000', 10);
+const rateLimitMax      = parseInt(process.env.RATE_LIMIT_MAX_REQUESTS || '400',    10);
+
 const globalLimiter = rateLimit({
-  windowMs: parseInt(process.env.RATE_LIMIT_WINDOW_MS    || '900000', 10),
-  max:      parseInt(process.env.RATE_LIMIT_MAX_REQUESTS || '400',    10),
+  windowMs: rateLimitWindowMs,
+  max:      rateLimitMax,
   standardHeaders: true,
   legacyHeaders:   false,
   keyGenerator:    (req) => req.user?.uid || req.ip,
+  // Use Redis store in production; default in-memory store in dev/test
+  ...(IS_PRODUCTION && { store: new RedisRateLimitStore(rateLimitWindowMs) }),
   message: {
     success: false,
     error: { code: 'RATE_LIMITED', message: 'Too many requests. Please retry later.' },
@@ -4317,6 +4495,72 @@ app.get(`${API_PREFIX}/metrics`, requireInternalToken, observabilityAdapter.prom
 // =============================================================================
 // Auth applied per-group intentionally: avoids the 401-before-404 ordering bug
 // that occurs when a global authenticate() precedes all routes.
+//
+// Design rationale: if a user calls GET /api/v1/nonexistent without a token,
+// a global auth guard would return 401. The correct answer is 404 — the route
+// doesn't exist. Per-route auth preserves correct 404 semantics for unknown
+// paths while still enforcing auth on every registered private route.
+
+// =============================================================================
+// ✅ GLOBAL AUTH SAFETY NET (belt-and-suspenders)
+// =============================================================================
+// Every private route already carries authenticate() individually.
+// This middleware fires AFTER all public routes (health, ready, webhooks,
+// internal, metrics) have been matched and handled by earlier mounts — so by
+// the time a request reaches here it is on a private path.
+//
+// Its sole job: if authenticate() somehow did NOT set req.user (e.g. a future
+// route is accidentally added without the middleware), reject with 401 before
+// any business logic can run on an unauthenticated request.
+//
+// It does NOT replace per-route authenticate() calls. It is a catch-all that
+// guarantees req.user is always present on private paths, turning a potential
+// 500 (crash on undefined req.user) into a clean 401.
+app.use(`${API_PREFIX}`, (req, res, next) => {
+  // Public paths are already handled by their own mounts above and will not
+  // reach this middleware. The guard below is a safety check for any edge-case
+  // where Express routing delivers a public-looking path here unexpectedly.
+  if (
+    req.path === '/health' ||
+    req.path.startsWith('/health/') ||
+    req.path === '/ready' ||
+    req.path === '/metrics' ||
+    req.path === '/webhooks' ||
+    req.path.startsWith('/webhooks/') ||
+    req.path === '/analyze' ||
+    req.path.startsWith('/analyze/') ||
+    req.path.startsWith('/internal/')
+  ) {
+    return next();
+  }
+
+  // req.user is set by authenticate(). If it is missing here, the individual
+  // route's authenticate() middleware was either absent or failed silently.
+  if (!req.user) {
+    logger.warn('[AuthGuard] Safety net triggered — req.user absent on private path', {
+      method:  req.method,
+      path:    req.originalUrl,
+      ip:      req.ip,
+      hint:    'Route is missing authenticate() middleware, or authenticate() failed without responding.',
+    });
+
+    return res.status(401).json({
+      success:   false,
+      errorCode: 'UNAUTHORIZED',
+      message:   'Authentication required.',
+      timestamp: new Date().toISOString(),
+    });
+  }
+
+  next();
+});
+
+logger.info('[AuthGuard] Global auth safety net registered', {
+  prefix:   `${API_PREFIX}/*`,
+  exempted: ['health', 'health/*', 'ready', 'metrics', 'webhooks/*', 'internal/*', 'analyze', 'analyze/*'],
+  role:     'catch-all — rejects requests where authenticate() did not set req.user',
+});
+
 
 registerRoute(
   `${API_PREFIX}/career`,
@@ -4411,9 +4655,11 @@ app.use(`${API_PREFIX}/career-onboarding`,  authenticate, require('./routes/care
 // FIX: aiRateLimit applied to semantic-match endpoint — AI inference routes
 // share a dedicated 20 req/min bucket per UID to prevent one user exhausting
 // the global quota and degrading all others.
-app.use(`${API_PREFIX}/skills`,    authenticate, aiRateLimit, require('./routes/semantic.routes'));
-app.use(`${API_PREFIX}/career`,    authenticate, aiRateLimit, require('./routes/semantic.routes'));
-// Note: semantic.routes handles both /skills/* and /career/advice + /career/learning-path.
+// FIX: semantic.routes uses absolute internal paths (/skills/similar, /career/advice etc).
+// Mounting at a sub-path (e.g. /skills or /career) caused Express to strip that prefix,
+// making routes only reachable at doubled paths (/career/career/advice).
+// Correct mount is at API_PREFIX so paths resolve as intended.
+app.use(`${API_PREFIX}`,           authenticate, aiRateLimit, require('./routes/semantic.routes'));
 // The two mounts let Express match the correct prefix; the router uses relative paths internally.
 
 /**
@@ -4465,8 +4711,10 @@ if (process.env.FEATURE_EVENT_BUS === 'true') {
 // FIX: Explicit path mounts for personalization module — replaces broad API_PREFIX
 // mount. aiRateLimit applied since personalization profile endpoints invoke AI
 // inference on every request.
-app.use(`${API_PREFIX}/user`,      authenticate, aiRateLimit, require('./modules/personalization/personalization.routes'));
-app.use(`${API_PREFIX}/career`,    authenticate, aiRateLimit, require('./modules/personalization/personalization.routes'));
+// FIX: personalization.routes comment says "Preferred mount: app.use(API_PREFIX, ...)".
+// Sub-path mounts broke routing (same prefix-stripping issue as semantic.routes above).
+// Restored to correct API_PREFIX mount. /user/* and /career/* paths resolve correctly.
+app.use(`${API_PREFIX}`,           authenticate, aiRateLimit, require('./modules/personalization/personalization.routes'));
 
 /**
  * Career Copilot — RAG-Grounded Conversational AI
@@ -4895,6 +5143,10 @@ const {
   replayDeployConsensus,
 } = require('./workers/lifecycleHeat.worker');
 
+const {
+  prewarmTenantBenchmarks,
+} = require('./workers/benchmarkPrewarm.worker');
+
 const predictiveHeat = require(
   './infrastructure/cache/predictiveHeat.service'
 );
@@ -5064,7 +5316,17 @@ async function bootstrap() {
 
    // Patch 35 → register distributed startup phases
 startupBarrier.registrationComplete = false;
-registeredRouteKeys.clear();
+// NOTE: registeredRouteKeys.clear() was here (Wave 30.5) but has been removed.
+//
+// Routes are registered synchronously at module-parse time, before bootstrap()
+// ever runs. Clearing the Set here wiped all entries that registerRoute() had
+// already added, making logRouteRegistrySummary() always report 0 and masking
+// the real route-guard count. The clear had no effect on Express's internal
+// router stack (which is what actually controls routing), so removing it is
+// safe — it only restores the accuracy of the diagnostic log.
+//
+// If you need to reset route state between hot-reload cycles, use nodemon's
+// --watch flag with a process restart rather than mutating module-level state.
 startupWatchdog.startedAt = Date.now();
 if (startupWatchdog.timer) {
   clearTimeout(startupWatchdog.timer);
@@ -5350,10 +5612,61 @@ logger.info(
   }
 );
  // PR 2: Redis must be ready before serving traffic
+    logger.info('[Bootstrap] Calling redis.connect()...');
     await connectRedis();
+    logger.info('[Bootstrap] redis.connect() completed');
+
+// Connect redis.singleton — the dedicated ioredis instance used by
+// CacheManager, AlertService, SlaService, and all core/cache modules.
+// This is a SEPARATE client from redisClient.js (which handles rate-limiting
+// and lease operations). Both must be connected before serving traffic.
+try {
+  const redisSingleton = require('./infrastructure/radis/redis.singleton');
+  if (redisSingleton.isReady()) {
+    logger.info('[Bootstrap] redis.singleton already ready — skipping connect');
+  } else {
+    logger.info('[Bootstrap] Connecting redis.singleton...');
+    await redisSingleton.connect();
+    logger.info('[Bootstrap] redis.singleton connected', {
+      ready: redisSingleton.isReady(),
+    });
+  }
+} catch (err) {
+  // Non-fatal in dev — singleton falls back gracefully via CacheManager → MemoryCache.
+  // Fatal in production (singleton.connect() already throws and env.js enforces Redis).
+  logger.warn('[Bootstrap] redis.singleton connect failed — DI services will use fallbacks', {
+    error: err.message,
+  });
+}
 completeStartupPhase('redis-connect');
 
-// ✅ ADD HERE
+// ─────────────────────────────────────────────────────────────────────────────
+// Phase 2 DI — Composition Root
+// Redis is connected above. Warm up all singleton services that lazily resolve
+// from redis.singleton so their first getClient() call hits Redis, not MemoryCache.
+// ─────────────────────────────────────────────────────────────────────────────
+try {
+  const cacheManager = require('./core/cache/cache.manager');
+  const alertService = require('./ai/observability/alert.service');
+  const slaService   = require('./ai/observability/sla.service');
+
+  // Touch each singleton — forces lazy Redis resolution now that Redis is ready.
+  // CacheManager resolves on getClient(); AlertService and SlaService resolve
+  // on first access to _useRedis (lazy upgrade path in the getter).
+  cacheManager.getClient();
+  void alertService._useRedis; // triggers lazy upgrade
+  void slaService._useRedis;   // triggers lazy upgrade
+
+  logger.info('[Bootstrap] Phase 2 DI composition root: Redis client wired', {
+    cacheManagerReady : cacheManager.getClient()?.status === 'ready',
+    alertRedisReady   : alertService._useRedis,
+    slaRedisReady     : slaService._useRedis,
+  });
+} catch (err) {
+  // Non-fatal — services fall back to MemoryCache / local dedup gracefully.
+  logger.warn('[Bootstrap] Phase 2 DI warm-up failed', { error: err.message });
+}
+// ─────────────────────────────────────────────────────────────────────────────
 let anomalySubscriberActive = false;
 let anomalySubscriberClient = null;
 
@@ -5934,7 +6247,43 @@ if (IS_TEST) {
   return;
 }
 
+// ── Production startup assertions ────────────────────────────────────────────
+// These checks run after all services are verified but before accepting traffic.
+// A misconfigured production deploy is rejected here rather than silently misbehaving.
+
+if (IS_PRODUCTION) {
+  // C3: Reject test Stripe keys in production — charges would go to Stripe's
+  // test environment and real users would never be billed.
+  const stripeKey = process.env.STRIPE_SECRET_KEY || '';
+  if (stripeKey.startsWith('sk_test_') || !stripeKey.startsWith('sk_live_')) {
+    throw new Error(
+      '[Startup] STRIPE_SECRET_KEY must be a live key (sk_live_...) in production. ' +
+      'A test key or missing key was detected — aborting to prevent revenue loss.'
+    );
+  }
+
+  // H3: Verify Slack alert webhook is configured and not a placeholder.
+  const slackWebhook = process.env.SLACK_ALERT_WEBHOOK_URL || '';
+  if (
+    !slackWebhook ||
+    slackWebhook.includes('TXXXXX') ||
+    slackWebhook.includes('BXXXXX') ||
+    !slackWebhook.startsWith('https://hooks.slack.com/services/')
+  ) {
+    throw new Error(
+      '[Startup] SLACK_ALERT_WEBHOOK_URL is not configured or contains the placeholder value. ' +
+      'Critical alerts will be silently lost. Set a real Slack webhook URL before deploying.'
+    );
+  }
+}
+
 server = app.listen(PORT, '0.0.0.0');
+
+// FIX: keepAliveTimeout must exceed the load balancer idle timeout (GCP = 600s).
+// Without this, Node closes keep-alive connections before GCP does, causing
+// sporadic 502 errors under sustained traffic.
+server.keepAliveTimeout = 620000;   // 620s > GCP's 600s idle timeout
+server.headersTimeout   = 625000;   // must be > keepAliveTimeout
 server.on('listening', () => {
   (async () => {
     completeStartupPhase('http-server-bind');
@@ -5955,13 +6304,12 @@ setTimeout(async () => {
     await replayDeployConsensus({
       activeTenants: activeTenants,
       warmFn: async (tenantId, meta) => {
-        if (global.benchmarkQueue?.enqueueTenantWarm) {
-          await global.benchmarkQueue.enqueueTenantWarm({
-            tenantId,
-            source: meta.source,
-            confidence: meta.confidence,
-          });
-        }
+        // FIX: global.benchmarkQueue was never set anywhere in the codebase.
+        // Replaced with a direct call to the prewarm worker which does the same job.
+        await prewarmTenantBenchmarks({
+          tenantId,
+          includeHotCohorts: true,
+        });
       },
     });
   } catch (error) {
@@ -6055,16 +6403,14 @@ logger.info('[Server] Patch 20 pressure balancer worker started');
 // global.__tenantCacheMesh concurrently.
 // The singleton below gives quorumReplication the same Map reference without
 // polluting the global namespace.
-const tenantCacheMeshSingleton = (() => {
-  if (!tenantCacheMeshSingleton._instance) {
-    tenantCacheMeshSingleton._instance = new Map();
-  }
-  return tenantCacheMeshSingleton._instance;
-});
-tenantCacheMeshSingleton._instance = new Map();
+// FIX: The original code was an IIFE that ended with }); instead of })()
+// — the function was assigned but never invoked, making the Map logic dead code.
+// The _instance was being set directly on the function object, which accidentally
+// worked but was semantically wrong. Replaced with a plain Map.
+const tenantCacheMeshSingleton = new Map();
 
 quorumReplication.startQuorumReplicationWorker(
-  () => tenantCacheMeshSingleton._instance
+  () => tenantCacheMeshSingleton
 );
 
 completeStartupPhase('quorum-replication');
@@ -6491,13 +6837,14 @@ anomalyFusionState.lastEvaluatedAt = null;
 anomalyFusionState.consensusScore  = 0;
 logger.info('[Wave37] Anomaly fusion state cleared on graceful shutdown');
 
-// Wave 33 — close fallback client if it was opened.
-if (leaseFailoverState._fallbackClient) {
-  try {
-    await leaseFailoverState._fallbackClient.quit();
-  } catch (_) {}
-  leaseFailoverState._fallbackClient = null;
-}
+// Wave 33 / Phase 3 Hardening (TASK 2): fallback client lifecycle is managed
+// by redis.fallback.js. fallbackRedis.quit() is idempotent and already
+// registered on SIGTERM/SIGINT via process.once inside the module.
+// We call it explicitly here for ordered shutdown within gracefulShutdown.
+await fallbackRedis.quit().catch((err) => {
+  logger.warn('[Wave33] Fallback Redis quit error during shutdown', { error: err?.message });
+});
+leaseFailoverState._fallbackClient = null;
 
   logger.info(
     `[Server] ${signal} received — shutting down gracefully...`

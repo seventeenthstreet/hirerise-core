@@ -27,7 +27,9 @@ let redisClient = null;
  * Lazy singleton Redis client reuse
  * Prevents repeated require/init overhead across worker executions
  */
-function getRedis() {
+// Phase 2: getClient() is now synchronous — no await needed.
+// CacheManager is pre-wired at bootstrap with the connected singleton client.
+async function getRedis() {
   if (redisClient) return redisClient;
 
   try {
@@ -119,7 +121,7 @@ class BaseWorker {
   }
 
   async _checkIdempotency(idempotencyKey) {
-    const redis = getRedis();
+    const redis = await getRedis();
     if (!redis) return null;
 
     try {
@@ -135,7 +137,7 @@ class BaseWorker {
   }
 
   async _markComplete(idempotencyKey, result) {
-    const redis = getRedis();
+    const redis = await getRedis();
     if (!redis) return;
 
     const payload = JSON.stringify({
@@ -218,7 +220,7 @@ class BaseWorker {
   }
 
   async invalidate(idempotencyKey) {
-    const redis = getRedis();
+    const redis = await getRedis();
     if (!redis) return;
 
     try {

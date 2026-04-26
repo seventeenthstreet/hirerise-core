@@ -1,6 +1,6 @@
 'use strict';
 
-const { v4: uuidv4 } = require('uuid');
+const { randomUUID: uuidv4 } = require('crypto');
 const { createClient } = require('@supabase/supabase-js');
 
 const logger = require('../../../utils/logger');

@@ -62,6 +62,17 @@ let _redis = null;
 let _lastFailure = 0;
 const memoryCache = new Map();
 
+// FIX: periodic TTL sweep so stale entries don't accumulate under low read-traffic.
+// .unref() ensures this timer never prevents clean process shutdown.
+setInterval(() => {
+  const now = Date.now();
+  for (const [key, entry] of memoryCache.entries()) {
+    if (now > entry.expiresAt) {
+      memoryCache.delete(key);
+    }
+  }
+}, 10 * 60 * 1000).unref();
+
 // ─────────────────────────────────────────────
 // Redis getter
 // ─────────────────────────────────────────────
@@ -72,7 +83,7 @@ async function getRedis() {
 
   try {
     const mgr = require('./cache/cache.manager');
-    const cache = await mgr.getClient();
+    const cache = mgr.getClient(); // synchronous post-bootstrap
 
     if (cache?.client?.get) {
       _redis = cache.client;
@@ -181,7 +192,7 @@ async function decompress(data) {
 // Safe Redis Exec
 // ─────────────────────────────────────────────
 
-async function safeExec(fn) {
+async function safeExec(fn, label = 'op') {
   try {
     return await Promise.race([
       fn(),
@@ -192,7 +203,8 @@ async function safeExec(fn) {
         )
       ),
     ]);
-  } catch {
+  } catch (err) {
+    logger.warn('[AIResultCache] Redis op failed', { label, error: err.message });
     return null;
   }
 }
@@ -211,7 +223,7 @@ async function checkCache(cacheKey) {
   if (!redis) return null;
 
   try {
-    const raw = await safeExec(() => redis.get(cacheKey));
+    const raw = await safeExec(() => redis.get(cacheKey), 'GET');
     if (!raw) return null;
 
     const parsed = await decompress(raw);
@@ -265,7 +277,7 @@ async function storeCache(cacheKey, result, feature) {
 
     await safeExec(() =>
       redis.set(cacheKey, compressed, 'EX', ttl)
-    );
+    , 'SET');
   } catch (err) {
     logger.warn('[AIResultCache] Write error', {
       error: err.message,
@@ -284,7 +296,7 @@ async function invalidateCache(feature, inputPayload) {
   const redis = await getRedis();
   if (!redis) return;
 
-  await safeExec(() => redis.del(key));
+  await safeExec(() => redis.del(key), 'DEL');
 }
 
 async function invalidateByPrefix(prefix) {
@@ -308,7 +320,7 @@ async function invalidateByPrefix(prefix) {
         'COUNT',
         100
       )
-    );
+    , 'SCAN');
 
     if (!res) break;
 
@@ -316,7 +328,7 @@ async function invalidateByPrefix(prefix) {
     cursor = next;
 
     if (keys.length) {
-      await safeExec(() => redis.del(...keys));
+      await safeExec(() => redis.del(...keys), 'DEL_BATCH');
     }
   } while (cursor !== '0');
 }

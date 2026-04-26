@@ -13,6 +13,8 @@
 const crypto = require('crypto');
 const { supabase } = require('../config/supabase');
 const cacheManager = require('../core/cache/cache.manager');
+// Phase 2: lazy getter — resolves Redis post-bootstrap on each call
+const getCache = () => cacheManager?.getClient?.() || null;
 const logger = require('../utils/logger');
 const {
   getUserVector,
@@ -50,7 +52,6 @@ const EVENT_WEIGHTS = Object.freeze({
   salary_check: 1.2,
 });
 
-const cache = cacheManager?.getClient?.() || null;
 
 function skillHash(skills = []) {
   return crypto
@@ -66,7 +67,7 @@ async function loadUserProfile(userId) {
 
   if (cache) {
     try {
-      const cached = await cache.get(cacheKey);
+      const cached = await getCache()?.get(cacheKey);
       if (cached) return JSON.parse(cached);
     } catch {}
   }
@@ -114,14 +115,14 @@ async function loadUserProfile(userId) {
       try {
         const hashKey = `personalization:skillhash:${userId}`;
         const nextHash = skillHash(cleanedSkills);
-        const prevHash = await cache.get(hashKey);
+        const prevHash = await getCache()?.get(hashKey);
 
         if (prevHash !== nextHash) {
           await updateUserVector(
             userId,
             cleanedSkills
           );
-          await cache.set(
+          await getCache()?.set(
             hashKey,
             nextHash,
             'EX',
@@ -154,7 +155,7 @@ async function loadUserProfile(userId) {
 
     if (cache) {
       try {
-        await cache.set(
+        await getCache()?.set(
           cacheKey,
           JSON.stringify(normalized),
           'EX',
@@ -219,13 +220,13 @@ async function upsertPersonalizationProfile(
 
     if (cache) {
       await Promise.allSettled([
-        cache.del(
+        getCache()?.del(
           `personalization:profile:${userId}`
         ),
-        cache.del(
+        getCache()?.del(
           `personalization:recommendations:${userId}`
         ),
-        cache.del(
+        getCache()?.del(
           `personalization:hydration:${userId}`
         ),
       ]);
@@ -275,10 +276,10 @@ async function trackBehaviorEvent(
 
     if (cache) {
       await Promise.allSettled([
-        cache.del(
+        getCache()?.del(
           `personalization:recommendations:${userId}`
         ),
-        cache.del(
+        getCache()?.del(
           `personalization:profile:${userId}`
         ),
       ]);
@@ -304,7 +305,7 @@ async function getPersonalizationProfile(userId) {
 
   if (cache) {
     try {
-      const cached = await cache.get(cacheKey);
+      const cached = await getCache()?.get(cacheKey);
       if (cached) return JSON.parse(cached);
     } catch {}
   }
@@ -319,7 +320,7 @@ async function getPersonalizationProfile(userId) {
     if (error) throw error;
 
     if (data && cache) {
-      await cache.set(
+      await getCache()?.set(
         cacheKey,
         JSON.stringify(data),
         'EX',

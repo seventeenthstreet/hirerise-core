@@ -1,64 +1,76 @@
 'use strict';
 
+/**
+ * src/ai/observability/alert.service.js  — Phase 2 Refactor
+ *
+ * CHANGES (Phase 2):
+ *  - Accepts an optional ioredis client via constructor (DI)
+ *  - Removed _initRedis() — no new Redis connections created here
+ *  - _useRedis getter delegates to ioredis client.status (synchronous)
+ *  - close() is now a no-op — lifecycle is the singleton's responsibility
+ *  - Business logic (fire, checkLatency, checkTokenSpike, dedup) UNCHANGED
+ *
+ * EXPORTS: singleton instance wired lazily from redis.singleton.
+ * Callers continue to require() and call methods directly — no changes needed.
+ */
+
 const observabilityRepo = require('../../repositories/ai-observability.repository');
-const logger = require('../../utils/logger');
+const logger            = require('../../utils/logger');
 
 const COOLDOWN_SECONDS = 3600; // 1 hour
 const ALERT_KEY_PREFIX = 'hirerise:alert_cooldown:';
 
 class AlertService {
-  constructor() {
-    this._localCache = new Map();
-    this._redisClient = null;
-    this._useRedis = false;
+  /**
+   * @param {import('ioredis').Redis | null} redisClient
+   *   Injected, already-connected ioredis client from the singleton.
+   *   Pass null (or omit) to disable Redis-backed deduplication.
+   *   When null, the first call to _useRedis will attempt a lazy
+   *   resolution from redis.singleton (post-bootstrap safe).
+   */
+  constructor(redisClient = null) {
+    this._localCache  = new Map();
+    this._redisClient = redisClient || null;
 
-    this._initRedis();
+    if (this._redisClient) {
+      logger.info('[AlertService] Redis deduplication active (injected client)');
+    } else {
+      logger.info('[AlertService] Using local (in-process) deduplication — will upgrade lazily once Redis is ready');
+    }
   }
 
   // ─────────────────────────────────────────────
-  // REDIS INIT
+  // READY HELPER
   // ─────────────────────────────────────────────
 
-  _initRedis() {
-    if (!process.env.REDIS_URL) return;
+  /**
+   * True only when an ioredis client is present and status === 'ready'.
+   *
+   * Lazy upgrade path: if this instance was constructed before Redis
+   * connected (e.g. required at module-parse time), this getter attempts
+   * to resolve the client from redis.singleton on every call until it
+   * succeeds.  Once resolved the reference is stored permanently on
+   * this._redisClient so subsequent calls are a single property read.
+   */
+  get _useRedis() {
+    // Fast path — already wired.
+    if (this._redisClient && this._redisClient.status === 'ready') return true;
 
-    try {
-      const Redis = require('ioredis');
-
-      this._redisClient = new Redis(process.env.REDIS_URL, {
-        maxRetriesPerRequest: 2,
-        lazyConnect: true,
-        connectTimeout: 3000,
-        commandTimeout: 1000,
-        enableOfflineQueue: false,
-      });
-
-      this._redisClient.on('ready', () => {
-        this._useRedis = true;
-        logger.info('[AlertService] Redis deduplication active');
-      });
-
-      this._redisClient.on('error', (err) => {
-        this._useRedis = false;
-        logger.warn('[AlertService] Redis unavailable, using local dedup', {
-          error: err.message,
-        });
-      });
-
-      this._redisClient.on('reconnecting', () => {
-        logger.warn('[AlertService] Redis reconnecting...');
-      });
-
-      // ✅ CRITICAL: actually connect
-      this._redisClient.connect().catch(() => {
-        this._useRedis = false;
-      });
-
-    } catch (err) {
-      logger.warn('[AlertService] Redis init failed', {
-        error: err.message,
-      });
+    // Lazy upgrade — attempt to resolve from singleton now that Redis
+    // may have connected during bootstrap.
+    if (!this._redisClient) {
+      try {
+        const redisSingleton = require('../../infrastructure/radis/redis.singleton');
+        if (redisSingleton && redisSingleton.isReady()) {
+          this._redisClient = redisSingleton.getClient();
+          logger.info('[AlertService] Lazily upgraded to Redis client (post-bootstrap)');
+        }
+      } catch (_) {
+        // singleton not available (test env) — remain in local-cache mode
+      }
     }
+
+    return !!(this._redisClient && this._redisClient.status === 'ready');
   }
 
   // ─────────────────────────────────────────────
@@ -72,16 +84,14 @@ class AlertService {
       severity,
       title,
       detail,
-      model = null,
+      model         = null,
       correlationId = null,
     } = params;
 
     if (!this._validateAlert(params)) return null;
 
-    // ✅ Improved dedupe key
     const dedupeKey = `${type}:${feature}:${severity}:${model || 'na'}:${process.env.NODE_ENV || 'dev'}`;
 
-    // ✅ Atomic dedup check
     const allowed = await this._trySetCooldown(dedupeKey);
     if (!allowed) return null;
 
@@ -96,27 +106,20 @@ class AlertService {
       environment: process.env.NODE_ENV || 'development',
     };
 
-    // ✅ Timeout protection
+    // Timeout protection around DB write
     const alertId = await Promise.race([
       observabilityRepo.writeAlert(alertEntry),
       new Promise((_, reject) =>
         setTimeout(() => reject(new Error('timeout')), 2000)
       ),
     ]).catch((err) => {
-      logger.error('[AlertService] Persist failed', {
-        error: err.message,
-      });
+      logger.error('[AlertService] Persist failed', { error: err.message });
       return null;
     });
 
     this._notifyAdmin({ ...alertEntry, alertId }).catch(() => {});
 
-    logger.warn('[ALERT]', {
-      type,
-      feature,
-      severity,
-      title,
-    });
+    logger.warn('[ALERT]', { type, feature, severity, title });
 
     return alertId;
   }
@@ -130,25 +133,19 @@ class AlertService {
 
     if (latencyMs >= latency.p95CriticalMs) {
       return this.fire({
-        type: 'LATENCY',
-        feature,
-        severity: 'CRITICAL',
+        type: 'LATENCY', feature, severity: 'CRITICAL',
         title: `Critical latency breach: ${latencyMs}ms`,
         detail: { latencyMs, threshold: latency.p95CriticalMs },
-        model,
-        correlationId,
+        model, correlationId,
       });
     }
 
     if (latencyMs >= latency.p95WarningMs) {
       return this.fire({
-        type: 'LATENCY',
-        feature,
-        severity: 'WARNING',
+        type: 'LATENCY', feature, severity: 'WARNING',
         title: `Latency warning: ${latencyMs}ms`,
         detail: { latencyMs, threshold: latency.p95WarningMs },
-        model,
-        correlationId,
+        model, correlationId,
       });
     }
   }
@@ -158,13 +155,10 @@ class AlertService {
 
     if (totalTokens >= tokens.absoluteSpikeThreshold) {
       return this.fire({
-        type: 'TOKEN_SPIKE',
-        feature,
-        severity: 'WARNING',
+        type: 'TOKEN_SPIKE', feature, severity: 'WARNING',
         title: `Token spike: ${totalTokens}`,
         detail: { totalTokens, threshold: tokens.absoluteSpikeThreshold },
-        model,
-        correlationId,
+        model, correlationId,
       });
     }
   }
@@ -174,7 +168,7 @@ class AlertService {
   // ─────────────────────────────────────────────
 
   async _trySetCooldown(key) {
-    if (this._useRedis && this._redisClient) {
+    if (this._useRedis) {
       try {
         const result = await this._redisClient.set(
           `${ALERT_KEY_PREFIX}${key}`,
@@ -183,8 +177,7 @@ class AlertService {
           'EX',
           COOLDOWN_SECONDS
         );
-
-        return result === 'OK'; // true = allowed
+        return result === 'OK'; // true = first caller wins
       } catch {
         return this._localTrySetCooldown(key);
       }
@@ -194,7 +187,7 @@ class AlertService {
   }
 
   _localTrySetCooldown(key) {
-    const now = Date.now();
+    const now  = Date.now();
     const last = this._localCache.get(key);
 
     if (last && now - last < COOLDOWN_SECONDS * 1000) {
@@ -203,7 +196,7 @@ class AlertService {
 
     this._localCache.set(key, now);
 
-    // prune
+    // Prune stale entries to avoid unbounded growth
     if (this._localCache.size > 1000) {
       const cutoff = now - COOLDOWN_SECONDS * 1000;
       for (const [k, v] of this._localCache.entries()) {
@@ -220,14 +213,8 @@ class AlertService {
 
   _validateAlert({ type, feature, severity, title }) {
     const validTypes = [
-      'LATENCY',
-      'ERROR_RATE',
-      'DRIFT',
-      'TOKEN_SPIKE',
-      'BUDGET',
-      'SLA_BREACH',
-      'CIRCUIT_BREAKER',
-      'CALIBRATION',
+      'LATENCY', 'ERROR_RATE', 'DRIFT', 'TOKEN_SPIKE', 'BUDGET',
+      'SLA_BREACH', 'CIRCUIT_BREAKER', 'CALIBRATION',
     ];
 
     const validSeverities = ['WARNING', 'CRITICAL'];
@@ -248,9 +235,7 @@ class AlertService {
     if (process.env.NODE_ENV === 'test') return;
 
     if (process.env.NODE_ENV !== 'production') {
-      logger.info('[AlertService] Notification', {
-        subject: alert.title,
-      });
+      logger.info('[AlertService] Notification', { subject: alert.title });
     }
 
     // plug: email / slack later
@@ -260,11 +245,29 @@ class AlertService {
   // SHUTDOWN
   // ─────────────────────────────────────────────
 
+  /**
+   * No-op in Phase 2.
+   * Redis lifecycle (quit/close) is managed exclusively by the singleton.
+   */
   async close() {
-    if (this._redisClient) {
-      await this._redisClient.quit().catch(() => {});
-    }
+    // intentionally empty — do not quit the shared singleton client
   }
 }
 
-module.exports = new AlertService();
+/**
+ * Lazy singleton — resolves Redis client from the singleton on first require()
+ * after bootstrap. Preserves the existing call pattern:
+ *   const alertService = require('...alert.service');
+ *   alertService.fire({ ... });
+ */
+function buildSingleton() {
+  try {
+    const redisSingleton = require('../../infrastructure/radis/redis.singleton');
+    const client = redisSingleton.isReady() ? redisSingleton.getClient() : null;
+    return new AlertService(client);
+  } catch (_) {
+    return new AlertService(null);
+  }
+}
+
+module.exports = buildSingleton();

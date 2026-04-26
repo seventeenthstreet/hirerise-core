@@ -52,6 +52,28 @@ function getStripeClient() {
     );
   }
 
+  // SECURITY: Reject publishable keys (pk_) which can never authenticate
+  // server-side API calls. A pk_ key here means a misconfigured deployment —
+  // fail loudly rather than silently sending unauthenticated requests.
+  if (apiKey.startsWith('pk_')) {
+    throw new AppError(
+      'STRIPE_SECRET_KEY must be a secret key (sk_live_ or sk_test_). ' +
+      'A publishable key (pk_) was provided — this is a misconfiguration.',
+      500,
+      {},
+      ErrorCodes.INTERNAL_ERROR,
+    );
+  }
+
+  if (!apiKey.startsWith('sk_')) {
+    throw new AppError(
+      'STRIPE_SECRET_KEY has an unrecognised format. Expected sk_live_ or sk_test_.',
+      500,
+      {},
+      ErrorCodes.INTERNAL_ERROR,
+    );
+  }
+
   stripeClient = new Stripe(apiKey, {
     apiVersion: '2024-04-10',
   });

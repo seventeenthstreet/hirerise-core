@@ -44,7 +44,7 @@ function isValidCSV(file) {
       .toLowerCase()
       .match(/\.[^.]+$/)?.[0] || '';
 
-  return CSV_MIME_TYPES.has(file.mimetype) || ext === '.csv';
+  return CSV_MIME_TYPES.has(file.mimetype) && ext === '.csv';
 }
 
 const upload = multer({

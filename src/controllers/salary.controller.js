@@ -11,6 +11,7 @@
 
 const { asyncHandler } = require('../utils/helpers');
 const { AppError, ErrorCodes } = require('../middleware/errorHandler');
+const { sendSuccess } = require('../shared/response');
 const salaryService = require('../services/salary.service');
 const SalaryIntelligenceService = require('../services/salary.intelligence.service');
 const logger = require('../utils/logger');
@@ -21,11 +22,11 @@ const salaryIntelligenceService = new SalaryIntelligenceService();
 // Helpers
 // ─────────────────────────────────────────────
 
+// BEFORE: local ok() — no requestId in meta
+// AFTER:  delegates to sendSuccess — picks up requestId + timestamp automatically
 function ok(res, data) {
-  return res.status(200).json({
-    success: true,
-    data,
-    meta: { requestedAt: new Date().toISOString() },
+  return sendSuccess(res, data, {}, {
+    requestedAt: new Date().toISOString(), // backward compat: old meta key
   });
 }
 

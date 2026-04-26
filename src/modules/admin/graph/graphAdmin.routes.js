@@ -44,9 +44,9 @@ const upload = multer({
     const name = (file.originalname || '').toLowerCase();
 
     const isCSV =
-      file.mimetype === 'text/csv' ||
+      (file.mimetype === 'text/csv' ||
       file.mimetype === 'application/csv' ||
-      file.mimetype === 'text/plain' ||
+      file.mimetype === 'text/plain') &&
       name.endsWith('.csv');
 
     if (!isCSV) {

@@ -17,7 +17,8 @@ const cacheManager = require('../../core/cache/cache.manager');
 const logger = require('../../utils/logger');
 
 const CACHE_TTL_SECONDS = 600;
-const cache = cacheManager.getClient();
+// Phase 2: lazy getter — resolves Redis post-bootstrap on each call
+const getCache = () => cacheManager.getClient();
 
 // ─────────────────────────────────────────────────────────────
 // HELPERS
@@ -108,14 +109,14 @@ async function loadUserProfile(userId) {
 
 async function cached(key, ttl, fn) {
   try {
-    const hit = await cache.get(key);
+    const hit = await getCache().get(key);
     if (hit) return JSON.parse(hit);
   } catch (_) {}
 
   const result = await fn();
 
   try {
-    await cache.set(key, JSON.stringify(result), 'EX', ttl);
+    await getCache().set(key, JSON.stringify(result), 'EX', ttl);
   } catch (_) {}
 
   return result;

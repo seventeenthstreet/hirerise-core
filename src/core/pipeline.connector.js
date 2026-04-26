@@ -43,10 +43,13 @@ async function withTimeout(fn, name) {
 
 function normalizeProfileForCache(profile) {
   return {
-    userId: profile.userId,
-    skills: [...(profile.skills || [])].sort(),
+    userId:          profile.userId,
+    skills:          [...(profile.skills || [])].sort(),
     experienceYears: Number(profile.experienceYears || 0),
-    detectedRoles: [...(profile.detectedRoles || [])].sort(),
+    detectedRoles:   [...(profile.detectedRoles || [])].sort(),
+    // Include authoritative role in cache key so a doctor and an accountant
+    // with identical skills/years don't share the same cached match result
+    canonicalRole:   profile.canonicalRole ?? null,
   };
 }
 
@@ -103,17 +106,36 @@ async function loadParsedData(userId, resumeId) {
 // ─────────────────────────────────────────────
 
 function buildUserProfile(userId, parsedData = {}) {
+  // ── Derive canonical role using same priority as normalizer ───────────────
+  //
+  // detectedRoles is a keyword-frequency scorer and must not drive role
+  // identity when the experience section has an actual job title.
+  //
+  // Priority:
+  //   experience[0].title  →  experience[0].role  →  detectedRoles[0]  →  null
+  const experienceTitle =
+    parsedData.experience?.[0]?.title ??
+    parsedData.experience?.[0]?.role  ??
+    null;
+
+  const hasExperience = (parsedData.experience?.length ?? 0) > 0;
+
+  const canonicalRole =
+    experienceTitle ||
+    (hasExperience
+      ? null   // has experience but blank title — don't fabricate from keywords
+      : (parsedData.detectedRoles?.[0] ?? null));
+
   return {
     userId,
     skills: (parsedData.skills || [])
-      .map((s) =>
-        typeof s === 'string' ? s : s?.name
-      )
+      .map((s) => typeof s === 'string' ? s : s?.name)
       .filter(Boolean),
-    experienceYears: Number(
-      parsedData.yearsExperience || 0
-    ),
+    experienceYears: Number(parsedData.yearsExperience || 0),
+    // detectedRoles retained for backward compat (used in scoreRoleMatch confidence calc)
     detectedRoles: parsedData.detectedRoles || [],
+    // canonicalRole is the authoritative role identity — use this for matching/caching
+    canonicalRole,
   };
 }
 

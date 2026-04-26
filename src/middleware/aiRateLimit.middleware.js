@@ -37,12 +37,18 @@ function _limitResponse(retryAfterSec) {
 }
 
 function _unavailableResponse() {
+  // Consistent with the existing error envelope used across this codebase:
+  //   { success, error: { code, message }, retryAfterSeconds, timestamp }
+  // retryAfterSeconds=60 gives clients a concrete back-off hint without
+  // overpromising when the RPC will recover.
   return {
     success: false,
     error: {
       code: 'RATE_LIMIT_SERVICE_UNAVAILABLE',
-      message: 'Rate limiting service is temporarily unavailable. Please try again shortly.',
+      message: 'Rate limiting temporarily unavailable. Please try again shortly.',
     },
+    retryAfterSeconds: 60,
+    timestamp: new Date().toISOString(),
   };
 }
 
@@ -95,12 +101,20 @@ async function aiRateLimit(req, res, next) {
     return next();
 
   } catch (err) {
-    logger.error('[aiRateLimit] Supabase RPC failed — failing OPEN', {
+    logger.error('[aiRateLimit] Supabase RPC failed', {
       error: err.message,
       key,
     });
 
-    return next(); // ✅ FAIL-OPEN (better UX than 503)
+    // Production: fail CLOSED — do not let a broken rate-limit service
+    // become a free pass for unlimited AI usage.
+    if (process.env.NODE_ENV === 'production') {
+      return res.status(503).json(_unavailableResponse());
+    }
+
+    // Dev/test: fail open so local development isn't blocked.
+    logger.warn('[aiRateLimit] Failing OPEN (non-production)');
+    return next();
   }
 }
 
@@ -132,12 +146,18 @@ function createAiRateLimit({ max = MAX_REQUESTS, windowS = WINDOW_S } = {}) {
       return next();
 
     } catch (err) {
-      logger.error('[aiRateLimit] Custom limiter failed — OPEN', {
+      logger.error('[aiRateLimit] Custom limiter RPC failed', {
         error: err.message,
         key: scopedKey,
       });
 
-      return next(); // ✅ fail-open
+      // Production: fail CLOSED
+      if (process.env.NODE_ENV === 'production') {
+        return res.status(503).json(_unavailableResponse());
+      }
+
+      logger.warn('[aiRateLimit] Custom limiter failing OPEN (non-production)');
+      return next();
     }
   };
 }

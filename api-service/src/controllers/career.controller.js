@@ -177,7 +177,8 @@ export async function getCareerResult(req, res, next) {
       });
     }
 
-    if (job.status !== 'complete') {
+    // Accept both 'complete' (DB-internal) and 'done' (canonical public) as completion.
+    if (job.status !== 'complete' && job.status !== 'done') {
       return res.status(202).json({
         jobId,
         status: job.status,
@@ -186,9 +187,10 @@ export async function getCareerResult(req, res, next) {
       });
     }
 
+    // Map DB-internal 'complete' → public 'done'. 'complete' is deprecated in API responses.
     return res.status(200).json({
       jobId,
-      status: 'complete',
+      status: 'done',
       result: job.result,
       ...responseMeta(req)
     });

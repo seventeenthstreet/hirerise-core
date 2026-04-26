@@ -58,8 +58,10 @@ function unavailableResponse() {
     success: false,
     error: {
       code: 'RATE_LIMIT_SERVICE_UNAVAILABLE',
-      message: 'Rate limiting service temporarily unavailable. Please try again shortly.',
+      message: 'Rate limiting temporarily unavailable. Please try again shortly.',
     },
+    retryAfterSeconds: 60,
+    timestamp: new Date().toISOString(),
   };
 }
 

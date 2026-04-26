@@ -4,12 +4,15 @@
  * src/routes/health.routes.js
  * HireRise PR 2 — Health + Deep Diagnostics
  *
- * Split:
+ * Routes:
  *   GET /health        → pure liveness
  *   GET /health/deep   → dependency diagnostics
+ *   GET /health/metrics → in-process performance snapshot
+ *   GET /health/redis  → Redis circuit breaker + latency metrics  ← Phase 4
  */
 
 const express = require('express');
+const { getMetricsSnapshot } = require('../monitoring/metrics');
 const { createClient } = require('@supabase/supabase-js');
 
 const router = express.Router();
@@ -46,8 +49,21 @@ function getProbeClient() {
 // ─────────────────────────────────────────────────────────────
 function requireProbeToken(req, res, next) {
   const expected = process.env.HEALTH_PROBE_TOKEN;
+  const IS_PROD   = process.env.NODE_ENV === 'production';
 
-  if (!expected) return next();
+  // HARDENING: In production HEALTH_PROBE_TOKEN MUST be set.
+  // If the env var is missing, the deep probe returns 503 to prevent
+  // exposing dependency health data on an effectively unguarded endpoint.
+  if (!expected) {
+    if (IS_PROD) {
+      return res.status(503).json({
+        error: 'Health probe not configured',
+        hint:  'Set HEALTH_PROBE_TOKEN in production environment',
+      });
+    }
+    // Non-production: allow through without token (dev convenience)
+    return next();
+  }
 
   const provided = req.headers['x-health-probe-token'];
 
@@ -224,6 +240,72 @@ function probeAiProviders() {
 }
 
 // ─────────────────────────────────────────────────────────────
+// Phase 4 — Redis circuit breaker probe
+// ─────────────────────────────────────────────────────────────
+
+/**
+ * Derives a human-readable status from singleton readiness + circuit state.
+ *
+ *   healthy  → ready AND circuit CLOSED
+ *   degraded → ready BUT circuit HALF_OPEN, OR failure rate is high
+ *   down     → not ready OR circuit OPEN
+ */
+function deriveRedisStatus(ready, circuitState, cbMetrics) {
+  if (!ready || circuitState === 'OPEN') return 'down';
+  if (circuitState === 'HALF_OPEN')      return 'degraded';
+
+  // Healthy but with elevated failure rate (>20% of calls failed)
+  const failureRate = cbMetrics.totalCalls > 0
+    ? cbMetrics.failures / cbMetrics.totalCalls
+    : 0;
+
+  if (failureRate > 0.2 || cbMetrics.slowCalls > 10) return 'degraded';
+
+  return 'healthy';
+}
+
+function probeRedisSingleton() {
+  try {
+    const singleton = require('../infrastructure/radis/redis.singleton');
+    const ready     = singleton.isReady();
+    const cb        = singleton.circuitBreaker;
+    const cbMetrics = cb.getMetrics();
+    const status    = deriveRedisStatus(ready, cbMetrics.state, cbMetrics);
+
+    return {
+      ok:      status !== 'down',
+      status,
+      ready,
+      circuit: cbMetrics.state,
+      metrics: {
+        totalCalls:    cbMetrics.totalCalls,
+        failures:      cbMetrics.failures,
+        failureRate:   cbMetrics.failureRate,       // e.g. 0.83
+        avgLatencyMs:  cbMetrics.avgLatencyMs,
+        slowCalls:     cbMetrics.slowCalls,
+        openDurationMs: cbMetrics.openDurationMs,  // ms OPEN, or null
+      },
+    };
+  } catch (err) {
+    return {
+      ok:      false,
+      status:  'down',
+      ready:   false,
+      circuit: 'UNKNOWN',
+      error:   err.message,
+      metrics: {
+        totalCalls:     0,
+        failures:       0,
+        failureRate:    0,
+        avgLatencyMs:   0,
+        slowCalls:      0,
+        openDurationMs: null,
+      },
+    };
+  }
+}
+
+// ─────────────────────────────────────────────────────────────
 // Routes
 // ─────────────────────────────────────────────────────────────
 
@@ -284,6 +366,82 @@ router.get('/deep', requireProbeToken, async (req, res) => {
     durationMs: Date.now() - start,
     ts: new Date().toISOString(),
     probes,
+  });
+});
+
+// ─────────────────────────────────────────────────────────────
+// GET /health/metrics — In-process performance snapshot
+// Protected by INTERNAL_SERVICE_TOKEN in production.
+// ─────────────────────────────────────────────────────────────
+router.get('/metrics', (req, res) => {
+  const internalToken = process.env.INTERNAL_SERVICE_TOKEN;
+  if (internalToken && process.env.NODE_ENV === 'production') {
+    const provided = req.headers['x-internal-token'] || req.headers['x-health-probe-token'];
+    if (provided !== internalToken) {
+      return res.status(403).json({ error: 'FORBIDDEN', message: 'Internal endpoint' });
+    }
+  }
+
+  const mem = process.memoryUsage();
+  return res.json({
+    status: 'ok',
+    service: 'hirerise-core',
+    environment: process.env.NODE_ENV ?? 'unknown',
+    memory: {
+      heapUsedMb: Number((mem.heapUsed / 1024 / 1024).toFixed(2)),
+      heapTotalMb: Number((mem.heapTotal / 1024 / 1024).toFixed(2)),
+      rssMb: Number((mem.rss / 1024 / 1024).toFixed(2)),
+    },
+    ...getMetricsSnapshot(),
+    ts: new Date().toISOString(),
+  });
+});
+
+// ─────────────────────────────────────────────────────────────
+// GET /health/redis — Redis circuit breaker + latency metrics
+//
+// Secured identically to /health/metrics (INTERNAL_SERVICE_TOKEN
+// in production; open in dev/test for convenience).
+//
+// Response shape:
+// {
+//   status:  "healthy" | "degraded" | "down",
+//   ready:   boolean,
+//   circuit: "CLOSED" | "OPEN" | "HALF_OPEN",
+//   metrics: {
+//     totalCalls:    number,        // safeExec invocations since boot (or last overflow reset)
+//     failures:      number,        // calls that threw or timed out
+//     failureRate:   number,        // failures / totalCalls, rounded to 2dp (0 when no calls)
+//     avgLatencyMs:  number,        // rolling mean wall-clock latency
+//     slowCalls:     number,        // calls exceeding REDIS_CB_SLOW_CALL_MS (default 200ms)
+//     openDurationMs: number | null // ms since circuit entered OPEN; null when CLOSED
+//   },
+//   ts: ISO string
+// }
+//
+// HTTP status codes:
+//   200 — healthy or degraded (system still operating)
+//   503 — down (circuit OPEN or client not ready)
+// ─────────────────────────────────────────────────────────────
+router.get('/redis', (req, res) => {
+  // Same token guard as /health/metrics
+  const internalToken = process.env.INTERNAL_SERVICE_TOKEN;
+  if (internalToken && process.env.NODE_ENV === 'production') {
+    const provided = req.headers['x-internal-token'] || req.headers['x-health-probe-token'];
+    if (provided !== internalToken) {
+      return res.status(403).json({ error: 'FORBIDDEN', message: 'Internal endpoint' });
+    }
+  }
+
+  const probe = probeRedisSingleton();
+
+  return res.status(probe.status === 'down' ? 503 : 200).json({
+    status:  probe.status,
+    ready:   probe.ready,
+    circuit: probe.circuit,
+    metrics: probe.metrics,
+    ...(probe.error ? { error: probe.error } : {}),
+    ts: new Date().toISOString(),
   });
 });
 

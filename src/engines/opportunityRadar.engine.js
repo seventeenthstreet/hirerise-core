@@ -20,6 +20,8 @@
 
 const crypto = require('crypto');
 const cacheManager = require('../core/cache/cache.manager');
+// Phase 2: lazy getter — resolves Redis post-bootstrap on each call
+const getCache = () => cacheManager?.getClient?.() || null;
 const { supabase } = require('../config/supabase');
 const logger = require('../utils/logger');
 
@@ -27,14 +29,13 @@ const CACHE_TTL = 1800;
 const STALE_TTL = 1800;
 const RADAR_RPC = 'get_opportunity_radar';
 
-const cache = cacheManager?.getClient?.();
 const inFlightRefreshes = new Set();
 
 async function getRadarVersion() {
   if (!cache) return 'v1';
 
   try {
-    const version = await cache.get('radar:version');
+    const version = await getCache()?.get('radar:version');
     return version || 'v1';
   } catch {
     return 'v1';
@@ -60,7 +61,7 @@ async function getOpportunityRadar(userId, opts = {}) {
 
   if (cache) {
     try {
-      const cached = await cache.get(cacheKey);
+      const cached = await getCache()?.get(cacheKey);
       if (cached) {
         try {
           return normalizeRadarPayload(JSON.parse(cached));
@@ -171,7 +172,7 @@ async function invalidateOpportunityRadar(userId) {
     } while (cursor !== '0');
 
     if (keys.length) {
-      await cache.del(keys);
+      await getCache()?.del(keys);
     }
   } catch (err) {
     logger.warn('[Radar] invalidation failed', {
@@ -185,7 +186,7 @@ async function bumpRadarVersion() {
   if (!cache) return;
 
   try {
-    await cache.set('radar:version', `v${Date.now()}`);
+    await getCache()?.set('radar:version', `v${Date.now()}`);
   } catch (err) {
     logger.warn('[Radar] version bump failed', {
       err: err.message,
@@ -240,7 +241,7 @@ async function writeCacheSafe(cacheKey, payload, userId) {
   if (!cache) return;
 
   try {
-    await cache.set(cacheKey, JSON.stringify(payload), 'EX', CACHE_TTL);
+    await getCache()?.set(cacheKey, JSON.stringify(payload), 'EX', CACHE_TTL);
   } catch (err) {
     logger.warn('[Radar] cache write failed', {
       userId,

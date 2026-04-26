@@ -31,7 +31,7 @@ const upload = multer({
         .match(/\.[^.]+$/)?.[0] || '';
 
     const isCSV =
-      CSV_MIME_TYPES.has(file.mimetype) ||
+      CSV_MIME_TYPES.has(file.mimetype) &&
       ext === '.csv';
 
     if (!isCSV) {

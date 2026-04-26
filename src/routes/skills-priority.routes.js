@@ -28,7 +28,8 @@ const chiSnapshotRepository = require(
 
 const router = express.Router();
 
-const cache = cacheManager.getClient();
+// Phase 2: lazy getter — resolves Redis post-bootstrap on each call
+const getCache = () => cacheManager.getClient();
 const CACHE_TTL_SECONDS = 1800;
 const DEFAULT_PROFICIENCY = 50;
 
@@ -140,7 +141,7 @@ router.get(
 
     if (!forceRefresh) {
       try {
-        const hit = await cache.get(cacheKey);
+        const hit = await getCache().get(cacheKey);
 
         if (hit) {
           logger.info('[SkillPriorityRoute] Cache hit', { userId });
@@ -276,7 +277,7 @@ router.get(
     const result = await engine.run(input, { isPremium });
 
     try {
-      await cache.set(
+      await getCache().set(
         cacheKey,
         JSON.stringify(result),
         CACHE_TTL_SECONDS

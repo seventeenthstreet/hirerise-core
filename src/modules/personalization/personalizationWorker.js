@@ -399,6 +399,8 @@ async function seedFromCVParse(
 
 function startPersonalizationHook() {
   try {
+    // Warm-up: touch cacheManager so it resolves the Redis client eagerly
+    // post-bootstrap. Result intentionally unused here.
     cacheManager.getClient();
 
     logger.info(

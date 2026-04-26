@@ -20,7 +20,7 @@ async function getRedis() {
 
   try {
     const mgr = require('./cache/cache.manager');
-    const cache = await mgr.getClient();
+    const cache = mgr.getClient(); // synchronous post-bootstrap
 
     if (cache?.client?.incr) {
       _redis = cache.client;

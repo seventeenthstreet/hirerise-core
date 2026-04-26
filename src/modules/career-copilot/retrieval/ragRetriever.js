@@ -40,7 +40,8 @@ const SOURCE_WEIGHTS = Object.freeze({
 
 const ALL_SOURCES = Object.freeze(Object.keys(SOURCE_WEIGHTS));
 
-const cache = cacheManager.getClient();
+// Phase 2: lazy getter — resolves Redis post-bootstrap on each call
+const getCache = () => cacheManager.getClient();
 const moduleCache = new Map();
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -172,7 +173,7 @@ async function retrieveContext(userId, opts = {}) {
 
   if (!forceRefresh) {
     try {
-      const cached = await cache.get(cacheKey);
+      const cached = await getCache().get(cacheKey);
       if (cached) {
         logger.debug('[RAGRetriever] Context cache hit', { userId });
         return { ...JSON.parse(cached), _cached: true };
@@ -241,7 +242,7 @@ async function retrieveContext(userId, opts = {}) {
   };
 
   try {
-    await cache.set(
+    await getCache().set(
       cacheKey,
       JSON.stringify(ragContext),
       'EX',

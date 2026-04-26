@@ -1,6 +1,8 @@
 'use strict';
 
 const metricsService = require('../ai/observability/metrics.service');
+// FIX: was using console.* — replaced with structured logger for proper log routing
+const logger = require('../utils/logger');
 
 /**
  * DailyAggregationWorker
@@ -26,7 +28,7 @@ class DailyAggregationWorker {
     const targetDate = dateStr || this._yesterdayUTC();
     const jobStart = Date.now();
 
-    console.log(`[AggregationWorker] Starting daily aggregation for ${targetDate}`);
+    logger.info('[AggregationWorker] Starting daily aggregation', { targetDate });
 
     try {
       const results = await metricsService.runDailyAggregation(targetDate);
@@ -40,10 +42,10 @@ class DailyAggregationWorker {
         success: results.filter(r => r.status === 'ok').length,
       };
 
-      console.log(`[AggregationWorker] Completed in ${elapsed}ms:`, JSON.stringify(summary));
+      logger.info('[AggregationWorker] Completed', summary);
       return summary;
     } catch (err) {
-      console.error('[AggregationWorker] Job failed:', err.message);
+      logger.error('[AggregationWorker] Job failed', { error: err.message, stack: err.stack });
       throw err;
     }
   }
@@ -65,21 +67,13 @@ if (require.main === module) {
 
   worker.runJob(dateArg)
     .then(result => {
-      console.log('Job completed:', result);
+      logger.info('[AggregationWorker] CLI completed', { result });
       process.exit(0);
     })
     .catch(err => {
-      console.error('Job failed:', err);
+      logger.error('[AggregationWorker] CLI failed', { error: err.message, stack: err.stack });
       process.exit(1);
     });
 }
 
 module.exports = new DailyAggregationWorker();
-
-
-
-
-
-
-
-

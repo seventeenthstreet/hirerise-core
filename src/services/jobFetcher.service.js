@@ -19,7 +19,8 @@ const {
   authoritativeUpsert,
 } = require('../lib/db/authoritativeMutation');
 
-const cache = cacheManager.getClient();
+// Phase 2: lazy getter — resolves Redis post-bootstrap on each call
+const getCache = () => cacheManager.getClient();
 
 const ADZUNA_BASE_URL = 'https://api.adzuna.com/v1/api/jobs';
 const CACHE_TTL_SECONDS = 24 * 60 * 60;
@@ -228,7 +229,7 @@ async function readCachedFromSupabase(userId, cacheKey) {
 
 async function setMemoryCache(cacheKey, payload) {
   try {
-    await cache.set(
+    await getCache().set(
       cacheKey,
       JSON.stringify(payload),
       CACHE_TTL_SECONDS
@@ -238,7 +239,7 @@ async function setMemoryCache(cacheKey, payload) {
 
 async function getMemoryCache(cacheKey) {
   try {
-    const cached = await cache.get(cacheKey);
+    const cached = await getCache().get(cacheKey);
     return cached ? JSON.parse(cached) : null;
   } catch (_) {
     return null;
@@ -352,7 +353,7 @@ async function invalidateJobCache(
   const cacheKey = buildCacheKey(userId, role, country);
 
   try {
-    await cache.delete(cacheKey);
+    await getCache().delete(cacheKey);
   } catch (_) {}
 
   logger.debug('[JobFetcher] Cache invalidated', {

@@ -3,6 +3,20 @@
 /**
  * routes/aiJobs.route.js
  *
+ * @deprecated LEGACY — not for frontend use.
+ *
+ * This endpoint exposes raw AI job status by jobId.
+ * It is an INTERNAL backend mechanism.
+ *
+ * Frontend MUST NOT poll this endpoint.
+ * Use the canonical resume-based polling endpoint instead:
+ *   GET /api/v1/resumes/:resumeId           — full resume record + status
+ *   GET /api/v1/resumes/:resumeId/status    — lightweight status-only poll
+ *
+ * This route is retained for backward compatibility with internal
+ * backend workers and admin tooling ONLY. It will not be removed,
+ * but it will never be the correct choice for new frontend code.
+ *
  * Client poll endpoint for async AI job status.
  *
  * GET /api/v1/ai-jobs/:jobId
@@ -61,6 +75,26 @@ router.get('/:jobId', async (req, res, next) => {
     route: 'GET /ai-jobs/:jobId',
     requestId: req.id || null,
   };
+
+  // DEPRECATION NOTICE: this endpoint is legacy / internal only.
+  // Frontend should poll GET /api/v1/resumes/:resumeId/status instead.
+  res.setHeader(
+    'Deprecation',
+    'true'
+  );
+  res.setHeader(
+    'Link',
+    '</api/v1/resumes/{resumeId}/status>; rel="successor-version"'
+  );
+  res.setHeader(
+    'X-Polling-Contract',
+    'DEPRECATED: use GET /api/v1/resumes/:resumeId/status — see frontend-contract.md'
+  );
+
+  logger.warn('[AIJobsRoute] Legacy job-poll endpoint called — frontend should use /resumes/:resumeId/status', {
+    ...requestMeta,
+    jobId: req.params?.jobId,
+  });
 
   try {
     const { jobId } = req.params;

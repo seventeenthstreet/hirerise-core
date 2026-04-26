@@ -1,7 +1,7 @@
 'use strict';
 
 const { supabase } = require('../../../config/supabase');
-const { v4: uuidv4 } = require('uuid');
+const { randomUUID: uuidv4 } = require('crypto');
 const logger = require('../../../utils/logger');
 
 const TABLE = 'distributed_locks';

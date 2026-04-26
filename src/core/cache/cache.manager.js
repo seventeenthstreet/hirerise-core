@@ -1,76 +1,81 @@
 'use strict';
 
 /**
- * CacheManager — Production Ready
+ * src/core/cache/cache.manager.js  — Phase 2 Refactor
  *
- * ✅ Supports Redis + Memory
- * ✅ Auto fallback to memory if Redis fails
- * ✅ Lazy initialization
- * ✅ Singleton-safe
- * ✅ Uses structured logging
+ * Design:
+ *  - Exports a SINGLETON INSTANCE (preserves existing require() pattern)
+ *  - getClient() is SYNCHRONOUS — no await at call sites
+ *  - Lazily reads from redis.singleton (already connected post-bootstrap)
+ *  - Falls back to MemoryCache when Redis is disabled / not ready
+ *
+ * USAGE (unchanged from Phase 1):
+ *   const cacheManager = require('.../cache.manager');
+ *   const cache = cacheManager.getClient();  // ← synchronous, no await
+ *
+ * CHANGES FROM PHASE 1:
+ *  - getClient() is now SYNCHRONOUS (removed async/Promise)
+ *  - No internal Redis creation — delegates to redis.singleton
+ *  - No init() / lazy-connect logic — resolved on first getClient() call
+ *  - setClient() available for DI in tests
  */
 
 const MemoryCache = require('./memory.cache');
-const RedisCache = require('./redis.cache');
-const logger = require('../../utils/logger');
+const logger      = require('../../utils/logger');
 
 class CacheManager {
   constructor() {
-    this.cache = null;
-    this.initialized = false;
+    this._client = null;
   }
 
   /**
-   * Initialize cache (lazy)
+   * Returns the cache client synchronously.
+   *
+   * On first call: resolves from redis.singleton, which is already
+   * connected because bootstrap awaits connect() before app.listen().
+   * Subsequent calls return the cached reference — zero overhead.
+   *
+   * @returns {import('ioredis').Redis | MemoryCache}
    */
-  async init() {
-    if (this.initialized) return;
+  getClient() {
+    if (this._client) return this._client;
 
-    // 🧪 Force memory in test
-    if (process.env.NODE_ENV === 'test') {
-      logger.info('[CacheManager] TEST mode → MemoryCache');
-      this.cache = new MemoryCache();
-      this.initialized = true;
-      return;
-    }
+    // Lazy resolution — safe post-bootstrap
+    try {
+      const redisSingleton = require('../../infrastructure/radis/redis.singleton');
 
-    const cacheType = process.env.CACHE_PROVIDER || 'memory';
-
-    if (cacheType === 'redis') {
-      try {
-        logger.info('[CacheManager] Initializing Redis cache');
-
-        const redis = new RedisCache();
-        await redis.connect?.(); // optional connect()
-
-        this.cache = redis;
-
-        logger.info('[CacheManager] Redis cache ready');
-      } catch (err) {
-        logger.error('[CacheManager] Redis failed, falling back to memory', {
-          error: err.message,
-        });
-
-        this.cache = new MemoryCache();
+      if (redisSingleton && redisSingleton.isReady()) {
+        // Permanently cache the real Redis client.
+        this._client = redisSingleton.getClient();
+        logger.info('[CacheManager] Resolved Redis client from singleton');
+        return this._client;
       }
-    } else {
-      logger.info('[CacheManager] Using Memory cache');
-      this.cache = new MemoryCache();
+    } catch (_) {
+      // singleton not available in test environment — fall through
     }
 
-    this.initialized = true;
+    // Fallback: return a MemoryCache but do NOT store it on this._client.
+    // This allows the next call (after Redis becomes ready post-bootstrap)
+    // to transparently upgrade to the real Redis client.
+    logger.warn('[CacheManager] Redis not ready — returning MemoryCache (not cached)');
+    return new MemoryCache();
   }
 
   /**
-   * Get cache client (ensures init)
+   * Explicit DI override — inject a specific client.
+   * Call before any getClient() to pin the client (e.g. in tests).
+   *
+   * @param {import('ioredis').Redis | MemoryCache} client
    */
-  async getClient() {
-    if (!this.initialized) {
-      await this.init();
-    }
-    return this.cache;
+  setClient(client) {
+    this._client = client;
+  }
+
+  /** Resets the resolved client — useful between tests. */
+  reset() {
+    this._client = null;
   }
 }
 
-// ✅ Singleton instance
+// ✅ Singleton instance — same module.exports shape as Phase 1
 module.exports = new CacheManager();

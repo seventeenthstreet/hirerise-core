@@ -10,6 +10,11 @@
  * - normalized skill cache convergence
  * - batch-safe processing
  * - cleaner observability
+ *
+ * SECURITY FIX: Mock embeddings are DISABLED in production.
+ * createMockEmbedding() is retained for development/test only.
+ * In production, missing embeddings return null and are skipped
+ * rather than persisting fake vectors that corrupt similarity scores.
  */
 
 const { supabase } = require('../config/supabase');
@@ -25,8 +30,20 @@ const VECTOR_DIMENSION = 384;
 const DEFAULT_BATCH_SIZE = 10;
 const BATCH_DELAY_MS = 100;
 
+const IS_PRODUCTION = process.env.NODE_ENV === 'production';
+
 // lightweight in-memory hot cache
 const localCache = new Map();
+
+// ─────────────────────────────────────────────────────────────
+// Structured fallback — returned instead of raw null in production.
+// Callers can check result?.status === 'missing_embedding' and decide
+// whether to skip, queue a backfill, or surface a metric.
+// ─────────────────────────────────────────────────────────────
+const MISSING_EMBEDDING_RESULT = Object.freeze({
+  embedding: null,
+  status: 'missing_embedding',
+});
 
 // ─────────────────────────────────────────────────────────────
 // Helpers
@@ -39,7 +56,20 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+/**
+ * DEVELOPMENT / TEST ONLY.
+ * Produces a deterministic but meaningless vector from a text hash.
+ * Must NEVER be called in production — it produces fake similarity scores
+ * that corrupt job-match rankings and career intelligence features.
+ */
 function createMockEmbedding(text) {
+  if (IS_PRODUCTION) {
+    // Defensive guard — should be unreachable due to call-site check below,
+    // but belt-and-suspenders prevents future callers from bypassing it.
+    logger.error('[EmbeddingService] createMockEmbedding called in production — blocked', { text });
+    return null;
+  }
+
   const normalized = normalizeSkill(text);
 
   if (!normalized) {
@@ -63,11 +93,13 @@ async function ensureSkillEmbedding(skill) {
   const normalized = normalizeSkill(skill);
 
   if (!normalized) {
-    return null;
+    // Invalid input — return structured fallback, not raw null.
+    return MISSING_EMBEDDING_RESULT;
   }
 
   const cached = localCache.get(normalized);
   if (cached) {
+    // Cached value is always a real embedding array — return directly.
     return cached;
   }
 
@@ -87,6 +119,18 @@ async function ensureSkillEmbedding(skill) {
       return data.embedding;
     }
 
+    // Production: no real embedding exists — do NOT generate or persist
+    // mock vectors. Return structured fallback so callers can distinguish
+    // "missing embedding" from an error and log/alert appropriately.
+    if (IS_PRODUCTION) {
+      logger.warn('[EmbeddingService] No real embedding found in production', {
+        skill_name: normalized,
+        status: 'missing_embedding',
+      });
+      return MISSING_EMBEDDING_RESULT;
+    }
+
+    // Development / test: generate and persist a deterministic mock embedding.
     const embedding = createMockEmbedding(normalized);
 
     await authoritativeUpsert({
@@ -106,9 +150,12 @@ async function ensureSkillEmbedding(skill) {
     logger.error('[EmbeddingService] ensureSkillEmbedding failed', {
       skill_name: normalized,
       error: err?.message || 'Unknown embedding error',
+      status: 'missing_embedding',
     });
 
-    return null;
+    // Return structured fallback — never raw null — so callers always
+    // get a consistent shape and can check result?.status.
+    return MISSING_EMBEDDING_RESULT;
   }
 }
 

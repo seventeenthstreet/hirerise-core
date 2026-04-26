@@ -1,0 +1,71 @@
+version: '3.9'
+
+# ─────────────────────────────────────────────────────────────
+# HireRise Local Development Stack
+#
+# Services:
+#   redis   — cache + session store (port 6379)
+#   api     — hirerise-core backend (port 3001)
+#
+# Usage:
+#   Start Redis only:   docker-compose up redis -d
+#   Start full stack:   docker-compose up -d
+#   View logs:          docker-compose logs -f
+#   Stop:               docker-compose down
+# ─────────────────────────────────────────────────────────────
+
+services:
+
+  # ── Redis ───────────────────────────────────────────────────
+  redis:
+    image: redis:7.2-alpine
+    container_name: hirerise-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    command: >
+      redis-server
+      --maxmemory 256mb
+      --maxmemory-policy allkeys-lru
+      --save ""
+      --appendonly no
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks:
+      - hirerise
+
+  # ── API (optional — run via nodemon for dev hot-reload) ─────
+  api:
+    build:
+      context: .
+      dockerfile: api-service/Dockerfile
+    container_name: hirerise-api
+    restart: unless-stopped
+    ports:
+      - "3001:8080"
+    env_file:
+      - .env
+    environment:
+      NODE_ENV: development
+      PORT: 8080
+      CACHE_PROVIDER: redis
+      REDIS_URL: redis://redis:6379
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      - hirerise
+    profiles:
+      - full   # only starts with: docker-compose --profile full up
+
+volumes:
+  redis_data:
+
+networks:
+  hirerise:
+    driver: bridge

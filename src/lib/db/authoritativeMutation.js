@@ -1,117 +1,64 @@
 'use strict';
 
-const { getClient } = require('../../config/supabase');
+/**
+ * src/lib/db/authoritativeMutation.js
+ *
+ * Single-function helper for upserts that MUST succeed.
+ * Any DB error is thrown as a hard error (not silently swallowed).
+ *
+ * Named "authoritative" because the caller treats this write as the
+ * single source of truth — it is never a fire-and-forget.
+ */
+
+const { supabase } = require('../../config/supabase');
 const logger = require('../../utils/logger');
 
-const mutationFence = new Map();
-const MAX_FENCE_KEYS = 10000;
-const MAX_RETRIES = 3;
-const BASE_BACKOFF_MS = 100;
-
-function getFenceKey(table, payload, conflictKey, requestKey) {
-  return `${table}:${requestKey || payload[conflictKey]}`;
-}
-
-function getCurrentSeq(key) {
-  return mutationFence.get(key) || 0;
-}
-
-function commitNextSeq(key, currentSeq) {
-  const next = currentSeq + 1;
-  mutationFence.set(key, next);
-
-  // simple bounded FIFO eviction to avoid process-lifetime leak
-  if (mutationFence.size > MAX_FENCE_KEYS) {
-    const oldestKey = mutationFence.keys().next().value;
-    if (oldestKey) {
-      mutationFence.delete(oldestKey);
-    }
-  }
-
-  return next;
-}
-
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-async function authoritativeUpsert({
-  table,
-  payload,
-  conflictKey = 'id',
-  requestKey,
-}) {
-  if (!table) {
-    throw new Error('authoritativeUpsert requires table');
+/**
+ * Upsert a single row and throw on any DB error.
+ *
+ * @param {object} opts
+ * @param {string} opts.table       - Supabase table name
+ * @param {object} opts.payload     - Row data to upsert
+ * @param {string} opts.conflictKey - Column(s) used for ON CONFLICT (e.g. 'id' or 'user_id')
+ * @returns {object} The payload that was written (Supabase upsert returns data only with select())
+ * @throws  On any DB error
+ */
+async function authoritativeUpsert({ table, payload, conflictKey }) {
+  if (!table || typeof table !== 'string') {
+    throw new Error('[authoritativeUpsert] table name is required');
   }
 
   if (!payload || typeof payload !== 'object') {
-    throw new Error('authoritativeUpsert requires valid payload');
+    throw new Error(`[authoritativeUpsert] invalid payload for table "${table}"`);
   }
 
-  const client = getClient();
-  const fenceKey = getFenceKey(
-    table,
-    payload,
-    conflictKey,
-    requestKey
-  );
-
-  const currentSeq = getCurrentSeq(fenceKey);
-
-  let lastError;
-
-  for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
-    try {
-      const finalPayload = {
-        ...payload,
-        updated_at: new Date().toISOString(),
-      };
-
-      const { data, error } = await client
-        .from(table)
-        .upsert(finalPayload, {
-          onConflict: conflictKey,
-        })
-        .select()
-        .single();
-
-      if (error) {
-        throw error;
-      }
-
-      // commit fence only after confirmed success
-      commitNextSeq(fenceKey, currentSeq);
-
-      return data;
-    } catch (error) {
-      lastError = error;
-
-      logger.warn(
-        '[Patch45] authoritative upsert attempt failed',
-        {
-          table,
-          conflictKey,
-          attempt,
-          error: error.message,
-        }
-      );
-
-      if (attempt < MAX_RETRIES) {
-        await sleep(BASE_BACKOFF_MS * Math.pow(2, attempt - 1));
-      }
-    }
+  if (!conflictKey) {
+    throw new Error(`[authoritativeUpsert] conflictKey is required for table "${table}"`);
   }
 
-  logger.error('[Patch45] authoritative upsert failed permanently', {
-    table,
-    conflictKey,
-    error: lastError?.message,
-  });
+  const { error } = await supabase
+    .from(table)
+    .upsert(payload, { onConflict: conflictKey });
 
-  throw lastError;
+  if (error) {
+    logger.error('[authoritativeUpsert] DB write failed', {
+      table,
+      conflictKey,
+      errorCode:    error.code,
+      errorMessage: error.message,
+      payloadKeys:  Object.keys(payload),
+    });
+
+    // Surface as a plain Error so callers can catch and convert to AppError
+    // if needed, without coupling this utility to the error handler module.
+    const err = new Error(`DB upsert failed on "${table}": ${error.message}`);
+    err.dbError    = error;
+    err.table      = table;
+    err.conflictKey = conflictKey;
+    throw err;
+  }
+
+  return payload;
 }
 
-module.exports = {
-  authoritativeUpsert,
-};
+module.exports = { authoritativeUpsert };
