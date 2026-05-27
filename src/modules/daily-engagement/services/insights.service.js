@@ -32,7 +32,7 @@ const {
 // ─────────────────────────────────────────────────────────────────────────────
 
 function getMarketTrend() {
-  return require('../../labor-market-intelligence/services/marketTrend.service');
+  return require('../../labor-market-intelligence/coordinators/marketIntelligence.coordinator');
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

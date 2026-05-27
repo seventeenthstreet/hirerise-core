@@ -46,9 +46,9 @@ const validate = (chains = []) => {
       return next(
         new AppError(
           'Request validation failed',
+          ErrorCodes.VALIDATION_ERROR,
           400,
-          { fields: formattedErrors },
-          ErrorCodes.VALIDATION_ERROR
+          { fields: formattedErrors }
         )
       );
     },

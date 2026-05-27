@@ -74,8 +74,11 @@ function requireTier(allowedTiers) {
           code: 'UNAUTHORIZED',
           message: 'Authentication required.',
         },
-        requestId,
-        timestamp: new Date().toISOString(),
+        // Phase 2B.2 — moved requestId/timestamp into meta for V2 compliance.
+        meta: {
+          requestId,
+          timestamp: new Date().toISOString(),
+        },
       });
     }
 
@@ -103,13 +106,17 @@ function requireTier(allowedTiers) {
         error: {
           code: 'TIER_INSUFFICIENT',
           message: `This feature is not available on your current plan (${tier}). Please upgrade to continue.`,
+          // Phase 2B.2 — moved details into error.details (V2 canonical position).
+          details: {
+            currentTier: tier,
+            requiredTiers: normalizedAllowed,
+          },
         },
-        details: {
-          currentTier: tier,
-          requiredTiers: normalizedAllowed,
+        // Phase 2B.2 — moved requestId/timestamp into meta for V2 compliance.
+        meta: {
+          requestId,
+          timestamp: new Date().toISOString(),
         },
-        requestId,
-        timestamp: new Date().toISOString(),
       });
     }
 

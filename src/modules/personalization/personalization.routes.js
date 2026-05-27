@@ -23,12 +23,20 @@
  * - Cleaned route structure for long-term scalability
  * - Hardened request validation boundaries
  * - Prepared for RBAC / tenant middleware layering
+ *
+ * PHASE 2D — QUOTA BOUNDARY FIX:
+ * aiRateLimit was previously applied at app.use(API_PREFIX, aiRateLimit, router)
+ * mount level in server.js, causing it to fire on ALL /api/v1/* requests, including
+ * the free onboarding operation POST /api/v1/users/me/direction.
+ * aiRateLimitShared is now applied per-handler below on AI inference routes only.
  */
 
 const { Router } = require('express');
 const { body } = require('express-validator');
 const { validate } = require('../../middleware/requestValidator');
 const controller = require('./personalization.controller');
+// Phase 2D: imported for per-handler application on AI inference routes only.
+const { aiRateLimitShared } = require('../../middleware/aiRateLimitShared.middleware');
 
 const router = Router();
 
@@ -118,6 +126,7 @@ const behaviorEventValidators = [
 
 router.get(
   '/career/personalized-recommendations',
+  aiRateLimitShared, // Phase 2D: AI inference — rate-limited per handler, not at mount
   controller.getPersonalizedRecommendations
 );
 
@@ -125,6 +134,7 @@ router.get(
 // User routes
 // ───────────────────────────────────────────────────────────────────────────────
 
+// behavior-event is a lightweight tracking write, not AI inference — no aiRateLimit needed.
 router.post(
   '/user/behavior-event',
   validate(behaviorEventValidators),
@@ -133,11 +143,13 @@ router.post(
 
 router.get(
   '/user/personalization-profile',
+  aiRateLimitShared, // Phase 2D: profile fetch invokes AI signal aggregation
   controller.getPersonalizationProfile
 );
 
 router.post(
   '/user/update-behavior-profile',
+  aiRateLimitShared, // Phase 2D: profile update invokes AI re-scoring
   controller.updateBehaviorProfile
 );
 

@@ -1,5 +1,7 @@
 'use strict';
 
+const logger = require('../../utils/logger');
+
 /**
  * src/services/admin/usageLogs.repository.js
  * Production-ready Supabase-native repository
@@ -60,7 +62,7 @@ class UsageLogsRepository {
 
       return data?.id ?? null;
     } catch (error) {
-      console.error('[UsageLogsRepository.logUsage]', error);
+      logger.error('[UsageLogsRepository] logUsage failed', { error: error.message, alertable: true });
       return null;
     }
   }

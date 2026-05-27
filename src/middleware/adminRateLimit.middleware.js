@@ -18,11 +18,17 @@ const logger = require('../utils/logger');
 const RATE_LIMIT_RPC = 'check_rate_limit';
 const DEFAULT_TIMEOUT_MS = 1500;
 
-const RATE_LIMIT_RESPONSE = (code, message) => ({
+// Phase 2B.1 — normalized to V2 canonical envelope.
+// timestamp moved into meta (not error object); meta.retryAfter added for
+// parser back-off extraction (parser reads meta?.retryAfter).
+const RATE_LIMIT_RESPONSE = (code, message, retryAfter = 60) => ({
   success: false,
   error: {
     code,
     message,
+  },
+  meta: {
+    retryAfter,
     timestamp: new Date().toISOString(),
   },
 });

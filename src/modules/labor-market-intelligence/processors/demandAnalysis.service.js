@@ -24,7 +24,7 @@ const {
 } = require('../models/jobMarket.model');
 const {
   aggregateSkillCounts
-} = require('./skillExtraction.service');
+} = require('./skillExtraction.utils');
 
 const UPSERT_CHUNK_SIZE = 500;
 const MAX_SKILL_RESULTS = 50;

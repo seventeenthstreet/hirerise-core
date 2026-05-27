@@ -1,6 +1,6 @@
 'use strict';
 
-const { createLogger, format, transports } = require('winston');
+const { createLogger, format, transports, addColors } = require('winston');
 const path = require('path');
 
 const {
@@ -12,6 +12,37 @@ const {
   printf,
   splat,
 } = format;
+
+// ── PATCH: Add 'fatal' level above 'error' ────────────────────────────────────
+// Winston's default npm levels go: error(0) warn(1) info(2) ...
+// We add fatal(0) above error by shifting the numeric priority convention:
+// fatal=0, error=1, warn=2, info=3, http=4, verbose=5, debug=6, silly=7
+// This means fatal(0) ALWAYS prints regardless of LOG_LEVEL.
+const CUSTOM_LEVELS = {
+  levels: {
+    fatal:   0,
+    error:   1,
+    warn:    2,
+    info:    3,
+    http:    4,
+    verbose: 5,
+    debug:   6,
+    silly:   7,
+  },
+  colors: {
+    fatal:   'bold red',
+    error:   'red',
+    warn:    'yellow',
+    info:    'green',
+    http:    'magenta',
+    verbose: 'cyan',
+    debug:   'blue',
+    silly:   'grey',
+  },
+};
+
+addColors(CUSTOM_LEVELS.colors);
+// ── END PATCH ─────────────────────────────────────────────────────────────────
 
 const isProduction = process.env.NODE_ENV === 'production';
 const defaultLevel = process.env.LOG_LEVEL || (isProduction ? 'info' : 'debug');
@@ -66,7 +97,9 @@ const loggerTransports = [
   new transports.Console({
     format: isProduction ? prodFormat : devFormat,
     handleExceptions: true,
-    stderrLevels: ['error'],
+    // PATCH: fatal also goes to stderr so Cloud Run / Docker operators
+    // see it on the error stream, not buried in stdout.
+    stderrLevels: ['fatal', 'error'],
   }),
 ];
 
@@ -88,6 +121,8 @@ if (process.env.LOG_FILE_PATH) {
 // ─────────────────────────────────────────────
 
 const logger = createLogger({
+  // PATCH: use custom levels that include 'fatal'
+  levels: CUSTOM_LEVELS.levels,
   level: defaultLevel,
   transports: loggerTransports,
   exitOnError: false,

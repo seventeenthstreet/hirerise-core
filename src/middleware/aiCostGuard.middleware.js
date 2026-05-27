@@ -166,17 +166,26 @@ async function aiCostGuard(req, res, next) {
         limit,
       });
 
+      // Phase 2B.1 — normalized to V2 canonical envelope.
+      // detail renamed to meta.details for V2 compliance; retryAfter added.
+      const secondsUntilMidnight = Math.ceil(
+        (new Date(`${todayISO()}T23:59:59Z`).getTime() - Date.now()) / 1000
+      );
       return res.status(429).json({
         success: false,
         error: {
           code: 'DAILY_AI_COST_LIMIT_EXCEEDED',
           message: 'Daily AI usage limit reached. Resets at midnight UTC.',
+          details: {
+            dailySpentUSD: Number(spent.toFixed(4)),
+            dailyLimitUSD: limit,
+            remainingUSD: Number(Math.max(limit - spent, 0).toFixed(4)),
+            resetsAt: `${todayISO()}T23:59:59Z`,
+          },
         },
-        detail: {
-          dailySpentUSD: Number(spent.toFixed(4)),
-          dailyLimitUSD: limit,
-          remainingUSD: Number(Math.max(limit - spent, 0).toFixed(4)),
-          resetsAt: `${todayISO()}T23:59:59Z`,
+        meta: {
+          retryAfter: Math.max(secondsUntilMidnight, 0),
+          timestamp: new Date().toISOString(),
         },
       });
     }

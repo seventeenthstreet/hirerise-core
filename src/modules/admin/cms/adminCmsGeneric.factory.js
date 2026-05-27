@@ -15,6 +15,7 @@ const { validate } = require('../../../middleware/requestValidator');
 const { body, param, query } = require('express-validator');
 const express = require('express');
 const logger  = require('../../../utils/logger');
+const { sendSuccess } = require('../../../shared/response');
 
 function getSupabase() { return require('../../../config/supabase'); }
 
@@ -182,25 +183,27 @@ function createCmsDatasetModule(config) {
   const controller = {
     create: asyncHandler(async (req, res) => {
       const result = await service.create(req.body, req.user.id, req.user?.agency);
-      res.status(201).json({ success: true, data: result });
+      return sendSuccess(res, result, {}, {}, 201);
     }),
     list: asyncHandler(async (req, res) => {
       const items = await service.list({ status: req.query.status,
         limit: parseInt(req.query.limit || '50'), offset: parseInt(req.query.offset || '0') });
-      res.json({ success: true, data: { items, total: items.length } });
+      return sendSuccess(res, { items, total: items.length });
     }),
     getById: asyncHandler(async (req, res) => {
       const item = await service.findById(req.params.id);
       if (!item) throw new AppError('Not found', 404, {}, ErrorCodes.NOT_FOUND);
-      res.json({ success: true, data: item });
+      return sendSuccess(res, item);
     }),
     update: asyncHandler(async (req, res) => {
       const result = await service.update(req.params.id, req.body, req.user.id);
-      res.json({ success: true, data: result });
+      return sendSuccess(res, result);
     }),
     delete: asyncHandler(async (req, res) => {
       await service.softDelete(req.params.id, req.user.id);
-      res.json({ success: true, message: `${datasetType} deleted` });
+      // V2 contract: success=true responses MUST include a `data` key.
+      // Use null for operations with no meaningful payload.
+      return sendSuccess(res, null, { message: `${datasetType} deleted` });
     }),
   };
 
@@ -231,11 +234,3 @@ module.exports = {
   educationLevelsModule,
   salaryBenchmarksModule,
 };
-
-
-
-
-
-
-
-

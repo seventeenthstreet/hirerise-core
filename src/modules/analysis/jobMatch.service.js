@@ -29,6 +29,7 @@ const {
 } = require('./jobMatchPremiumEngine');
 
 const chiSnapshotsRepository = require('./repositories/chiSnapshots.repository');
+const analyticsCache = require('../../infrastructure/cache/analyticsCache.utils');
 
 const {
   CREDIT_COSTS,
@@ -218,6 +219,17 @@ async function saveJobMatchResult(
       aiCostUsd: result.costUSD ?? null,
       operationType,
     });
+
+    // ── Cache invalidation ────────────────────────────────────────────
+    // Owned by the service layer; repository persists only.
+    if (userId) {
+      await Promise.allSettled([
+        analyticsCache.invalidatePattern(`analytics:${userId}:percentile:*`),
+        analyticsCache.invalidatePattern(`analytics:${userId}:trend:*`),
+        analyticsCache.invalidatePattern(`analytics:${userId}:dashboard:*`),
+        analyticsCache.invalidatePattern(`analytics:${userId}:cohort:*`),
+      ]);
+    }
   } catch (error) {
     logger.error(
       '[JobMatchService] CHI snapshot save failed',

@@ -48,6 +48,9 @@ function getSupabaseClient() {
   return client;
 }
 
-module.exports = {
-  getSupabaseClient,
-};
+module.exports = getSupabaseClient();
+
+// Also export the factory function for callers that need to call getSupabaseClient() explicitly.
+// Usage: const supabase = require('../lib/supabaseClient')  → supabase.from(...)  ✅
+// Usage: const { getSupabaseClient } = require('../lib/supabaseClient')           ✅
+module.exports.getSupabaseClient = getSupabaseClient;

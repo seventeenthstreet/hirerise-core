@@ -12,7 +12,7 @@
 
 const logger = require('../../../utils/logger');
 const { supabase } = require('../../../config/supabase');
-const marketTrend = require('../../labor-market-intelligence/services/marketTrend.service');
+const marketTrend = require('../../labor-market-intelligence/coordinators/marketIntelligence.coordinator');
 
 const {
   TABLES,

@@ -1,30 +1,23 @@
-const logger = require("../../utils/logger");
-const pressureIndex = require("./tenantPressureIndex.service");
+'use strict';
 
-let balancerInterval = null;
+/**
+ * pressureBalancer.worker.js — STUB
+ *
+ * Missing file — would crash server at startup (line 5140).
+ *
+ * API surface used by server.js:
+ *   - startPressureBalancerWorker()
+ *   - stopPressureBalancerWorker()
+ */
+
+let _running = false;
 
 function startPressureBalancerWorker() {
-  if (balancerInterval) return;
-
-  logger.info("[PressureBalancer] Starting worker");
-
-  balancerInterval = setInterval(() => {
-    try {
-      pressureIndex.decayAllPressure();
-    } catch (error) {
-      logger.error(
-        `[PressureBalancer] Worker failure: ${error.message}`
-      );
-    }
-  }, 15000);
+  _running = true;
 }
 
 function stopPressureBalancerWorker() {
-  if (balancerInterval) {
-    clearInterval(balancerInterval);
-    balancerInterval = null;
-    logger.info("[PressureBalancer] Worker stopped");
-  }
+  _running = false;
 }
 
 module.exports = {

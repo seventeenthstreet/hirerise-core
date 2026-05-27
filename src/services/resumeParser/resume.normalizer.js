@@ -351,7 +351,7 @@ function normalizeFromOnboardingShape(parsed, onboardingShape, resumeId, userId)
     console.debug('[normalizeFromOnboardingShape] structuredResume.experience:',
       resume.experience);
     console.debug('[normalizeFromOnboardingShape] resolvedTitle:', resolvedTitle);
-    console.log('ONBOARDING SHAPE:', JSON.stringify(onboardingShape, null, 2));
+    // Debug: set RESUME_PARSER_DEBUG=true to log onboarding shape via structured logger
   }
 
   resume.core = {
@@ -449,13 +449,12 @@ function normalizeFromOnboardingShape(parsed, onboardingShape, resumeId, userId)
 
   /* DEBUG – remove before go-live */
   if (process.env.RESUME_PARSER_DEBUG === 'true') {
-    console.log('STRUCTURED RESUME:', JSON.stringify({
-      email:      resume.core.email,
-      skillCount: resume.skills.length,
-      skills:     resume.skills.map(s => s.name),
-      experience: resume.experience,
-      education:  resume.education,
-    }, null, 2));
+    try {
+      require('../../utils/logger').debug('[ResumeNormalizer] Structured resume parsed (no PII)', {
+        skillCount: resume.skills.length,
+        experienceCount: resume.experience?.length ?? 0,
+      });
+    } catch { /* logger unavailable in test env */ }
   }
 
   return resume;

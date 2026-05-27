@@ -6,7 +6,7 @@
  */
 
 const { parseCSVBuffer } = require('./csvParser.util');
-const { checkDependencies, getNextStep } = require('./importDependency.service');
+const { checkDependencies, getNextStep } = require('./importDependency.utils');
 const { AppError, ErrorCodes } = require('../../../middleware/errorHandler');
 const { supabase } = require('../../../config/supabase');
 const logger = require('../../../utils/logger');

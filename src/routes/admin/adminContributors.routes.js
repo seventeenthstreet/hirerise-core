@@ -1,5 +1,8 @@
 'use strict';
 
+// CONTRACT NOTE (Phase 2): All error responses use V2 canonical shape.
+
+
 /**
  * src/routes/admin/adminContributors.routes.js
  *
@@ -58,8 +61,13 @@ router.use((req, res, next) => {
   if (!hasAdminAccess(req)) {
     return res.status(403).json({
       success: false,
-      errorCode: 'FORBIDDEN',
-      message: 'Insufficient privileges.',
+      error: {
+        code: 'FORBIDDEN',
+        message: 'Insufficient privileges.',
+      },
+      meta: {
+        timestamp: new Date().toISOString(),
+      },
     });
   }
 
@@ -136,8 +144,13 @@ router.get(
 
       return res.status(500).json({
         success: false,
-        errorCode: 'DB_ERROR',
-        message: 'Failed to fetch contributors.',
+        error: {
+          code: 'DB_ERROR',
+          message: 'Failed to fetch contributors.',
+        },
+        meta: {
+          timestamp: new Date().toISOString(),
+        },
       });
     }
 
@@ -176,9 +189,16 @@ router.post(
     const actorId = getActorId(req);
 
     if (!actorId) {
+      // CONTRACT NOTE: V2 canonical shape — Phase 2 migration
       return res.status(401).json({
         success: false,
-        message: 'Unauthenticated',
+        error: {
+          code: 'UNAUTHORIZED',
+          message: 'Unauthenticated.',
+        },
+        meta: {
+          timestamp: new Date().toISOString(),
+        },
       });
     }
 
@@ -200,32 +220,52 @@ router.post(
 
       return res.status(500).json({
         success: false,
-        errorCode: 'DB_ERROR',
-        message: 'Failed to verify user.',
+        error: {
+          code: 'DB_ERROR',
+          message: 'Failed to verify user.',
+        },
+        meta: {
+          timestamp: new Date().toISOString(),
+        },
       });
     }
 
     if (!user) {
       return res.status(404).json({
         success: false,
-        errorCode: 'NOT_FOUND',
-        message: 'User not found.',
+        error: {
+          code: 'NOT_FOUND',
+          message: 'User not found.',
+        },
+        meta: {
+          timestamp: new Date().toISOString(),
+        },
       });
     }
 
     if (user.role === 'contributor') {
       return res.status(409).json({
         success: false,
-        errorCode: 'ALREADY_CONTRIBUTOR',
-        message: 'User is already a contributor.',
+        error: {
+          code: 'ALREADY_CONTRIBUTOR',
+          message: 'User is already a contributor.',
+        },
+        meta: {
+          timestamp: new Date().toISOString(),
+        },
       });
     }
 
     if (ADMIN_ROLES.has(user.role)) {
       return res.status(409).json({
         success: false,
-        errorCode: 'ALREADY_ADMIN',
-        message: 'User already has admin or higher privileges.',
+        error: {
+          code: 'ALREADY_ADMIN',
+          message: 'User already has admin or higher privileges.',
+        },
+        meta: {
+          timestamp: new Date().toISOString(),
+        },
       });
     }
 
@@ -248,8 +288,13 @@ router.post(
 
       return res.status(500).json({
         success: false,
-        errorCode: 'AUTH_UPDATE_FAILED',
-        message: 'Failed to update auth role.',
+        error: {
+          code: 'AUTH_UPDATE_FAILED',
+          message: 'Failed to update auth role.',
+        },
+        meta: {
+          timestamp: new Date().toISOString(),
+        },
       });
     }
 
@@ -322,9 +367,16 @@ router.post(
     const actorId = getActorId(req);
 
     if (!actorId) {
+      // CONTRACT NOTE: V2 canonical shape — Phase 2 migration
       return res.status(401).json({
         success: false,
-        message: 'Unauthenticated',
+        error: {
+          code: 'UNAUTHORIZED',
+          message: 'Unauthenticated.',
+        },
+        meta: {
+          timestamp: new Date().toISOString(),
+        },
       });
     }
 
@@ -333,8 +385,13 @@ router.post(
     if (uid === actorId) {
       return res.status(400).json({
         success: false,
-        errorCode: 'SELF_DEMOTE',
-        message: 'You cannot demote yourself.',
+        error: {
+          code: 'SELF_DEMOTE',
+          message: 'You cannot demote yourself.',
+        },
+        meta: {
+          timestamp: new Date().toISOString(),
+        },
       });
     }
 
@@ -357,24 +414,39 @@ router.post(
 
       return res.status(500).json({
         success: false,
-        errorCode: 'DB_ERROR',
-        message: 'Failed to verify user.',
+        error: {
+          code: 'DB_ERROR',
+          message: 'Failed to verify user.',
+        },
+        meta: {
+          timestamp: new Date().toISOString(),
+        },
       });
     }
 
     if (!user) {
       return res.status(404).json({
         success: false,
-        errorCode: 'NOT_FOUND',
-        message: 'User not found.',
+        error: {
+          code: 'NOT_FOUND',
+          message: 'User not found.',
+        },
+        meta: {
+          timestamp: new Date().toISOString(),
+        },
       });
     }
 
     if (ADMIN_ROLES.has(user.role)) {
       return res.status(403).json({
         success: false,
-        errorCode: 'CANNOT_DEMOTE_ADMIN',
-        message: 'Cannot demote a user with admin privileges.',
+        error: {
+          code: 'CANNOT_DEMOTE_ADMIN',
+          message: 'Cannot demote a user with admin privileges.',
+        },
+        meta: {
+          timestamp: new Date().toISOString(),
+        },
       });
     }
 
@@ -397,8 +469,13 @@ router.post(
 
       return res.status(500).json({
         success: false,
-        errorCode: 'AUTH_UPDATE_FAILED',
-        message: 'Failed to update auth role.',
+        error: {
+          code: 'AUTH_UPDATE_FAILED',
+          message: 'Failed to update auth role.',
+        },
+        meta: {
+          timestamp: new Date().toISOString(),
+        },
       });
     }
 

@@ -12,7 +12,7 @@
  */
 
 const { supabase } = require('../../config/supabase');
-const svc = require('../skillGraph/skillGraph.service');
+const svc = require('../skillGraph/skillGraph.util');
 const cacheManager = require('../../core/cache/cache.manager');
 const logger = require('../../utils/logger');
 

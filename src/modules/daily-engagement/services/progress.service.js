@@ -21,7 +21,7 @@ const PROFILE_CACHE_TTL_SEC = 300;
 // ─────────────────────────────────────────────────────────────────────────────
 
 function getMarketTrend() {
-  return require('../../labor-market-intelligence/services/marketTrend.service');
+  return require('../../labor-market-intelligence/coordinators/marketIntelligence.coordinator');
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

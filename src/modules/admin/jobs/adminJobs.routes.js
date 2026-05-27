@@ -28,10 +28,18 @@ const syncRateLimiter = rateLimit({
       path: req.originalUrl,
     });
 
+    // Phase 2B.2 — normalized to V2 canonical envelope.
+    // Previous shape { success: false, message: string } was missing error object.
     res.status(429).json({
       success: false,
-      message:
-        'Too many sync requests. Maximum 5 per 15 minutes per IP. Please try again later.',
+      error: {
+        code: 'RATE_LIMIT_EXCEEDED',
+        message: 'Too many sync requests. Maximum 5 per 15 minutes per IP. Please try again later.',
+      },
+      meta: {
+        retryAfter: 15 * 60,
+        timestamp: new Date().toISOString(),
+      },
     });
   },
 
@@ -61,11 +69,3 @@ router.all('/sync', (req, res) => {
 });
 
 module.exports = router;
-
-
-
-
-
-
-
-

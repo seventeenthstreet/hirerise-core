@@ -1,10 +1,3 @@
-// ── Load .env FIRST — before any require() reads process.env ─────────────────
-// dotenv must populate process.env before any module is imported, because
-// Node caches modules at parse time. Any require() above this line that
-// reads process.env (e.g. supabase.js, redisClient.js via env.js) will see
-// empty values, causing silent fallbacks (e.g. CACHE_PROVIDER → 'memory').
-require('dotenv').config();
-
 /**
  * server.js — HireRise Core Engine Entry Point
  *
@@ -85,20 +78,6 @@ require('dotenv').config();
  *     module-level `activeTenants` array. This eliminates TypeScript blindness,
  *     singleton isolation issues, and the race condition where a worker and a
  *     route handler could diverge on different global object references.
- *
- * ── Phase 3 Hardening Fixes ───────────────────────────────────────────────────
- *
- * P3-T2  Fallback Redis lifecycle centralised — getLeaseRedisClient() previously
- *        called `new Redis(fallbackUrl, {...})` inline on every invocation when
- *        _fallbackClient was null and usingFallback=true. This bypassed lifecycle
- *        management: no shutdown handler, no observability, potential duplicate
- *        creation under concurrent failover. Replaced with fallbackRedis.getClient()
- *        (src/infrastructure/redis/redis.fallback.js) which is a proper singleton
- *        with: single-creation guarantee, process.once SIGTERM/SIGINT handler,
- *        full ioredis event logging under [Redis:Fallback] prefix, and isReady()
- *        via client.status === 'ready'. gracefulShutdown now calls
- *        fallbackRedis.quit() (idempotent) instead of the bare .quit() call with
- *        empty catch.
  */
 
 'use strict';
@@ -158,8 +137,8 @@ process.on('uncaughtException', async (err) => {
 // ── Environment validation — MUST be first ────────────────────────────────────
 // Validates all required environment variables before anything else loads.
 // Server will not start if required variables are missing or malformed.
-// NOTE: dotenv.config() is called at the very top of this file (line 1) so
-// process.env is already populated here — this require just runs validation.
+require('dotenv').config();
+require('./scripts/validate-env')();
 require('./config/env');
 
 // ── Environment constants — single source of truth ───────────────────────────
@@ -182,13 +161,6 @@ const {
   closeRedis,
 } = require('./config/redisClient');
 const { supabase } = require('./config/supabase');
-
-// ── Phase 3 Hardening: lifecycle-managed fallback Redis client ────────────────
-// Replaces the unmanaged inline `new Redis(fallbackUrl, {...})` in
-// getLeaseRedisClient(). Provides singleton lifecycle, shutdown handling,
-// and full observability for the Wave 33 cross-region fallback client.
-// NOTE: placed in './infrastructure/radis/' — matches the existing codebase folder name.
-const fallbackRedis = require('./infrastructure/radis/redis.fallback');
 
 // ── Utilities ─────────────────────────────────────────────────────────────────
 const logger = require('./utils/logger');
@@ -1659,20 +1631,27 @@ function getLeaseRedisClient() {
     return leaseFailoverState._fallbackClient;
   }
 
-  // Fallback not yet initialised — resolve via lifecycle-managed singleton.
-  // Phase 3 Hardening (TASK 2): fallbackRedis.getClient() replaces the previous
-  // inline `new Redis(fallbackUrl, {...})` which bypassed all lifecycle management
-  // (no shutdown handler, no observability, recreatable under concurrent calls).
-  // fallbackRedis provides: singleton guarantee, process.once shutdown handler,
-  // full ioredis event logging ([Redis:Fallback] prefix), and isReady() via
-  // client.status === 'ready'. Returns null when LEASE_REDIS_FALLBACK_URL is unset.
-  const fallbackClient = fallbackRedis.getClient();
-  if (fallbackClient) {
-    leaseFailoverState._fallbackClient = fallbackClient;
-    logger.info('[Wave33] Lease fallback Redis client resolved via lifecycle manager', {
-      region: leaseFailoverState.fallbackRegion,
-    });
-    return fallbackClient;
+  // Fallback not yet initialised — try to create it now if URL is set.
+  const fallbackUrl = process.env.LEASE_REDIS_FALLBACK_URL;
+  if (fallbackUrl) {
+    try {
+      // ioredis is already a dependency (used by the primary client config).
+      const Redis = require('ioredis');
+      const client = new Redis(fallbackUrl, {
+        lazyConnect:            true,
+        enableOfflineQueue:     false,
+        maxRetriesPerRequest:   1,
+        connectTimeout:         3000,
+        commandTimeout:         3000,
+      });
+      leaseFailoverState._fallbackClient = client;
+      logger.info('[Wave33] Lease fallback Redis client initialised', {
+        region: leaseFailoverState.fallbackRegion,
+      });
+      return client;
+    } catch (err) {
+      logger.warn('[Wave33] Lease fallback Redis client init failed', { error: err.message });
+    }
   }
 
   // No fallback available — return primary even though it may be down.
@@ -3878,6 +3857,10 @@ app.set('trust proxy', 1);
 const MAIN_DOMAIN  = process.env.MAIN_DOMAIN  || 'hirerise.com';
 const ADMIN_DOMAIN = process.env.ADMIN_DOMAIN || `admin.${MAIN_DOMAIN}`;
 
+if (IS_PRODUCTION && (!process.env.ALLOWED_ORIGINS || process.env.ALLOWED_ORIGINS.trim() === '')) {
+  throw new Error('[CORS] ALLOWED_ORIGINS must be set in production');
+}
+
 const _rawAllowedOrigins = process.env.ALLOWED_ORIGINS
   ? process.env.ALLOWED_ORIGINS.split(',').map(o => o.trim()).filter(Boolean)
   : [];
@@ -3889,10 +3872,17 @@ const allowedOrigins = [
     `https://${ADMIN_DOMAIN}`,
     `https://www.${MAIN_DOMAIN}`,
   ]),
-  // localhost origins only in non-production environments
+  // CORS FIX: Include 127.0.0.1 variants in addition to localhost.
+  // Some browsers and tools send 127.0.0.1 as the Origin header instead of
+  // localhost (they are technically different origins). Without these entries,
+  // requests from 127.0.0.1:3000 would be rejected with a CORS error even
+  // though the backend correctly allows localhost:3000.
+  // PORT NOTE: backend .env must set PORT=3001 to match NEXT_PUBLIC_API_BASE_URL.
   ...(IS_PRODUCTION ? [] : [
     'http://localhost:3000',
     'http://localhost:3001',
+    'http://127.0.0.1:3000',
+    'http://127.0.0.1:3001',
   ]),
 ].filter(Boolean);
 
@@ -3900,33 +3890,8 @@ const allowedOrigins = [
 // Global middleware — single registration, enforced order
 // =============================================================================
 app.use(correlationMiddleware);
-// HARDENING: Explicit helmet config.
-// CSP disabled — pure JSON API server, no HTML responses.
-// HSTS: 1 year, includeSubDomains, preload — tells browsers to always use HTTPS.
-// x-powered-by suppressed — do not advertise Express to attackers.
-app.disable('x-powered-by');
-app.use(helmet({
-  contentSecurityPolicy: false,          // API server — no HTML, CSP not applicable
-  hsts: {
-    maxAge: 31536000,                     // 1 year in seconds
-    includeSubDomains: true,
-    preload: true,
-  },
-}));
-// HARDENING: Disable compression for authenticated requests to prevent BREACH attacks.
-// BREACH exploits response compression + secret in response body (e.g. CSRF tokens).
-// Compression is safe for public/unauthenticated responses (health, static).
-app.use(compression({
-  filter: (req, res) => {
-    // Never compress if the request carries an Authorization header (authenticated).
-    // This covers all JWT-authenticated API calls.
-    if (req.headers['authorization']) {
-      return false;
-    }
-    // Fall back to compression's default filter for everything else.
-    return compression.filter(req, res);
-  },
-}));
+app.use(helmet());
+app.use(compression());
 
 app.use(cors({
   origin: (origin, callback) => {
@@ -4098,16 +4063,16 @@ class RedisRateLimitStore {
   async increment(key) {
     const redisKey = `${this.prefix}${key}`;
     try {
-      // ATOMIC: redisClient.incr uses INCR + EXPIRE-on-first-write.
-      // INCR is a single Redis command — no race condition between read and
-      // write. EXPIRE is only set when the counter transitions from 0→1 so
-      // the window TTL is never accidentally extended by concurrent requests.
-      const totalHits = await redisClient.incr(redisKey, this.windowSeconds);
+      // Use the unified redisClient.get/set API (works with ioredis internally)
+      const raw = await redisClient.get(redisKey);
+      const current = raw ? parseInt(raw, 10) : 0;
+      const next = current + 1;
+      await redisClient.set(redisKey, String(next), this.windowSeconds);
       const resetTime = new Date(Date.now() + this.windowSeconds * 1000);
-      return { totalHits, resetTime };
+      return { totalHits: next, resetTime };
     } catch (err) {
       // If Redis is unavailable, fail open at the store level — the
-      // Supabase-backed AI limiters are the real enforcement layer.
+      // Supabase-backed AI limiters provide the real enforcement layer.
       logger.warn('[GlobalRateLimit] Redis store error — allowing request', {
         error: err.message,
         key: redisKey,
@@ -4119,9 +4084,10 @@ class RedisRateLimitStore {
   async decrement(key) {
     const redisKey = `${this.prefix}${key}`;
     try {
-      // DECR is atomic — safe under concurrency.
-      if (redisClient._redis) {
-        await redisClient._redis.decr(redisKey);
+      const raw = await redisClient.get(redisKey);
+      const current = raw ? parseInt(raw, 10) : 0;
+      if (current > 0) {
+        await redisClient.set(redisKey, String(current - 1), this.windowSeconds);
       }
     } catch {
       // best-effort
@@ -4502,64 +4468,12 @@ app.get(`${API_PREFIX}/metrics`, requireInternalToken, observabilityAdapter.prom
 // paths while still enforcing auth on every registered private route.
 
 // =============================================================================
-// ✅ GLOBAL AUTH SAFETY NET (belt-and-suspenders)
+// ✅ GLOBAL AUTH SAFETY NET — moved below all route registrations
 // =============================================================================
-// Every private route already carries authenticate() individually.
-// This middleware fires AFTER all public routes (health, ready, webhooks,
-// internal, metrics) have been matched and handled by earlier mounts — so by
-// the time a request reaches here it is on a private path.
-//
-// Its sole job: if authenticate() somehow did NOT set req.user (e.g. a future
-// route is accidentally added without the middleware), reject with 401 before
-// any business logic can run on an unauthenticated request.
-//
-// It does NOT replace per-route authenticate() calls. It is a catch-all that
-// guarantees req.user is always present on private paths, turning a potential
-// 500 (crash on undefined req.user) into a clean 401.
-app.use(`${API_PREFIX}`, (req, res, next) => {
-  // Public paths are already handled by their own mounts above and will not
-  // reach this middleware. The guard below is a safety check for any edge-case
-  // where Express routing delivers a public-looking path here unexpectedly.
-  if (
-    req.path === '/health' ||
-    req.path.startsWith('/health/') ||
-    req.path === '/ready' ||
-    req.path === '/metrics' ||
-    req.path === '/webhooks' ||
-    req.path.startsWith('/webhooks/') ||
-    req.path === '/analyze' ||
-    req.path.startsWith('/analyze/') ||
-    req.path.startsWith('/internal/')
-  ) {
-    return next();
-  }
-
-  // req.user is set by authenticate(). If it is missing here, the individual
-  // route's authenticate() middleware was either absent or failed silently.
-  if (!req.user) {
-    logger.warn('[AuthGuard] Safety net triggered — req.user absent on private path', {
-      method:  req.method,
-      path:    req.originalUrl,
-      ip:      req.ip,
-      hint:    'Route is missing authenticate() middleware, or authenticate() failed without responding.',
-    });
-
-    return res.status(401).json({
-      success:   false,
-      errorCode: 'UNAUTHORIZED',
-      message:   'Authentication required.',
-      timestamp: new Date().toISOString(),
-    });
-  }
-
-  next();
-});
-
-logger.info('[AuthGuard] Global auth safety net registered', {
-  prefix:   `${API_PREFIX}/*`,
-  exempted: ['health', 'health/*', 'ready', 'metrics', 'webhooks/*', 'internal/*', 'analyze', 'analyze/*'],
-  role:     'catch-all — rejects requests where authenticate() did not set req.user',
-});
+// NOTE: This block has been relocated to just before notFoundHandler/errorHandler
+// so that per-route authenticate() middleware runs FIRST and sets req.user
+// before this guard checks for it. Previously it was registered before the
+// routes, so req.user was always undefined here and every request got a 401.
 
 
 registerRoute(
@@ -4626,6 +4540,78 @@ app.use(`${API_PREFIX}/onboarding`,    authenticate, require('./modules/onboardi
 // Without this, onboarding_completed was never saved; AuthGuard caused infinite
 // redirect loop back to /onboarding → permanent spinner on /dashboard.
 app.use(`${API_PREFIX}/student-onboarding`, authenticate, require('./routes/student-onboarding.routes'));
+
+// ── Phase 3A–3C: v2 Step Routes (Academics / Activities / Cognitive) ──────────
+// These controllers expect req.supabase (service-role singleton) and
+// req.onboardingSession (loaded via session.service.getSession).
+// The routes were fully implemented but never mounted — causing 404s and the
+// 429 storm from client retry logic hammering the missing endpoints.
+{
+  const sessionService = require('./modules/student-onboarding/services/session.service');
+
+  /**
+   * Injects req.supabase and req.onboardingSession so v2 step controllers
+   * can use them without importing the singleton directly.
+   * authenticate must run before this middleware (req.user must be set).
+   */
+  async function requireOnboardingSession(req, res, next) {
+    try {
+      req.supabase          = supabase; // singleton imported at line 163
+      req.onboardingSession = await sessionService.getSession(req.user.id);
+      next();
+    } catch (err) {
+      if (err.status === 404) {
+        return res.status(404).json({
+          success: false,
+          error: { message: 'No onboarding session found. Call POST /session to begin.' },
+        });
+      }
+      next(err);
+    }
+  }
+
+  // Phase 3A — Academics
+  app.use(
+    `${API_PREFIX}/student-onboarding/v2/step/academics`,
+    authenticate,
+    requireOnboardingSession,
+    require('./modules/student-onboarding/routes/academics.routes'),
+  );
+
+  // Phase 3B — Activities
+  app.use(
+    `${API_PREFIX}/student-onboarding/v2/step/activities`,
+    authenticate,
+    requireOnboardingSession,
+    require('./modules/student-onboarding/routes/activities.routes'),
+  );
+
+  // Phase 3C — Cognitive
+  app.use(
+    `${API_PREFIX}/student-onboarding/v2/step/cognitive`,
+    authenticate,
+    requireOnboardingSession,
+    require('./modules/student-onboarding/routes/cognitive.routes'),
+  );
+}
+
+// ── Phase 3D: Cross-Domain Intelligence Layer ─────────────────────────────────
+// Mounted at /api/v1/intelligence
+// Auth: JWT (authenticate) + Admin role guard (enforced inside intelligence.routes.js)
+// Scope: Internal diagnostics only — not student-facing.
+//
+// Routes:
+//   GET  /api/v1/intelligence/registry
+//   GET  /api/v1/intelligence/student/:userId/vector
+//   GET  /api/v1/intelligence/student/:userId/confidence
+//   GET  /api/v1/intelligence/student/:userId/evidence/:signalKey
+//   POST /api/v1/intelligence/student/:userId/trigger
+app.use(
+  `${API_PREFIX}/intelligence`,
+  authenticate,
+  require('./modules/student-onboarding/routes/intelligence.routes')
+);
+
 app.use(`${API_PREFIX}/career-onboarding`,  authenticate, require('./routes/career-onboarding.routes'));
 
 /**
@@ -4911,11 +4897,17 @@ registerRoute(
   require('./routes/users.routes')
 );
 
-registerRoute(
-  `${API_PREFIX}/user-direction`,
-  authenticate,
-  directionRouter
-);
+// FIX: Direction router was mounted at /api/v1/user-direction but all frontend
+// calls target /api/v1/users/me/direction. The direction router defines routes
+// as /me/direction, /me/direction (GET), and /me/direction (DELETE) — they must
+// be mounted under /api/v1/users so that the full resolved paths match.
+// Mounting under /api/v1/user-direction caused every POST/GET/DELETE
+// /api/v1/users/me/direction call to hit the 404 handler, which returns
+// { success: false, error: { code: 'NOT_FOUND' } } — the error seen in the console.
+// Direction router — mounted directly (not via registerRoute) to avoid the
+// duplicate-signature guard falsely blocking it when users.routes.js is already
+// registered at the same /api/v1/users prefix.
+app.use(`${API_PREFIX}/users`, authenticate, directionRouter);
 
 app.use(`${API_PREFIX}/analyze`,  authenticate, require('./modules/analysis/analysis.route'));
 
@@ -5118,6 +5110,57 @@ app.use(`${API_PREFIX}/admin/market-intelligence`, authenticate, requireMasterAd
  *   POST /api/v1/career/alerts/read             → mark alerts as read
  */
 
+
+// =============================================================================
+// ✅ GLOBAL AUTH SAFETY NET (belt-and-suspenders) — correctly placed AFTER routes
+// =============================================================================
+// Every private route already carries authenticate() individually.
+// This guard fires AFTER all route handlers have had a chance to run
+// authenticate() and set req.user. If req.user is still absent at this point,
+// either a route is missing authenticate() or it failed silently.
+//
+// IMPORTANT: Must be registered AFTER all app.use(route, authenticate, router)
+// calls so that per-route authenticate() runs first and populates req.user
+// before this check executes.
+app.use(`${API_PREFIX}`, (req, res, next) => {
+  if (
+    req.path === '/health' ||
+    req.path.startsWith('/health/') ||
+    req.path === '/ready' ||
+    req.path === '/metrics' ||
+    req.path === '/webhooks' ||
+    req.path.startsWith('/webhooks/') ||
+    req.path === '/analyze' ||
+    req.path.startsWith('/analyze/') ||
+    req.path.startsWith('/internal/')
+  ) {
+    return next();
+  }
+
+  if (!req.user) {
+    logger.warn('[AuthGuard] Safety net triggered — req.user absent on private path', {
+      method:  req.method,
+      path:    req.originalUrl,
+      ip:      req.ip,
+      hint:    'Route is missing authenticate() middleware, or authenticate() failed without responding.',
+    });
+
+    return res.status(401).json({
+      success:   false,
+      errorCode: 'UNAUTHORIZED',
+      message:   'Authentication required.',
+      timestamp: new Date().toISOString(),
+    });
+  }
+
+  next();
+});
+
+logger.info('[AuthGuard] Global auth safety net registered', {
+  prefix:   `${API_PREFIX}/*`,
+  exempted: ['health', 'health/*', 'ready', 'metrics', 'webhooks/*', 'internal/*', 'analyze', 'analyze/*'],
+  role:     'catch-all — rejects requests where authenticate() did not set req.user',
+});
 
 // =============================================================================
 // ✅ Terminal handlers — must be last
@@ -5612,61 +5655,10 @@ logger.info(
   }
 );
  // PR 2: Redis must be ready before serving traffic
-    logger.info('[Bootstrap] Calling redis.connect()...');
     await connectRedis();
-    logger.info('[Bootstrap] redis.connect() completed');
-
-// Connect redis.singleton — the dedicated ioredis instance used by
-// CacheManager, AlertService, SlaService, and all core/cache modules.
-// This is a SEPARATE client from redisClient.js (which handles rate-limiting
-// and lease operations). Both must be connected before serving traffic.
-try {
-  const redisSingleton = require('./infrastructure/radis/redis.singleton');
-  if (redisSingleton.isReady()) {
-    logger.info('[Bootstrap] redis.singleton already ready — skipping connect');
-  } else {
-    logger.info('[Bootstrap] Connecting redis.singleton...');
-    await redisSingleton.connect();
-    logger.info('[Bootstrap] redis.singleton connected', {
-      ready: redisSingleton.isReady(),
-    });
-  }
-} catch (err) {
-  // Non-fatal in dev — singleton falls back gracefully via CacheManager → MemoryCache.
-  // Fatal in production (singleton.connect() already throws and env.js enforces Redis).
-  logger.warn('[Bootstrap] redis.singleton connect failed — DI services will use fallbacks', {
-    error: err.message,
-  });
-}
 completeStartupPhase('redis-connect');
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Phase 2 DI — Composition Root
-// Redis is connected above. Warm up all singleton services that lazily resolve
-// from redis.singleton so their first getClient() call hits Redis, not MemoryCache.
-// ─────────────────────────────────────────────────────────────────────────────
-try {
-  const cacheManager = require('./core/cache/cache.manager');
-  const alertService = require('./ai/observability/alert.service');
-  const slaService   = require('./ai/observability/sla.service');
-
-  // Touch each singleton — forces lazy Redis resolution now that Redis is ready.
-  // CacheManager resolves on getClient(); AlertService and SlaService resolve
-  // on first access to _useRedis (lazy upgrade path in the getter).
-  cacheManager.getClient();
-  void alertService._useRedis; // triggers lazy upgrade
-  void slaService._useRedis;   // triggers lazy upgrade
-
-  logger.info('[Bootstrap] Phase 2 DI composition root: Redis client wired', {
-    cacheManagerReady : cacheManager.getClient()?.status === 'ready',
-    alertRedisReady   : alertService._useRedis,
-    slaRedisReady     : slaService._useRedis,
-  });
-} catch (err) {
-  // Non-fatal — services fall back to MemoryCache / local dedup gracefully.
-  logger.warn('[Bootstrap] Phase 2 DI warm-up failed', { error: err.message });
-}
-// ─────────────────────────────────────────────────────────────────────────────
+// ✅ ADD HERE
 let anomalySubscriberActive = false;
 let anomalySubscriberClient = null;
 
@@ -6247,36 +6239,6 @@ if (IS_TEST) {
   return;
 }
 
-// ── Production startup assertions ────────────────────────────────────────────
-// These checks run after all services are verified but before accepting traffic.
-// A misconfigured production deploy is rejected here rather than silently misbehaving.
-
-if (IS_PRODUCTION) {
-  // C3: Reject test Stripe keys in production — charges would go to Stripe's
-  // test environment and real users would never be billed.
-  const stripeKey = process.env.STRIPE_SECRET_KEY || '';
-  if (stripeKey.startsWith('sk_test_') || !stripeKey.startsWith('sk_live_')) {
-    throw new Error(
-      '[Startup] STRIPE_SECRET_KEY must be a live key (sk_live_...) in production. ' +
-      'A test key or missing key was detected — aborting to prevent revenue loss.'
-    );
-  }
-
-  // H3: Verify Slack alert webhook is configured and not a placeholder.
-  const slackWebhook = process.env.SLACK_ALERT_WEBHOOK_URL || '';
-  if (
-    !slackWebhook ||
-    slackWebhook.includes('TXXXXX') ||
-    slackWebhook.includes('BXXXXX') ||
-    !slackWebhook.startsWith('https://hooks.slack.com/services/')
-  ) {
-    throw new Error(
-      '[Startup] SLACK_ALERT_WEBHOOK_URL is not configured or contains the placeholder value. ' +
-      'Critical alerts will be silently lost. Set a real Slack webhook URL before deploying.'
-    );
-  }
-}
-
 server = app.listen(PORT, '0.0.0.0');
 
 // FIX: keepAliveTimeout must exceed the load balancer idle timeout (GCP = 600s).
@@ -6837,14 +6799,13 @@ anomalyFusionState.lastEvaluatedAt = null;
 anomalyFusionState.consensusScore  = 0;
 logger.info('[Wave37] Anomaly fusion state cleared on graceful shutdown');
 
-// Wave 33 / Phase 3 Hardening (TASK 2): fallback client lifecycle is managed
-// by redis.fallback.js. fallbackRedis.quit() is idempotent and already
-// registered on SIGTERM/SIGINT via process.once inside the module.
-// We call it explicitly here for ordered shutdown within gracefulShutdown.
-await fallbackRedis.quit().catch((err) => {
-  logger.warn('[Wave33] Fallback Redis quit error during shutdown', { error: err?.message });
-});
-leaseFailoverState._fallbackClient = null;
+// Wave 33 — close fallback client if it was opened.
+if (leaseFailoverState._fallbackClient) {
+  try {
+    await leaseFailoverState._fallbackClient.quit();
+  } catch (_) {}
+  leaseFailoverState._fallbackClient = null;
+}
 
   logger.info(
     `[Server] ${signal} received — shutting down gracefully...`

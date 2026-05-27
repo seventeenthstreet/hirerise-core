@@ -270,4 +270,18 @@ class ResumeGrowthService {
   }
 }
 
-module.exports = ResumeGrowthService;
+/**
+ * Singleton instance — repositories are owned here, not in the controller.
+ */
+const ResumeGrowthRepository = require('./resumeGrowth.repository');
+const RoleRepository = require('./role.repository');
+const skillRepository = require('../../repositories/skillRepository');
+
+const _instance = new ResumeGrowthService({
+  roleRepository: new RoleRepository(),
+  skillRepository: new skillRepository(),
+  resumeGrowthRepository: new ResumeGrowthRepository(),
+});
+
+module.exports = _instance;
+module.exports.ResumeGrowthService = ResumeGrowthService;

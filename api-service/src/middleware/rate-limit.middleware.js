@@ -14,15 +14,20 @@ const LIMITS = Object.freeze({
 const VALID_WINDOWS = new Set(['minute', 'day']);
 const RATE_LIMIT_TIMEOUT_MS = 1000;
 
-function getTimestamp() {
-  return new Date().toISOString();
-}
 
-function sendRateLimitResponse(res, payload, requestId) {
+function sendRateLimitResponse(res, code, message, retryAfter, requestId, details) {
   return res.status(429).json({
-    ...payload,
-    requestId,
-    timestamp: getTimestamp(),
+    success: false,
+    error: {
+      code,
+      message,
+      ...(details ? { details } : {}),
+    },
+    meta: {
+      requestId: requestId ?? null,
+      timestamp: new Date().toISOString(),
+      retryAfter,
+    },
   });
 }
 
@@ -63,11 +68,9 @@ export function rateLimit({ counterKey, limit, window = 'minute' }) {
 
         return sendRateLimitResponse(
           res,
-          {
-            error: 'RATE_LIMIT_EXCEEDED',
-            message: `Too many requests. Limit: ${limit} per ${window}.`,
-            retryAfter: getRetryAfter(window),
-          },
+          'RATE_LIMIT_EXCEEDED',
+          `Too many requests. Limit: ${limit} per ${window}.`,
+          getRetryAfter(window),
           req.requestId
         );
       }
@@ -163,13 +166,11 @@ export async function pendingJobLimitMiddleware(req, res, next) {
 
       return sendRateLimitResponse(
         res,
-        {
-          error: 'PENDING_JOB_LIMIT_EXCEEDED',
-          message: result.message,
-          pendingJobs: result.count,
-          limit: result.limit,
-        },
-        req.requestId
+        'PENDING_JOB_LIMIT_EXCEEDED',
+        result.message,
+        0,
+        req.requestId,
+        { pendingJobs: result.count, limit: result.limit }
       );
     }
 

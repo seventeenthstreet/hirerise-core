@@ -1,3 +1,5 @@
+'use strict';
+
 import { Router } from 'express';
 import { authenticate } from '../middleware/auth.middleware.js';
 import {
@@ -10,6 +12,10 @@ import {
   submitResume,
   getResumeScore,
 } from '../controllers/resume.controller.js';
+
+// ── Validation ────────────────────────────────────────────────────────────────
+import { resumeSubmitSchema } from '../validations/schemas/resume.schema.js';
+import { validate } from '../validations/middleware/validate.js';
 
 export const resumeRouter = Router();
 
@@ -49,6 +55,8 @@ resumeRouter.post(
   '/submit',
   resumeSubmitRateLimit,
   pendingJobLimitMiddleware,
+  resumeSubmitSchema, // ← express-validator chain
+  validate,           // ← reject early if invalid
   submitResume,
 );
 

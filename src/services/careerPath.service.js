@@ -15,9 +15,9 @@
  */
 
 const careerRepo = require('../repositories/career.repository');
-const readinessService = require('./readiness.service');
-const promotionService = require('./promotion.service');
-const timeEstimatorService = require('./timeEstimator.service');
+const readinessService = require('./readiness.utils');
+const promotionService = require('./promotion.utils');
+const timeEstimatorService = require('./timeEstimator.utils');
 const logger = require('../utils/logger');
 
 let careerGraph = null;

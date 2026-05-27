@@ -12,9 +12,15 @@
  */
 
 const {
-  getSecret,
-  upsertSecret,
-} = require('../secrets/secrets.service');
+  getMarketProvider,
+  getAdzunaCredentials,
+  getSerpApiKey,
+  getCustomProviderCredentials,
+  saveMarketProvider,
+  saveAdzunaCredentials,
+  saveSerpApiCredentials,
+  saveCustomCredentials,
+} = require('./marketIntelligence.config');
 
 const { supabase } = require('../../config/supabase');
 const logger = require('../../utils/logger');
@@ -47,7 +53,7 @@ function cacheKey(role, country) {
 
 async function getProviderOrNull() {
   try {
-    const provider = await getSecret('MARKET_API_PROVIDER');
+    const provider = await getMarketProvider();
     return provider || null;
   } catch (error) {
     logger.warn('Market provider secret unavailable', {
@@ -67,47 +73,21 @@ async function saveConfig(config, adminUid) {
     );
   }
 
-  const operations = [
-    upsertSecret('MARKET_API_PROVIDER', provider, adminUid),
-  ];
+  await saveMarketProvider(provider, adminUid);
 
   switch (provider) {
     case PROVIDERS.ADZUNA:
-      operations.push(
-        upsertSecret('MARKET_ADZUNA_APP_ID', config.appId, adminUid),
-        upsertSecret('MARKET_ADZUNA_APP_KEY', config.appKey, adminUid)
-      );
+      await saveAdzunaCredentials(config.appId, config.appKey, adminUid);
       break;
 
     case PROVIDERS.SERPAPI:
-      operations.push(
-        upsertSecret('MARKET_SERPAPI_KEY', config.apiKey, adminUid)
-      );
-      if (config.searchEngine) {
-        operations.push(
-          upsertSecret(
-            'MARKET_SERPAPI_ENGINE',
-            config.searchEngine,
-            adminUid
-          )
-        );
-      }
+      await saveSerpApiCredentials(config.apiKey, config.searchEngine, adminUid);
       break;
 
     case PROVIDERS.CUSTOM:
-      operations.push(
-        upsertSecret('MARKET_CUSTOM_BASE_URL', config.baseUrl, adminUid),
-        upsertSecret('MARKET_CUSTOM_API_KEY', config.apiKey, adminUid),
-        upsertSecret(
-          'MARKET_CUSTOM_AUTH_TYPE',
-          config.authType || 'bearer',
-          adminUid
-        )
-      );
+      await saveCustomCredentials(config.baseUrl, config.apiKey, config.authType, adminUid);
       break;
   }
-
-  await Promise.all(operations);
 
   return {
     provider,
@@ -282,10 +262,7 @@ async function fetchJson(url, options = {}) {
 }
 
 async function fetchFromAdzuna(role, country) {
-  const [appId, appKey] = await Promise.all([
-    getSecret('MARKET_ADZUNA_APP_ID'),
-    getSecret('MARKET_ADZUNA_APP_KEY'),
-  ]);
+  const { appId, appKey } = await getAdzunaCredentials();
 
   const url = new URL(
     `https://api.adzuna.com/v1/api/jobs/${country}/search/1`
@@ -310,7 +287,7 @@ async function fetchFromAdzuna(role, country) {
 }
 
 async function fetchFromSerpApi(role, country) {
-  const apiKey = await getSecret('MARKET_SERPAPI_KEY');
+  const apiKey = await getSerpApiKey();
   const url = new URL('https://serpapi.com/search.json');
 
   url.searchParams.set('q', role);
@@ -332,10 +309,7 @@ async function fetchFromSerpApi(role, country) {
 }
 
 async function fetchFromCustom(role, country) {
-  const [baseUrl, apiKey] = await Promise.all([
-    getSecret('MARKET_CUSTOM_BASE_URL'),
-    getSecret('MARKET_CUSTOM_API_KEY'),
-  ]);
+  const { baseUrl, apiKey } = await getCustomProviderCredentials();
 
   const url = new URL('/demand', baseUrl);
   url.searchParams.set('role', role);

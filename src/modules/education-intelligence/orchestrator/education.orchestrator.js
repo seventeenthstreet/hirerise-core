@@ -14,7 +14,7 @@ const EducationROIEngine = require('../engines/educationROI.engine');
 const CareerDigitalTwinEngine = require('../engines/careerDigitalTwin.engine');
 
 const skillEvolutionService = require('../../skill-evolution/services/skillEvolution.service');
-const marketTrendService = require('../../labor-market-intelligence/services/marketTrend.service');
+const marketTrendService = require('../../labor-market-intelligence/coordinators/marketIntelligence.coordinator');
 
 const ENGINE_VERSION = '1.4.0';
 

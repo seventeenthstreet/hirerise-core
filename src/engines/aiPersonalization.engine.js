@@ -16,10 +16,7 @@ const cacheManager = require('../core/cache/cache.manager');
 // Phase 2: lazy getter — resolves Redis post-bootstrap on each call
 const getCache = () => cacheManager?.getClient?.() || null;
 const logger = require('../utils/logger');
-const {
-  getUserVector,
-  updateUserVector,
-} = require('../services/userVector.service');
+// userVector ops are resolved by the owning service and injected as vectorOps argument
 
 const CACHE_TTL_SECONDS = 600;
 const HYDRATION_CACHE_TTL = 300;
@@ -60,7 +57,7 @@ function skillHash(skills = []) {
     .digest('hex');
 }
 
-async function loadUserProfile(userId) {
+async function loadUserProfile(userId, vectorOps = {}) {
   if (!userId) throw new Error('userId is required');
 
   const cacheKey = `personalization:hydration:${userId}`;
@@ -118,10 +115,12 @@ async function loadUserProfile(userId) {
         const prevHash = await getCache()?.get(hashKey);
 
         if (prevHash !== nextHash) {
-          await updateUserVector(
-            userId,
-            cleanedSkills
-          );
+          if (typeof vectorOps.updateUserVector === 'function') {
+            await vectorOps.updateUserVector(
+              userId,
+              cleanedSkills
+            );
+          }
           await getCache()?.set(
             hashKey,
             nextHash,
@@ -185,7 +184,8 @@ async function loadUserProfile(userId) {
 
 async function upsertPersonalizationProfile(
   userId,
-  profile
+  profile,
+  vectorOps = {}
 ) {
   if (!userId) {
     throw new Error('userId is required');
@@ -195,10 +195,12 @@ async function upsertPersonalizationProfile(
     let userVector = null;
 
     try {
-      userVector = await getUserVector(
-        userId,
-        profile.skills || []
-      );
+      userVector = typeof vectorOps.getUserVector === 'function'
+        ? await vectorOps.getUserVector(
+            userId,
+            profile.skills || []
+          )
+        : null;
     } catch (_) {}
 
     const payload = {

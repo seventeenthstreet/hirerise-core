@@ -33,8 +33,8 @@ const {
 } = require('./onboarding.helpers');
 
 // ── Phase 2: scoring services ────────────────────────────────────────────────
-const { computeConfidence } = require('../../services/confidence.service');
-const { computeQuality }    = require('../../services/quality.service');
+const { computeConfidence } = require('../../services/confidence.utils');
+const { computeQuality }    = require('../../services/quality.utils');
 // ─────────────────────────────────────────────────────────────────────────────
 
 const STORAGE_BUCKET = 'resumes';

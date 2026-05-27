@@ -1,4 +1,4 @@
-const cache = require("../../../infrastructure/cache/analyticsCache.service");
+const cache = require("../../../infrastructure/cache/analyticsCache.utils");
 
 const SIGNAL_WEIGHTS = {
   dashboardImpression: 3,

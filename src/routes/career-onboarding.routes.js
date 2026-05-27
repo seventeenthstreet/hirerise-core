@@ -4,8 +4,12 @@
  * routes/career-onboarding.routes.js
  * Mounted at: /api/v1/career-onboarding
  *
- * POST /complete
- * Completes professional onboarding using a single atomic Supabase RPC.
+ * PATCH: ETag correctness — POST /complete now explicitly bumps users.updated_at
+ * after the RPC so the lightweight freshness token used by GET /me is
+ * invalidated when professional_onboarding_complete flips.
+ *
+ * Root cause: same as student-onboarding — RPC sets professional_onboarding_complete
+ * but may not bump users.updated_at, leaving the GET /me ETag stale.
  */
 
 const { Router } = require('express');
@@ -13,6 +17,7 @@ const { body } = require('express-validator');
 const { validate } = require('../middleware/requestValidator');
 const { supabase } = require('../config/supabase');
 const logger = require('../utils/logger');
+const freshnessCache = require('../utils/freshnessCache');
 
 const router = Router();
 
@@ -33,67 +38,24 @@ function resolveUserId(req) {
 router.post(
   '/complete',
   validate([
-    body('jobTitle')
-      .isString()
-      .trim()
-      .notEmpty()
-      .isLength({ max: MAX_TEXT })
+    body('jobTitle').isString().trim().notEmpty().isLength({ max: MAX_TEXT })
       .withMessage('jobTitle is required'),
-
-    body('yearsExperience')
-      .isFloat({ min: 0, max: MAX_EXPERIENCE })
-      .toFloat()
-      .withMessage(
-        `yearsExperience must be between 0 and ${MAX_EXPERIENCE}`
-      ),
-
-    body('industry')
-      .isString()
-      .trim()
-      .notEmpty()
-      .isLength({ max: MAX_TEXT })
+    body('yearsExperience').isFloat({ min: 0, max: MAX_EXPERIENCE }).toFloat()
+      .withMessage(`yearsExperience must be between 0 and ${MAX_EXPERIENCE}`),
+    body('industry').isString().trim().notEmpty().isLength({ max: MAX_TEXT })
       .withMessage('industry is required'),
-
-    body('educationLevel')
-      .isString()
-      .trim()
-      .notEmpty()
-      .isLength({ max: MAX_TEXT })
+    body('educationLevel').isString().trim().notEmpty().isLength({ max: MAX_TEXT })
       .withMessage('educationLevel is required'),
-
-    body('country')
-      .isString()
-      .trim()
-      .notEmpty()
-      .isLength({ max: MAX_TEXT })
+    body('country').isString().trim().notEmpty().isLength({ max: MAX_TEXT })
       .withMessage('country is required'),
-
-    body('city')
-      .isString()
-      .trim()
-      .notEmpty()
-      .isLength({ max: MAX_TEXT })
+    body('city').isString().trim().notEmpty().isLength({ max: MAX_TEXT })
       .withMessage('city is required'),
-
-    body('salaryRange')
-      .optional({ nullable: true })
-      .isString()
-      .trim()
-      .isLength({ max: MAX_TEXT }),
-
-    body('careerGoals')
-      .isArray({ min: 1, max: 20 })
+    body('salaryRange').optional({ nullable: true }).isString().trim().isLength({ max: MAX_TEXT }),
+    body('careerGoals').isArray({ min: 1, max: 20 })
       .withMessage('at least one career goal is required'),
-
-    body('skills')
-      .optional()
-      .isArray({ max: MAX_SKILLS })
+    body('skills').optional().isArray({ max: MAX_SKILLS })
       .withMessage(`skills must be max ${MAX_SKILLS}`),
-
-    body('cvUploaded')
-      .optional()
-      .isBoolean()
-      .toBoolean(),
+    body('cvUploaded').optional().isBoolean().toBoolean(),
   ]),
   async (req, res, next) => {
     try {
@@ -102,10 +64,7 @@ router.post(
       if (!userId) {
         return res.status(401).json({
           success: false,
-          error: {
-            code: 'UNAUTHORIZED',
-            message: 'Authentication required.',
-          },
+          error: { code: 'UNAUTHORIZED', message: 'Authentication required.' },
         });
       }
 
@@ -141,35 +100,42 @@ router.post(
 
       if (error) throw error;
 
-      logger.info(
-        '[CareerOnboarding] Professional onboarding completed',
-        {
+      // ── ETag INVALIDATION FIX ──────────────────────────────────────────────
+      // The complete_professional_onboarding RPC sets professional_onboarding_complete
+      // = true in the users table but may not bump users.updated_at.
+      // Explicitly touch updated_at so the GET /me ETag token invalidates.
+      const { error: touchErr } = await supabase
+        .from('users')
+        .update({ updated_at: new Date().toISOString() })
+        .eq('id', userId);
+
+      if (touchErr) {
+        logger.warn('[CareerOnboarding] updated_at bump failed — ETag may be stale', {
           userId,
-          jobTitle,
-          industry,
-          cvUploaded,
-          goalsCount: careerGoals.length,
-          skillsCount: skills.length,
-        }
-      );
+          err: touchErr.message,
+        });
+      }
+      // ── END ETag INVALIDATION FIX ─────────────────────────────────────────
+
+      // Phase 2: invalidate freshness cache — professional_onboarding_complete has changed.
+      freshnessCache.del(`app-entry:${userId}`);
+      freshnessCache.del(`user-me:${userId}`);
+
+      logger.info('[CareerOnboarding] Professional onboarding completed', {
+        userId, jobTitle, industry, cvUploaded,
+        goalsCount: careerGoals.length, skillsCount: skills.length,
+      });
 
       return res.status(200).json({
         success: true,
-        data: {
-          message:
-            'Professional career profile created. Onboarding complete.',
-        },
+        data: { message: 'Professional career profile created. Onboarding complete.' },
       });
     } catch (error) {
-      logger.error(
-        '[CareerOnboarding] Failed to complete onboarding',
-        {
-          userId: resolveUserId(req),
-          error: error.message,
-          stack: error.stack,
-        }
-      );
-
+      logger.error('[CareerOnboarding] Failed to complete onboarding', {
+        userId: resolveUserId(req),
+        error: error.message,
+        stack: error.stack,
+      });
       return next(error);
     }
   }

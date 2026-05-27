@@ -13,8 +13,21 @@
  * - analytics-friendly rule metadata
  */
 
-const conversionIntentService = require('./conversionIntent.service');
 const logger = require('../utils/conversion.logger');
+
+// ---------------------------------------------------------------------------
+// Score provider — injected by ConversionPipelineCoordinator at boot.
+// ConversionNudgeService is a stage worker; it does not import sibling services.
+// ---------------------------------------------------------------------------
+let _scoreProvider = null;
+
+/**
+ * Called once at startup by conversionPipeline.coordinator.js.
+ * @param {function(userId: string): Promise<object>} fn
+ */
+function setScoreProvider(fn) {
+  _scoreProvider = fn;
+}
 
 const FALLBACK_RULE = Object.freeze({
   id: 'fallback_safe',
@@ -91,7 +104,14 @@ class ConversionNudgeService {
         throw new Error('userId is required');
       }
 
-      const scores = await conversionIntentService.getScores(userId);
+      if (!_scoreProvider) {
+        throw new Error(
+          'conversionNudgeService: scoreProvider not initialised. ' +
+          'Ensure conversionPipeline.coordinator is loaded at startup.'
+        );
+      }
+
+      const scores = await _scoreProvider(userId);
 
       const {
         totalIntentScore,
@@ -162,3 +182,4 @@ class ConversionNudgeService {
 }
 
 module.exports = new ConversionNudgeService();
+module.exports.setScoreProvider = setScoreProvider;

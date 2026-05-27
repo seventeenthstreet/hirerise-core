@@ -135,12 +135,22 @@ function tierQuota(feature) {
 
         return res.status(429).json({
           success: false,
-          errorCode: 'QUOTA_EXCEEDED',
-          quotaExhausted: true,
-          upgradeUrl: process.env.UPGRADE_URL ?? '/pricing',
-          details: { feature, limit, used: current },
-          requestId,
-          timestamp: new Date().toISOString(),
+          error: {
+            code: 'TIER_INSUFFICIENT',
+            message: 'Monthly quota exhausted.',
+            details: {
+              feature,
+              limit,
+              used: current,
+              quotaExhausted: true,
+              upgradeUrl: process.env.UPGRADE_URL ?? '/pricing',
+            },
+          },
+          meta: {
+            requestId,
+            timestamp: new Date().toISOString(),
+            retryAfter: 0,
+          },
         });
       }
 
@@ -181,11 +191,15 @@ function tierQuota(feature) {
 
       return res.status(503).json({
         success: false,
-        errorCode: 'QUOTA_SERVICE_UNAVAILABLE',
-        message: 'Quota service unavailable',
-        retryAfter: 30,
-        requestId,
-        timestamp: new Date().toISOString(),
+        error: {
+          code: 'RATE_LIMIT_SERVICE_UNAVAILABLE',
+          message: 'Quota service unavailable. Please retry shortly.',
+        },
+        meta: {
+          requestId,
+          timestamp: new Date().toISOString(),
+          retryAfter: 30,
+        },
       });
     }
   };

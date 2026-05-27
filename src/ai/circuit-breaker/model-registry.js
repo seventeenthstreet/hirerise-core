@@ -1,5 +1,8 @@
 'use strict';
 
+let _logger;
+try { _logger = require('../../utils/logger'); } catch { _logger = { warn: console.warn.bind(console), error: console.error.bind(console) }; }
+
 /**
  * model-registry.js (OPTIMIZED)
  *
@@ -103,7 +106,7 @@ class ModelRegistry {
 
     // Validate feature
     if (!FEATURE_MODEL_CONFIG[feature]) {
-      console.warn(`[ModelRegistry] Unknown feature: ${feature}`);
+      _logger.warn('[ModelRegistry] Unknown feature', { feature });
     }
 
     let model =
@@ -114,7 +117,7 @@ class ModelRegistry {
 
     // Validate model exists
     if (!MODEL_CATALOG[model]) {
-      console.error(`[ModelRegistry] Invalid model: ${model}, falling back`);
+      _logger.warn('[ModelRegistry] Invalid model, using fallback', { model });
       model = 'claude-sonnet-4-6';
     }
 

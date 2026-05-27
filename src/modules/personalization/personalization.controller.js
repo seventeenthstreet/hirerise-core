@@ -11,35 +11,19 @@
  *   GET  /api/v1/user/personalization-profile
  *   POST /api/v1/user/update-behavior-profile
  *
- * Supabase migration notes:
- * - Removed Firebase UID-first assumptions
- * - Added Supabase JWT compatibility
- * - Hardened body/query parsing
- * - Improved error logging consistency
- * - Preserved API response contracts
+ * CONTRACT NOTE (Phase 2 Hardening — Task 6: Shadowed Local Helper Resolution):
+ *   Removed local `sendSuccess` and `sendError` helper functions.
+ *   These were V2-shaped but lacked the canonical meta envelope and had a
+ *   different argument order, causing import ambiguity and drift risk.
+ *   Migrated to shared sendSuccess/sendError from src/shared/response.
+ *
+ *   NOTE: sendError argument order changed — callers updated to match shared
+ *   signature: sendError(res, statusCode, message, code).
  */
 
 const logger = require('../../utils/logger');
-const engine = require('../../engines/aiPersonalization.engine');
-
-// ───────────────────────────────────────────────────────────────────────────────
-// Response helpers
-// ───────────────────────────────────────────────────────────────────────────────
-
-function sendSuccess(res, data, statusCode = 200) {
-  return res.status(statusCode).json({
-    success: true,
-    data,
-  });
-}
-
-function sendError(res, message, statusCode = 500, meta = undefined) {
-  return res.status(statusCode).json({
-    success: false,
-    error: message,
-    ...(meta ? { meta } : {}),
-  });
-}
+const engine = require('./personalization.service');
+const { sendSuccess, sendError } = require('../../shared/response');
 
 // ───────────────────────────────────────────────────────────────────────────────
 // Request helpers
@@ -93,7 +77,7 @@ async function getPersonalizedRecommendations(req, res) {
   const userId = getAuthenticatedUserId(req);
 
   if (!userId) {
-    return sendError(res, 'Unauthenticated', 401);
+    return sendError(res, 401, 'Unauthenticated', 'UNAUTHORIZED');
   }
 
   const topN = parseInteger(req.query.topN, 10, {
@@ -137,7 +121,7 @@ async function trackBehaviorEvent(req, res) {
   const userId = getAuthenticatedUserId(req);
 
   if (!userId) {
-    return sendError(res, 'Unauthenticated', 401);
+    return sendError(res, 401, 'Unauthenticated', 'UNAUTHORIZED');
   }
 
   const {
@@ -150,7 +134,7 @@ async function trackBehaviorEvent(req, res) {
   } = req.body || {};
 
   if (!event_type || typeof event_type !== 'string') {
-    return sendError(res, '"event_type" is required', 400);
+    return sendError(res, 400, '"event_type" is required', 'INVALID_INPUT');
   }
 
   try {
@@ -176,7 +160,7 @@ async function trackBehaviorEvent(req, res) {
       stack: error.stack,
     });
 
-    return sendError(res, 'Failed to record behavior event', 500);
+    return sendError(res, 500, 'Failed to record behavior event', 'INTERNAL_ERROR');
   }
 }
 
@@ -188,7 +172,7 @@ async function getPersonalizationProfile(req, res) {
   const userId = getAuthenticatedUserId(req);
 
   if (!userId) {
-    return sendError(res, 'Unauthenticated', 401);
+    return sendError(res, 401, 'Unauthenticated', 'UNAUTHORIZED');
   }
 
   try {
@@ -224,7 +208,7 @@ async function getPersonalizationProfile(req, res) {
       }
     );
 
-    return sendError(res, 'Failed to load personalization profile', 500);
+    return sendError(res, 500, 'Failed to load personalization profile', 'INTERNAL_ERROR');
   }
 }
 
@@ -236,7 +220,7 @@ async function updateBehaviorProfile(req, res) {
   const userId = getAuthenticatedUserId(req);
 
   if (!userId) {
-    return sendError(res, 'Unauthenticated', 401);
+    return sendError(res, 401, 'Unauthenticated', 'UNAUTHORIZED');
   }
 
   try {
@@ -257,7 +241,7 @@ async function updateBehaviorProfile(req, res) {
       stack: error.stack,
     });
 
-    return sendError(res, 'Failed to update behavior profile', 500);
+    return sendError(res, 500, 'Failed to update behavior profile', 'INTERNAL_ERROR');
   }
 }
 

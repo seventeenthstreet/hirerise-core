@@ -40,11 +40,19 @@ function ok(res, data) {
   });
 }
 
+// CONTRACT NOTE (Phase 2): V2 canonical error shape.
 function bad(res, message, code = 400) {
+  const errorCode =
+    code === 401 ? 'UNAUTHORIZED' :
+    code === 403 ? 'FORBIDDEN' :
+    code === 404 ? 'NOT_FOUND' :
+    code === 422 ? 'UNPROCESSABLE_ENTITY' :
+    'BAD_REQUEST';
   res.set('Cache-Control', 'no-store');
   return res.status(code).json({
     success: false,
-    error: message,
+    error: { code: errorCode, message },
+    meta: { timestamp: new Date().toISOString() },
   });
 }
 

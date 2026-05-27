@@ -11,7 +11,7 @@
 const logger = require('../../../utils/logger');
 const uniRepo = require('../repositories/university.repository');
 const { UNIVERSITY_ROLES } = require('../models/university.model');
-const matchingService = require('../../opportunities/services/studentMatching.service');
+const matchingService = require('../../opportunities/coordinators/opportunity.coordinator');
 
 // ─────────────────────────────────────────────────────────────
 // Error Helpers

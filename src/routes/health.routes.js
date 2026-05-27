@@ -1,448 +1,216 @@
 'use strict';
 
 /**
- * src/routes/health.routes.js
- * HireRise PR 2 — Health + Deep Diagnostics
+ * src/routes/health.routes.js  (HARDENED REPLACEMENT)
  *
- * Routes:
- *   GET /health        → pure liveness
- *   GET /health/deep   → dependency diagnostics
- *   GET /health/metrics → in-process performance snapshot
- *   GET /health/redis  → Redis circuit breaker + latency metrics  ← Phase 4
+ * PHASE 5 — Backend Health + Readiness
+ *
+ * ENDPOINTS
+ * ─────────
+ * GET /health   — Liveness probe (lightweight, ~1 ms).
+ *                 Used by load balancers / Docker HEALTHCHECK.
+ *                 Always returns 200 while the process is alive.
+ *
+ * GET /ready    — Readiness probe (verifies Supabase + DB connectivity).
+ *                 Used by Kubernetes / Cloud Run before routing traffic.
+ *                 Returns 200 when all critical services are reachable.
+ *                 Returns 503 when any critical service is degraded.
+ *
+ * RESPONSE SHAPES
+ * ───────────────
+ * /health:
+ *   { "ok": true, "service": "hirerise-core", "uptime": 42 }
+ *
+ * /ready (healthy):
+ *   {
+ *     "ok": true,
+ *     "services": {
+ *       "supabase": "up",
+ *       "database": "up"
+ *     },
+ *     "timestamp": "2026-05-21T12:00:00.000Z",
+ *     "requestId": "req_abc123"
+ *   }
+ *
+ * /ready (degraded):
+ *   {
+ *     "ok": false,
+ *     "services": {
+ *       "supabase": "up",
+ *       "database": "down"
+ *     },
+ *     "error": "database check failed: connection refused",
+ *     "timestamp": "2026-05-21T12:00:00.000Z",
+ *     "requestId": "req_abc123"
+ *   }
+ *
+ * PHASE 2: requestId is read from the X-Request-ID header (set by
+ * correlationMiddleware) and echoed in every health response so log lines
+ * from probe failures can be correlated to frontend requests.
+ *
+ * PRODUCTION SAFETY
+ * ─────────────────
+ * - /health is always public (no auth required).
+ * - /ready is always public — Kubernetes probes cannot send auth headers.
+ * - Internal service details (memory, PID, env vars) are NEVER exposed
+ *   in the default response. A ?verbose=1 + INTERNAL_SERVICE_TOKEN query
+ *   guard may be added separately for internal tooling.
+ * - All checks run in parallel (Promise.allSettled) with a 2-second
+ *   timeout each to prevent probe timeouts from cascading.
  */
 
-const express = require('express');
-const { getMetricsSnapshot } = require('../monitoring/metrics');
-const { createClient } = require('@supabase/supabase-js');
+const express     = require('express');
+const logger      = require('../utils/logger');
 
 const router = express.Router();
 
-// ─────────────────────────────────────────────────────────────
-// Supabase admin client singleton
-// ─────────────────────────────────────────────────────────────
-let probeClient = null;
+const SERVICE_NAME          = 'hirerise-core';
+const READINESS_TIMEOUT_MS  = 2_000;
 
-function getProbeClient() {
-  if (probeClient) return probeClient;
-
-  const url = process.env.SUPABASE_URL;
-  const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
-
-  if (!url || !key) {
-    throw new Error(
-      'SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY not set'
-    );
-  }
-
-  probeClient = createClient(url, key, {
-    auth: {
-      persistSession: false,
-      autoRefreshToken: false,
-    },
-  });
-
-  return probeClient;
-}
-
-// ─────────────────────────────────────────────────────────────
-// Probe token guard
-// ─────────────────────────────────────────────────────────────
-function requireProbeToken(req, res, next) {
-  const expected = process.env.HEALTH_PROBE_TOKEN;
-  const IS_PROD   = process.env.NODE_ENV === 'production';
-
-  // HARDENING: In production HEALTH_PROBE_TOKEN MUST be set.
-  // If the env var is missing, the deep probe returns 503 to prevent
-  // exposing dependency health data on an effectively unguarded endpoint.
-  if (!expected) {
-    if (IS_PROD) {
-      return res.status(503).json({
-        error: 'Health probe not configured',
-        hint:  'Set HEALTH_PROBE_TOKEN in production environment',
-      });
-    }
-    // Non-production: allow through without token (dev convenience)
-    return next();
-  }
-
-  const provided = req.headers['x-health-probe-token'];
-
-  if (!provided || provided !== expected) {
-    return res.status(401).json({
-      error: 'Invalid probe token',
-    });
-  }
-
-  return next();
-}
-
-// ─────────────────────────────────────────────────────────────
-// Individual probes
-// ─────────────────────────────────────────────────────────────
-async function probeDatabase() {
-  const start = Date.now();
-
-  try {
-    const { error } = await getProbeClient()
-      .from('users')
-      .select('id')
-      .limit(1);
-
-    if (error) throw error;
-
-    return {
-      ok: true,
-      latencyMs: Date.now() - start,
-    };
-  } catch (error) {
-    return {
-      ok: false,
-      latencyMs: Date.now() - start,
-      error: error.message,
-    };
-  }
-}
-
-async function probeRedis() {
-  const start = Date.now();
-
-  try {
-    const {
-      getRedisStatus,
-    } = require('../config/redisClient');
-
-    const redis = getRedisStatus();
-
-    return {
-      ok: redis.connected,
-      latencyMs: Date.now() - start,
-      provider: redis.provider,
-      backend: redis.backend,
-      ...(process.env.NODE_ENV !== 'production' &&
-      redis.error
-        ? { error: redis.error }
-        : {}),
-    };
-  } catch (error) {
-    return {
-      ok: false,
-      latencyMs: Date.now() - start,
-      error: error.message,
-    };
-  }
-}
-
-async function probeAnthropic() {
-  const start = Date.now();
-
-  try {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 5000);
-
-    const response = await fetch('https://api.anthropic.com', {
-      method: 'HEAD',
-      signal: controller.signal,
-    });
-
-    clearTimeout(timeout);
-
-    return {
-      ok: response.status < 600,
-      latencyMs: Date.now() - start,
-      httpStatus: response.status,
-    };
-  } catch (error) {
-    return {
-      ok: false,
-      latencyMs: Date.now() - start,
-      error:
-        error.name === 'AbortError'
-          ? 'timeout (5s)'
-          : error.message,
-    };
-  }
-}
-
-async function probeAiQueueDepth() {
-  const start = Date.now();
-
-  try {
-    const threshold = new Date(
-      Date.now() - 5 * 60_000
-    ).toISOString();
-
-    const { count, error } = await getProbeClient()
-      .from('ai_jobs')
-      .select('id', { count: 'exact', head: true })
-      .eq('status', 'pending')
-      .lte('created_at', threshold);
-
-    if (error) throw error;
-
-    const staleCount = count ?? 0;
-    const ok = staleCount < 10;
-
-    return {
-      ok,
-      latencyMs: Date.now() - start,
-      staleJobs: staleCount,
-      note: ok
-        ? null
-        : `${staleCount} jobs pending >5min — queue processor may be down`,
-    };
-  } catch (error) {
-    return {
-      ok: true,
-      latencyMs: Date.now() - start,
-      error: error.message,
-      note: 'probe failed',
-    };
-  }
-}
-
-function probeProcess() {
-  const mem = process.memoryUsage();
-
-  return {
-    ok: true,
-    uptimeSeconds: Math.floor(process.uptime()),
-    memoryRssMB: Math.round(mem.rss / 1_048_576),
-    heapUsedMB: Math.round(mem.heapUsed / 1_048_576),
-    heapTotalMB: Math.round(mem.heapTotal / 1_048_576),
-    nodeVersion: process.version,
-  };
-}
-
-function probeAiProviders() {
-  try {
-    const { getProviderHealth } = require('../services/aiRouter');
-    const providers = getProviderHealth();
-
-    const anyDown = providers.some(
-      (provider) => provider.status === 'down'
-    );
-
-    return {
-      ok: !anyDown,
-      providers,
-      note: anyDown
-        ? 'One or more AI providers are in cooldown — fallback chain still active'
-        : null,
-    };
-  } catch (error) {
-    return {
-      ok: true,
-      providers: [],
-      error: error.message,
-      note: 'probe unavailable',
-    };
-  }
-}
-
-// ─────────────────────────────────────────────────────────────
-// Phase 4 — Redis circuit breaker probe
-// ─────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// HELPER: timeout-safe promise race
+// ─────────────────────────────────────────────────────────────────────────────
 
 /**
- * Derives a human-readable status from singleton readiness + circuit state.
+ * Races a promise against a deadline.
+ * On timeout, resolves to { ok: false, reason: 'timeout' } rather than rejecting
+ * so Promise.allSettled sees a resolved value and can still aggregate results.
  *
- *   healthy  → ready AND circuit CLOSED
- *   degraded → ready BUT circuit HALF_OPEN, OR failure rate is high
- *   down     → not ready OR circuit OPEN
+ * @param {Promise<*>} promise
+ * @param {number}     ms
+ * @returns {Promise<{ ok: true } | { ok: false, reason: string }>}
  */
-function deriveRedisStatus(ready, circuitState, cbMetrics) {
-  if (!ready || circuitState === 'OPEN') return 'down';
-  if (circuitState === 'HALF_OPEN')      return 'degraded';
-
-  // Healthy but with elevated failure rate (>20% of calls failed)
-  const failureRate = cbMetrics.totalCalls > 0
-    ? cbMetrics.failures / cbMetrics.totalCalls
-    : 0;
-
-  if (failureRate > 0.2 || cbMetrics.slowCalls > 10) return 'degraded';
-
-  return 'healthy';
+function withReadinessTimeout(promise, ms) {
+  let timerId;
+  const timeout = new Promise((resolve) => {
+    timerId = setTimeout(() => resolve({ ok: false, reason: 'timeout' }), ms);
+  });
+  return Promise.race([
+    promise.then(() => ({ ok: true })).catch((err) => ({ ok: false, reason: err?.message ?? String(err) })),
+    timeout,
+  ]).finally(() => clearTimeout(timerId));
 }
 
-function probeRedisSingleton() {
-  try {
-    const singleton = require('../infrastructure/radis/redis.singleton');
-    const ready     = singleton.isReady();
-    const cb        = singleton.circuitBreaker;
-    const cbMetrics = cb.getMetrics();
-    const status    = deriveRedisStatus(ready, cbMetrics.state, cbMetrics);
+// ─────────────────────────────────────────────────────────────────────────────
+// HELPER: get request ID (Phase 2 — correlation)
+// ─────────────────────────────────────────────────────────────────────────────
 
-    return {
-      ok:      status !== 'down',
-      status,
-      ready,
-      circuit: cbMetrics.state,
-      metrics: {
-        totalCalls:    cbMetrics.totalCalls,
-        failures:      cbMetrics.failures,
-        failureRate:   cbMetrics.failureRate,       // e.g. 0.83
-        avgLatencyMs:  cbMetrics.avgLatencyMs,
-        slowCalls:     cbMetrics.slowCalls,
-        openDurationMs: cbMetrics.openDurationMs,  // ms OPEN, or null
-      },
-    };
-  } catch (err) {
-    return {
-      ok:      false,
-      status:  'down',
-      ready:   false,
-      circuit: 'UNKNOWN',
-      error:   err.message,
-      metrics: {
-        totalCalls:     0,
-        failures:       0,
-        failureRate:    0,
-        avgLatencyMs:   0,
-        slowCalls:      0,
-        openDurationMs: null,
-      },
-    };
-  }
+function getRequestId(req) {
+  return req.requestId                    // set by correlationMiddleware
+    ?? req.headers['x-request-id']
+    ?? req.headers['x-correlation-id']
+    ?? null;
 }
 
-// ─────────────────────────────────────────────────────────────
-// Routes
-// ─────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /health — liveness probe
+// ─────────────────────────────────────────────────────────────────────────────
 
-/**
- * Pure liveness probe
- * Returns 200 if Node process is alive.
- */
-router.get('/', (_req, res) => {
+router.get('/health', (req, res) => {
   return res.status(200).json({
-    status: 'healthy',
-    ts: new Date().toISOString(),
+    ok:         true,
+    service:    SERVICE_NAME,
+    uptime:     Math.floor(process.uptime()),
+    timestamp:  new Date().toISOString(),
+    requestId:  getRequestId(req),
   });
 });
 
+// ─────────────────────────────────────────────────────────────────────────────
+// SERVICE CHECKS — Supabase + DB
+// ─────────────────────────────────────────────────────────────────────────────
+
 /**
- * Deep dependency diagnostics
+ * Verify Supabase admin client connectivity by executing a lightweight
+ * no-result query (limit 0). Returns { ok: true } or { ok: false, reason }.
  */
-router.get('/deep', requireProbeToken, async (req, res) => {
-  const start = Date.now();
+async function checkSupabase() {
+  // Lazy-load to avoid circular dependency with supabaseClient module
+  const supabase = require('../lib/supabaseClient');
+  const { error } = await supabase
+    .from('user_profiles')
+    .select('id')
+    .limit(0);
 
-  const [database, redis, anthropic, aiQueue] =
-    await Promise.all([
-      probeDatabase(),
-      probeRedis(),
-      probeAnthropic(),
-      probeAiQueueDepth(),
-    ]);
+  if (error) throw new Error(error.message ?? 'supabase query failed');
+}
 
-  const processProbe = probeProcess();
-  const aiProviders = probeAiProviders();
+/**
+ * Verify direct Postgres connectivity via Supabase's rpc or a raw PG client.
+ * Falls back to the same Supabase check if a separate pg client is not configured.
+ */
+async function checkDatabase() {
+  // If you have a raw pg Pool, prefer: await pool.query('SELECT 1');
+  // For Supabase-only setups, re-use the Supabase client with a different table:
+  const supabase = require('../lib/supabaseClient');
+  const { error } = await supabase.rpc('version'); // or any lightweight RPC
 
-  const probes = {
-    database,
-    redis,
-    anthropic,
-    aiQueue,
-    aiProviders,
-    process: processProbe,
+  // rpc('version') may not exist — fall back to a table query
+  if (error && error.code !== 'PGRST301') { // PGRST301 = function not found
+    const { error: e2 } = await supabase
+      .from('user_profiles')
+      .select('id')
+      .limit(0);
+    if (e2) throw new Error(e2.message ?? 'database query failed');
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /ready — readiness probe
+// ─────────────────────────────────────────────────────────────────────────────
+
+router.get('/ready', async (req, res) => {
+  const requestId = getRequestId(req);
+  const start     = Date.now();
+
+  // Run all checks in parallel — no check can block others
+  const [supabaseResult, dbResult] = await Promise.allSettled([
+    withReadinessTimeout(checkSupabase(), READINESS_TIMEOUT_MS),
+    withReadinessTimeout(checkDatabase(), READINESS_TIMEOUT_MS),
+  ]);
+
+  const supabaseOk = supabaseResult.status === 'fulfilled' && supabaseResult.value.ok;
+  const dbOk       = dbResult.status       === 'fulfilled' && dbResult.value.ok;
+
+  const allOk = supabaseOk && dbOk;
+  const durationMs = Date.now() - start;
+
+  const body = {
+    ok:       allOk,
+    services: {
+      supabase: supabaseOk ? 'up' : 'down',
+      database: dbOk       ? 'up' : 'down',
+    },
+    timestamp:  new Date().toISOString(),
+    requestId,
+    durationMs,
+    ...(
+      !allOk ? {
+        errors: {
+          supabase: supabaseOk ? undefined : (
+            supabaseResult.status === 'fulfilled'
+              ? supabaseResult.value.reason
+              : supabaseResult.reason?.message
+          ),
+          database: dbOk ? undefined : (
+            dbResult.status === 'fulfilled'
+              ? dbResult.value.reason
+              : dbResult.reason?.message
+          ),
+        },
+      } : {}
+    ),
   };
 
-  let status = 'healthy';
-
-  if (!database.ok) {
-    status = 'unhealthy';
-  } else if (
-    !redis.ok ||
-    !anthropic.ok ||
-    !aiQueue.ok ||
-    !aiProviders.ok
-  ) {
-    status = 'degraded';
+  if (!allOk) {
+    logger.warn('[Ready] Readiness check degraded', {
+      requestId,
+      services: body.services,
+      durationMs,
+    });
   }
 
-  return res.status(status === 'unhealthy' ? 503 : 200).json({
-    status,
-    environment: process.env.NODE_ENV || 'unknown',
-    version: process.env.APP_VERSION || 'unknown',
-    durationMs: Date.now() - start,
-    ts: new Date().toISOString(),
-    probes,
-  });
-});
-
-// ─────────────────────────────────────────────────────────────
-// GET /health/metrics — In-process performance snapshot
-// Protected by INTERNAL_SERVICE_TOKEN in production.
-// ─────────────────────────────────────────────────────────────
-router.get('/metrics', (req, res) => {
-  const internalToken = process.env.INTERNAL_SERVICE_TOKEN;
-  if (internalToken && process.env.NODE_ENV === 'production') {
-    const provided = req.headers['x-internal-token'] || req.headers['x-health-probe-token'];
-    if (provided !== internalToken) {
-      return res.status(403).json({ error: 'FORBIDDEN', message: 'Internal endpoint' });
-    }
-  }
-
-  const mem = process.memoryUsage();
-  return res.json({
-    status: 'ok',
-    service: 'hirerise-core',
-    environment: process.env.NODE_ENV ?? 'unknown',
-    memory: {
-      heapUsedMb: Number((mem.heapUsed / 1024 / 1024).toFixed(2)),
-      heapTotalMb: Number((mem.heapTotal / 1024 / 1024).toFixed(2)),
-      rssMb: Number((mem.rss / 1024 / 1024).toFixed(2)),
-    },
-    ...getMetricsSnapshot(),
-    ts: new Date().toISOString(),
-  });
-});
-
-// ─────────────────────────────────────────────────────────────
-// GET /health/redis — Redis circuit breaker + latency metrics
-//
-// Secured identically to /health/metrics (INTERNAL_SERVICE_TOKEN
-// in production; open in dev/test for convenience).
-//
-// Response shape:
-// {
-//   status:  "healthy" | "degraded" | "down",
-//   ready:   boolean,
-//   circuit: "CLOSED" | "OPEN" | "HALF_OPEN",
-//   metrics: {
-//     totalCalls:    number,        // safeExec invocations since boot (or last overflow reset)
-//     failures:      number,        // calls that threw or timed out
-//     failureRate:   number,        // failures / totalCalls, rounded to 2dp (0 when no calls)
-//     avgLatencyMs:  number,        // rolling mean wall-clock latency
-//     slowCalls:     number,        // calls exceeding REDIS_CB_SLOW_CALL_MS (default 200ms)
-//     openDurationMs: number | null // ms since circuit entered OPEN; null when CLOSED
-//   },
-//   ts: ISO string
-// }
-//
-// HTTP status codes:
-//   200 — healthy or degraded (system still operating)
-//   503 — down (circuit OPEN or client not ready)
-// ─────────────────────────────────────────────────────────────
-router.get('/redis', (req, res) => {
-  // Same token guard as /health/metrics
-  const internalToken = process.env.INTERNAL_SERVICE_TOKEN;
-  if (internalToken && process.env.NODE_ENV === 'production') {
-    const provided = req.headers['x-internal-token'] || req.headers['x-health-probe-token'];
-    if (provided !== internalToken) {
-      return res.status(403).json({ error: 'FORBIDDEN', message: 'Internal endpoint' });
-    }
-  }
-
-  const probe = probeRedisSingleton();
-
-  return res.status(probe.status === 'down' ? 503 : 200).json({
-    status:  probe.status,
-    ready:   probe.ready,
-    circuit: probe.circuit,
-    metrics: probe.metrics,
-    ...(probe.error ? { error: probe.error } : {}),
-    ts: new Date().toISOString(),
-  });
+  return res.status(allOk ? 200 : 503).json(body);
 });
 
 module.exports = router;

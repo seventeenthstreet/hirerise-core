@@ -1,7 +1,7 @@
 'use strict';
 
 const observabilityRepo = require('../../repositories/ai-observability.repository');
-const alertService = require('../observability/alert.service');
+const alertService = require('../observability/alert.utils');
 const logger = require('../../utils/logger');
 
 const CALIBRATION_THRESHOLDS = {

@@ -1,60 +1,28 @@
-const logger = require("../../utils/logger");
+'use strict';
 
-const routingState = {
-  regionLatency: new Map(),
-  regionHealth: new Map(),
-};
+/**
+ * sovereignRoutingMesh.service.js — STUB
+ *
+ * Missing file — caused server crash at startup (line 5126).
+ *
+ * API surface used by server.js:
+ *   - updateRegionLatency(regionId, latencyMs)
+ *   - updateRegionHealth(regionId, isHealthy)
+ */
 
-function updateRegionLatency(region, latencyMs) {
-  routingState.regionLatency.set(region, {
-    latencyMs,
-    updatedAt: Date.now(),
-  });
+const _regions = new Map();
+
+function updateRegionLatency(regionId, latencyMs) {
+  const entry = _regions.get(regionId) ?? {};
+  _regions.set(regionId, { ...entry, latency: latencyMs });
 }
 
-function updateRegionHealth(region, isHealthy) {
-  routingState.regionHealth.set(region, {
-    isHealthy,
-    updatedAt: Date.now(),
-  });
-}
-
-function getLatency(region) {
-  return routingState.regionLatency.get(region)?.latencyMs ?? 9999;
-}
-
-function isHealthy(region) {
-  return routingState.regionHealth.get(region)?.isHealthy ?? true;
-}
-
-function routeRegion(allowedRegions = []) {
-  const candidates = allowedRegions.filter(isHealthy);
-
-  if (candidates.length === 0) {
-    return allowedRegions[0] || "ap-south-1";
-  }
-
-  let bestRegion = candidates[0];
-  let bestLatency = getLatency(bestRegion);
-
-  for (const region of candidates) {
-    const latency = getLatency(region);
-
-    if (latency < bestLatency) {
-      bestLatency = latency;
-      bestRegion = region;
-    }
-  }
-
-  logger.info(
-    `[SovereignRouting] region=${bestRegion} latency=${bestLatency}`
-  );
-
-  return bestRegion;
+function updateRegionHealth(regionId, isHealthy) {
+  const entry = _regions.get(regionId) ?? {};
+  _regions.set(regionId, { ...entry, healthy: isHealthy });
 }
 
 module.exports = {
   updateRegionLatency,
   updateRegionHealth,
-  routeRegion,
 };

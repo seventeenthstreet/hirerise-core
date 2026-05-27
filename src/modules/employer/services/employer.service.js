@@ -16,7 +16,7 @@
 const logger = require('../../../utils/logger');
 const empRepo = require('../repositories/employer.repository');
 const { supabase } = require('../../../config/supabase');
-const matchingService = require('../../opportunities/services/studentMatching.service');
+const matchingService = require('../../opportunities/coordinators/opportunity.coordinator');
 
 const PIPELINE_CONCURRENCY_LIMIT = 5;
 

@@ -1,5 +1,8 @@
 'use strict';
 
+// CONTRACT NOTE (Phase 2): All error responses use V2 canonical shape.
+
+
 /**
  * adaptiveWeight.routes.js (SUPABASE OPTIMIZED)
  *
@@ -39,9 +42,13 @@ const validateKey = (req, res, next) => {
   if (!roleFamily || !experienceBucket || !industryTag) {
     return res.status(400).json({
       success: false,
-      errorCode: 'INVALID_INPUT',
-      message: 'roleFamily, experienceBucket, and industryTag are required',
-      timestamp: new Date().toISOString(),
+      error: {
+        code: 'INVALID_INPUT',
+        message: 'roleFamily, experienceBucket, and industryTag are required',
+      },
+      meta: {
+        timestamp: new Date().toISOString(),
+      },
     });
   }
 

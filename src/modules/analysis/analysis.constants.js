@@ -48,6 +48,31 @@ function isValidOperation(operationType) {
   return Object.prototype.hasOwnProperty.call(DEFAULT_CREDIT_COSTS, operationType);
 }
 
+/**
+ * Standalone remaining-uses calculator — does NOT require a resolver instance.
+ * Accepts a user doc (reads aiCreditsRemaining) or a raw number.
+ * Returns a map of { operationType: remainingCount }.
+ *
+ * Mirrors the logic inside createConfigResolver().getRemainingUses() but
+ * operates directly against DEFAULT_CREDIT_COSTS so it can be imported
+ * without instantiating a resolver.
+ */
+function getRemainingUses(userDocOrCredits) {
+  const raw =
+    typeof userDocOrCredits === 'number'
+      ? userDocOrCredits
+      : Number(userDocOrCredits?.aiCreditsRemaining ?? 0);
+
+  const safeCredits = Math.max(raw || 0, 0);
+  const result = {};
+
+  for (const [operation, cost] of Object.entries(DEFAULT_CREDIT_COSTS)) {
+    result[operation] = Math.floor(safeCredits / cost);
+  }
+
+  return result;
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Resolver factory (for services that load dynamic DB config)
 // ─────────────────────────────────────────────────────────────────────────────
@@ -108,5 +133,6 @@ module.exports = {
   COST_PER_CREDIT_INR,
   CREDIT_COSTS,        // ← FIXED: direct export for creditGuard.middleware
   isValidOperation,    // ← FIXED: standalone export
+  getRemainingUses,    // ← FIXED: standalone export (was only inside createConfigResolver)
   createConfigResolver,
 };

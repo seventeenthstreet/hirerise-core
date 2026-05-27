@@ -9,7 +9,7 @@ const cacheManager = require('../core/cache/cache.manager');
 const getCache = () => cacheManager?.getClient?.() || null;
 const { supabase } = require('../config/supabase');
 const logger = require('../utils/logger');
-const { getUserVector } = require('../services/userVector.service'); // ✅ NEW
+// userVector is resolved by the owning service and passed as userVector argument
 
 const CACHE_TTL = 600;
 const MODEL = process.env.ANTHROPIC_MODEL || 'claude-sonnet-4-20250514';
@@ -40,29 +40,18 @@ function safeParse(text) {
 // MAIN ENGINE
 // ─────────────────────────────────────────────
 
-async function generateLearningPath({ skill, userSkills = [], targetRole = '', userId }) {
+async function generateLearningPath({ skill, userSkills = [], targetRole = '', userId, userVector = null }) {
   if (!skill) throw new Error('skill required');
 
   const cacheKey = `learning:path:${userId || 'anon'}:${skill.toLowerCase()}`; // ✅ improved
 
   // 🔹 Redis cache
-  if (cache) {
+  if (getCache()) {
     const cached = await getCache()?.get(cacheKey);
     if (cached) return JSON.parse(cached);
   }
 
-  // 🔥 NEW: get user vector (non-blocking safe)
-  let userVector = null;
-  try {
-    if (userId) {
-      userVector = await getUserVector(userId, userSkills);
-    }
-  } catch (err) {
-    logger.warn('[LearningPath] user vector fetch failed', {
-      userId,
-      err: err.message
-    });
-  }
+  // userVector is passed in from the owning service
 
   // 🔹 Supabase cache
   try {
@@ -73,7 +62,7 @@ async function generateLearningPath({ skill, userSkills = [], targetRole = '', u
       .maybeSingle();
 
     if (data?.path) {
-      if (cache) {
+      if (getCache()) {
         await getCache()?.set(cacheKey, JSON.stringify(data.path), 'EX', CACHE_TTL);
       }
       return data.path;
@@ -122,7 +111,7 @@ Return strict JSON with steps, duration, and outcome.`;
   };
 
   // 🔹 Cache write
-  if (cache) {
+  if (getCache()) {
     await getCache()?.set(cacheKey, JSON.stringify(result), 'EX', CACHE_TTL);
   }
 

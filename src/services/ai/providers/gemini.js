@@ -169,7 +169,7 @@ async function extractResume(resumeText) {
     // truncate for cost control
     const text = resumeText.slice(0, MAX_INPUT_CHARS);
 
-    console.log('🤖 Gemini: extracting resume...');
+    logger.debug('[Gemini] Extracting resume from PDF');
 
     // Try primary model
     try {
@@ -183,7 +183,7 @@ async function extractResume(resumeText) {
 
       return result;
     } catch (err) {
-      console.warn('⚠️ Gemini primary failed, trying fallback...', err.message);
+      logger.warn('[Gemini] Primary model failed, trying fallback', { error: err.message });
     }
 
     // Fallback model

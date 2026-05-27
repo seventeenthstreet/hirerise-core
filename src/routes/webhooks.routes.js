@@ -96,6 +96,12 @@ router.post(
   '/razorpay',
   express.raw({ type: 'application/json' }),
   asyncHandler(async (req, res) => {
+    // CONTRACT EXEMPTION: WEBHOOK_ACK
+    // Webhook ACK responses intentionally bypass the V2 envelope.
+    // { received: true } is the industry-standard shape for payment webhook ACKs
+    // (Razorpay, Stripe). The receiving service validates this exact shape.
+    // Wrapping in { success, data } would break all webhook integrations.
+    // See docs/api-contract-exemptions.md — WEBHOOK_ACK exemption.
     const secret = process.env.RAZORPAY_WEBHOOK_SECRET;
     const signature = req.headers['x-razorpay-signature'];
 
@@ -158,6 +164,8 @@ router.post(
   '/stripe',
   express.raw({ type: 'application/json' }),
   asyncHandler(async (req, res) => {
+    // CONTRACT EXEMPTION: WEBHOOK_ACK
+    // See docs/api-contract-exemptions.md — WEBHOOK_ACK exemption.
     const secret = process.env.STRIPE_WEBHOOK_SECRET;
     const signature = req.headers['stripe-signature'];
 

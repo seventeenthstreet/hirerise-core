@@ -11,9 +11,12 @@
   "scripts": {
     "start": "node src/server.js",
     "dev": "nodemon --signal SIGTERM src/server.js",
-    "lint": "eslint src/**/*.js",
+    "lint": "eslint src",
+    "depcruise": "depcruise src --config .dependency-cruiser.cjs",
+    "madge": "madge --circular src",
     "test": "cross-env NODE_ENV=test jest --runInBand",
     "test:watch": "cross-env NODE_ENV=test jest --watch",
+    "test:contract": "cross-env NODE_ENV=test jest tests/contract/ --runInBand",
     "import:data": "node src/data-import/excelImporter.js",
     "health:smoke": "node scripts/health-smoke.js",
     "ready:smoke": "node scripts/ready-smoke.js",
@@ -52,7 +55,8 @@
     "stripe": "^20.4.0",
     "unpdf": "^1.6.0",
     "winston": "^3.11.0",
-    "zod": "^3.25.76"
+    "zod": "^3.25.76",
+    "rate-limit-redis": "^4.2.0"
   },
   "devDependencies": {
     "@babel/generator": "^7.29.1",
@@ -62,13 +66,16 @@
     "@types/express": "^5.0.6",
     "@types/node": "^25.5.0",
     "cross-env": "^10.1.0",
+    "dependency-cruiser": "^16.10.4",
     "eslint": "^8.54.0",
+    "eslint-plugin-local": "file:src/eslint-plugin-local",
     "jest": "^29.7.0",
+    "madge": "^8.0.0",
     "nodemon": "^3.0.2",
     "supertest": "^6.3.4",
     "ts-node": "^10.9.2",
     "tsx": "^4.21.0",
-    "typescript": "^6.0.2"
+    "typescript": "^5.8.3"
   },
   "jest": {
     "testEnvironment": "node",
@@ -94,6 +101,7 @@
     "basic-ftp": ">=5.2.3",
     "@xmldom/xmldom": ">=0.8.13",
     "picomatch": ">=2.3.2",
-    "minimatch": ">=3.1.4"
+    "minimatch": ">=3.1.4",
+    "typescript": "^5.8.3"
   }
 }

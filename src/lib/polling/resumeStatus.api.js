@@ -41,18 +41,14 @@ export function makeResumeFetcher(resumeId, authToken) {
 
     let response;
 
-    try {
-      response = await fetch(url, {
-        method:  'GET',
-        headers: {
-          'Content-Type':  'application/json',
-          ...(authToken ? { Authorization: `Bearer ${authToken}` } : {}),
-        },
-      });
-    } catch (networkErr) {
-      // Rethrow as a network error — the poller engine will handle retry logic
-      throw networkErr;
-    }
+    // Network errors propagate to the poller engine for retry handling
+    response = await fetch(url, {
+      method:  'GET',
+      headers: {
+        'Content-Type':  'application/json',
+        ...(authToken ? { Authorization: `Bearer ${authToken}` } : {}),
+      },
+    });
 
     // Parse body regardless of HTTP status so the poller can read json.success
     let body;

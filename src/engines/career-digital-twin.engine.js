@@ -1,7 +1,11 @@
 'use strict';
 
 /**
- * Career Digital Twin Engine (Supabase Optimized + AI Vector Integrated)
+ * Career Digital Twin Engine (Atomic — Supabase Optimized)
+ *
+ * Engine purity: accepts pre-computed chain and opportunity data from
+ * the owning service. No sibling engine orchestration here.
+ * userVector resolved upstream and passed via userProfile.userVector.
  */
 
 const crypto       = require('crypto');
@@ -10,10 +14,6 @@ const cacheManager = require('../core/cache/cache.manager');
 const getCache = () => cacheManager?.getClient?.() || null;
 const supabase     = require('../config/supabase');
 const logger       = require('../utils/logger');
-const { getUserVector } = require('../services/userVector.service'); // ✅ NEW
-
-const careerPathEngine  = require('./career-path.engine');
-const opportunityEngine = require('./career-opportunity.engine');
 
 const CACHE_TTL_SECONDS = 900;
 
@@ -36,34 +36,23 @@ function profileHash(profile) {
 
 // ─────────────────────────────────────────────
 // MAIN ENGINE
+// Accepts pre-resolved careerChain and opportunityRoles from owning service.
 // ─────────────────────────────────────────────
 
-async function simulateCareerPaths(userProfile, marketData = {}) {
-  const { role, skills = [], experience_years = 0, industry, userId } = userProfile;
+async function simulateCareerPaths(userProfile, marketData = {}, engineInputs = {}) {
+  const { role, skills = [], experience_years = 0, industry, userVector = null } = userProfile;
 
   if (!role) throw new Error('role required');
 
   const hash     = profileHash(userProfile);
   const cacheKey = `career:twin:${userProfile.role}:${hash}`;
 
-  // 🔥 NEW: Fetch user vector (non-blocking safe usage)
-  let userVector = null;
-  try {
-    if (userId) {
-      userVector = await getUserVector(userId, skills);
-    }
-  } catch (err) {
-    logger.warn('[DigitalTwin] user vector fetch failed', {
-      userId,
-      err: err.message
-    });
-  }
-
   // ───────────── Redis Cache ─────────────
 
+  const cache = getCache();
   if (cache) {
     try {
-      const cached = await getCache()?.get(cacheKey);
+      const cached = await cache.get(cacheKey);
       if (cached) {
         logger.debug('[DigitalTwin] Redis hit');
         return JSON.parse(cached);
@@ -86,7 +75,7 @@ async function simulateCareerPaths(userProfile, marketData = {}) {
       const parsed = JSON.parse(data.result);
 
       if (cache) {
-        await getCache()?.set(cacheKey, JSON.stringify(parsed), 'EX', CACHE_TTL_SECONDS);
+        await cache.set(cacheKey, JSON.stringify(parsed), 'EX', CACHE_TTL_SECONDS);
       }
 
       logger.debug('[DigitalTwin] Supabase hit');
@@ -98,36 +87,10 @@ async function simulateCareerPaths(userProfile, marketData = {}) {
 
   logger.info('[DigitalTwin] Running fresh simulation', { role });
 
-  // ───────────── PARALLEL FETCH ─────────────
+  // ───────────── Pre-computed inputs from owning service ─────────────
 
-  let rawChain = [];
-  let opportunityRoles = [];
-
-  try {
-    const [chain, opp] = await Promise.all([
-      careerPathEngine.getProgressionChain(role, industry).catch(() => []),
-
-      // 🔥 Pass vector for future AI-based opportunity scoring
-      opportunityEngine.analyzeCareerOpportunities({
-        role,
-        skills,
-        experience_years,
-        industry,
-        userId,
-        userVector // ✅ NEW (non-breaking)
-      }).catch(() => ({ opportunities: [] }))
-    ]);
-
-    rawChain = chain || [];
-
-    opportunityRoles = (opp.opportunities || []).slice(0, 10).map(o => ({
-      role: o.next_role || o.role,
-      years_to_next: o.estimated_years || 2
-    }));
-
-  } catch (err) {
-    logger.error('[DigitalTwin] Engine dependency failed', { err: err.message });
-  }
+  const rawChain = Array.isArray(engineInputs.careerChain) ? engineInputs.careerChain : [];
+  const opportunityRoles = Array.isArray(engineInputs.opportunityRoles) ? engineInputs.opportunityRoles : [];
 
   const mergedChain =
     rawChain.length > 0 ? rawChain :
@@ -153,8 +116,6 @@ async function simulateCareerPaths(userProfile, marketData = {}) {
       industry,
       simulated_at: new Date().toISOString(),
       path_count: simulations.length,
-
-      // 🔥 NEW: AI metadata (non-breaking)
       vector_used: !!userVector
     }
   };
@@ -163,7 +124,7 @@ async function simulateCareerPaths(userProfile, marketData = {}) {
 
   if (cache) {
     try {
-      await getCache()?.set(cacheKey, JSON.stringify(result), 'EX', CACHE_TTL_SECONDS);
+      await cache.set(cacheKey, JSON.stringify(result), 'EX', CACHE_TTL_SECONDS);
     } catch (err) {
       logger.warn('[Cache] Redis write failed', { err: err.message });
     }

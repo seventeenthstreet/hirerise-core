@@ -14,8 +14,21 @@
  */
 
 const conversionEventRepository = require('../repositories/conversionEvent.repository');
-const conversionAggregateService = require('./conversionAggregate.service');
 const logger = require('../utils/conversion.logger');
+
+// ---------------------------------------------------------------------------
+// Aggregate notifier — injected by ConversionPipelineCoordinator at boot.
+// ConversionEventService is a stage worker; it does not import sibling services.
+// ---------------------------------------------------------------------------
+let _aggregateNotifier = null;
+
+/**
+ * Called once at startup by conversionPipeline.coordinator.js.
+ * @param {function(userId: string, eventType: string): Promise<void>} fn
+ */
+function setAggregateNotifier(fn) {
+  _aggregateNotifier = fn;
+}
 
 const {
   ENGAGEMENT_WEIGHTS,
@@ -138,9 +151,10 @@ class ConversionEventService {
   // ---------------------------------------------------------------------------
 
   _deferAggregateUpdate(userId, eventType) {
+    if (!_aggregateNotifier) return;
+
     const run = () => {
-      conversionAggregateService
-        .onEventRecorded(userId, eventType)
+      _aggregateNotifier(userId, eventType)
         .catch((error) => {
           logger.error(
             'conversionEventService aggregate update failed',
@@ -163,3 +177,4 @@ class ConversionEventService {
 }
 
 module.exports = new ConversionEventService();
+module.exports.setAggregateNotifier = setAggregateNotifier;

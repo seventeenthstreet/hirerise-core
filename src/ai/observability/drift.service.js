@@ -3,7 +3,7 @@
 const crypto = require('crypto');
 const observabilityRepo = require('../../repositories/ai-observability.repository');
 const OBSERVABILITY_CONFIG = require('../../config/observability.config');
-const alertService = require('../observability/alert.service');
+const alertService = require('../observability/alert.utils');
 const logger = require('../../utils/logger');
 
 class DriftService {

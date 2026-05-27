@@ -2,7 +2,7 @@
 
 const observabilityRepo = require('../../repositories/ai-observability.repository');
 const OBSERVABILITY_CONFIG = require('../../config/observability.config');
-const alertService = require('./alert.service');
+const alertService = require('./alert.utils');
 const logger = require('../../utils/logger');
 
 class CostTracker {

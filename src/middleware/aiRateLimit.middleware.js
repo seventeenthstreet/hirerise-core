@@ -24,6 +24,9 @@ function _resolveKey(req) {
   return `ai_rate:${userId}`;
 }
 
+// Phase 2B.1 — normalized to V2 canonical envelope.
+// retryAfter lives in meta.retryAfter (parser reads meta?.retryAfter ?? meta?.retryAfterSeconds).
+// Retry-After HTTP header is set separately by the caller for HTTP-level back-off.
 function _limitResponse(retryAfterSec) {
   return {
     success: false,
@@ -31,24 +34,24 @@ function _limitResponse(retryAfterSec) {
       code: 'RATE_LIMITED',
       message: `Too many AI requests. Please wait ${retryAfterSec} seconds before trying again.`,
     },
-    retryAfterSeconds: retryAfterSec,
-    timestamp: new Date().toISOString(),
+    meta: {
+      retryAfter: retryAfterSec,
+      timestamp: new Date().toISOString(),
+    },
   };
 }
 
 function _unavailableResponse() {
-  // Consistent with the existing error envelope used across this codebase:
-  //   { success, error: { code, message }, retryAfterSeconds, timestamp }
-  // retryAfterSeconds=60 gives clients a concrete back-off hint without
-  // overpromising when the RPC will recover.
   return {
     success: false,
     error: {
       code: 'RATE_LIMIT_SERVICE_UNAVAILABLE',
       message: 'Rate limiting temporarily unavailable. Please try again shortly.',
     },
-    retryAfterSeconds: 60,
-    timestamp: new Date().toISOString(),
+    meta: {
+      retryAfter: 60,
+      timestamp: new Date().toISOString(),
+    },
   };
 }
 

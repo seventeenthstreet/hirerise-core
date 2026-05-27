@@ -9,7 +9,7 @@ const cacheManager = require('../core/cache/cache.manager');
 // Phase 2: lazy getter — resolves Redis post-bootstrap on each call
 const getCache = () => cacheManager?.getClient?.() || null;
 const logger = require('../utils/logger');
-const { getUserVector } = require('../services/userVector.service'); // ✅ NEW
+// userVector is resolved by the owning service and passed via userProfile.userVector
 
 const CACHE_TTL = 600;
 
@@ -44,7 +44,7 @@ function buildCacheKey(skills, userId) {
 
 async function recommendLearning(userProfile, skillGaps) {
   try {
-    const { userId, skills: userSkills = [] } = userProfile || {};
+    const { userId, skills: userSkills = [], userVector = null } = userProfile || {};
 
     // Normalize input skills
     const skills = Array.isArray(skillGaps)
@@ -65,7 +65,7 @@ async function recommendLearning(userProfile, skillGaps) {
     const cacheKey = buildCacheKey(skills, userId);
 
     // ───────────── Redis Cache ─────────────
-    if (cache) {
+    if (getCache()) {
       try {
         const cached = await getCache()?.get(cacheKey);
         if (cached) return JSON.parse(cached);
@@ -74,18 +74,7 @@ async function recommendLearning(userProfile, skillGaps) {
       }
     }
 
-    // 🔥 NEW: Get user vector (non-blocking safe)
-    let userVector = null;
-    try {
-      if (userId) {
-        userVector = await getUserVector(userId, userSkills);
-      }
-    } catch (err) {
-      logger.warn('[Learning] user vector fetch failed', {
-        userId,
-        err: err.message
-      });
-    }
+    // userVector is passed in from the owning service via userProfile.userVector
 
     // ───────────── Supabase Query ─────────────
     let data = [];
@@ -176,7 +165,7 @@ async function recommendLearning(userProfile, skillGaps) {
     };
 
     // ───────────── Cache Write ─────────────
-    if (cache) {
+    if (getCache()) {
       try {
         await getCache()?.set(cacheKey, JSON.stringify(response), 'EX', CACHE_TTL);
       } catch (err) {

@@ -22,8 +22,22 @@
 const logger = require('../../../utils/logger');
 const { supabase } = require('../../../config/supabase');
 
-const jobCollector = require('../collectors/jobCollector.service');
-const demandAnalysis = require('../processors/demandAnalysis.service');
+// ─────────────────────────────────────────────────────────────────────────────
+// Demand-analysis providers — injected by MarketIntelligenceCoordinator.
+// marketTrend.service is a pure read facade; it does not import sibling services.
+// ─────────────────────────────────────────────────────────────────────────────
+
+let _loadSkillDemand = null;
+let _loadCareerScores = null;
+
+/**
+ * Called once at startup by marketIntelligence.coordinator.js.
+ * @param {{ loadSkillDemand: Function, loadCareerScores: Function }} providers
+ */
+function setDemandProviders({ loadSkillDemand, loadCareerScores }) {
+  _loadSkillDemand = loadSkillDemand;
+  _loadCareerScores = loadCareerScores;
+}
 
 const DEFAULT_CACHE_TTL_MS = 60 * 60 * 1000;
 const CACHE_TTL_MS = normalizePositiveInt(
@@ -83,26 +97,12 @@ function invalidateCache() {
 // Refresh Pipeline
 // ───────────────────────────────────────────────────────────────────────────────
 
-async function runRefresh({ batchSize = 50 } = {}) {
-  logger.info(
-    { batchSize },
-    '[MarketTrend] Starting full LMI refresh'
-  );
-
-  const collectResult = await jobCollector.collect({ batchSize });
-  const analysisResult = await demandAnalysis.runFullAnalysis();
-
-  invalidateCache();
-
-  const result = {
-    ...collectResult,
-    ...analysisResult
-  };
-
-  logger.info(result, '[MarketTrend] Refresh complete');
-
-  return result;
-}
+/**
+ * runRefresh is intentionally removed from marketTrend.service.
+ * Pipeline sequencing (jobCollector → demandAnalysis → invalidateCache) is
+ * owned by MarketIntelligenceCoordinator.
+ * This service is now a pure read facade + cache layer.
+ */
 
 // ───────────────────────────────────────────────────────────────────────────────
 // Read APIs
@@ -148,7 +148,7 @@ async function getSkillDemand(limit = 20) {
     return entry.value.slice(0, limit);
   }
 
-  const result = await demandAnalysis.loadSkillDemand();
+  const result = await _loadSkillDemand();
   const data = result.length ? result : STATIC_SKILL_DEMAND;
 
   setCache(entry, data);
@@ -193,7 +193,7 @@ async function getSalaryBenchmarks() {
 }
 
 async function getCareerScoresMap() {
-  const scores = await demandAnalysis.loadCareerScores();
+  const scores = await _loadCareerScores();
 
   if (Object.keys(scores).length > 0) {
     return scores;
@@ -309,10 +309,10 @@ function normalizePositiveInt(value, fallback) {
 }
 
 module.exports = Object.freeze({
-  runRefresh,
   getCareerTrends,
   getSkillDemand,
   getSalaryBenchmarks,
   getCareerScoresMap,
-  invalidateCache
+  invalidateCache,
+  setDemandProviders,
 });

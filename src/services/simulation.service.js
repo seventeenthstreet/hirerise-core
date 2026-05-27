@@ -1,4 +1,4 @@
-const careerPathService = require("./careerPath.service");
+const careerPathService = require("./careerPath.utils");
 
 function simulateCareerPath(startRoleId, userProfile, maxSteps = 5) {
   let currentRoleId = startRoleId;

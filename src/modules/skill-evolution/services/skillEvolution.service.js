@@ -23,7 +23,7 @@ const {
   buildSkillRecommendationRow,
 } = require('../models/studentSkills.model');
 
-const marketTrendService = require('../../labor-market-intelligence/services/marketTrend.service');
+const marketTrendService = require('../../labor-market-intelligence/coordinators/marketIntelligence.coordinator');
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Generate + persist recommendations

@@ -12,6 +12,7 @@ const { body } = require('express-validator');
 const { validate } = require('../middleware/requestValidator');
 const { supabase } = require('../config/supabase');
 const logger = require('../utils/logger');
+const freshnessCache = require('../utils/freshnessCache');
 
 const router = express.Router();
 const MAX_RESUME_JSON_SIZE = 500_000; // 500 KB soft cap
@@ -148,8 +149,13 @@ router.post(
       if (!userId) {
         return res.status(401).json({
           success: false,
-          errorCode: 'UNAUTHORIZED',
-          message: 'Authentication required.',
+          error: {
+            code: 'UNAUTHORIZED',
+            message: 'Authentication required.',
+          },
+          meta: {
+            timestamp: new Date().toISOString(),
+          },
         });
       }
 
@@ -162,8 +168,13 @@ router.post(
       if (jsonSize > MAX_RESUME_JSON_SIZE) {
         return res.status(413).json({
           success: false,
-          errorCode: 'RESUME_TOO_LARGE',
-          message: 'Resume data exceeds maximum allowed size.',
+          error: {
+            code: 'RESUME_TOO_LARGE',
+            message: 'Resume data exceeds maximum allowed size.',
+          },
+          meta: {
+            timestamp: new Date().toISOString(),
+          },
         });
       }
 
@@ -172,9 +183,14 @@ router.post(
       if (!valid) {
         return res.status(422).json({
           success: false,
-          errorCode: 'VALIDATION_FAILED',
-          message: 'Resume data does not meet completion requirements.',
-          missing,
+          error: {
+            code: 'VALIDATION_FAILED',
+            message: 'Resume data does not meet completion requirements.',
+            details: { missing },
+          },
+          meta: {
+            timestamp: new Date().toISOString(),
+          },
         });
       }
 
@@ -212,17 +228,24 @@ router.post(
 
         return res.status(500).json({
           success: false,
-          errorCode: 'ONBOARDING_COMPLETION_FAILED',
-          message: 'Onboarding completion returned invalid result.',
+          error: {
+            code: 'ONBOARDING_COMPLETION_FAILED',
+            message: 'Onboarding completion returned invalid result.',
+          },
+          meta: {
+            timestamp: new Date().toISOString(),
+          },
         });
       }
 
       if (rpcResult.already_complete) {
         return res.json({
           success: true,
-          alreadyComplete: true,
-          profileStrength: null,
-          message: 'Onboarding already complete.',
+          data: {
+            alreadyComplete: true,
+            profileStrength: null,
+            message: 'Onboarding already complete.',
+          },
         });
       }
 
@@ -231,11 +254,17 @@ router.post(
         profileStrength,
       });
 
+      // Phase 2: invalidate freshness cache — onboarding_completed has changed.
+      freshnessCache.del(`app-entry:${userId}`);
+      freshnessCache.del(`user-me:${userId}`);
+
       return res.json({
         success: true,
-        alreadyComplete: false,
-        profileStrength,
-        message: 'Onboarding complete.',
+        data: {
+          alreadyComplete: false,
+          profileStrength,
+          message: 'Onboarding complete.',
+        },
       });
     } catch (error) {
       return next(error);
@@ -256,7 +285,13 @@ router.patch(
       if (!userId) {
         return res.status(401).json({
           success: false,
-          message: 'Unauthorized',
+          error: {
+            code: 'UNAUTHORIZED',
+            message: 'Authentication required.',
+          },
+          meta: {
+            timestamp: new Date().toISOString(),
+          },
         });
       }
 
@@ -272,7 +307,7 @@ router.patch(
       if (Object.keys(patch).length === 1) {
         return res.json({
           success: true,
-          message: 'Nothing to update.',
+          data: { message: 'Nothing to update.' },
         });
       }
 
@@ -285,7 +320,7 @@ router.patch(
 
       return res.json({
         success: true,
-        message: 'Progress saved.',
+        data: { message: 'Progress saved.' },
       });
     } catch (error) {
       return next(error);
@@ -300,7 +335,13 @@ router.get('/resume', async (req, res, next) => {
     if (!userId) {
       return res.status(401).json({
         success: false,
-        message: 'Unauthorized',
+        error: {
+          code: 'UNAUTHORIZED',
+          message: 'Authentication required.',
+        },
+        meta: {
+          timestamp: new Date().toISOString(),
+        },
       });
     }
 

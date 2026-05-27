@@ -42,6 +42,8 @@ function buildKey(plan, uid) {
   return `ai_rate_plan:${plan}:${uid}:${todayKey()}`;
 }
 
+// Phase 2B.1 — normalized to V2 canonical envelope.
+// retryAfter lives in meta.retryAfter; root-level retryAfterSeconds removed.
 function limitResponse(limit, plan) {
   return {
     success: false,
@@ -49,7 +51,10 @@ function limitResponse(limit, plan) {
       code: 'RATE_LIMITED',
       message: `You've reached your daily limit of ${limit} AI requests on the ${plan} plan. Your limit resets at UTC midnight.`,
     },
-    retryAfterSeconds: secondsUntilMidnight(),
+    meta: {
+      retryAfter: secondsUntilMidnight(),
+      timestamp: new Date().toISOString(),
+    },
   };
 }
 
@@ -60,8 +65,10 @@ function unavailableResponse() {
       code: 'RATE_LIMIT_SERVICE_UNAVAILABLE',
       message: 'Rate limiting temporarily unavailable. Please try again shortly.',
     },
-    retryAfterSeconds: 60,
-    timestamp: new Date().toISOString(),
+    meta: {
+      retryAfter: 60,
+      timestamp: new Date().toISOString(),
+    },
   };
 }
 

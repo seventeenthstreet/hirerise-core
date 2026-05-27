@@ -1,5 +1,8 @@
 'use strict';
 
+// CONTRACT NOTE (Phase 2): All error responses use V2 canonical shape.
+
+
 /**
  * adminJobSync.routes.js (SUPABASE READY)
  *
@@ -52,10 +55,13 @@ const syncRateLimiter = rateLimit({
 
     return res.status(429).json({
       success: false,
-      errorCode: 'RATE_LIMIT_EXCEEDED',
-      message:
-        'Too many sync requests. Maximum 5 per 15 minutes per IP.',
-      timestamp: new Date().toISOString(),
+      error: {
+        code: 'RATE_LIMIT_EXCEEDED',
+        message: 'Too many sync requests. Maximum 5 per 15 minutes per IP.',
+      },
+      meta: {
+        timestamp: new Date().toISOString(),
+      },
     });
   },
 
@@ -70,18 +76,26 @@ const validateSyncRequest = (req, res, next) => {
   if (source && typeof source !== 'string') {
     return res.status(400).json({
       success: false,
-      errorCode: 'INVALID_INPUT',
-      message: 'source must be a string',
-      timestamp: new Date().toISOString(),
+      error: {
+        code: 'INVALID_INPUT',
+        message: 'source must be a string',
+      },
+      meta: {
+        timestamp: new Date().toISOString(),
+      },
     });
   }
 
   if (force !== undefined && typeof force !== 'boolean') {
     return res.status(400).json({
       success: false,
-      errorCode: 'INVALID_INPUT',
-      message: 'force must be a boolean',
-      timestamp: new Date().toISOString(),
+      error: {
+        code: 'INVALID_INPUT',
+        message: 'force must be a boolean',
+      },
+      meta: {
+        timestamp: new Date().toISOString(),
+      },
     });
   }
 
@@ -115,9 +129,13 @@ router.post(
 router.all('/sync', (req, res) => {
   return res.status(405).json({
     success: false,
-    errorCode: 'METHOD_NOT_ALLOWED',
-    message: 'Method Not Allowed',
-    timestamp: new Date().toISOString(),
+    error: {
+      code: 'METHOD_NOT_ALLOWED',
+      message: 'Method Not Allowed',
+    },
+    meta: {
+      timestamp: new Date().toISOString(),
+    },
   });
 });
 

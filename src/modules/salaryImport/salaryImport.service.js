@@ -35,7 +35,7 @@ const salaryRepository = require('../salary/salary.repository');
 const {
   validateSalaryRecord,
   logImport,
-} = require('../salary/salary.service');
+} = require('../salary/salary.validation');
 const roleAliasRepository = require('../roleAliases/roleAlias.repository');
 const { logAdminAction } = require('../../utils/adminAuditLogger');
 const { supabase } = require('../../config/supabase');

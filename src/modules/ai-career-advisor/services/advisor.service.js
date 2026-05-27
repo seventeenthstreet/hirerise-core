@@ -18,7 +18,7 @@ const anthropic = require('../../../config/anthropic.client');
 const { supabase } = require('../../../config/supabase');
 
 const { COLLECTIONS } = require('../../education-intelligence/models/student.model');
-const marketTrendService = require('../../labor-market-intelligence/services/marketTrend.service');
+const marketTrendService = require('../../labor-market-intelligence/coordinators/marketIntelligence.coordinator');
 const {
   buildSystemPrompt,
   buildConversationMessages,

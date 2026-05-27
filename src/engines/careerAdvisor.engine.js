@@ -10,7 +10,7 @@ const cacheManager = require('../core/cache/cache.manager');
 const getCache = () => cacheManager?.getClient?.() || null;
 const supabase     = require('../config/supabase');
 const logger       = require('../utils/logger');
-const { getUserVector } = require('../services/userVector.service'); // ✅ NEW
+// userVector is resolved by the owning service and passed as argument
 
 const CACHE_TTL_SECONDS = 600;
 
@@ -112,7 +112,8 @@ async function generateCareerAdvice({
   profile,
   skillGap,
   marketDemand,
-  topJobMatches
+  topJobMatches,
+  userVector = null
 }) {
   if (!userId || !profile) {
     throw new Error('userId and profile required');
@@ -121,20 +122,11 @@ async function generateCareerAdvice({
   const hash     = profileHash(profile);
   const cacheKey = `career:advice:${userId}`;
 
-  // 🔥 NEW: get user vector (non-blocking safe usage)
-  let userVector = null;
-  try {
-    userVector = await getUserVector(userId, profile.skills || []);
-  } catch (err) {
-    logger.warn('[CareerAdvisor] user vector fetch failed', {
-      userId,
-      err: err.message
-    });
-  }
+  // userVector is passed in from the owning service
 
   // ───────────── Redis Cache ─────────────
 
-  if (cache) {
+  if (getCache()) {
     try {
       const cached = await getCache()?.get(cacheKey);
       if (cached) {
@@ -167,7 +159,7 @@ async function generateCareerAdvice({
       if (parsed) {
         parsed._profile_hash = hash;
 
-        if (cache) {
+        if (getCache()) {
           await getCache()?.set(cacheKey, JSON.stringify(parsed), 'EX', CACHE_TTL_SECONDS);
         }
 
@@ -226,7 +218,7 @@ async function generateCareerAdvice({
 
   // ───────────── Cache Write ─────────────
 
-  if (cache) {
+  if (getCache()) {
     try {
       await getCache()?.set(cacheKey, JSON.stringify(result), 'EX', CACHE_TTL_SECONDS);
     } catch (err) {

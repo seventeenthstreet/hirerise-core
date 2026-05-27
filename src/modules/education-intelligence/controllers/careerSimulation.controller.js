@@ -2,10 +2,7 @@
 
 const { supabase } = require('../../../config/supabase');
 const logger = require('../../../utils/logger');
-const repository = require('../repositories/student.repository');
-const CareerSuccessEngine = require('../engines/careerSuccess.engine');
-const EducationROIEngine = require('../engines/educationROI.engine');
-const CareerDigitalTwinEngine = require('../engines/careerDigitalTwin.engine');
+const educationIntelligenceService = require('../../../services/educationIntelligence.service');
 const { COLLECTIONS } = require('../models/student.model');
 
 function getAuthenticatedUserId(req) {
@@ -87,11 +84,8 @@ async function simulateCareers(req, res, next) {
       '[SimulationController] Simulation requested'
     );
 
-    const [student, cognitive, streamScores] = await Promise.all([
-      repository.getStudent(studentId),
-      repository.getCognitive(studentId),
-      repository.getStreamScores(studentId)
-    ]);
+    const { student, cognitive, streamScores } =
+      await educationIntelligenceService.getStudentContext(studentId);
 
     if (!student) {
       return res.status(404).json({
@@ -118,31 +112,9 @@ async function simulateCareers(req, res, next) {
       cognitive
     };
 
-    const careerResult = await CareerSuccessEngine.analyze(
+    const { twinResult } = await educationIntelligenceService.simulateCareers(
       context,
       recommendedStream
-    );
-
-    const roiResult = await EducationROIEngine.analyze(
-      careerResult,
-      recommendedStream
-    );
-
-    const cognitiveProxy = {
-      scores: {
-        analytical: cognitive.analytical_score,
-        logical: cognitive.logical_score,
-        memory: cognitive.memory_score,
-        communication: cognitive.communication_score,
-        creativity: cognitive.creativity_score
-      }
-    };
-
-    const twinResult = await CareerDigitalTwinEngine.simulate(
-      careerResult,
-      roiResult,
-      cognitiveProxy,
-      null
     );
 
     await replaceCareerSimulations(

@@ -12,16 +12,17 @@ const tokenCache = globalThis.__AUTH_TOKEN_CACHE__ ?? new Map();
 
 globalThis.__AUTH_TOKEN_CACHE__ = tokenCache;
 
-function getTimestamp() {
-  return new Date().toISOString();
-}
-
-function sendError(res, status, error, message, requestId) {
+function sendError(res, status, code, message, requestId) {
   return res.status(status).json({
-    error,
-    message,
-    requestId,
-    timestamp: getTimestamp(),
+    success: false,
+    error: {
+      code,
+      message,
+    },
+    meta: {
+      requestId: requestId ?? null,
+      timestamp: new Date().toISOString(),
+    },
   });
 }
 

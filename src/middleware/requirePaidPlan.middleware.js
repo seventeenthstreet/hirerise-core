@@ -45,8 +45,11 @@ async function requirePaidPlan(req, res, next) {
         code: 'UNAUTHORIZED',
         message: 'Authentication required.',
       },
-      requestId,
-      timestamp: new Date().toISOString(),
+      // Phase 2B.2 — moved requestId/timestamp into meta for V2 compliance.
+      meta: {
+        requestId,
+        timestamp: new Date().toISOString(),
+      },
     });
   }
 
@@ -67,13 +70,13 @@ async function requirePaidPlan(req, res, next) {
   try {
     const { data, error } = await supabase
       .from('users')
-      .select('tier, plan')
+      .select('tier')
       .eq('id', userId)
       .maybeSingle();
 
     if (error) throw error;
 
-    const dbTier = normalizeTier(data?.tier ?? data?.plan ?? null);
+    const dbTier = normalizeTier(data?.tier ?? null);
 
     if (PAID_TIERS.has(dbTier)) {
       logger.info('[requirePaidPlan] DB tier grants access', {
@@ -130,8 +133,11 @@ async function requirePaidPlan(req, res, next) {
       code: 'PLAN_UPGRADE_REQUIRED',
       message: 'This feature requires a paid plan. Please upgrade to continue.',
     },
-    requestId,
-    timestamp: new Date().toISOString(),
+    // Phase 2B.2 — moved requestId/timestamp into meta for V2 compliance.
+    meta: {
+      requestId,
+      timestamp: new Date().toISOString(),
+    },
   });
 }
 

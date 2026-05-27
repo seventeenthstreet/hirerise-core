@@ -1,5 +1,8 @@
 'use strict';
 
+// CONTRACT NOTE (Phase 2): All error responses use V2 canonical shape.
+
+
 /**
  * adminCmsCareerDomains.module.js (Supabase Optimized)
  *
@@ -56,8 +59,13 @@ const careerDomainsModule = {
       if (existing) {
         return res.status(409).json({
           success: false,
-          errorCode: 'DUPLICATE_DOMAIN',
-          message: 'Career domain already exists',
+          error: {
+            code: 'DUPLICATE_DOMAIN',
+            message: 'Career domain already exists',
+          },
+          meta: {
+            timestamp: new Date().toISOString(),
+          },
         });
       }
 

@@ -1,5 +1,8 @@
 'use strict';
 
+// CONTRACT NOTE (Phase 2): All error responses use V2 canonical shape.
+
+
 /**
  * adminCmsImport.routes.js (Supabase - Production Hardened)
  */
@@ -65,8 +68,13 @@ router.post(
     if (!adminId) {
       return res.status(401).json({
         success: false,
-        errorCode: 'UNAUTHORIZED',
-        message: 'Admin authentication required',
+        error: {
+          code: 'UNAUTHORIZED',
+          message: 'Admin authentication required',
+        },
+        meta: {
+          timestamp: new Date().toISOString(),
+        },
       });
     }
 

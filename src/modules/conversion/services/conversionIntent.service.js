@@ -13,9 +13,22 @@
  * - cache stampede prevention
  */
 
-const conversionAggregateService = require('./conversionAggregate.service');
 const cacheProvider = require('../utils/conversionCache.provider');
 const logger = require('../utils/conversion.logger');
+
+// ---------------------------------------------------------------------------
+// Raw score provider — injected by ConversionPipelineCoordinator at boot.
+// ConversionIntentService is a stage worker; it does not import sibling services.
+// ---------------------------------------------------------------------------
+let _rawScoreProvider = null;
+
+/**
+ * Called once at startup by conversionPipeline.coordinator.js.
+ * @param {function(userId: string): Promise<object>} fn
+ */
+function setRawScoreProvider(fn) {
+  _rawScoreProvider = fn;
+}
 
 const {
   DIMENSION_WEIGHTS,
@@ -95,7 +108,14 @@ class ConversionIntentService {
   // ---------------------------------------------------------------------------
 
   async _computeAndCache(userId) {
-    const raw = await conversionAggregateService.getRawScores(userId);
+    if (!_rawScoreProvider) {
+      throw new Error(
+        'conversionIntentService: rawScoreProvider not initialised. ' +
+        'Ensure conversionPipeline.coordinator is loaded at startup.'
+      );
+    }
+
+    const raw = await _rawScoreProvider(userId);
 
     const decayed = this._applyDecay(raw);
 
@@ -187,3 +207,4 @@ class ConversionIntentService {
 }
 
 module.exports = new ConversionIntentService();
+module.exports.setRawScoreProvider = setRawScoreProvider;

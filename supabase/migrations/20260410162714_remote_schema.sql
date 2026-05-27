@@ -136,21 +136,19 @@ drop index if exists "public"."idx_chi_scores_user_chi";
 
 drop index if exists "public"."idx_chi_scores_user_role";
 
+-- TEMP DISABLED: partitions created before parent table exists
+-- create table "public"."chi_scores_2026_04" partition of "public"."chi_scores"
+-- FOR VALUES FROM ('2026-04-01 00:00:00+00') TO ('2026-05-01 00:00:00+00');
 
-  create table "public"."chi_scores_2026_04" partition of "public"."chi_scores" FOR VALUES FROM ('2026-04-01 00:00:00+00') TO ('2026-05-01 00:00:00+00');
+-- create table "public"."chi_scores_2026_05" partition of "public"."chi_scores"
+-- FOR VALUES FROM ('2026-05-01 00:00:00+00') TO ('2026-06-01 00:00:00+00');
 
+-- create table "public"."chi_scores_2026_06" partition of "public"."chi_scores"
+-- FOR VALUES FROM ('2026-06-01 00:00:00+00') TO ('2026-07-01 00:00:00+00');
 
-
-  create table "public"."chi_scores_2026_05" partition of "public"."chi_scores" FOR VALUES FROM ('2026-05-01 00:00:00+00') TO ('2026-06-01 00:00:00+00');
-
-
-
-  create table "public"."chi_scores_2026_06" partition of "public"."chi_scores" FOR VALUES FROM ('2026-06-01 00:00:00+00') TO ('2026-07-01 00:00:00+00');
-
-
-
-  create table "public"."chi_scores_default" partition of "public"."chi_scores" DEFAULT;
-
+-- create table "public"."chi_scores_default" partition of "public"."chi_scores"
+-- DEFAULT;
+ 
 
 
   create table "public"."chi_scores_legacy" (
@@ -208,49 +206,49 @@ alter table "public"."chi_scores" alter column "skill_match" set data type numer
 
 alter table "public"."chi_scores" disable row level security;
 
-CREATE UNIQUE INDEX chi_scores_2026_04_pkey ON public.chi_scores_2026_04 USING btree (id, last_updated);
+-- CREATE UNIQUE INDEX chi_scores_2026_04_pkey ON public.chi_scores_2026_04 USING btree (id, last_updated);
 
-CREATE INDEX chi_scores_2026_04_role_idx ON public.chi_scores_2026_04 USING btree (role_id);
+-- CREATE INDEX chi_scores_2026_04_role_idx ON public.chi_scores_2026_04 USING btree (role_id);
 
-CREATE INDEX chi_scores_2026_04_user_id_chi_score_idx ON public.chi_scores_2026_04 USING btree (user_id, chi_score DESC);
+-- CREATE INDEX chi_scores_2026_04_user_id_chi_score_idx ON public.chi_scores_2026_04 USING btree (user_id, chi_score DESC);
 
-CREATE INDEX chi_scores_2026_04_user_id_last_updated_idx ON public.chi_scores_2026_04 USING btree (user_id, last_updated DESC);
+-- CREATE INDEX chi_scores_2026_04_user_id_last_updated_idx ON public.chi_scores_2026_04 USING btree (user_id, last_updated DESC);
 
-CREATE INDEX chi_scores_2026_04_user_id_role_id_idx ON public.chi_scores_2026_04 USING btree (user_id, role_id);
+-- CREATE INDEX chi_scores_2026_04_user_id_role_id_idx ON public.chi_scores_2026_04 USING btree (user_id, role_id);
 
-CREATE INDEX chi_scores_2026_04_user_last_updated_idx ON public.chi_scores_2026_04 USING btree (user_id, last_updated DESC);
+-- CREATE INDEX chi_scores_2026_04_user_last_updated_idx ON public.chi_scores_2026_04 USING btree (user_id, last_updated DESC);
 
-CREATE UNIQUE INDEX chi_scores_2026_05_pkey ON public.chi_scores_2026_05 USING btree (id, last_updated);
+--CREATE UNIQUE INDEX chi_scores_2026_05_pkey ON public.chi_scores_2026_05 USING btree (id, last_updated);
 
-CREATE INDEX chi_scores_2026_05_role_idx ON public.chi_scores_2026_05 USING btree (role_id);
+--CREATE INDEX chi_scores_2026_05_role_idx ON public.chi_scores_2026_05 USING btree (role_id);
 
-CREATE INDEX chi_scores_2026_05_user_id_chi_score_idx ON public.chi_scores_2026_05 USING btree (user_id, chi_score DESC);
+--CREATE INDEX chi_scores_2026_05_user_id_chi_score_idx ON public.chi_scores_2026_05 USING btree (user_id, chi_score DESC);
 
-CREATE INDEX chi_scores_2026_05_user_id_last_updated_idx ON public.chi_scores_2026_05 USING btree (user_id, last_updated DESC);
+--CREATE INDEX chi_scores_2026_05_user_id_last_updated_idx ON public.chi_scores_2026_05 USING btree (user_id, last_updated DESC);
 
-CREATE INDEX chi_scores_2026_05_user_id_role_id_idx ON public.chi_scores_2026_05 USING btree (user_id, role_id);
+--CREATE INDEX chi_scores_2026_05_user_id_role_id_idx ON public.chi_scores_2026_05 USING btree (user_id, role_id);
 
-CREATE INDEX chi_scores_2026_05_user_last_updated_idx ON public.chi_scores_2026_05 USING btree (user_id, last_updated DESC);
+--CREATE INDEX chi_scores_2026_05_user_last_updated_idx ON public.chi_scores_2026_05 USING btree (user_id, last_updated DESC);
 
-CREATE UNIQUE INDEX chi_scores_2026_06_pkey ON public.chi_scores_2026_06 USING btree (id, last_updated);
+--CREATE UNIQUE INDEX chi_scores_2026_06_pkey ON public.chi_scores_2026_06 USING btree (id, last_updated);
 
-CREATE INDEX chi_scores_2026_06_role_idx ON public.chi_scores_2026_06 USING btree (role_id);
+--CREATE INDEX chi_scores_2026_06_role_idx ON public.chi_scores_2026_06 USING btree (role_id);
 
-CREATE INDEX chi_scores_2026_06_user_id_chi_score_idx ON public.chi_scores_2026_06 USING btree (user_id, chi_score DESC);
+--CREATE INDEX chi_scores_2026_06_user_id_chi_score_idx ON public.chi_scores_2026_06 USING btree (user_id, chi_score DESC);
 
-CREATE INDEX chi_scores_2026_06_user_id_last_updated_idx ON public.chi_scores_2026_06 USING btree (user_id, last_updated DESC);
+--CREATE INDEX chi_scores_2026_06_user_id_last_updated_idx ON public.chi_scores_2026_06 USING btree (user_id, last_updated DESC);
 
-CREATE INDEX chi_scores_2026_06_user_id_role_id_idx ON public.chi_scores_2026_06 USING btree (user_id, role_id);
+--CREATE INDEX chi_scores_2026_06_user_id_role_id_idx ON public.chi_scores_2026_06 USING btree (user_id, role_id);
 
-CREATE INDEX chi_scores_2026_06_user_last_updated_idx ON public.chi_scores_2026_06 USING btree (user_id, last_updated DESC);
+--CREATE INDEX chi_scores_2026_06_user_last_updated_idx ON public.chi_scores_2026_06 USING btree (user_id, last_updated DESC);
 
-CREATE UNIQUE INDEX chi_scores_default_pkey ON public.chi_scores_default USING btree (id, last_updated);
+-- CREATE UNIQUE INDEX chi_scores_default_pkey ON public.chi_scores_default USING btree (id, last_updated)
 
-CREATE INDEX chi_scores_default_user_id_chi_score_idx ON public.chi_scores_default USING btree (user_id, chi_score DESC);
+-- CREATE INDEX chi_scores_default_user_id_chi_score_idx ON public.chi_scores_default USING btree (user_id, chi_score DESC);
 
-CREATE INDEX chi_scores_default_user_id_last_updated_idx ON public.chi_scores_default USING btree (user_id, last_updated DESC);
+-- CREATE INDEX chi_scores_default_user_id_last_updated_idx ON public.chi_scores_default USING btree (user_id, last_updated DESC);
 
-CREATE INDEX chi_scores_default_user_id_role_id_idx ON public.chi_scores_default USING btree (user_id, role_id);
+-- CREATE INDEX chi_scores_default_user_id_role_id_idx ON public.chi_scores_default USING btree (user_id, role_id);
 
 CREATE UNIQUE INDEX chi_scores_v2_pkey ON ONLY public.chi_scores USING btree (id, last_updated);
 
@@ -266,15 +264,15 @@ CREATE INDEX idx_chi_scores_user_chi ON public.chi_scores_legacy USING btree (us
 
 CREATE INDEX idx_chi_scores_user_role ON public.chi_scores_legacy USING btree (user_id, role_id);
 
-alter table "public"."chi_scores" add constraint "chi_scores_v2_pkey" PRIMARY KEY using index "chi_scores_v2_pkey";
+-- alter table "public"."chi_scores" add constraint "chi_scores_v2_pkey" PRIMARY KEY using index "chi_scores_v2_pkey";
 
-alter table "public"."chi_scores_2026_04" add constraint "chi_scores_2026_04_pkey" PRIMARY KEY using index "chi_scores_2026_04_pkey";
+-- alter table "public"."chi_scores_2026_04" add constraint "chi_scores_2026_04_pkey" PRIMARY KEY using index "chi_scores_2026_04_pkey";
 
-alter table "public"."chi_scores_2026_05" add constraint "chi_scores_2026_05_pkey" PRIMARY KEY using index "chi_scores_2026_05_pkey";
+--alter table "public"."chi_scores_2026_05" add constraint "chi_scores_2026_05_pkey" PRIMARY KEY using index "chi_scores_2026_05_pkey";
 
-alter table "public"."chi_scores_2026_06" add constraint "chi_scores_2026_06_pkey" PRIMARY KEY using index "chi_scores_2026_06_pkey";
+--alter table "public"."chi_scores_2026_06" add constraint "chi_scores_2026_06_pkey" PRIMARY KEY using index "chi_scores_2026_06_pkey";
 
-alter table "public"."chi_scores_default" add constraint "chi_scores_default_pkey" PRIMARY KEY using index "chi_scores_default_pkey";
+--alter table "public"."chi_scores_default" add constraint "chi_scores_default_pkey" PRIMARY KEY using index "chi_scores_default_pkey";
 
 alter table "public"."chi_scores_legacy" add constraint "chi_scores_pkey" PRIMARY KEY using index "chi_scores_pkey";
 
@@ -793,173 +791,173 @@ CREATE UNIQUE INDEX idx_chi_weekly_rollups_unique ON public.chi_weekly_rollups_m
 
 CREATE INDEX idx_chi_weekly_rollups_user_week ON public.chi_weekly_rollups_mv USING btree (user_id, week_bucket DESC);
 
-grant delete on table "public"."chi_scores_2026_04" to "anon";
+--grant delete on table "public"."chi_scores_2026_04" to "anon";
 
-grant insert on table "public"."chi_scores_2026_04" to "anon";
+--grant insert on table "public"."chi_scores_2026_04" to "anon";
 
-grant references on table "public"."chi_scores_2026_04" to "anon";
+--grant references on table "public"."chi_scores_2026_04" to "anon";
 
-grant select on table "public"."chi_scores_2026_04" to "anon";
+--grant select on table "public"."chi_scores_2026_04" to "anon";
 
-grant trigger on table "public"."chi_scores_2026_04" to "anon";
+--grant trigger on table "public"."chi_scores_2026_04" to "anon";
 
-grant truncate on table "public"."chi_scores_2026_04" to "anon";
+--grant truncate on table "public"."chi_scores_2026_04" to "anon";
 
-grant update on table "public"."chi_scores_2026_04" to "anon";
+--grant update on table "public"."chi_scores_2026_04" to "anon";
 
-grant delete on table "public"."chi_scores_2026_04" to "authenticated";
+--grant delete on table "public"."chi_scores_2026_04" to "authenticated";
 
-grant insert on table "public"."chi_scores_2026_04" to "authenticated";
+--grant insert on table "public"."chi_scores_2026_04" to "authenticated";
 
-grant references on table "public"."chi_scores_2026_04" to "authenticated";
+--grant references on table "public"."chi_scores_2026_04" to "authenticated";
 
-grant select on table "public"."chi_scores_2026_04" to "authenticated";
+-- grant select on table "public"."chi_scores_2026_04" to "authenticated";
 
-grant trigger on table "public"."chi_scores_2026_04" to "authenticated";
+--grant trigger on table "public"."chi_scores_2026_04" to "authenticated";
 
-grant truncate on table "public"."chi_scores_2026_04" to "authenticated";
+--grant truncate on table "public"."chi_scores_2026_04" to "authenticated";
 
-grant update on table "public"."chi_scores_2026_04" to "authenticated";
+--grant update on table "public"."chi_scores_2026_04" to "authenticated";
 
-grant delete on table "public"."chi_scores_2026_04" to "service_role";
+--grant delete on table "public"."chi_scores_2026_04" to "service_role";
 
-grant insert on table "public"."chi_scores_2026_04" to "service_role";
+--grant insert on table "public"."chi_scores_2026_04" to "service_role";
 
-grant references on table "public"."chi_scores_2026_04" to "service_role";
+--grant references on table "public"."chi_scores_2026_04" to "service_role";
 
-grant select on table "public"."chi_scores_2026_04" to "service_role";
+--grant select on table "public"."chi_scores_2026_04" to "service_role";
 
-grant trigger on table "public"."chi_scores_2026_04" to "service_role";
+--grant trigger on table "public"."chi_scores_2026_04" to "service_role";
 
-grant truncate on table "public"."chi_scores_2026_04" to "service_role";
+--grant truncate on table "public"."chi_scores_2026_04" to "service_role";
 
-grant update on table "public"."chi_scores_2026_04" to "service_role";
+--grant update on table "public"."chi_scores_2026_04" to "service_role";
 
-grant delete on table "public"."chi_scores_2026_05" to "anon";
+--grant delete on table "public"."chi_scores_2026_05" to "anon";
 
-grant insert on table "public"."chi_scores_2026_05" to "anon";
+--grant insert on table "public"."chi_scores_2026_05" to "anon";
 
-grant references on table "public"."chi_scores_2026_05" to "anon";
+--grant references on table "public"."chi_scores_2026_05" to "anon";
 
-grant select on table "public"."chi_scores_2026_05" to "anon";
+--grant select on table "public"."chi_scores_2026_05" to "anon";
 
-grant trigger on table "public"."chi_scores_2026_05" to "anon";
+--grant trigger on table "public"."chi_scores_2026_05" to "anon";
 
-grant truncate on table "public"."chi_scores_2026_05" to "anon";
+--grant truncate on table "public"."chi_scores_2026_05" to "anon";
 
-grant update on table "public"."chi_scores_2026_05" to "anon";
+--grant update on table "public"."chi_scores_2026_05" to "anon";
 
-grant delete on table "public"."chi_scores_2026_05" to "authenticated";
+--grant delete on table "public"."chi_scores_2026_05" to "authenticated";
 
-grant insert on table "public"."chi_scores_2026_05" to "authenticated";
+--grant insert on table "public"."chi_scores_2026_05" to "authenticated";
 
-grant references on table "public"."chi_scores_2026_05" to "authenticated";
+--grant references on table "public"."chi_scores_2026_05" to "authenticated";
 
-grant select on table "public"."chi_scores_2026_05" to "authenticated";
+--grant select on table "public"."chi_scores_2026_05" to "authenticated";
 
-grant trigger on table "public"."chi_scores_2026_05" to "authenticated";
+--grant trigger on table "public"."chi_scores_2026_05" to "authenticated";
 
-grant truncate on table "public"."chi_scores_2026_05" to "authenticated";
+--grant truncate on table "public"."chi_scores_2026_05" to "authenticated";
 
-grant update on table "public"."chi_scores_2026_05" to "authenticated";
+--grant update on table "public"."chi_scores_2026_05" to "authenticated";
 
-grant delete on table "public"."chi_scores_2026_05" to "service_role";
+--grant delete on table "public"."chi_scores_2026_05" to "service_role";
 
-grant insert on table "public"."chi_scores_2026_05" to "service_role";
+--grant insert on table "public"."chi_scores_2026_05" to "service_role";
 
-grant references on table "public"."chi_scores_2026_05" to "service_role";
+--grant references on table "public"."chi_scores_2026_05" to "service_role";
 
-grant select on table "public"."chi_scores_2026_05" to "service_role";
+--grant select on table "public"."chi_scores_2026_05" to "service_role";
 
-grant trigger on table "public"."chi_scores_2026_05" to "service_role";
+--grant trigger on table "public"."chi_scores_2026_05" to "service_role";
 
-grant truncate on table "public"."chi_scores_2026_05" to "service_role";
+--grant truncate on table "public"."chi_scores_2026_05" to "service_role";
 
-grant update on table "public"."chi_scores_2026_05" to "service_role";
+--grant update on table "public"."chi_scores_2026_05" to "service_role";
 
-grant delete on table "public"."chi_scores_2026_06" to "anon";
+--grant delete on table "public"."chi_scores_2026_06" to "anon";
 
-grant insert on table "public"."chi_scores_2026_06" to "anon";
+--grant insert on table "public"."chi_scores_2026_06" to "anon";
 
-grant references on table "public"."chi_scores_2026_06" to "anon";
+--grant references on table "public"."chi_scores_2026_06" to "anon";
 
-grant select on table "public"."chi_scores_2026_06" to "anon";
+--grant select on table "public"."chi_scores_2026_06" to "anon";
 
-grant trigger on table "public"."chi_scores_2026_06" to "anon";
+--grant trigger on table "public"."chi_scores_2026_06" to "anon";
 
-grant truncate on table "public"."chi_scores_2026_06" to "anon";
+--grant truncate on table "public"."chi_scores_2026_06" to "anon";
 
-grant update on table "public"."chi_scores_2026_06" to "anon";
+--grant update on table "public"."chi_scores_2026_06" to "anon";
 
-grant delete on table "public"."chi_scores_2026_06" to "authenticated";
+--grant delete on table "public"."chi_scores_2026_06" to "authenticated";
 
-grant insert on table "public"."chi_scores_2026_06" to "authenticated";
+--grant insert on table "public"."chi_scores_2026_06" to "authenticated";
 
-grant references on table "public"."chi_scores_2026_06" to "authenticated";
+--grant references on table "public"."chi_scores_2026_06" to "authenticated";
 
-grant select on table "public"."chi_scores_2026_06" to "authenticated";
+--grant select on table "public"."chi_scores_2026_06" to "authenticated";
 
-grant trigger on table "public"."chi_scores_2026_06" to "authenticated";
+--grant trigger on table "public"."chi_scores_2026_06" to "authenticated";
 
-grant truncate on table "public"."chi_scores_2026_06" to "authenticated";
+--grant truncate on table "public"."chi_scores_2026_06" to "authenticated";
 
-grant update on table "public"."chi_scores_2026_06" to "authenticated";
+--grant update on table "public"."chi_scores_2026_06" to "authenticated";
 
-grant delete on table "public"."chi_scores_2026_06" to "service_role";
+--grant delete on table "public"."chi_scores_2026_06" to "service_role";
 
-grant insert on table "public"."chi_scores_2026_06" to "service_role";
+--grant insert on table "public"."chi_scores_2026_06" to "service_role";
 
-grant references on table "public"."chi_scores_2026_06" to "service_role";
+--grant references on table "public"."chi_scores_2026_06" to "service_role";
 
-grant select on table "public"."chi_scores_2026_06" to "service_role";
+--grant select on table "public"."chi_scores_2026_06" to "service_role";
 
-grant trigger on table "public"."chi_scores_2026_06" to "service_role";
+--grant trigger on table "public"."chi_scores_2026_06" to "service_role";
 
-grant truncate on table "public"."chi_scores_2026_06" to "service_role";
+--grant truncate on table "public"."chi_scores_2026_06" to "service_role";
 
-grant update on table "public"."chi_scores_2026_06" to "service_role";
+--grant update on table "public"."chi_scores_2026_06" to "service_role";
 
-grant delete on table "public"."chi_scores_default" to "anon";
+-- grant delete on table "public"."chi_scores_default" to "anon";
 
-grant insert on table "public"."chi_scores_default" to "anon";
+-- grant insert on table "public"."chi_scores_default" to "anon";
 
-grant references on table "public"."chi_scores_default" to "anon";
+-- grant references on table "public"."chi_scores_default" to "anon";
 
-grant select on table "public"."chi_scores_default" to "anon";
+-- grant select on table "public"."chi_scores_default" to "anon";
 
-grant trigger on table "public"."chi_scores_default" to "anon";
+-- grant trigger on table "public"."chi_scores_default" to "anon";
 
-grant truncate on table "public"."chi_scores_default" to "anon";
+-- grant truncate on table "public"."chi_scores_default" to "anon";
 
-grant update on table "public"."chi_scores_default" to "anon";
+-- grant update on table "public"."chi_scores_default" to "anon";
 
-grant delete on table "public"."chi_scores_default" to "authenticated";
+-- grant delete on table "public"."chi_scores_default" to "authenticated";
 
-grant insert on table "public"."chi_scores_default" to "authenticated";
+-- grant insert on table "public"."chi_scores_default" to "authenticated";
 
-grant references on table "public"."chi_scores_default" to "authenticated";
+-- grant references on table "public"."chi_scores_default" to "authenticated";
 
-grant select on table "public"."chi_scores_default" to "authenticated";
+-- grant select on table "public"."chi_scores_default" to "authenticated";
 
-grant trigger on table "public"."chi_scores_default" to "authenticated";
+-- grant trigger on table "public"."chi_scores_default" to "authenticated";
 
-grant truncate on table "public"."chi_scores_default" to "authenticated";
+-- grant truncate on table "public"."chi_scores_default" to "authenticated";
 
-grant update on table "public"."chi_scores_default" to "authenticated";
+-- grant update on table "public"."chi_scores_default" to "authenticated";
 
-grant delete on table "public"."chi_scores_default" to "service_role";
+-- grant delete on table "public"."chi_scores_default" to "service_role";
 
-grant insert on table "public"."chi_scores_default" to "service_role";
+-- grant insert on table "public"."chi_scores_default" to "service_role";
 
-grant references on table "public"."chi_scores_default" to "service_role";
+-- grant references on table "public"."chi_scores_default" to "service_role";
 
-grant select on table "public"."chi_scores_default" to "service_role";
+-- grant select on table "public"."chi_scores_default" to "service_role";
 
-grant trigger on table "public"."chi_scores_default" to "service_role";
+-- grant trigger on table "public"."chi_scores_default" to "service_role";
 
-grant truncate on table "public"."chi_scores_default" to "service_role";
+-- grant truncate on table "public"."chi_scores_default" to "service_role";
 
-grant update on table "public"."chi_scores_default" to "service_role";
+-- grant update on table "public"."chi_scores_default" to "service_role";
 
 grant delete on table "public"."chi_scores_legacy" to "anon";
 
@@ -1041,5 +1039,3 @@ with check ((auth.uid() = user_id));
 
 
 CREATE TRIGGER on_auth_user_created AFTER INSERT ON auth.users FOR EACH ROW EXECUTE FUNCTION public.handle_new_user();
-
-

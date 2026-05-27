@@ -1,7 +1,7 @@
 'use strict';
 
 const logger = require('../../utils/logger');
-const migration = require('./crossRegionMigration.service');
+const migration = require('./crossRegionMigration.utils');
 
 const DEFAULT_INTERVAL_MS = Number(
   process.env.REGION_MIGRATION_INTERVAL_MS || 30000

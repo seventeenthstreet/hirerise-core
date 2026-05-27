@@ -43,7 +43,6 @@
  *  - All engine calls wrapped in try/catch with structured logging.
  *  - saveAnalysisResult logs the full payload (sanitised) before insert.
  */
-console.log("🚀 ANALYSIS SERVICE HIT");
 const crypto = require('crypto');
 
 const { supabase }             = require('../../config/supabase');
@@ -53,8 +52,8 @@ const logger                   = require('../../utils/logger');
 const { runFreeEngine }                  = require('./engines/freeEngine');
 const { runFullAnalysis, runGenerateCV } = require('./engines/premiumEngine');
 
-const creditConfigService        = require('../../services/billing/creditConfig.service');
-const { getWeightedRoleContext } = require('../../services/career/careerWeight.service');
+const creditConfigService        = require('../../config/credits.config');
+const { getWeightedRoleContext } = require('../../services/career/careerWeight.util');
 
 const DEFAULT_CHI_LOOKBACK_DAYS   = 45;
 const DEFAULT_WEEKLY_ROLLUP_WEEKS = 12;

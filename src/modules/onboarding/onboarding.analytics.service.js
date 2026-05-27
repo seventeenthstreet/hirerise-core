@@ -353,13 +353,15 @@ async function getProgress(userId) {
     const [progressRes, usersRes] = await Promise.all([
       supabase
         .from(TABLE_ONBOARDING_PROGRESS)
-        .select('step, step_history, completed_at, updated_at')
+        // completed_at does not exist — use onboarding_completed_at
+        .select('step, step_history, onboarding_completed_at, updated_at')
         .eq('id', userId)
         .maybeSingle(),
 
       supabase
         .from('users')
-        .select('onboarding_completed, onboarding_completed_at')
+        // onboarding_completed_at does not exist on users table
+        .select('onboarding_completed')
         .eq('id', userId)
         .maybeSingle(),
     ]);
@@ -389,7 +391,7 @@ async function getProgress(userId) {
       step:               progress.step ?? null,
       completedSteps:     stepHistory,
       onboardingCompleted: user?.onboarding_completed ?? (progress.step === 'completed'),
-      completedAt:        progress.completed_at ?? null,
+      completedAt:        progress.onboarding_completed_at ?? null,
       updatedAt:          progress.updated_at ?? null,
     };
   } catch (err) {

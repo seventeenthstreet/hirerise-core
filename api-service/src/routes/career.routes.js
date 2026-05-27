@@ -13,6 +13,10 @@ import {
   getCareerResult,
 } from '../controllers/career.controller.js';
 
+// ── Validation ────────────────────────────────────────────────────────────────
+import { careerPathSchema } from '../validations/schemas/career.schema.js';
+import { validate } from '../validations/middleware/validate.js';
+
 export const careerRouter = Router();
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -39,6 +43,8 @@ careerRouter.post(
   '/path',
   careerRequestRateLimit,
   pendingJobLimitMiddleware,
+  careerPathSchema,   // ← express-validator chain
+  validate,           // ← reject early if invalid
   requestCareerPath,
 );
 

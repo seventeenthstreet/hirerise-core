@@ -9,7 +9,7 @@ const cacheManager = require('../core/cache/cache.manager');
 // Phase 2: lazy getter — resolves Redis post-bootstrap on each call
 const getCache = () => cacheManager?.getClient?.() || null;
 const logger = require('../utils/logger');
-const { getUserVector } = require('../services/userVector.service'); // ✅ NEW
+const { getUserVector } = require('../services/userVector.utils'); // ✅ NEW
 
 const CACHE_TTL = 600;
 

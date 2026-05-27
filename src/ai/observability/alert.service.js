@@ -1,7 +1,7 @@
 'use strict';
 
 /**
- * src/ai/observability/alert.service.js  — Phase 2 Refactor
+ * src/ai/observability/alert.service.js  — Phase 2 Refactor / Phase 3 Fix
  *
  * CHANGES (Phase 2):
  *  - Accepts an optional ioredis client via constructor (DI)
@@ -10,8 +10,20 @@
  *  - close() is now a no-op — lifecycle is the singleton's responsibility
  *  - Business logic (fire, checkLatency, checkTokenSpike, dedup) UNCHANGED
  *
- * EXPORTS: singleton instance wired lazily from redis.singleton.
- * Callers continue to require() and call methods directly — no changes needed.
+ * PHASE 3 FIX — bootstrap ordering:
+ *  Root cause: ai-observability.routes.js is require()'d at module parse time
+ *  (server.js line ~4933, before bootstrap() runs). This caused buildSingleton()
+ *  to execute before await connectRedis(), capturing a null Redis client that
+ *  was then frozen in Node's module cache permanently.
+ *
+ *  Fix: _redisClient is now a lazy getter that reads from redis.singleton on
+ *  every access. The singleton is always ready by the time any real operation
+ *  runs (post-bootstrap), so the getter finds it connected. No call-site changes.
+ *  The constructor no longer accepts or stores an injected client — the DI
+ *  indirection is replaced by direct singleton resolution, which is simpler and
+ *  immune to require-order races.
+ *
+ * EXPORTS: singleton instance. Callers unchanged.
  */
 
 const observabilityRepo = require('../../repositories/ai-observability.repository');
@@ -21,22 +33,10 @@ const COOLDOWN_SECONDS = 3600; // 1 hour
 const ALERT_KEY_PREFIX = 'hirerise:alert_cooldown:';
 
 class AlertService {
-  /**
-   * @param {import('ioredis').Redis | null} redisClient
-   *   Injected, already-connected ioredis client from the singleton.
-   *   Pass null (or omit) to disable Redis-backed deduplication.
-   *   When null, the first call to _useRedis will attempt a lazy
-   *   resolution from redis.singleton (post-bootstrap safe).
-   */
-  constructor(redisClient = null) {
-    this._localCache  = new Map();
-    this._redisClient = redisClient || null;
-
-    if (this._redisClient) {
-      logger.info('[AlertService] Redis deduplication active (injected client)');
-    } else {
-      logger.info('[AlertService] Using local (in-process) deduplication — will upgrade lazily once Redis is ready');
-    }
+  constructor() {
+    this._localCache = new Map();
+    // _redisClient is resolved lazily via getter — see below.
+    // Logging deferred to first _useRedis check so it reflects actual readiness.
   }
 
   // ─────────────────────────────────────────────
@@ -44,32 +44,33 @@ class AlertService {
   // ─────────────────────────────────────────────
 
   /**
-   * True only when an ioredis client is present and status === 'ready'.
+   * Lazily resolves the connected Redis client from the canonical module.
    *
-   * Lazy upgrade path: if this instance was constructed before Redis
-   * connected (e.g. required at module-parse time), this getter attempts
-   * to resolve the client from redis.singleton on every call until it
-   * succeeds.  Once resolved the reference is stored permanently on
-   * this._redisClient so subsequent calls are a single property read.
+   * WHY LAZY: This module may be require()'d before bootstrap() calls
+   * await connectRedis() (e.g. via route files loaded at parse time).
+   * Capturing the client at construction time would freeze a null reference.
+   * Reading from redisClient on each access means we always get the live
+   * client once Redis is ready, with no module-cache races.
+   *
+   * Cost: one require() call (returns cached module object) + one property
+   * read per _redisClient access. Both are O(1) and negligible.
+   *
+   * @returns {import('ioredis').Redis | null}
+   */
+  get _redisClient() {
+    try {
+      const redisClient = require('../../config/redisClient');
+      return redisClient.getRedisClient?.() ?? null;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * True only when the singleton client is present and connected.
+   * ioredis exposes readiness via client.status.
    */
   get _useRedis() {
-    // Fast path — already wired.
-    if (this._redisClient && this._redisClient.status === 'ready') return true;
-
-    // Lazy upgrade — attempt to resolve from singleton now that Redis
-    // may have connected during bootstrap.
-    if (!this._redisClient) {
-      try {
-        const redisSingleton = require('../../infrastructure/radis/redis.singleton');
-        if (redisSingleton && redisSingleton.isReady()) {
-          this._redisClient = redisSingleton.getClient();
-          logger.info('[AlertService] Lazily upgraded to Redis client (post-bootstrap)');
-        }
-      } catch (_) {
-        // singleton not available (test env) — remain in local-cache mode
-      }
-    }
-
     return !!(this._redisClient && this._redisClient.status === 'ready');
   }
 
@@ -255,19 +256,9 @@ class AlertService {
 }
 
 /**
- * Lazy singleton — resolves Redis client from the singleton on first require()
- * after bootstrap. Preserves the existing call pattern:
- *   const alertService = require('...alert.service');
- *   alertService.fire({ ... });
+ * Singleton export — no Redis client injection needed.
+ * The instance resolves Redis lazily via the _redisClient getter on every
+ * operation, so it is always correct regardless of when this module is first
+ * require()'d relative to bootstrap().
  */
-function buildSingleton() {
-  try {
-    const redisSingleton = require('../../infrastructure/radis/redis.singleton');
-    const client = redisSingleton.isReady() ? redisSingleton.getClient() : null;
-    return new AlertService(client);
-  } catch (_) {
-    return new AlertService(null);
-  }
-}
-
-module.exports = buildSingleton();
+module.exports = new AlertService();

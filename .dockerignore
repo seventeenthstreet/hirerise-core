@@ -1,90 +1,78 @@
-# ============================================================================
-# .dockerignore — PRODUCTION SAFE (Supabase + monorepo optimized)
-# Prevent large build context, secrets leakage, test payloads, and legacy files
-# ============================================================================
+# =============================================================================
+# HireRise .dockerignore — applies to both frontend and backend builds
+# =============================================================================
 
-# ============================================================================
-# Node dependencies / package managers
-# ============================================================================
-node_modules
-.pnpm-store
-.npm
-.yarn
-.yarn-cache
-.yarn/*
-!.yarn/releases
-!.yarn/plugins
-
-# ============================================================================
-# Environment / secrets
-# ============================================================================
+# --- Secrets & local config (NEVER ship these) ---
 .env
 .env.*
-.env.keys
-.env.local
-.env.*.local
-secrets/
-.supabase/
-.branches
-.temp
+!.env.example
+!.env.production.example
+*.key
+*.pem
+*.p12
+*.pfx
+claudeapi\ key.txt
+"googlesheets api.txt"
+"supa api.txt"
+"supa data password.txt"
 
-# ============================================================================
-# Test fixtures / payloads / debug scripts
-# ============================================================================
-personal.json
-chi.json
-career.json
-body.json
-gencv.json
-growth.json
-score.json
-test.json
+# --- Development artifacts ---
+node_modules
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.npm
+.yarn
 
-get-token.js
-get-firebase-token.mjs
-test-tier-integration.js
+# --- Next.js build cache (rebuilt in Docker) ---
+.next
+out
 
-# ============================================================================
-# Logs / debug output
-# ============================================================================
-*.log
-firestore-debug.log
-supabase-debug.log
-coverage/
-__tests__/
+# --- Test files ---
+**/__tests__
+**/tests
+**/*.test.js
+**/*.test.ts
+**/*.spec.js
+**/*.spec.ts
+jest.config.*
+coverage
+.nyc_output
 
-# ============================================================================
-# Git / repo metadata
-# ============================================================================
+# --- Docs & data ---
+docs
+Career\ data
+*.docx
+*.xlsx
+*.pdf
+*.csv
+*.json5
+README.md
+FOLDER_STRUCTURE.md
+structure.txt
+
+# --- Dev tooling ---
+nodemon.json
+.eslint*
+.dependency-cruiser.cjs
+dependency-cruiser*.cjs
+.gitleaks.toml
+*.sh
+!scripts/docker-entrypoint.sh
+
+# --- Git ---
 .git
 .gitignore
-.gitattributes
-.github/
+.githooks
+.github
 
-# ============================================================================
-# Dev tooling / local configs
-# ============================================================================
-.eslintrc*
-.prettierrc*
-.editorconfig
-nodemon.json
-.vscode/
-.idea/
+# --- Quarantine (never deploy) ---
+**/quarantine
+**/src/quarantine
 
-# ============================================================================
-# Docs / local notes
-# ============================================================================
-docs/
-README.md
-structure.txt
-*.md
-
-# ============================================================================
-# Build outputs
-# ============================================================================
-dist/
-build/
-.next/
-.nuxt/
-.cache/
-tmp/
+# --- Misc ---
+*.log
+.DS_Store
+Thumbs.db
+*.zip
+*.z0*

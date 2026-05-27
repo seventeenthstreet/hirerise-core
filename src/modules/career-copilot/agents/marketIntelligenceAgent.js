@@ -14,7 +14,7 @@ const BaseAgent = require('./baseAgent');
 const logger = require('../../../utils/logger');
 
 const marketTrendService = safeRequire(
-  '../../../modules/labor-market-intelligence/services/marketTrend.service',
+  '../../../modules/labor-market-intelligence/coordinators/marketIntelligence.coordinator',
   'MarketTrendService'
 );
 

@@ -14,8 +14,8 @@
  * - modular override resolution
  */
 
-const resumeScoreService = require('./resumeScore.service');
-const salaryService = require('./salary.service');
+const resumeScoreService = require('./resumeScore.utils');
+const salaryService = require('./salary.utils');
 const careerGraphRepository = require('../repositories/career.repository');
 const llmClient = require('../utils/llmClient');
 const validator = require('../utils/careerOutput.validator');

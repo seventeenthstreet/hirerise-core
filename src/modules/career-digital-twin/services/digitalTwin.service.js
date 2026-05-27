@@ -11,6 +11,9 @@ const anthropic = require('../../../config/anthropic.client');
 const { supabase } = require('../../../config/supabase');
 const cacheManager = require('../../../core/cache/cache.manager');
 const engine = require('../../../engines/career-digital-twin.engine');
+const careerPathEngine = require('../../../engines/career-path.engine');
+const opportunityEngine = require('../../../engines/career-opportunity.engine');
+const { getUserVector } = require('../../../services/userVector.utils');
 
 const {
   TABLE,
@@ -225,8 +228,47 @@ async function runSimulation({
     role: userProfile?.role,
   });
 
+  const { role, skills = [], experience_years = 0, industry } = userProfile || {};
+
+  // Resolve userVector and sibling engine data here — service owns orchestration
+  let userVector = null;
+  try {
+    if (userId && Array.isArray(skills) && skills.length > 0) {
+      userVector = await getUserVector(userId, skills);
+    }
+  } catch (err) {
+    logger.warn('[DigitalTwinService] vector:fetch:failed', { userId, error: err.message });
+  }
+
+  let careerChain = [];
+  let opportunityRoles = [];
+  try {
+    const [chain, opp] = await Promise.all([
+      careerPathEngine.getProgressionChain(role, industry).catch(() => []),
+      opportunityEngine.analyzeCareerOpportunities({
+        role,
+        skills,
+        experience_years,
+        industry,
+        userId,
+        userVector,
+      }).catch(() => ({ opportunities: [] })),
+    ]);
+    careerChain = chain || [];
+    opportunityRoles = (opp.opportunities || []).slice(0, 10).map(o => ({
+      role: o.next_role || o.role,
+      years_to_next: o.estimated_years || 2,
+    }));
+  } catch (err) {
+    logger.warn('[DigitalTwinService] engine:inputs:failed', { error: err.message });
+  }
+
   const simulationResult =
-    await engine.simulateCareerPaths(userProfile, marketData);
+    await engine.simulateCareerPaths(
+      { ...userProfile, userVector },
+      marketData,
+      { careerChain, opportunityRoles }
+    );
 
   if (includeNarrative) {
     simulationResult.career_paths = await enrichWithNarratives(

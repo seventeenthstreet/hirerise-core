@@ -1,5 +1,5 @@
 const logger = require("../../utils/logger");
-const predictiveHeat = require("./predictiveHeat.service");
+const predictiveHeat = require("./predictiveHeat.utils");
 
 const localityHistory = new Map();
 

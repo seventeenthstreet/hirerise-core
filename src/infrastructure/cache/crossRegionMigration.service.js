@@ -1,10 +1,10 @@
 'use strict';
 
 const logger = require('../../utils/logger');
-const cache = require('./analyticsCache.service');
-const locality = require('./regionLocalityForecast.service');
-const lineageReplication = require('./lineageRegionReplication.service');
-const warmPrefetch = require('./warmStatePrefetch.service');
+const cache = require('./analyticsCache.utils');
+const locality = require('./regionLocalityForecast.utils');
+const lineageReplication = require('./lineageRegionReplication.utils');
+const warmPrefetch = require('./warmStatePrefetch.utils');
 
 const DEFAULT_TOP_N = Number(process.env.CROSS_REGION_TOP_N || 10);
 const CURRENT_REGION = process.env.CLOUD_RUN_REGION || 'primary';

@@ -68,7 +68,8 @@ function createLimiter(max, message) {
     keyGenerator: getAuthKey,
     message: {
       success: false,
-      error: message,
+      error: { code: 'RATE_LIMIT_EXCEEDED', message },
+      meta: { timestamp: new Date().toISOString() },
     },
   });
 }

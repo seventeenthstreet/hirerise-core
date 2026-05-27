@@ -1,97 +1,62 @@
 'use strict';
 
 /**
- * route-registration.snippet.js
- * =============================
+ * core/src/route-registration.snippet.js (PHASE 3C ADDITION)
+ * ════════════════════════════════════════════════════════════
+ * Add the following block to server.js alongside the existing Phase 3B
+ * activities route registration.
  *
- * PURPOSE
- * -------
- * Central route registration snippet for the dual onboarding system.
+ * LOCATION: In server.js, find the activities mount added by Phase 3B:
  *
- * This Supabase-first version removes all Firebase / Firestore legacy
- * references and standardizes route protection using the project's
- * JWT middleware.
+ *   app.use(
+ *     '/api/v1/student-onboarding/v2/step/activities',
+ *     requireAuth,
+ *     requireSession,
+ *     activitiesRouter,
+ *   );
  *
- * ------------------------------------------------------------------
- * USAGE: Add inside app.js / server.js route registration block
- * ------------------------------------------------------------------
+ * Add the cognitive block directly after it.
  *
- * Replace old users route:
+ * PREREQUISITES (already present from Phase 3B):
+ *   • requireAuth middleware      — validates Bearer token, attaches req.user
+ *   • requireSession middleware   — attaches req.onboardingSession + req.sessionService
+ *   • req.supabase                — service-role Supabase client
  *
- *   app.use('/api/v1/users', verifySupabaseToken, require('./routes/users.routes'));
- *
- * Add new onboarding routes:
- *
- *   app.use('/api/v1/student-onboarding', verifySupabaseToken, require('./routes/student-onboarding.routes'));
- *   app.use('/api/v1/career-onboarding', verifySupabaseToken, require('./routes/career-onboarding.routes'));
- *
- * ------------------------------------------------------------------
- * COMPLETE MOUNT BLOCK (DROP-IN READY)
- * ------------------------------------------------------------------
+ * BASE PATH: /api/v1/student-onboarding/v2/step/cognitive
  */
 
-// Existing protected routes
-// app.use('/api/v1/onboarding', verifySupabaseToken, onboardingRoutes);
-// ... other existing routes ...
+const cognitiveRouter = require('./modules/student-onboarding/routes/cognitive.routes');
 
-// Updated users route
-app.use(
-  '/api/v1/users',
-  verifySupabaseToken,
-  require('./routes/users.routes')
-);
+// In your Express app setup (server.js), add directly after the activities mount:
+//
+//   app.use(
+//     '/api/v1/student-onboarding/v2/step/cognitive',
+//     requireAuth,
+//     requireSession,
+//     cognitiveRouter,
+//   );
+//
+// This registers the following endpoints:
+//
+//   GET    /api/v1/student-onboarding/v2/step/cognitive
+//          Returns: { ok, taxonomy, responses, signals, signal_quality }
+//          Use:     Initial load + refresh recovery
+//
+//   POST   /api/v1/student-onboarding/v2/step/cognitive/response
+//          Body:    { question_id: uuid, selected_option_keys: string[], is_partial?: boolean }
+//          Returns: { ok, response, signal_quality }
+//          Use:     Progressive save — fires on every option tap
+//
+//   POST   /api/v1/student-onboarding/v2/step/cognitive/responses/batch
+//          Body:    { responses: [{ question_id, selected_option_keys }] }
+//          Returns: { ok, responses, signal_quality }
+//          Use:     Multi-response batch save
+//
+//   POST   /api/v1/student-onboarding/v2/step/cognitive/commit
+//          Body:    {}
+//          Returns: { ok, signals, signal_quality }
+//          Errors:  422 COGNITIVE_SIGNAL_INSUFFICIENT if required questions unanswered
+//          Use:     Signal extraction + mark all responses committed
+//                   Does NOT advance session (page.tsx useUpdateOnboardingStep handles that)
 
-// New dual onboarding routes
-app.use(
-  '/api/v1/student-onboarding',
-  verifySupabaseToken,
-  require('./routes/student-onboarding.routes')
-);
-
-app.use(
-  '/api/v1/career-onboarding',
-  verifySupabaseToken,
-  require('./routes/career-onboarding.routes')
-);
-
-/**
- * ------------------------------------------------------------------
- * SUPABASE DATABASE SCHEMA SUMMARY
- * ------------------------------------------------------------------
- *
- * public.users
- *   └─ id (uuid PK)
- *   └─ auth_user_id (uuid UNIQUE) ← references auth.users(id)
- *   └─ email
- *   └─ display_name
- *   └─ photo_url
- *   └─ tier
- *   └─ plan_amount
- *   └─ ai_credits_remaining
- *   └─ onboarding_completed
- *   └─ resume_uploaded
- *   └─ chi_score
- *   └─ subscription_status
- *   └─ subscription_provider
- *   └─ subscription_id
- *   └─ NEW: user_type ('student' | 'professional' | null)
- *   └─ NEW: student_onboarding_complete boolean default false
- *   └─ NEW: professional_onboarding_complete boolean default false
- *   └─ created_at timestamptz
- *   └─ updated_at timestamptz
- *
- * public.student_onboarding_drafts
- *   └─ auth_user_id uuid PK
- *   └─ draft_data jsonb
- *   └─ updated_at timestamptz
- *
- * public.student_career_profiles
- *   └─ auth_user_id uuid PK
- *   └─ profile_data jsonb
- *   └─ created_at timestamptz
- *
- * public.professional_career_profiles
- *   └─ auth_user_id uuid PK
- *   └─ profile_data jsonb
- *   └─ created_at timestamptz
- */
+module.exports = { cognitiveRouter };

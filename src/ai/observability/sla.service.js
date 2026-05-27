@@ -1,7 +1,7 @@
 'use strict';
 
 /**
- * src/ai/observability/sla.service.js  — Phase 2 Refactor
+ * src/ai/observability/sla.service.js  — Phase 2 Refactor / Phase 3 Fix
  *
  * CHANGES (Phase 2):
  *  - Class renamed to SlaService (was erroneously named AlertService in
@@ -12,8 +12,14 @@
  *  - Redis is used for caching SLA window data; falls back to DB-only reads
  *  - close() is now a no-op — lifecycle is the singleton's responsibility
  *
- * WIRING (composition root):
- *   const slaService = new SlaService(redisSingleton.getClient());
+ * PHASE 3 FIX — bootstrap ordering:
+ *  Root cause: same as alert.service.js — buildSingleton() was firing at
+ *  require() time (before bootstrap's await connectRedis()) because
+ *  ai-observability.routes.js is loaded at server.js parse time.
+ *
+ *  Fix: _redisClient is now a lazy getter that reads from redis.singleton on
+ *  every access. No constructor injection; no module-cache race. The singleton
+ *  is always connected by the time any real SLA operation is triggered.
  */
 
 const observabilityRepo = require('../../repositories/ai-observability.repository');
@@ -23,21 +29,9 @@ const SLA_CACHE_PREFIX = 'hirerise:sla:';
 const SLA_CACHE_TTL    = 3600; // 1 hour
 
 class SlaService {
-  /**
-   * @param {import('ioredis').Redis | null} redisClient
-   *   Injected, already-connected ioredis client from the singleton.
-   *   Pass null to disable Redis-backed SLA caching (DB-only mode).
-   *   When null, _useRedis will attempt a lazy resolution from
-   *   redis.singleton on first access (post-bootstrap safe).
-   */
-  constructor(redisClient = null) {
-    this._redisClient = redisClient || null;
-
-    if (this._redisClient) {
-      logger.info('[SlaService] Initialized with injected Redis client');
-    } else {
-      logger.info('[SlaService] No Redis client — will upgrade lazily once Redis is ready');
-    }
+  constructor() {
+    // _redisClient is resolved lazily via getter — no client injection needed.
+    // See getter below for rationale.
   }
 
   // ─────────────────────────────────────────────
@@ -45,30 +39,25 @@ class SlaService {
   // ─────────────────────────────────────────────
 
   /**
-   * True only when an ioredis client is present and status === 'ready'.
+   * Lazily resolves the connected Redis client from the canonical module.
    *
-   * Lazy upgrade path: if this instance was constructed before Redis
-   * connected (required at module-parse time), this getter attempts to
-   * resolve the client from redis.singleton on every call until it
-   * succeeds.  Once resolved the reference is stored permanently.
+   * WHY LAZY: sla.service may be require()'d before bootstrap() calls
+   * await connectRedis(). Capturing the client at construction time would
+   * freeze a null reference. Reading from redisClient on each access means
+   * we always see the live client once Redis is ready — no timing dependency.
+   *
+   * @returns {import('ioredis').Redis | null}
    */
-  get _useRedis() {
-    // Fast path — already wired.
-    if (this._redisClient && this._redisClient.status === 'ready') return true;
-
-    // Lazy upgrade — attempt to resolve from singleton.
-    if (!this._redisClient) {
-      try {
-        const redisSingleton = require('../../infrastructure/radis/redis.singleton');
-        if (redisSingleton && redisSingleton.isReady()) {
-          this._redisClient = redisSingleton.getClient();
-          logger.info('[SlaService] Lazily upgraded to Redis client (post-bootstrap)');
-        }
-      } catch (_) {
-        // singleton not available (test env) — remain in DB-only mode
-      }
+  get _redisClient() {
+    try {
+      const redisClient = require('../../config/redisClient');
+      return redisClient.getRedisClient?.() ?? null;
+    } catch {
+      return null;
     }
+  }
 
+  get _useRedis() {
     return !!(this._redisClient && this._redisClient.status === 'ready');
   }
 
@@ -165,19 +154,9 @@ class SlaService {
 }
 
 /**
- * Lazy singleton — resolves Redis client from the singleton on first require()
- * after bootstrap. Preserves the existing call pattern:
- *   const slaService = require('...sla.service');
- *   await slaService.evaluateDailySLA(date);
+ * Singleton export — no Redis client injection needed.
+ * The instance resolves Redis lazily via the _redisClient getter on every
+ * operation, so it is always correct regardless of when this module is first
+ * require()'d relative to bootstrap().
  */
-function buildSingleton() {
-  try {
-    const redisSingleton = require('../../infrastructure/radis/redis.singleton');
-    const client = redisSingleton.isReady() ? redisSingleton.getClient() : null;
-    return new SlaService(client);
-  } catch (_) {
-    return new SlaService(null);
-  }
-}
-
-module.exports = buildSingleton();
+module.exports = new SlaService();

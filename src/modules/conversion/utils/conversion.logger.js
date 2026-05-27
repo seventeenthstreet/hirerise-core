@@ -25,7 +25,7 @@ const LOGGER_CANDIDATE_PATHS = [
 
 for (const path of LOGGER_CANDIDATE_PATHS) {
   try {
-    // eslint-disable-next-line global-require, import/no-dynamic-require
+    // eslint-disable-next-line global-require
     baseLogger = require(path);
     break;
   } catch {

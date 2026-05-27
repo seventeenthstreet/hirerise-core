@@ -36,7 +36,7 @@ const REDIS_CANDIDATE_PATHS = [
 if (process.env.NODE_ENV === 'production') {
   for (const path of REDIS_CANDIDATE_PATHS) {
     try {
-      // eslint-disable-next-line global-require, import/no-dynamic-require
+      // eslint-disable-next-line global-require
       redisClient = require(path);
 
       if (redisClient) {

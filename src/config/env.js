@@ -4,7 +4,20 @@
  * src/config/env.js
  * HireRise PR 2 — Backend Infra Safety
  * Production-grade fail-fast validator
+ *
+ * PATCH: Structured startup logging hardening
+ * - logger.fatal() emitted BEFORE process.exit(1) for every missing
+ *   webhook secret so Cloud Run / Docker / Kubernetes operators see an
+ *   explicit, machine-parseable fatal event in structured JSON logs.
+ * - Non-production webhook-secret warnings also upgraded to structured
+ *   logger.warn() (replaces bare console.warn).
+ * - No secret values are logged anywhere — presence-only checks only.
  */
+
+// NOTE: logger is required lazily inside the fail-fast block so that
+// env.js can still be loaded by unit tests that don't configure Winston.
+// The require() at module level would pull in Winston before NODE_ENV
+// is known to be 'test', which causes noise in test output.
 
 function required(name) {
   const val = process.env[name];
@@ -57,6 +70,11 @@ function validatePositiveInt(value, name) {
 
 const errors = [];
 
+// Per-secret structured fatal descriptors: collected during validation
+// so we can emit logger.fatal() calls BEFORE process.exit(1).
+// Shape: { secret: string, impact: string }
+const fatalWebhookSecretErrors = [];
+
 function safe(fn) {
   try {
     return fn();
@@ -95,11 +113,6 @@ const env = {
   ),
 
   // Internal service auth
-  // In production this is required (enforced above).
-  // In non-production it defaults to a well-known dev placeholder — this is
-  // intentional for local development but is NEVER usable in production
-  // because: (a) the token is publicly known, (b) production guards above
-  // require it to be explicitly set and ≥32 chars.
   INTERNAL_SERVICE_TOKEN:
     nodeEnv === 'production'
       ? safe(() => required('INTERNAL_SERVICE_TOKEN'))
@@ -137,9 +150,8 @@ const env = {
 
   // Billing
   STRIPE_SECRET_KEY: optional('STRIPE_SECRET_KEY'),
-  STRIPE_WEBHOOK_SECRET: optional(
-    'STRIPE_WEBHOOK_SECRET'
-  ),
+  STRIPE_WEBHOOK_SECRET: optional('STRIPE_WEBHOOK_SECRET'),
+  RAZORPAY_WEBHOOK_SECRET: optional('RAZORPAY_WEBHOOK_SECRET'),
 
   // App
   HIRERISE_MODE: optional('HIRERISE_MODE', 'launch'),
@@ -161,8 +173,6 @@ if (env.SUPABASE_URL) {
 }
 
 // Stripe key validation
-// Runs on every startup — catches misconfiguration before any payment
-// request is attempted rather than failing deep inside a checkout flow.
 if (env.STRIPE_SECRET_KEY) {
   if (env.STRIPE_SECRET_KEY.startsWith('pk_')) {
     errors.push(
@@ -177,11 +187,58 @@ if (env.STRIPE_SECRET_KEY) {
     );
   }
 }
-// In production, Stripe is required — no silent degradation.
 if (env.NODE_ENV === 'production' && !env.STRIPE_SECRET_KEY) {
   errors.push(
     '[env] STRIPE_SECRET_KEY is required in production'
   );
+}
+
+// ── Webhook secret validation ─────────────────────────────────
+//
+// RULE: do NOT log secret values — presence-only checks used throughout.
+//
+// PATCH: Each missing production webhook secret is registered into
+// fatalWebhookSecretErrors so the fail-fast block can emit a
+// logger.fatal() with impact context before calling process.exit(1).
+// This gives Cloud Run / Docker / Kubernetes operators a structured
+// machine-parseable fatal log entry, not just a plain text error line.
+
+const WEBHOOK_SECRET_IMPACTS = {
+  STRIPE_WEBHOOK_SECRET:    'Stripe billing events will fail — Stripe subscriptions will never activate or cancel',
+  RAZORPAY_WEBHOOK_SECRET:  'Razorpay billing events will fail — Razorpay subscriptions will never activate or cancel',
+};
+
+if (env.NODE_ENV === 'production') {
+  for (const [key, impact] of Object.entries(WEBHOOK_SECRET_IMPACTS)) {
+    if (!process.env[key] || !process.env[key].trim()) {
+      // Register for structured fatal logging in the fail-fast block below.
+      fatalWebhookSecretErrors.push({ secret: key, impact });
+
+      errors.push(
+        `[env] ${key} is required in production. ` +
+        'Missing webhook secrets cause HTTP 500 on every payment event — ' +
+        'subscriptions will never activate or cancel.'
+      );
+    }
+  }
+} else {
+  // Non-production: structured warn (replaces bare console.warn).
+  // Deferred to after-logger is loaded — emitted inline here using
+  // console.warn so the logger module is not imported at the top level
+  // (avoids Winston initialisation noise in test environments).
+  for (const [key, impact] of Object.entries(WEBHOOK_SECRET_IMPACTS)) {
+    if (!process.env[key] || !process.env[key].trim()) {
+      // PATCH: structured warn output — human-readable in dev, parseable in staging
+      console.warn(JSON.stringify({
+        severity: 'WARN',
+        message: '[WebhookConfig] Webhook secret not set — signature verification will fail at runtime',
+        secret: key,
+        impact,
+        startupBlocked: false,
+        env: nodeEnv,
+      }));
+    }
+  }
 }
 
 // PORT validation
@@ -247,17 +304,12 @@ if (env.NODE_ENV === 'production') {
     );
   }
 
-  // SECURITY: ALLOW_TEST_AUTH must NEVER be set in production.
-  // It disables auth on all routes when combined with NODE_ENV=test.
-  // If someone accidentally copies a test .env to production, fail fast.
   if (process.env.ALLOW_TEST_AUTH === 'true') {
     errors.push(
       '[env] ALLOW_TEST_AUTH=true is FORBIDDEN in production — remove it immediately'
     );
   }
 
-  // SECURITY: ADMIN_HARDENING_ENABLED should always be true in production.
-  // Not a hard error but emit a loud warning so it isn't silently missed.
   if (process.env.ADMIN_HARDENING_ENABLED !== 'true') {
     console.warn(
       '[env] WARNING: ADMIN_HARDENING_ENABLED is not set to "true" in production. ' +
@@ -282,7 +334,15 @@ if (env.CACHE_PROVIDER === 'redis') {
   }
 }
 
-// ── Fail Fast ────────────────────────────────────────────────
+// ── Fail Fast ─────────────────────────────────────────────────
+//
+// PATCH: Before calling process.exit(1), emit one structured logger.fatal()
+// per missing webhook secret so cloud log aggregators (Cloud Run, Datadog,
+// CloudWatch, etc.) can parse the machine-readable JSON entry and fire
+// deployment-blocking alerts.
+//
+// RULE: Only secrets that are missing are included; no secret values are
+// logged. Each call is limited to one per secret (no duplicate noisy logging).
 
 if (errors.length && env.NODE_ENV !== 'test') {
   const border = '═'.repeat(72);
@@ -297,6 +357,39 @@ if (errors.length && env.NODE_ENV !== 'test') {
 
   console.error(border);
 
+  // ── PATCH: Structured fatal log per missing webhook secret ──────────────
+  // Emitted AFTER the human-readable summary (so the border block is still
+  // easy to read in raw logs) and BEFORE process.exit(1).
+  //
+  // logger is required lazily here so env.js remains importable in test
+  // environments where Winston may not be fully initialised.
+  if (fatalWebhookSecretErrors.length > 0) {
+    let logger;
+    try {
+      logger = require('../utils/logger');
+    } catch {
+      // Fallback: if logger itself cannot load (e.g. missing winston dep),
+      // write structured JSON directly to stderr so the entry is still
+      // machine-parseable by log aggregators.
+      logger = {
+        fatal: (msg, meta) =>
+          process.stderr.write(
+            JSON.stringify({ severity: 'FATAL', message: msg, ...meta }) + '\n'
+          ),
+      };
+    }
+
+    for (const { secret, impact } of fatalWebhookSecretErrors) {
+      // RULE: log secret NAME only — never the secret VALUE.
+      logger.fatal('[WebhookConfig] Missing required webhook secret', {
+        secret,
+        impact,
+        startupBlocked: true,
+      });
+    }
+  }
+  // ── END PATCH ───────────────────────────────────────────────────────────
+
   const softFailAllowed =
     process.env.ALLOW_SOFT_FAIL === 'true' &&
     env.NODE_ENV !== 'production';
@@ -309,10 +402,8 @@ if (errors.length && env.NODE_ENV !== 'test') {
 }
 
 // ── Safe Debug Summary ───────────────────────────────────────
-// Only emit in development — never in production, where stdout may
-// be scraped by log aggregators or visible in crash reports.
+// Only emit in development — never in production.
 if (env.NODE_ENV === 'development') {
-  // Values are boolean presence-checks only — no secret values are logged.
   console.log('[env] Loaded config:', {
     NODE_ENV: env.NODE_ENV,
     PORT: env.PORT,
@@ -322,6 +413,9 @@ if (env.NODE_ENV === 'development') {
     INTERNAL_TOKEN: !!env.INTERNAL_SERVICE_TOKEN,
     API_TIMEOUT_MS: env.API_TIMEOUT_MS,
     AI_PROVIDER_TIMEOUT_MS: env.AI_PROVIDER_TIMEOUT_MS,
+    // PATCH: presence-check booleans for webhook secrets (no values logged)
+    STRIPE_WEBHOOK_SECRET_SET:   !!env.STRIPE_WEBHOOK_SECRET,
+    RAZORPAY_WEBHOOK_SECRET_SET: !!env.RAZORPAY_WEBHOOK_SECRET,
   });
 }
 

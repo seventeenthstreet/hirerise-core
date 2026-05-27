@@ -11,7 +11,7 @@
  * - null-safe parsed resume fallback
  */
 
-const lockService = require('../core/infrastructure/locking/lock.service');
+const lockService = require('../core/infrastructure/locking/lock.utils');
 const cacheManager = require('../core/cache/cache.manager');
 const logger = require('../utils/logger');
 

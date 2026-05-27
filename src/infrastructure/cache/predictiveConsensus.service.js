@@ -1,4 +1,4 @@
-const cache = require("./analyticsCache.service");
+const cache = require("./analyticsCache.utils");
 const logger = require("../../utils/logger");
 
 const PREFIX = "predictive:consensus";

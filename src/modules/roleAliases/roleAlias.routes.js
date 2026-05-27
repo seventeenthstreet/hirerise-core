@@ -1,5 +1,7 @@
 'use strict';
 
+const logger = require('../../utils/logger');
+
 /**
  * src/modules/roleAliases/roleAlias.routes.js
  *
@@ -101,9 +103,8 @@ router.post(
         ipAddress: req.ip
       });
     } catch (auditError) {
-      console.error('Admin audit log failed:', {
-        route: 'POST /role-aliases',
-        error: auditError.message
+      logger.warn('[RoleAlias] Admin audit log write failed', {
+        adminId, targetUserId, action, error: auditErr.message, alertable: true,
       });
     }
 

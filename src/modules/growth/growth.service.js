@@ -1,9 +1,6 @@
 'use strict';
 
-const ResumeGrowthService = require('../resumeGrowth/resumeGrowth.service');
-const ResumeGrowthRepository = require('../resumeGrowth/resumeGrowth.repository');
-const RoleRepository = require('../../repositories/RoleRepository');
-const skillRepository = require('../../repositories/skillRepository');
+const { getLatestBaseline } = require('./growth.data');
 const logger = require('../../utils/logger');
 
 const {
@@ -12,18 +9,6 @@ const {
   projectLevel,
   projectPromotionReadiness
 } = require('./growth.utils');
-
-/**
- * Singleton dependency graph
- * Reused across requests for better performance and stable DB connection reuse.
- */
-const dependencies = Object.freeze({
-  roleRepository: new RoleRepository(),
-  skillRepository: new skillRepository(),
-  resumeGrowthRepository: new ResumeGrowthRepository()
-});
-
-const resumeGrowthService = new ResumeGrowthService(dependencies);
 
 /**
  * Normalize and sanitize inputs.
@@ -65,7 +50,7 @@ async function getBaseline(userId, targetRoleId) {
   if (!userId) return null;
 
   try {
-    return await resumeGrowthService.getLatest(userId, targetRoleId);
+    return await getLatestBaseline(userId, targetRoleId);
   } catch (error) {
     logger.warn('Growth baseline fetch failed, using fallback defaults', {
       module: 'growth.service',

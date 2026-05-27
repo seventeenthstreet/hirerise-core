@@ -28,6 +28,10 @@ const conversionAggregateService = require('./services/conversionAggregate.servi
 const conversionIntentService = require('./services/conversionIntent.service');
 const conversionNudgeService = require('./services/conversionNudge.service');
 
+// Wire cross-stage providers. Must be required before any service is called.
+// Coordinator owns all inter-service dependency injection for this pipeline.
+require('./coordinators/conversionPipeline.coordinator');
+
 /* -------------------------------------------------------------------------- */
 /*                             CONTRACT VALIDATION                            */
 /* -------------------------------------------------------------------------- */

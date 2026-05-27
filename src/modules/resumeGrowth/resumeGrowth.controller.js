@@ -18,23 +18,8 @@
  * - Stable API response contract preserved
  */
 
-const ResumeGrowthService = require('./resumeGrowth.service');
-const ResumeGrowthRepository = require('./resumeGrowth.repository');
-const RoleRepository = require('./role.repository');
-const skillRepository = require('../../repositories/skillRepository');
+const resumeGrowthService = require('./resumeGrowth.service');
 const { AppError, ErrorCodes } = require('../../middleware/errorHandler');
-
-/**
- * Singleton dependency graph
- * Prevents unnecessary per-request object construction.
- */
-const dependencies = Object.freeze({
-  roleRepository: new RoleRepository(),
-  skillRepository: new skillRepository(),
-  resumeGrowthRepository: new ResumeGrowthRepository(),
-});
-
-const resumeGrowthService = new ResumeGrowthService(dependencies);
 
 /**
  * Extract authenticated user id safely.

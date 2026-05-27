@@ -3,7 +3,19 @@
 /**
  * intelligenceOrchestrator.js
  *
- * Unified CHI v2 orchestration layer
+ * Unified CHI v2 orchestration layer.
+ * Sole owner of all engine imports for the chiV2 module.
+ *
+ * Exposes:
+ *   runIntelligence  — full pipeline (POST /full-intelligence)
+ *   runCalculate     — CHI score only (POST /calculate)
+ *   runSkillGap      — skill gap only (POST /skill-gap)
+ *   runCareerPath    — career path only (POST /career-path)
+ *   runOpportunities — opportunity analysis (POST /opportunities)
+ *
+ * Ownership:
+ *   chiV2.controller → intelligenceOrchestrator → engines
+ *
  * - fully Supabase-compatible
  * - parallel fault-isolated engine execution
  * - no duplicate scoring recomputation
@@ -17,7 +29,91 @@ const { recommendLearning } = require('../../engines/learning.engine');
 const logger = require('../../utils/logger');
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Main
+// Individual run methods (used by controller for single-purpose endpoints)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Run CHI score calculation only.
+ *
+ * @param {object} profile  Normalised profile from controller
+ * @returns {Promise<object>} chiResult
+ */
+async function runCalculate(profile) {
+  return calculateCHI(profile);
+}
+
+/**
+ * Resolve target role and run skill gap analysis.
+ * Returns null if the target role is not found in the graph.
+ *
+ * @param {object} profile
+ * @returns {Promise<object|null>}
+ */
+async function runSkillGap(profile) {
+  const targetRoleId = await resolveRoleId(profile.target_role);
+
+  if (!targetRoleId) return null;
+
+  return analyseSkillGap(targetRoleId, profile.skills);
+}
+
+/**
+ * Resolve roles and run career path recommendation.
+ * Returns null if the target role is not found in the graph.
+ *
+ * @param {object} profile
+ * @returns {Promise<object|null>}
+ */
+async function runCareerPath(profile) {
+  const [targetRoleId, currentRoleId] = await Promise.all([
+    resolveRoleId(profile.target_role),
+    profile.current_role
+      ? resolveRoleId(profile.current_role)
+      : Promise.resolve(null),
+  ]);
+
+  if (!targetRoleId) return null;
+
+  return recommendCareerPath(currentRoleId, targetRoleId);
+}
+
+/**
+ * Resolve current role and run opportunity analysis.
+ * Returns null if the current role is not found in the graph.
+ *
+ * @param {object} profile
+ * @param {{ country: string|null, top_n: number }} options
+ * @returns {Promise<object|null>}
+ */
+async function runOpportunities(profile, options = {}) {
+  const [currentRoleId, chiResult] = await Promise.all([
+    resolveRoleId(profile.current_role),
+    profile.target_role
+      ? calculateCHI(profile).catch((error) => {
+          logger.warn('[Intelligence] CHI pre-score degraded', {
+            error: error.message,
+          });
+          return null;
+        })
+      : Promise.resolve(null),
+  ]);
+
+  if (!currentRoleId) return null;
+
+  return analyseCareerOpportunities(
+    {
+      current_role_id: currentRoleId,
+      chi_score: chiResult?.chi_score ?? null,
+    },
+    {
+      country: options.country ?? null,
+      top_n: options.top_n ?? 3,
+    }
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Full pipeline (POST /full-intelligence)
 // ─────────────────────────────────────────────────────────────────────────────
 
 async function runIntelligence(profile, options = {}) {
@@ -28,7 +124,7 @@ async function runIntelligence(profile, options = {}) {
     skill_levels = [],
     education_level,
     years_experience = 0,
-    current_salary = 0
+    current_salary = 0,
   } = profile;
 
   if (!target_role) {
@@ -41,7 +137,7 @@ async function runIntelligence(profile, options = {}) {
     resolveRoleId(target_role),
     current_role
       ? resolveRoleId(current_role)
-      : Promise.resolve(null)
+      : Promise.resolve(null),
   ]);
 
   if (!targetRoleId) {
@@ -51,7 +147,7 @@ async function runIntelligence(profile, options = {}) {
   logger.info('[Intelligence] Starting unified run', {
     current_role_id: currentRoleId,
     target_role_id: targetRoleId,
-    skill_count: skills.length
+    skill_count: skills.length,
   });
 
   const chiInput = {
@@ -61,7 +157,7 @@ async function runIntelligence(profile, options = {}) {
     skill_levels,
     education_level,
     years_experience,
-    current_salary
+    current_salary,
   };
 
   const settled = await Promise.allSettled([
@@ -72,33 +168,28 @@ async function runIntelligence(profile, options = {}) {
       ? analyseCareerOpportunities(
           {
             current_role_id: currentRoleId,
-            chi_score: null // patched after CHI
+            chi_score: null, // patched after CHI
           },
           {
             country: options.country,
-            top_n: options.top_n
+            top_n: options.top_n,
           }
         )
-      : Promise.resolve(null)
+      : Promise.resolve(null),
   ]);
 
   const [
     chiResult,
     skillGapResult,
     careerPathResult,
-    opportunityBase
+    opportunityBase,
   ] = settled.map((result, index) => {
     if (result.status === 'fulfilled') return result.value;
 
-    const names = [
-      'CHI',
-      'SkillGap',
-      'CareerPath',
-      'Opportunity'
-    ];
+    const names = ['CHI', 'SkillGap', 'CareerPath', 'Opportunity'];
 
     logger.error(`[Intelligence] ${names[index]} failed`, {
-      error: result.reason?.message
+      error: result.reason?.message,
     });
 
     return null;
@@ -106,10 +197,7 @@ async function runIntelligence(profile, options = {}) {
 
   const opportunityResult =
     opportunityBase && chiResult?.chi_score != null
-      ? patchOpportunityScores(
-          opportunityBase,
-          chiResult.chi_score
-        )
+      ? patchOpportunityScores(opportunityBase, chiResult.chi_score)
       : opportunityBase;
 
   const allGaps = extractAllSkillGaps(skillGapResult);
@@ -120,19 +208,19 @@ async function runIntelligence(profile, options = {}) {
           {
             role: current_role ?? null,
             target_role,
-            skills
+            skills,
           },
           allGaps
-        ).catch(error => {
+        ).catch((error) => {
           logger.warn('[Intelligence] Learning degraded', {
-            error: error.message
+            error: error.message,
           });
           return null;
         })
       : null;
 
   logger.info('[Intelligence] Unified run complete', {
-    elapsed_ms: Date.now() - start
+    elapsed_ms: Date.now() - start,
   });
 
   return buildOutput({
@@ -142,7 +230,7 @@ async function runIntelligence(profile, options = {}) {
     opportunityResult,
     learningResult,
     targetRoleId,
-    currentRoleId
+    currentRoleId,
   });
 }
 
@@ -156,28 +244,26 @@ function extractAllSkillGaps(skillGapResult) {
   return [
     ...(skillGapResult.high_priority ?? []),
     ...(skillGapResult.medium_priority ?? []),
-    ...(skillGapResult.low_priority ?? [])
+    ...(skillGapResult.low_priority ?? []),
   ];
 }
 
 function patchOpportunityScores(result, chiScore) {
-  const patched = {
+  return {
     ...result,
     career_opportunities: [...(result.career_opportunities || [])]
-      .map(opp => ({
+      .map((opp) => ({
         ...opp,
         opportunity_score: Math.round(
           chiScore * 0.6 + opp.market_demand_score * 0.4
-        )
+        ),
       }))
       .sort((a, b) => b.opportunity_score - a.opportunity_score),
     meta: {
       ...result.meta,
-      chi_score_used: chiScore
-    }
+      chi_score_used: chiScore,
+    },
   };
-
-  return patched;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -191,13 +277,13 @@ function buildOutput({
   opportunityResult,
   learningResult,
   targetRoleId,
-  currentRoleId
+  currentRoleId,
 }) {
   const insights = [
     ...(chiResult?.insights ?? []),
     ...buildCareerPathInsights(careerPathResult),
     ...buildSkillGapInsights(skillGapResult),
-    ...(opportunityResult?.insights ?? [])
+    ...(opportunityResult?.insights ?? []),
   ];
 
   return {
@@ -206,11 +292,11 @@ function buildOutput({
 
     skill_gap: {
       high_priority:
-        skillGapResult?.high_priority?.map(s => s.skill_name) ?? [],
+        skillGapResult?.high_priority?.map((s) => s.skill_name) ?? [],
       medium_priority:
-        skillGapResult?.medium_priority?.map(s => s.skill_name) ?? [],
+        skillGapResult?.medium_priority?.map((s) => s.skill_name) ?? [],
       low_priority:
-        skillGapResult?.low_priority?.map(s => s.skill_name) ?? []
+        skillGapResult?.low_priority?.map((s) => s.skill_name) ?? [],
     },
 
     skill_gap_detail: skillGapResult
@@ -222,53 +308,38 @@ function buildOutput({
           skill_coverage_pct: skillGapResult.skill_coverage_pct,
           total_required: skillGapResult.total_required,
           total_missing: skillGapResult.total_missing,
-          total_matched: skillGapResult.total_matched
+          total_matched: skillGapResult.total_matched,
         }
       : null,
 
     learning_path:
-      skillGapResult?.learning_path?.steps?.map(
-        step => step.skill_name
-      ) ?? [],
+      skillGapResult?.learning_path?.steps?.map((step) => step.skill_name) ?? [],
 
-    learning_path_detail:
-      skillGapResult?.learning_path ?? null,
+    learning_path_detail: skillGapResult?.learning_path ?? null,
 
     career_path:
-      careerPathResult?.career_path?.map(
-        step => step.role_name
-      ) ?? [],
+      careerPathResult?.career_path?.map((step) => step.role_name) ?? [],
 
     career_path_detail: careerPathResult ?? null,
 
-    estimated_years:
-      careerPathResult?.estimated_years ?? null,
+    estimated_years: careerPathResult?.estimated_years ?? null,
 
-    next_role:
-      careerPathResult?.next_role?.role_name ?? null,
+    next_role: careerPathResult?.next_role?.role_name ?? null,
 
-    next_role_detail:
-      careerPathResult?.next_role ?? null,
+    next_role_detail: careerPathResult?.next_role ?? null,
 
     next_role_skills:
-      careerPathResult?.next_role_skills?.map(
-        skill => skill.skill_name
-      ) ?? [],
+      careerPathResult?.next_role_skills?.map((skill) => skill.skill_name) ?? [],
 
-    next_role_skills_detail:
-      careerPathResult?.next_role_skills ?? [],
+    next_role_skills_detail: careerPathResult?.next_role_skills ?? [],
 
-    career_opportunities:
-      opportunityResult?.career_opportunities ?? [],
+    career_opportunities: opportunityResult?.career_opportunities ?? [],
 
-    opportunity_meta:
-      opportunityResult?.meta ?? null,
+    opportunity_meta: opportunityResult?.meta ?? null,
 
-    learning_recommendations:
-      learningResult?.learning_recommendations ?? [],
+    learning_recommendations: learningResult?.learning_recommendations ?? [],
 
-    learning_recommendations_summary:
-      learningResult?.summary ?? null,
+    learning_recommendations_summary: learningResult?.summary ?? null,
 
     insights: [...new Set(insights)],
 
@@ -280,11 +351,11 @@ function buildOutput({
         'skill_gap',
         'career_path',
         'opportunity',
-        'learning'
+        'learning',
       ],
       chi_meta: chiResult?.meta ?? null,
-      calculated_at: new Date().toISOString()
-    }
+      calculated_at: new Date().toISOString(),
+    },
   };
 }
 
@@ -306,9 +377,7 @@ function buildCareerPathInsights(result) {
   }
 
   if (result.next_role) {
-    insights.push(
-      `Your immediate next step is: ${result.next_role.role_name}`
-    );
+    insights.push(`Your immediate next step is: ${result.next_role.role_name}`);
   }
 
   return insights;
@@ -323,7 +392,7 @@ function buildSkillGapInsights(result) {
   if (highCount > 0) {
     const names = result.high_priority
       .slice(0, 2)
-      .map(skill => skill.skill_name)
+      .map((skill) => skill.skill_name)
       .join(', ');
 
     insights.push(
@@ -351,5 +420,9 @@ function buildSkillGapInsights(result) {
 }
 
 module.exports = {
-  runIntelligence
+  runIntelligence,
+  runCalculate,
+  runSkillGap,
+  runCareerPath,
+  runOpportunities,
 };

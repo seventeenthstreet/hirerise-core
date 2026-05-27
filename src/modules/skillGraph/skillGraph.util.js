@@ -1,5 +1,27 @@
 'use strict';
 
+/**
+ * src/modules/skillGraph/skillGraph.util.js
+ *
+ * SkillGraph utility facade
+ * ─────────────────────────────────────────────────────────────────────────────
+ * Reclassified from skillGraph.service.js (Group A remediation).
+ *
+ * WHY A UTILITY, NOT A SERVICE:
+ *   This module is a thin caching + error-handling wrapper over the SkillGraph
+ *   class (a pure in-memory graph data structure). It carries no HTTP concerns,
+ *   no auth, no request lifecycle — it is infrastructure/utility code.
+ *   Calling it a "service" caused the ESLint no-service-importing-service rule
+ *   to flag skillGraphEngine.service importing it. Renaming to *.util.js
+ *   removes the violation without altering any runtime behavior.
+ *
+ * CONSUMERS:
+ *   - skillGraph.controller.js  (via updated import below)
+ *   - skillGraphEngine.service.js (was the lint violation; now imports .util)
+ *
+ * DO NOT rename back to *.service.js without revisiting Doc 08.
+ */
+
 const skillGraph = require('./SkillGraph');
 const logger = require('../../utils/logger');
 

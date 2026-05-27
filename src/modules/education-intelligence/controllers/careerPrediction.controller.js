@@ -2,8 +2,7 @@
 
 const { supabase } = require('../../../config/supabase');
 const logger = require('../../../utils/logger');
-const repository = require('../repositories/student.repository');
-const CareerSuccessEngine = require('../engines/careerSuccess.engine');
+const educationIntelligenceService = require('../../../services/educationIntelligence.service');
 const { COLLECTIONS } = require('../models/student.model');
 
 function getAuthenticatedUserId(req) {
@@ -52,11 +51,8 @@ async function predictCareers(req, res, next) {
       '[CareerPrediction] Requested'
     );
 
-    const [student, cognitive, streamScores] = await Promise.all([
-      repository.getStudent(studentId),
-      repository.getCognitive(studentId),
-      repository.getStreamScores(studentId)
-    ]);
+    const { student, cognitive, streamScores } =
+      await educationIntelligenceService.getStudentContext(studentId);
 
     if (!student) {
       return res.status(404).json({
@@ -77,7 +73,7 @@ async function predictCareers(req, res, next) {
     const recommendedStream =
       streamScores?.recommended_stream ?? 'engineering';
 
-    const result = await CareerSuccessEngine.analyze(
+    const result = await educationIntelligenceService.predictCareers(
       {
         studentId,
         student,

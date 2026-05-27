@@ -1,7 +1,7 @@
 'use strict';
 
 const { asyncHandler } = require('../../utils/helpers');
-const svc = require('./skillGraph.service');
+const svc = require('./skillGraph.util');
 const { AppError, ErrorCodes } = require('../../middleware/errorHandler');
 
 /**

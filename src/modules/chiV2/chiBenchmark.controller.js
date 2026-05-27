@@ -1,5 +1,8 @@
 'use strict';
 
+// CONTRACT NOTE (Phase 2): All error responses use V2 canonical shape.
+
+
 const benchmarkService = require('./chiBenchmark.service');
 const logger = require('../../utils/logger');
 
@@ -28,8 +31,13 @@ async function getUserBenchmarkAnalytics(req, res, next) {
     if (!userId) {
       return res.status(401).json({
         success: false,
-        errorCode: 'UNAUTHORIZED',
-        message: 'Missing authenticated user',
+        error: {
+          code: 'UNAUTHORIZED',
+          message: 'Missing authenticated user',
+        },
+        meta: {
+          timestamp: new Date().toISOString(),
+        },
       });
     }
 

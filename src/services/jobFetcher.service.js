@@ -14,7 +14,7 @@
 const { supabase } = require('../config/supabase');
 const cacheManager = require('../core/cache/cache.manager');
 const logger = require('../utils/logger');
-const { detectUserCountry } = require('./salary.service');
+const { detectUserCountry } = require('../utils/geo.util');
 const {
   authoritativeUpsert,
 } = require('../lib/db/authoritativeMutation');

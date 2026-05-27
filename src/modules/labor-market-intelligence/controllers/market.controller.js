@@ -13,7 +13,7 @@
  */
 
 const logger = require('../../../utils/logger');
-const marketSvc = require('../services/marketTrend.service');
+const marketSvc = require('../coordinators/marketIntelligence.coordinator');
 const jobCollector = require('../collectors/jobCollector.service');
 
 const DEFAULT_BATCH_SIZE = 50;

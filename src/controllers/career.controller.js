@@ -26,12 +26,7 @@ const getCareerPaths = asyncHandler(async (req, res) => {
   const { currentRoleId } = req.params;
 
   if (!currentRoleId) {
-    // BEFORE: { success:false, errorCode:'INVALID_INPUT', message:'...' }
-    // AFTER:  { success:false, error:'...', message:'...', code:'INVALID_INPUT', meta:{...} }
-    // Old field `errorCode` preserved via extra spread for backward compat.
-    return sendError(res, 400, 'currentRoleId is required', 'INVALID_INPUT', {
-      errorCode: 'INVALID_INPUT',
-    });
+    return sendError(res, 400, 'currentRoleId is required', 'INVALID_INPUT');
   }
 
   const result = await careerPathService.getCareerPath(currentRoleId);
@@ -53,9 +48,7 @@ const getCareerPathsWithGap = asyncHandler(async (req, res) => {
   } = req.body || {};
 
   if (!currentRoleId) {
-    return sendError(res, 400, 'currentRoleId is required', 'INVALID_INPUT', {
-      errorCode: 'INVALID_INPUT',
-    });
+    return sendError(res, 400, 'currentRoleId is required', 'INVALID_INPUT');
   }
 
   const result = await careerPathService.getCareerPath(currentRoleId, {
@@ -80,12 +73,7 @@ const matchJobDescription = asyncHandler(async (req, res) => {
   const { userProfile, rawJobDescription } = req.body || {};
 
   if (!userProfile || !rawJobDescription) {
-    return sendError(
-      res, 400,
-      'userProfile and rawJobDescription are required',
-      'INVALID_INPUT',
-      { errorCode: 'INVALID_INPUT' }
-    );
+    return sendError(res, 400, 'userProfile and rawJobDescription are required', 'INVALID_INPUT');
   }
 
   const safeSkills = Array.isArray(userProfile.skills)

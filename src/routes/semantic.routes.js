@@ -3,6 +3,15 @@
 /**
  * routes/semantic.routes.js
  * Semantic AI upgrade routes
+ *
+ * QUOTA BOUNDARY FIX (Phase 2D):
+ * aiRateLimit was previously applied at the app.use(API_PREFIX, ...) mount level
+ * in server.js, which caused it to fire for EVERY /api/v1/* request — including
+ * free onboarding operations like POST /api/v1/users/me/direction.
+ *
+ * aiRateLimit is now applied here at individual route handler level so it only
+ * restricts actual AI inference endpoints. Free onboarding operations that share
+ * the /api/v1/* prefix are unaffected.
  */
 
 const express = require('express');
@@ -13,6 +22,12 @@ const router = express.Router();
 const { authenticate } = require('../middleware/auth.middleware');
 const { validate } = require('../middleware/requestValidator');
 const logger = require('../utils/logger');
+
+// Imported here for route-level application (Phase 2D quota boundary fix).
+// Uses the shared express-rate-limit instance (same counter semantics as the
+// old server.js mount-level instance: 20/min per UID, V2 canonical envelope).
+// Do NOT move back to server.js mount level — that scope is too broad.
+const { aiRateLimitShared } = require('../middleware/aiRateLimitShared.middleware');
 
 // ─────────────────────────────────────────────────────────────
 // Engines
@@ -46,7 +61,7 @@ function getJobMatchSvc() {
 function getMarketSvc() {
   if (!marketSvc) {
     try {
-      marketSvc = require('../modules/labor-market-intelligence/services/marketTrend.service');
+      marketSvc = require('../modules/labor-market-intelligence/coordinators/marketIntelligence.coordinator');
     } catch (_) {
       marketSvc = null;
     }
@@ -90,6 +105,7 @@ function fail(res, message, code = 500) {
 router.get(
   '/skills/similar',
   authenticate,
+  aiRateLimitShared, // Phase 2D: applied per-handler, not at mount level
   validate([
     query('skill')
       .isString()
@@ -135,6 +151,7 @@ router.get(
 router.post(
   '/skills/embed',
   authenticate,
+  aiRateLimitShared, // Phase 2D: applied per-handler, not at mount level
   validate([
     body('skill')
       .optional()
@@ -194,6 +211,7 @@ router.post(
 router.get(
   '/job-seeker/jobs/semantic-match',
   authenticate,
+  aiRateLimitShared, // Phase 2D: applied per-handler, not at mount level
   validate([
     query('limit').optional().isInt({ min: 1, max: 30 }).toInt(),
     query('minScore').optional().isInt({ min: 0, max: 100 }).toInt(),
@@ -281,6 +299,7 @@ router.get(
 router.get(
   '/career/advice',
   authenticate,
+  aiRateLimitShared, // Phase 2D: applied per-handler, not at mount level
   async (req, res) => {
     const userId = resolveUserId(req);
     if (!userId) return fail(res, 'Unauthenticated', 401);
@@ -346,6 +365,7 @@ router.get(
 router.get(
   '/skills/learning-path',
   authenticate,
+  aiRateLimitShared, // Phase 2D: applied per-handler, not at mount level
   async (req, res) => {
     const userId = resolveUserId(req);
     const { skill, skills, targetRole } = req.query;

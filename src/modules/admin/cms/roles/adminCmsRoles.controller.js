@@ -19,7 +19,7 @@ const createRole = asyncHandler(async (req, res) => {
   const agency  = req.user?.agency ?? null;
 
   if (!adminId) {
-    return res.status(401).json({ success: false, error: 'Unauthorized' });
+    return res.status(401).json({ success: false, error: { code: 'UNAUTHORIZED', message: 'Unauthorized.' }, meta: { timestamp: new Date().toISOString() } });
   }
 
   const {
@@ -33,7 +33,7 @@ const createRole = asyncHandler(async (req, res) => {
 
   // Basic validation (fast fail)
   if (!name || typeof name !== 'string') {
-    return res.status(400).json({ success: false, error: 'Role name is required' });
+    return res.status(400).json({ success: false, error: { code: 'INVALID_INPUT', message: 'Role name is required.' }, meta: { timestamp: new Date().toISOString() } });
   }
 
   const role = await rolesService.createRole(
@@ -68,11 +68,11 @@ const updateRole = asyncHandler(async (req, res) => {
   const roleId  = req.params.roleId;
 
   if (!adminId) {
-    return res.status(401).json({ success: false, error: 'Unauthorized' });
+    return res.status(401).json({ success: false, error: { code: 'UNAUTHORIZED', message: 'Unauthorized.' }, meta: { timestamp: new Date().toISOString() } });
   }
 
   if (!roleId) {
-    return res.status(400).json({ success: false, error: 'Role ID is required' });
+    return res.status(400).json({ success: false, error: { code: 'INVALID_INPUT', message: 'Role ID is required.' }, meta: { timestamp: new Date().toISOString() } });
   }
 
   const {
@@ -97,7 +97,7 @@ const updateRole = asyncHandler(async (req, res) => {
   );
 
   if (Object.keys(updates).length === 0) {
-    return res.status(400).json({ success: false, error: 'No valid fields to update' });
+    return res.status(400).json({ success: false, error: { code: 'INVALID_INPUT', message: 'No valid fields to update.' }, meta: { timestamp: new Date().toISOString() } });
   }
 
   const updated = await rolesService.updateRole(roleId, updates, adminId);

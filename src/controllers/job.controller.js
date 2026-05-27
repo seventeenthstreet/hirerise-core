@@ -1,5 +1,9 @@
 'use strict';
 
+// CONTRACT NOTE (Phase 2): All error responses use V2 canonical shape.
+// { success:false, error:{code,message}, meta:{timestamp} }
+
+
 /**
  * job.controller.js — Optimized
  *
@@ -74,8 +78,13 @@ const getRoleById = asyncHandler(async (req, res) => {
   if (!roleId) {
     return res.status(400).json({
       success: false,
-      errorCode: 'INVALID_ROLE_ID',
-      message: 'roleId is required'
+      error: {
+        code: 'INVALID_ROLE_ID',
+        message: 'roleId is required',
+      },
+      meta: {
+        timestamp: new Date().toISOString(),
+      },
     });
   }
 
@@ -84,8 +93,13 @@ const getRoleById = asyncHandler(async (req, res) => {
   if (!role) {
     return res.status(404).json({
       success: false,
-      errorCode: 'ROLE_NOT_FOUND',
-      message: `Role ${roleId} not found`
+      error: {
+        code: 'ROLE_NOT_FOUND',
+        message: `Role ${roleId} not found`,
+      },
+      meta: {
+        timestamp: new Date().toISOString(),
+      },
     });
   }
 

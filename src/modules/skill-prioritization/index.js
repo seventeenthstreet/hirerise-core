@@ -1,5 +1,7 @@
 'use strict';
 
+const logger = require('../../utils/logger');
+
 /**
  * modules/skill-prioritization/index.js
  *
@@ -26,7 +28,7 @@ const { supabase } = require('../../config/supabase');
  * without introducing hard dependency coupling.
  */
 const logRepoError = (repo, operation, error, meta = {}) => {
-  console.error(`[skill-prioritization] ${repo}.${operation} failed`, {
+  logger.error('[SkillPrioritization] Repository operation failed', {
     message: error?.message,
     code: error?.code,
     details: error?.details,

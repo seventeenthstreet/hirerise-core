@@ -6,7 +6,7 @@ const cacheManager = require('../core/cache/cache.manager');
 const getCache = () => cacheManager?.getClient?.() || null;
 const { supabase } = require('../config/supabase');
 const logger = require('../utils/logger');
-const { getUserVector } = require('../services/userVector.service');
+// userVector is resolved by the owning service and passed via userProfile.userVector
 
 const CACHE_TTL = 600;
 const MATCH_RPC = 'match_jobs_by_embedding';
@@ -63,13 +63,14 @@ async function getSemanticJobRecommendations(userProfile = {}, opts = {}) {
     yearsExperience = 0,
     industry = '',
     location = '',
+    userVector: preloadedVector = null,
   } = userProfile;
 
   const cacheKey = `semantic:${userId}:${hashProfile(
     userProfile
   )}:${topN}:${minScore}`;
 
-  if (cache) {
+  if (getCache()) {
     try {
       const cached = await getCache()?.get(cacheKey);
       if (cached) {
@@ -87,15 +88,7 @@ async function getSemanticJobRecommendations(userProfile = {}, opts = {}) {
     }
   }
 
-  let userVector = null;
-  try {
-    userVector = await getUserVector(userId, skills);
-  } catch (err) {
-    logger.error('[Semantic] user vector failed', {
-      userId,
-      err: err.message,
-    });
-  }
+  const userVector = preloadedVector;
 
   if (!Array.isArray(userVector) || !userVector.length) {
     return emptyResponse('no_vector');
@@ -215,7 +208,7 @@ async function getSemanticJobRecommendations(userProfile = {}, opts = {}) {
     vector_used: true,
   });
 
-  if (cache) {
+  if (getCache()) {
     try {
       await getCache()?.set(cacheKey, JSON.stringify(response), 'EX', CACHE_TTL);
     } catch (err) {

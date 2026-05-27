@@ -1,5 +1,8 @@
 'use strict';
 
+// CONTRACT NOTE (Phase 2): All error responses use V2 canonical shape.
+
+
 /**
  * src/routes/admin/adminMetrics.routes.js
  *
@@ -213,9 +216,13 @@ router.get('/', async (req, res) => {
   if (error) {
     return res.status(400).json({
       success: false,
-      errorCode: 'VALIDATION_ERROR',
-      message: error,
-      timestamp: new Date().toISOString(),
+      error: {
+        code: 'VALIDATION_ERROR',
+        message: error,
+      },
+      meta: {
+        timestamp: new Date().toISOString(),
+      },
     });
   }
 
@@ -249,9 +256,13 @@ router.get('/', async (req, res) => {
 
     return res.status(500).json({
       success: false,
-      errorCode: 'INTERNAL_ERROR',
-      message: 'Failed to compute metrics.',
-      timestamp: new Date().toISOString(),
+      error: {
+        code: 'INTERNAL_ERROR',
+        message: 'Failed to compute metrics.',
+      },
+      meta: {
+        timestamp: new Date().toISOString(),
+      },
     });
   }
 });
@@ -265,8 +276,13 @@ router.get('/aggregated', async (req, res) => {
   if (error) {
     return res.status(400).json({
       success: false,
-      errorCode: 'VALIDATION_ERROR',
-      message: error,
+      error: {
+        code: 'VALIDATION_ERROR',
+        message: error,
+      },
+      meta: {
+        timestamp: new Date().toISOString(),
+      },
     });
   }
 
@@ -288,8 +304,13 @@ router.get('/aggregated', async (req, res) => {
 
     return res.status(500).json({
       success: false,
-      errorCode: 'INTERNAL_ERROR',
-      message: 'Failed to fetch aggregated metrics.',
+      error: {
+        code: 'INTERNAL_ERROR',
+        message: 'Failed to fetch aggregated metrics.',
+      },
+      meta: {
+        timestamp: new Date().toISOString(),
+      },
     });
   }
 });
@@ -303,8 +324,13 @@ router.post('/aggregate', verifySuperAdmin, async (req, res) => {
   if (dateStr && !/^\d{4}-\d{2}-\d{2}$/.test(dateStr)) {
     return res.status(400).json({
       success: false,
-      errorCode: 'VALIDATION_ERROR',
-      message: 'date must be YYYY-MM-DD format.',
+      error: {
+        code: 'VALIDATION_ERROR',
+        message: 'date must be YYYY-MM-DD format.',
+      },
+      meta: {
+        timestamp: new Date().toISOString(),
+      },
     });
   }
 
@@ -329,8 +355,13 @@ router.post('/aggregate', verifySuperAdmin, async (req, res) => {
 
     return res.status(500).json({
       success: false,
-      errorCode: 'INTERNAL_ERROR',
-      message: 'Aggregation job failed.',
+      error: {
+        code: 'INTERNAL_ERROR',
+        message: 'Aggregation job failed.',
+      },
+      meta: {
+        timestamp: new Date().toISOString(),
+      },
     });
   }
 });

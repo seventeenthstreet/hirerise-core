@@ -31,30 +31,32 @@ const SUPPORTED_ENTITY_TYPES = Object.freeze([
   'salaryBenchmark',
 ]);
 
+// CONTRACT NOTE (Phase 2): errorCode renamed to `code` to align with V2 contract.
+// The approve route builds { error: { code: classified.code, message } } from these entries.
 const RPC_ERROR_MAP = Object.freeze({
   PENDING_NOT_FOUND: {
     status: 404,
-    errorCode: 'NOT_FOUND',
+    code: 'NOT_FOUND',
     message: 'Entry not found.',
   },
   ALREADY_REVIEWED: {
     status: 409,
-    errorCode: 'ALREADY_REVIEWED',
+    code: 'ALREADY_REVIEWED',
     message: 'Entry has already been reviewed.',
   },
   INVALID_ENTITY_TYPE: {
     status: 400,
-    errorCode: 'INVALID_ENTITY_TYPE',
+    code: 'INVALID_ENTITY_TYPE',
     message: 'Unsupported entity type.',
   },
   LIVE_INSERT_FAILED: {
     status: 500,
-    errorCode: 'LIVE_INSERT_FAILED',
+    code: 'LIVE_INSERT_FAILED',
     message: 'Failed to create live CMS record.',
   },
   CONCURRENT_APPROVAL: {
     status: 409,
-    errorCode: 'CONCURRENT_APPROVAL',
+    code: 'CONCURRENT_APPROVAL',
     message:
       'Another approval is in progress for this entry. Please retry.',
   },
@@ -274,16 +276,26 @@ router.get(
     if (error || !data) {
       return res.status(404).json({
         success: false,
-        errorCode: 'NOT_FOUND',
-        message: 'Entry not found.',
+        error: {
+          code: 'NOT_FOUND',
+          message: 'Entry not found.',
+        },
+        meta: {
+          timestamp: new Date().toISOString(),
+        },
       });
     }
 
     if (!isMasterOrAdmin(req) && data.submitted_by !== actorId) {
       return res.status(403).json({
         success: false,
-        errorCode: 'FORBIDDEN',
-        message: 'Access denied.',
+        error: {
+          code: 'FORBIDDEN',
+          message: 'Access denied.',
+        },
+        meta: {
+          timestamp: new Date().toISOString(),
+        },
       });
     }
 
@@ -319,8 +331,13 @@ router.post(
     if (!actorId) {
       return res.status(401).json({
         success: false,
-        errorCode: 'UNAUTHENTICATED',
-        message: 'Unauthenticated.',
+        error: {
+          code: 'UNAUTHENTICATED',
+          message: 'Unauthenticated.',
+        },
+        meta: {
+          timestamp: new Date().toISOString(),
+        },
       });
     }
 
@@ -337,8 +354,13 @@ router.post(
       if (classified) {
         return res.status(classified.status).json({
           success: false,
-          errorCode: classified.errorCode,
-          message: classified.message,
+          error: {
+            code: classified.code,
+            message: classified.message,
+          },
+          meta: {
+            timestamp: new Date().toISOString(),
+          },
         });
       }
 
@@ -351,8 +373,13 @@ router.post(
 
       return res.status(500).json({
         success: false,
-        errorCode: 'RPC_FAILURE',
-        message: 'Approval transaction failed.',
+        error: {
+          code: 'RPC_FAILURE',
+          message: 'Approval transaction failed.',
+        },
+        meta: {
+          timestamp: new Date().toISOString(),
+        },
       });
     }
 
@@ -365,8 +392,13 @@ router.post(
 
       return res.status(500).json({
         success: false,
-        errorCode: 'RPC_INVALID_RESPONSE',
-        message: 'Approval completed with invalid RPC response.',
+        error: {
+          code: 'RPC_INVALID_RESPONSE',
+          message: 'Approval completed with invalid RPC response.',
+        },
+        meta: {
+          timestamp: new Date().toISOString(),
+        },
       });
     }
 
@@ -422,16 +454,26 @@ router.post(
     if (error || !entry) {
       return res.status(404).json({
         success: false,
-        errorCode: 'NOT_FOUND',
-        message: 'Entry not found.',
+        error: {
+          code: 'NOT_FOUND',
+          message: 'Entry not found.',
+        },
+        meta: {
+          timestamp: new Date().toISOString(),
+        },
       });
     }
 
     if (entry.status !== 'pending') {
       return res.status(409).json({
         success: false,
-        errorCode: 'ALREADY_REVIEWED',
-        message: `Entry has already been ${entry.status}.`,
+        error: {
+          code: 'ALREADY_REVIEWED',
+          message: `Entry has already been ${entry.status}.`,
+        },
+        meta: {
+          timestamp: new Date().toISOString(),
+        },
       });
     }
 
@@ -489,24 +531,39 @@ router.delete(
     if (error || !entry) {
       return res.status(404).json({
         success: false,
-        errorCode: 'NOT_FOUND',
-        message: 'Entry not found.',
+        error: {
+          code: 'NOT_FOUND',
+          message: 'Entry not found.',
+        },
+        meta: {
+          timestamp: new Date().toISOString(),
+        },
       });
     }
 
     if (!isMasterOrAdmin(req) && entry.submitted_by !== actorId) {
       return res.status(403).json({
         success: false,
-        errorCode: 'FORBIDDEN',
-        message: 'You can only withdraw your own submissions.',
+        error: {
+          code: 'FORBIDDEN',
+          message: 'You can only withdraw your own submissions.',
+        },
+        meta: {
+          timestamp: new Date().toISOString(),
+        },
       });
     }
 
     if (entry.status === 'approved') {
       return res.status(409).json({
         success: false,
-        errorCode: 'ALREADY_APPROVED',
-        message: 'Approved entries cannot be withdrawn.',
+        error: {
+          code: 'ALREADY_APPROVED',
+          message: 'Approved entries cannot be withdrawn.',
+        },
+        meta: {
+          timestamp: new Date().toISOString(),
+        },
       });
     }
 

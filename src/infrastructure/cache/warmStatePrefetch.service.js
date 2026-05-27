@@ -1,8 +1,8 @@
 'use strict';
 
 const logger = require('../../utils/logger');
-const cache = require('./analyticsCache.service');
-const predictiveHeat = require('./predictiveHeat.service');
+const cache = require('./analyticsCache.utils');
+const predictiveHeat = require('./predictiveHeat.utils');
 const snapshotWorker = require('../workers/cacheSnapshot.worker');
 
 const DEFAULT_TOP_N = Number(process.env.WARM_PREFETCH_TOP_N || 12);

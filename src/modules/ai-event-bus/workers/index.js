@@ -27,7 +27,7 @@ const ENGINE_PATHS = {
   semanticJobMatch: '../../engines/semanticJobMatching.engine',
   opportunityRadar: '../../engines/opportunityRadar.engine',
   careerAdvisor: '../../engines/careerAdvisor.engine',
-  marketTrend: '../../modules/labor-market-intelligence/services/marketTrend.service',
+  marketTrend: '../../modules/labor-market-intelligence/coordinators/marketIntelligence.coordinator',
   careerRisk: '../../engines/careerRisk.engine',
 };
 

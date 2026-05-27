@@ -10,35 +10,21 @@
  *   GET  /career/emerging-roles            — public catalogue of emerging roles
  *   POST /career/opportunity-radar/refresh — trigger signal refresh (admin)
  *
- * Supabase migration notes:
- * - Removed Firebase-style auth assumptions
- * - Supports Supabase JWT user payload conventions
- * - Hardened query parsing and null safety
- * - Improved structured logging consistency
- * - Preserves existing API response shape
+ * CONTRACT NOTE (Phase 2 Hardening — Task 6: Shadowed Local Helper Resolution):
+ *   Removed local `sendSuccess` and `sendError` helper functions.
+ *   These were V2-shaped but diverged from the canonical helpers (no meta envelope
+ *   in sendSuccess, different argument order in sendError). Migrated to:
+ *     const { sendSuccess, sendError } = require('../../shared/response');
+ *
+ *   BEFORE: local sendSuccess(res, data, statusCode) / sendError(res, message, statusCode, meta)
+ *   AFTER:  shared sendSuccess(res, data, extra, meta, status) / sendError(res, status, message, code)
+ *
+ *   NOTE: sendError argument order changed — callers updated to match shared signature.
  */
 
 const logger = require('../../utils/logger');
-const engine = require('../../engines/opportunityRadar.engine');
-
-// ───────────────────────────────────────────────────────────────────────────────
-// Response helpers
-// ───────────────────────────────────────────────────────────────────────────────
-
-function sendSuccess(res, data, statusCode = 200) {
-  return res.status(statusCode).json({
-    success: true,
-    data,
-  });
-}
-
-function sendError(res, message, statusCode = 500, meta = undefined) {
-  return res.status(statusCode).json({
-    success: false,
-    error: message,
-    ...(meta ? { meta } : {}),
-  });
-}
+const engine = require('./opportunityRadar.service');
+const { sendSuccess, sendError } = require('../../shared/response');
 
 // ───────────────────────────────────────────────────────────────────────────────
 // Query helpers
@@ -109,7 +95,7 @@ async function getOpportunityRadar(req, res) {
   const userId = getAuthenticatedUserId(req);
 
   if (!userId) {
-    return sendError(res, 'Unauthenticated', 401);
+    return sendError(res, 401, 'Unauthenticated', 'UNAUTHORIZED');
   }
 
   const topN = parseInteger(req.query.limit, 10, { min: 1, max: 30 });
@@ -140,7 +126,7 @@ async function getOpportunityRadar(req, res) {
       query: req.query,
     });
 
-    return sendError(res, 'Failed to load opportunity radar', 500);
+    return sendError(res, 500, 'Failed to load opportunity radar', 'INTERNAL_ERROR');
   }
 }
 
@@ -184,7 +170,7 @@ async function getEmergingRoles(req, res) {
       query: req.query,
     });
 
-    return sendError(res, 'Failed to load emerging roles', 500);
+    return sendError(res, 500, 'Failed to load emerging roles', 'INTERNAL_ERROR');
   }
 }
 
@@ -198,7 +184,7 @@ async function getEmergingRoles(req, res) {
  */
 async function refreshSignals(req, res) {
   if (!isAdmin(req)) {
-    return sendError(res, 'Admin access required', 403);
+    return sendError(res, 403, 'Admin access required', 'FORBIDDEN');
   }
 
   try {
@@ -217,7 +203,7 @@ async function refreshSignals(req, res) {
       userId: getAuthenticatedUserId(req),
     });
 
-    return sendError(res, 'Signal refresh failed', 500);
+    return sendError(res, 500, 'Signal refresh failed', 'INTERNAL_ERROR');
   }
 }
 

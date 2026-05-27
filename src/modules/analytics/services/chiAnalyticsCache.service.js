@@ -2,7 +2,7 @@
 
 const { supabase } = require('../../../config/supabase');
 const logger = require('../../../utils/logger');
-const cache = require('../../../infrastructure/cache/analyticsCache.service');
+const cache = require('../../../infrastructure/cache/analyticsCache.utils');
 
 const CACHE_NAMESPACE_VERSION = 'v1';
 

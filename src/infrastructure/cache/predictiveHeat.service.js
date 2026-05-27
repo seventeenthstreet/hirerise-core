@@ -1,10 +1,10 @@
-const cache = require("./analyticsCache.service");
+const cache = require("./analyticsCache.utils");
 
 const replayPolicyEngine = require(
   "../governance/replayPolicy.engine"
 );
 
-const pressureIndex = require("./tenantPressureIndex.service");
+const pressureIndex = require("./tenantPressureIndex.utils");
 const WINDOW_15M_MS = 15 * 60 * 1000;
 const WINDOW_1H_MS = 60 * 60 * 1000;
 const FORECAST_TTL_MS = 14 * 24 * 60 * 60 * 1000;

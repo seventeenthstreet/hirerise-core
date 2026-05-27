@@ -1,3 +1,5 @@
+'use strict';
+
 import { Router } from 'express';
 import { authenticate } from '../middleware/auth.middleware.js';
 import {
@@ -10,6 +12,10 @@ import {
   requestSalaryBenchmark,
   getSalaryResult,
 } from '../controllers/salary.controller.js';
+
+// ── Validation ────────────────────────────────────────────────────────────────
+import { salaryBenchmarkSchema } from '../validations/schemas/salary.schema.js';
+import { validate } from '../validations/middleware/validate.js';
 
 export const salaryRouter = Router();
 
@@ -24,6 +30,8 @@ salaryRouter.post(
   '/benchmark',
   salaryRequestRateLimit,
   pendingJobLimitMiddleware,
+  salaryBenchmarkSchema,  // ← express-validator chain
+  validate,               // ← reject early if invalid
   requestSalaryBenchmark,
 );
 

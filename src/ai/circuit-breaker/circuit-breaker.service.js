@@ -12,7 +12,7 @@
 
 import redis from '../../config/redis.js';
 import observability from '../observability/observability-adapter.js';
-import alertService from '../observability/alert.service.js';
+import alertService from '../observability/alert.utils.js';
 
 // Namespace (VERY IMPORTANT for multi-service systems)
 const SERVICE = process.env.SERVICE_NAME || 'core';
