@@ -80,3 +80,4 @@ get-firebase-token.js
 get-firebase-token.mjs
 test-tier-integration.js
 firestore-backup.json
+backups/
