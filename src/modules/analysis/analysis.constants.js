@@ -19,6 +19,7 @@ const DEFAULT_CREDIT_COSTS = Object.freeze({
   jobMatchAnalysis: 2,
   jobSpecificCV:   3,
   chiCalculation:  1,
+  jobMatchPremium: 2,
 });
 
 const DEFAULT_PLAN_CREDITS = Object.freeze({

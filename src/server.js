@@ -229,6 +229,10 @@ const marketIntelRouter    = require('./modules/marketIntelligence/marketIntelli
 const { skillDemandRouter } = require('./modules/skillDemand');
 const directionRouter      = require('./routes/userDirection.routes');
 
+// ── WP-7: System Health + XAI Metrics ────────────────────────────────────────
+const systemHealthRoutes = require('./routes/admin/systemHealth.routes');
+const xaiMetricsRoutes   = require('./routes/admin/xaiMetrics.routes');
+
 // ── Daily Engagement System ───────────────────────────────────────────────────
 const {
   engagementRouter,
@@ -4921,6 +4925,20 @@ app.use(`${API_PREFIX}/dashboard`,     authenticate, require('./modules/dashboar
 app.use(`${API_PREFIX}/app-entry`,     authenticate, require('./modules/appEntry/appEntry.route'));
 app.use(`${API_PREFIX}/qualifications`, authenticate, require('./modules/qualification/qualification.routes'));
 
+// ── WP-13B — Premium Job Match Intelligence ───────────────────────────────────
+// Requires a paid plan. authenticate verifies the Supabase JWT; requirePaidPlan
+// checks the subscription tier (pro | elite | enterprise | premium) via the JWT
+// claim with a Supabase DB fallback. Free users receive HTTP 403.
+const jobMatchPremiumRouter = require('./modules/jobMatchPremium/routes/jobMatchPremium.routes');
+const { requirePaidPlan }   = require('./middleware/requirePaidPlan.middleware');
+
+app.use(
+  `${API_PREFIX}/premium`,
+  authenticate,
+  requirePaidPlan,
+  jobMatchPremiumRouter
+);
+
 // =============================================================================
 // ✅ Admin Routes (authenticate + requireAdmin)
 // =============================================================================
@@ -4931,6 +4949,9 @@ app.use(`${API_PREFIX}/admin`, adminRateLimit);
 
 app.use(`${API_PREFIX}/admin/metrics`,           authenticate, requireAdmin, require('./routes/admin/adminMetrics.routes'));
 app.use(`${API_PREFIX}/admin/ai`,                authenticate, requireAdmin, require('./routes/admin/ai-observability.routes'));
+// WP-7 — Phase 1 stubs (WP-13: replace stub bodies with real service calls)
+app.use(`${API_PREFIX}/system`,  authenticate, requireAdmin, systemHealthRoutes);
+app.use(`${API_PREFIX}/metrics`, authenticate, requireAdmin, xaiMetricsRoutes);
 app.use(`${API_PREFIX}/admin/jobs`,              authenticate, requireAdmin, require('./modules/admin/jobs/adminJobs.routes'));
 app.use(`${API_PREFIX}/admin/adaptive-weights`,  authenticate, requireAdmin, require('./modules/adaptiveWeight/adaptiveWeight.routes'));
 
