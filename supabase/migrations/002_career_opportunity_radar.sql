@@ -8,47 +8,84 @@
 -- TABLE 1 — career_opportunity_signals
 -- Master registry of detected emerging/high-growth roles.
 -- Populated by OpportunityRadarEngine on a scheduled basis.
--- =============================================================================
+--- =============================================================================
 
 CREATE TABLE IF NOT EXISTS career_opportunity_signals (
-  id               UUID         PRIMARY KEY DEFAULT gen_random_uuid(),
-  role_name        TEXT         NOT NULL,
-  industry         TEXT         NOT NULL,
+  id                 UUID         PRIMARY KEY DEFAULT gen_random_uuid(),
+  role_name          TEXT         NOT NULL,
+  industry           TEXT         NOT NULL,
 
   -- Growth metrics (raw, from LMI data)
-  growth_rate      NUMERIC(6,2) NOT NULL DEFAULT 0,   -- YoY % e.g. 42.5 = 42.5%
-  salary_growth_rate NUMERIC(6,2) NOT NULL DEFAULT 0, -- YoY salary growth %
-  average_salary   TEXT         NOT NULL DEFAULT '0', -- human-readable e.g. "₹12L"
-  average_salary_raw BIGINT     NOT NULL DEFAULT 0,   -- INR annual for sorting
+  growth_rate        NUMERIC(6,2) NOT NULL DEFAULT 0,
+  salary_growth_rate NUMERIC(6,2) NOT NULL DEFAULT 0,
+  average_salary     TEXT         NOT NULL DEFAULT '0',
+  average_salary_raw BIGINT       NOT NULL DEFAULT 0,
 
   -- Demand metrics
-  demand_score     NUMERIC(5,2) NOT NULL DEFAULT 0 CHECK (demand_score    BETWEEN 0 AND 100),
-  emerging_score   NUMERIC(5,2) NOT NULL DEFAULT 0 CHECK (emerging_score  BETWEEN 0 AND 100),
-  opportunity_score NUMERIC(5,2) NOT NULL DEFAULT 0 CHECK (opportunity_score BETWEEN 0 AND 100),
+  demand_score       NUMERIC(5,2) NOT NULL DEFAULT 0
+                     CHECK (demand_score BETWEEN 0 AND 100),
+  emerging_score     NUMERIC(5,2) NOT NULL DEFAULT 0
+                     CHECK (emerging_score BETWEEN 0 AND 100),
+  opportunity_score  NUMERIC(5,2) NOT NULL DEFAULT 0
+                     CHECK (opportunity_score BETWEEN 0 AND 100),
 
-  -- Scoring components (stored for transparency / debugging)
-  score_breakdown  JSONB        NOT NULL DEFAULT '{}',
-  -- e.g. { "job_growth": 35, "salary_growth": 25, "skill_demand": 22, "industry_growth": 16 }
+  -- Scoring components
+  score_breakdown    JSONB        NOT NULL DEFAULT '{}',
 
-  -- Skill data
-  required_skills  JSONB        NOT NULL DEFAULT '[]',
-  -- e.g. ["Power BI", "SQL", "Process Optimization"]
+  -- Required skills
+  required_skills    TEXT[]       NOT NULL DEFAULT '{}',
 
   -- Metadata
-  growth_trend     TEXT         NOT NULL DEFAULT 'Moderate'
-                   CHECK (growth_trend IN ('Very High', 'High', 'Moderate', 'Emerging', 'Stable')),
-  is_emerging      BOOLEAN      NOT NULL DEFAULT false,  -- true = new role < 3 years mainstream
-  data_source      TEXT         NOT NULL DEFAULT 'lmi',  -- 'lmi' | 'seed' | 'manual'
-  signal_date      DATE         NOT NULL DEFAULT CURRENT_DATE,
+  growth_trend       TEXT         NOT NULL DEFAULT 'Moderate'
+                     CHECK (growth_trend IN ('Very High','High','Moderate','Emerging','Stable')),
+  is_emerging        BOOLEAN      NOT NULL DEFAULT false,
+  data_source        TEXT         NOT NULL DEFAULT 'lmi',
+  signal_date        DATE         NOT NULL DEFAULT CURRENT_DATE,
 
-  created_at       TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
-  updated_at       TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+  created_at         TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+  updated_at         TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
 
-  -- Unique per role+industry combination; safe to upsert on refresh
   UNIQUE (role_name, industry)
 );
 
--- Indexes for common query patterns
+-- =============================================================================
+-- Enterprise Schema Validation
+-- Detect legacy schema drift before continuing.
+-- =============================================================================
+DO $$
+DECLARE
+    actual_type text;
+BEGIN
+    SELECT format_type(a.atttypid, a.atttypmod)
+      INTO actual_type
+    FROM pg_attribute a
+    JOIN pg_class c
+      ON c.oid = a.attrelid
+    JOIN pg_namespace n
+      ON n.oid = c.relnamespace
+    WHERE n.nspname = 'public'
+      AND c.relname = 'career_opportunity_signals'
+      AND a.attname = 'required_skills'
+      AND a.attnum > 0
+      AND NOT a.attisdropped
+    LIMIT 1;
+
+    IF actual_type IS NULL THEN
+        RAISE EXCEPTION
+            'Schema validation failed: public.career_opportunity_signals.required_skills column not found.';
+    END IF;
+
+    IF actual_type <> 'text[]' THEN
+        RAISE EXCEPTION
+            'Schema drift detected: public.career_opportunity_signals.required_skills is %, expected text[].',
+            actual_type;
+    END IF;
+END $$;
+
+-- =============================================================================
+-- Indexes
+-- =============================================================================
+
 CREATE INDEX IF NOT EXISTS idx_opp_signals_score
   ON career_opportunity_signals (opportunity_score DESC);
 
@@ -61,11 +98,17 @@ CREATE INDEX IF NOT EXISTS idx_opp_signals_emerging
 CREATE INDEX IF NOT EXISTS idx_opp_signals_trend
   ON career_opportunity_signals (growth_trend, opportunity_score DESC);
 
--- Auto-update updated_at
-DROP TRIGGER IF EXISTS set_opp_signals_updated_at ON career_opportunity_signals;
+-- =============================================================================
+-- Trigger
+-- =============================================================================
+
+DROP TRIGGER IF EXISTS set_opp_signals_updated_at
+ON career_opportunity_signals;
+
 CREATE TRIGGER set_opp_signals_updated_at
   BEFORE UPDATE ON career_opportunity_signals
-  FOR EACH ROW EXECUTE PROCEDURE trigger_set_updated_at();
+  FOR EACH ROW
+  EXECUTE PROCEDURE trigger_set_updated_at();
 
 -- =============================================================================
 -- TABLE 2 — user_opportunity_matches
@@ -116,6 +159,7 @@ CREATE TABLE IF NOT EXISTS opportunity_radar_runs (
 
 ALTER TABLE user_opportunity_matches ENABLE ROW LEVEL SECURITY;
 
+DROP POLICY IF EXISTS "users_own_opp_matches" ON user_opportunity_matches;
 CREATE POLICY "users_own_opp_matches"
   ON user_opportunity_matches FOR SELECT
   USING (user_id = auth.uid()::text);
@@ -123,6 +167,7 @@ CREATE POLICY "users_own_opp_matches"
 -- career_opportunity_signals is public read (no sensitive data)
 ALTER TABLE career_opportunity_signals ENABLE ROW LEVEL SECURITY;
 
+DROP POLICY IF EXISTS "signals_public_read" ON career_opportunity_signals;
 CREATE POLICY "signals_public_read"
   ON career_opportunity_signals FOR SELECT
   USING (true);
@@ -141,61 +186,61 @@ VALUES
   ('AI Product Manager', 'Technology', 65.0, 28.0, '₹22L', 2200000,
    88, 92, 89,
    '{"job_growth":35,"salary_growth":25,"skill_demand":22,"industry_growth":7}',
-   '["Product Management","AI/ML Fundamentals","Prompt Engineering","Data Analysis","Stakeholder Management"]',
+   '{"Product Management","AI/ML Fundamentals","Prompt Engineering","Data Analysis","Stakeholder Management"}',
    'Very High', true, 'seed'),
 
   ('Data Operations Specialist', 'Technology', 48.0, 22.0, '₹14L', 1400000,
    82, 78, 82,
    '{"job_growth":35,"salary_growth":22,"skill_demand":18,"industry_growth":7}',
-   '["SQL","Python","Data Pipelines","Power BI","Process Optimization"]',
+   '{"SQL","Python","Data Pipelines","Power BI","Process Optimization"}',
    'High', true, 'seed'),
 
   ('Automation Consultant', 'Operations', 55.0, 25.0, '₹18L', 1800000,
    85, 80, 85,
    '{"job_growth":35,"salary_growth":25,"skill_demand":19,"industry_growth":6}',
-   '["RPA Tools","Process Mapping","Python","Business Analysis","Change Management"]',
+   '{"RPA Tools","Process Mapping","Python","Business Analysis","Change Management"}',
    'Very High', true, 'seed'),
 
   ('Growth Analyst', 'Marketing & Technology', 42.0, 20.0, '₹12L', 1200000,
    78, 72, 79,
    '{"job_growth":35,"salary_growth":20,"skill_demand":18,"industry_growth":6}',
-   '["Google Analytics","SQL","A/B Testing","Excel","Python"]',
+   '{"Google Analytics","SQL","A/B Testing","Excel","Python"}',
    'High', false, 'seed'),
 
   ('Sustainability Manager', 'Consulting & Manufacturing', 38.0, 18.0, '₹16L', 1600000,
    72, 85, 76,
    '{"job_growth":35,"salary_growth":18,"skill_demand":17,"industry_growth":6}',
-   '["ESG Reporting","Carbon Accounting","Project Management","Stakeholder Engagement","Regulatory Compliance"]',
+   '{"ESG Reporting","Carbon Accounting","Project Management","Stakeholder Engagement","Regulatory Compliance"}',
    'High', true, 'seed'),
 
   ('MLOps Engineer', 'Technology', 72.0, 32.0, '₹25L', 2500000,
    91, 88, 91,
    '{"job_growth":35,"salary_growth":25,"skill_demand":23,"industry_growth":8}',
-   '["Python","Docker","Kubernetes","ML Frameworks","CI/CD","Cloud Platforms"]',
+   '{"Python","Docker","Kubernetes","ML Frameworks","CI/CD","Cloud Platforms"}',
    'Very High', true, 'seed'),
 
   ('Operations Analyst', 'Operations & Finance', 35.0, 18.0, '₹12L', 1200000,
    75, 68, 75,
    '{"job_growth":35,"salary_growth":18,"skill_demand":17,"industry_growth":5}',
-   '["Power BI","SQL","Process Optimization","Excel","Business Analysis"]',
+   '{"Power BI","SQL","Process Optimization","Excel","Business Analysis"}',
    'High', false, 'seed'),
 
   ('Prompt Engineer', 'Technology', 120.0, 45.0, '₹20L', 2000000,
    86, 95, 88,
    '{"job_growth":35,"salary_growth":25,"skill_demand":21,"industry_growth":7}',
-   '["LLM APIs","Python","NLP","Technical Writing","AI/ML Fundamentals"]',
+   '{"LLM APIs","Python","NLP","Technical Writing","AI/ML Fundamentals"}',
    'Very High', true, 'seed'),
 
   ('Climate Risk Analyst', 'Finance & Insurance', 40.0, 22.0, '₹18L', 1800000,
    70, 82, 73,
    '{"job_growth":35,"salary_growth":22,"skill_demand":16,"industry_growth":0}',
-   '["Risk Modelling","ESG Frameworks","Financial Analysis","Python","Data Visualization"]',
+   '{"Risk Modelling","ESG Frameworks","Financial Analysis","Python","Data Visualization"}',
    'Emerging', true, 'seed'),
 
   ('Cybersecurity Analyst', 'Technology & Banking', 60.0, 30.0, '₹18L', 1800000,
    90, 75, 88,
    '{"job_growth":35,"salary_growth":25,"skill_demand":21,"industry_growth":7}',
-   '["Network Security","Python","SIEM Tools","Threat Analysis","Cloud Security"]',
+   '{"Network Security","Python","SIEM Tools","Threat Analysis","Cloud Security"}',
    'Very High', false, 'seed')
 
 ON CONFLICT (role_name, industry) DO NOTHING;

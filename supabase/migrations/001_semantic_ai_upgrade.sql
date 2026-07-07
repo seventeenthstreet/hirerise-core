@@ -147,21 +147,13 @@ ALTER TABLE career_advice_cache   ENABLE ROW LEVEL SECURITY;
 
 -- Service role bypasses RLS — backend uses service role key
 -- Authenticated users can only read their own rows (if you ever expose via REST)
-DROP POLICY IF EXISTS "users_own_match_cache"
-ON semantic_match_cache;
-
 CREATE POLICY "users_own_match_cache"
-ON semantic_match_cache
-FOR SELECT
-USING (user_id = auth.uid()::text);
-
-DROP POLICY IF EXISTS "users_own_advice_cache"
-ON career_advice_cache;
+  ON semantic_match_cache FOR SELECT
+  USING (user_id = auth.uid()::text);
 
 CREATE POLICY "users_own_advice_cache"
-ON career_advice_cache
-FOR SELECT
-USING (user_id = auth.uid()::text);
+  ON career_advice_cache FOR SELECT
+  USING (user_id = auth.uid()::text);
 
 -- =============================================================================
 -- Helper SQL function for pgvector cosine similarity search
