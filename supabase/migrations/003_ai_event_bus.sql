@@ -184,11 +184,22 @@ ALTER TABLE risk_analysis_results     ENABLE ROW LEVEL SECURITY;
 ALTER TABLE opportunity_radar_results ENABLE ROW LEVEL SECURITY;
 ALTER TABLE career_advice_results     ENABLE ROW LEVEL SECURITY;
 
+DROP POLICY IF EXISTS "own_pipeline_jobs"  ON ai_pipeline_jobs;
 CREATE POLICY "own_pipeline_jobs"   ON ai_pipeline_jobs          FOR SELECT USING (user_id = auth.uid()::text);
+
+DROP POLICY IF EXISTS "own_health_results" ON career_health_results;
 CREATE POLICY "own_health_results"  ON career_health_results     FOR SELECT USING (user_id = auth.uid()::text);
+
+DROP POLICY IF EXISTS "own_match_results"  ON job_match_results;
 CREATE POLICY "own_match_results"   ON job_match_results         FOR SELECT USING (user_id = auth.uid()::text);
+
+DROP POLICY IF EXISTS "own_risk_results"   ON risk_analysis_results;
 CREATE POLICY "own_risk_results"    ON risk_analysis_results     FOR SELECT USING (user_id = auth.uid()::text);
+
+DROP POLICY IF EXISTS "own_radar_results"  ON opportunity_radar_results;
 CREATE POLICY "own_radar_results"   ON opportunity_radar_results FOR SELECT USING (user_id = auth.uid()::text);
+
+DROP POLICY IF EXISTS "own_advice_results" ON career_advice_results;
 CREATE POLICY "own_advice_results"  ON career_advice_results     FOR SELECT USING (user_id = auth.uid()::text);
 
 -- =============================================================================
