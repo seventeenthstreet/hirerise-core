@@ -17,10 +17,7 @@ CREATE EXTENSION IF NOT EXISTS vector;
 CREATE TABLE IF NOT EXISTS skill_embeddings (
   id              UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
   skill_name      TEXT        NOT NULL UNIQUE,
-  -- text-embedding-3-small → 1536 dims
-  -- text-embedding-3-large → 3072 dims
-  -- Use 1536 as default (cost-effective for this use case)
-  embedding_vector VECTOR(1536) NOT NULL,
+  embedding       VECTOR(384) NOT NULL,
   created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
@@ -150,13 +147,21 @@ ALTER TABLE career_advice_cache   ENABLE ROW LEVEL SECURITY;
 
 -- Service role bypasses RLS — backend uses service role key
 -- Authenticated users can only read their own rows (if you ever expose via REST)
+DROP POLICY IF EXISTS "users_own_match_cache"
+ON semantic_match_cache;
+
 CREATE POLICY "users_own_match_cache"
-  ON semantic_match_cache FOR SELECT
-  USING (user_id = auth.uid()::text);
+ON semantic_match_cache
+FOR SELECT
+USING (user_id = auth.uid()::text);
+
+DROP POLICY IF EXISTS "users_own_advice_cache"
+ON career_advice_cache;
 
 CREATE POLICY "users_own_advice_cache"
-  ON career_advice_cache FOR SELECT
-  USING (user_id = auth.uid()::text);
+ON career_advice_cache
+FOR SELECT
+USING (user_id = auth.uid()::text);
 
 -- =============================================================================
 -- Helper SQL function for pgvector cosine similarity search
@@ -164,7 +169,7 @@ CREATE POLICY "users_own_advice_cache"
 -- =============================================================================
 
 CREATE OR REPLACE FUNCTION find_similar_skills(
-  query_vector VECTOR(1536),
+  query_vector VECTOR(384),
   top_k        INT DEFAULT 5,
   min_score    FLOAT DEFAULT 0.6
 )
@@ -175,9 +180,9 @@ RETURNS TABLE (
 LANGUAGE sql STABLE AS $$
   SELECT
     skill_name,
-    1 - (embedding_vector <=> query_vector) AS similarity
+    1 - (embedding <=> query_vector) AS similarity
   FROM skill_embeddings
-  ORDER BY embedding_vector <=> query_vector
+  ORDER BY embedding <=> query_vector
   LIMIT top_k;
 $$;
 

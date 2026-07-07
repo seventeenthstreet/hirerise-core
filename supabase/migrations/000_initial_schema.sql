@@ -2661,10 +2661,10 @@ CREATE OR REPLACE FUNCTION "public"."find_similar_skills"("query_vector" "public
     AS $$
   SELECT
     skill_name,
-    1 - (embedding_vector <=> query_vector) AS similarity
+    1 - (embedding <=> query_vector) AS similarity
   FROM skill_embeddings
-  WHERE 1 - (embedding_vector <=> query_vector) > min_score
-  ORDER BY embedding_vector <=> query_vector
+  WHERE 1 - (embedding <=> query_vector) > min_score
+  ORDER BY embedding <=> query_vector
   LIMIT top_k;
 $$;
 
