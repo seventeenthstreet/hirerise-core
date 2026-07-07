@@ -141,14 +141,17 @@ ALTER TABLE user_personalization_profile ENABLE ROW LEVEL SECURITY;
 ALTER TABLE personalized_recommendations ENABLE ROW LEVEL SECURITY;
 
 -- Users can only read/write their own rows
+DROP POLICY IF EXISTS "own_behavior_events" ON user_behavior_events;
 CREATE POLICY "own_behavior_events"
   ON user_behavior_events FOR ALL
   USING (user_id = auth.uid()::text);
 
+DROP POLICY IF EXISTS "own_personalization_profile" ON user_personalization_profile;
 CREATE POLICY "own_personalization_profile"
   ON user_personalization_profile FOR ALL
   USING (user_id = auth.uid()::text);
 
+DROP POLICY IF EXISTS "own_personalized_recs" ON personalized_recommendations;
 CREATE POLICY "own_personalized_recs"
   ON personalized_recommendations FOR SELECT
   USING (user_id = auth.uid()::text);
