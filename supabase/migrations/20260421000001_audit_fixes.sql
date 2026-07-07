@@ -146,6 +146,19 @@ CREATE POLICY "resumes: own update"
 
 -- ---------------------------------------------------------------------------
 -- FIX 8: Ensure health_check table exists (used by verifyConnection in supabase.js).
+--
+-- NOTE: public.health_check already exists as of 000_initial_schema.sql with
+-- canonical definition (id integer NOT NULL PRIMARY KEY, no default/sequence,
+-- no ts column). The CREATE TABLE IF NOT EXISTS below is therefore always a
+-- no-op against that canonical table (hence the "relation already exists"
+-- NOTICE) and is kept only so this migration remains self-contained if ever
+-- run against a database that lacks the table entirely.
+--
+-- The real schema drift is that this migration's INSERT assumed a "ts"
+-- column that the canonical table never had. Reconcile by adding the
+-- missing column, then upsert a single sentinel row (id = 1) rather than
+-- inserting bare "(ts)", since the canonical "id" column is NOT NULL with
+-- no default/sequence and would otherwise reject the insert.
 -- ---------------------------------------------------------------------------
 
 CREATE TABLE IF NOT EXISTS public.health_check (
@@ -153,9 +166,12 @@ CREATE TABLE IF NOT EXISTS public.health_check (
   ts   TIMESTAMP WITH TIME ZONE DEFAULT now()
 );
 
-INSERT INTO public.health_check (ts)
-VALUES (now())
-ON CONFLICT DO NOTHING;
+ALTER TABLE public.health_check
+  ADD COLUMN IF NOT EXISTS ts TIMESTAMP WITH TIME ZONE DEFAULT now();
+
+INSERT INTO public.health_check (id, ts)
+VALUES (1, now())
+ON CONFLICT (id) DO UPDATE SET ts = EXCLUDED.ts;
 
 -- =============================================================================
 -- End of migration
