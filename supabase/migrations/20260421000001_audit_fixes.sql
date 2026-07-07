@@ -49,8 +49,38 @@ ALTER TABLE public.resume_analyses
 -- Safe: Supabase implicitly casts UUID↔TEXT; this makes it explicit.
 -- ---------------------------------------------------------------------------
 
+-- Drop policies that depend on public.resume_analyses.user_id before the
+-- type change (Postgres blocks ALTER COLUMN TYPE while a policy references
+-- the column). admins_read_all_analyses is NOT dropped: it references
+-- user_roles.user_id, not resume_analyses.user_id, so it has no dependency
+-- on this column.
+DROP POLICY IF EXISTS "users_insert_own_analyses" ON public.resume_analyses;
+DROP POLICY IF EXISTS "users_read_own_analyses" ON public.resume_analyses;
+DROP POLICY IF EXISTS "users_update_own_analyses" ON public.resume_analyses;
+
 ALTER TABLE public.resume_analyses
   ALTER COLUMN user_id TYPE TEXT USING user_id::TEXT;
+
+-- Recreate the dropped policies identically, except auth.uid() (uuid) is
+-- cast to text to match the new column type.
+CREATE POLICY "users_insert_own_analyses"
+  ON public.resume_analyses
+  FOR INSERT
+  TO authenticated
+  WITH CHECK ((auth.uid())::text = user_id);
+
+CREATE POLICY "users_read_own_analyses"
+  ON public.resume_analyses
+  FOR SELECT
+  TO authenticated
+  USING ((auth.uid())::text = user_id);
+
+CREATE POLICY "users_update_own_analyses"
+  ON public.resume_analyses
+  FOR UPDATE
+  TO authenticated
+  USING ((auth.uid())::text = user_id)
+  WITH CHECK ((auth.uid())::text = user_id);
 
 -- ---------------------------------------------------------------------------
 -- FIX 4: onboarding_progress — user_id was nullable and often not written.
