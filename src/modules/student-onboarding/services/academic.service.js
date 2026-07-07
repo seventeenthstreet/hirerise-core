@@ -72,7 +72,10 @@ async function saveAcademicsStep(ctx, userId, sessionId, validatedBody) {
   const normalizedYears = normalizeAcademicYears(yearsInput, ACADEMIC_BOARD_TYPES);
 
   // Persist each year sequentially — each year is an independent upsert
-  for (const [yearKey, yearData] of Object.entries(normalizedYears)) {
+  // NOTE: normalizeAcademicYears returns an array, not an object — iterate
+  // directly with for...of and use yearData.academic_year (not array index).
+  for (const yearData of normalizedYears) {
+    const yearKey        = yearData.academic_year;
     const subjects       = yearData.subjects ?? [];
     const subjectCount   = subjects.length;
 

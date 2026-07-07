@@ -3885,8 +3885,10 @@ const allowedOrigins = [
   ...(IS_PRODUCTION ? [] : [
     'http://localhost:3000',
     'http://localhost:3001',
+    'http://localhost:5173',   // Vite dev server
     'http://127.0.0.1:3000',
     'http://127.0.0.1:3001',
+    'http://127.0.0.1:5173',   // Vite dev server (127.0.0.1 variant)
   ]),
 ].filter(Boolean);
 
@@ -4110,12 +4112,34 @@ class RedisRateLimitStore {
 const rateLimitWindowMs = parseInt(process.env.RATE_LIMIT_WINDOW_MS    || '900000', 10);
 const rateLimitMax      = parseInt(process.env.RATE_LIMIT_MAX_REQUESTS || '400',    10);
 
+// AUTH BOOT ENDPOINTS — exempt from global rate limiting.
+//
+// WHY: /api/v1/app-entry and /api/v1/users/me are called on every page load
+// as part of the Supabase auth hydration sequence (warmAppEntry + fetchUser).
+// React StrictMode double-mounts and Supabase firing INITIAL_SESSION +
+// SIGNED_IN + TOKEN_REFRESHED in rapid succession mean these two endpoints are
+// hit 4-6 times per login in dev. The globalLimiter runs BEFORE authenticate,
+// so req.user is always undefined at that point — all requests fall back to
+// IP-based bucketing, meaning every dev request on localhost shares one counter.
+// This causes spurious 429s on the boot endpoints, which AppContext catches as
+// RateLimitHydrationError and defers — but Supabase keeps firing TOKEN_REFRESHED,
+// each of which retries the pair of requests, producing an infinite 429 storm
+// that prevents the user from ever logging in.
+//
+// The boot endpoints are already protected by authenticate (JWT verification),
+// so skipping the global IP limiter here does not reduce security.
+const AUTH_BOOT_PATHS = new Set(['/api/v1/app-entry', '/api/v1/users/me']);
+
 const globalLimiter = rateLimit({
   windowMs: rateLimitWindowMs,
   max:      rateLimitMax,
   standardHeaders: true,
   legacyHeaders:   false,
-  keyGenerator:    (req) => req.user?.uid || req.ip,
+  // NOTE: keyGenerator runs before authenticate, so req.user?.uid is always
+  // undefined here. We key by IP as a fallback. If you move globalLimiter to
+  // run after authenticate, change this to: req.user?.uid || req.ip
+  keyGenerator: (req) => req.user?.uid || req.ip,
+  skip: (req) => AUTH_BOOT_PATHS.has(req.path),
   // Use Redis store in production; default in-memory store in dev/test
   ...(IS_PRODUCTION && { store: new RedisRateLimitStore(rateLimitWindowMs) }),
   message: {
@@ -4522,6 +4546,14 @@ app.use(`${API_PREFIX}/admin/graph`,               authenticate, requireAdmin, r
 app.use(`${API_PREFIX}/admin/graph-intelligence`,  authenticate, requireAdmin, require('./modules/admin/graph/graphIntelligence.routes'));
 app.use(`${API_PREFIX}/admin/platform-intelligence`, authenticate, requireAdmin, require('./modules/platform-intelligence/routes/platformIntelligence.routes'));
 
+// WP-P2-01 — Source Intelligence Management (SIM).
+// Enterprise registry of external knowledge sources: metadata + governance
+// only (no collection/transform/publish). Admin-only — internal governance
+// surface, not student/employer facing. See
+// modules/source-intelligence/server-registration.snippet.js for the full
+// route summary and the optional event-publisher wiring.
+app.use(`${API_PREFIX}/admin/source-intelligence`, authenticate, requireAdmin, require('./modules/source-intelligence').routes);
+
 app.use(`${API_PREFIX}/chi-v2`,        authenticate, require('./modules/chiV2/chiV2.routes'));
 app.use(`${API_PREFIX}/salary`,        authenticate, require('./routes/salary.routes'));
 
@@ -4924,6 +4956,38 @@ app.use(`${API_PREFIX}/cover-letter`,  authenticate, require('./modules/coverLet
 app.use(`${API_PREFIX}/dashboard`,     authenticate, require('./modules/dashboard/dashboard.route'));
 app.use(`${API_PREFIX}/app-entry`,     authenticate, require('./modules/appEntry/appEntry.route'));
 app.use(`${API_PREFIX}/qualifications`, authenticate, require('./modules/qualification/qualification.routes'));
+
+// ── WP-IMP-02 — Knowledge Runtime (KnowledgeService) ──────────────────────────
+// Read-only taxonomy access (career domains / roles / skills / skill
+// clusters). Individual reads are open to any authenticated user;
+// /invalidate/:nodeId is gated behind requireAdmin inside the router itself.
+app.use(`${API_PREFIX}/knowledge`, authenticate, require('./modules/knowledge-runtime/knowledge/knowledge.routes'));
+
+// ── WP-IMP-03 — Knowledge Runtime (StudentService / student context) ─────────
+// /me/* routes resolve identity from req.user.id; /:userId is gated behind
+// requireAdmin inside the router itself.
+app.use(`${API_PREFIX}/student-context`, authenticate, require('./modules/knowledge-runtime/student/studentIntelligence.routes'));
+
+// ── WP-IMP-04 — Knowledge Runtime (RecommendationService) ─────────────────────
+// Deterministic, rule-based candidate generation only — no scoring/ranking/
+// explainability (deferred to future work packages). /me resolves identity
+// from req.user.id.
+app.use(`${API_PREFIX}/recommendations`, authenticate, require('./modules/knowledge-runtime/recommendation/recommendation.routes'));
+
+// ── WP-IMP-04A — Knowledge Runtime (ValidationService) ────────────────────────
+// Deterministic quality gate over Knowledge/Student/Recommendation output
+// plus IQF (Intelligence Quality Framework) signals — no AI/LLM. /me
+// resolves identity from req.user.id.
+app.use(`${API_PREFIX}/validation`, authenticate, require('./modules/knowledge-runtime/validation/validation.routes'));
+
+// ── WP-IMP-05 — Knowledge Runtime (DecisionEngine) ─────────────────────────────
+// Deterministic Decision Engine, scoped to the `skill` decision type per
+// WP-ARB-01's ratified v1 scope; every other decisionType returns a
+// well-formed WITHHELD Decision (DR-TYP-01). No AI/LLM, no repository
+// access — see documents/WP-DIF-01/WP_IMP05_IMPLEMENTATION_CLARIFICATION.md
+// §13 for the frozen implementation baseline. /me resolves identity from
+// req.user.id.
+app.use(`${API_PREFIX}/decisions`, authenticate, require('./modules/knowledge-runtime/decision/decision.routes'));
 
 // ── WP-13B — Premium Job Match Intelligence ───────────────────────────────────
 // Requires a paid plan. authenticate verifies the Supabase JWT; requirePaidPlan

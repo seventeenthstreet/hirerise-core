@@ -18,7 +18,7 @@ process.env.TEST_JWT =
 /**
  * Silence logger noise in test output.
  */
-jest.mock('../src/utils/logger', () => ({
+jest.mock('../utils/logger', () => ({
   info: jest.fn(),
   warn: jest.fn(),
   error: jest.fn(),

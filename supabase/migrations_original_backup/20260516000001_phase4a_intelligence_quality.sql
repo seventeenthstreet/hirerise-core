@@ -249,40 +249,79 @@ ALTER TABLE signal_reliability_scores   ENABLE ROW LEVEL SECURITY;
 ALTER TABLE cluster_stability_profiles  ENABLE ROW LEVEL SECURITY;
 ALTER TABLE cluster_drift_history       ENABLE ROW LEVEL SECURITY;
 
+-- =============================================================================
+-- RLS POLICIES
+-- =============================================================================
+
 -- Users can read their own records
-CREATE POLICY IF NOT EXISTS signal_coverage_profiles_user_read
-  ON signal_coverage_profiles FOR SELECT
-  USING (auth.uid() = user_id);
 
-CREATE POLICY IF NOT EXISTS signal_reliability_scores_user_read
-  ON signal_reliability_scores FOR SELECT
-  USING (auth.uid() = user_id);
+DROP POLICY IF EXISTS signal_coverage_profiles_user_read
+ON signal_coverage_profiles;
 
-CREATE POLICY IF NOT EXISTS cluster_stability_profiles_user_read
-  ON cluster_stability_profiles FOR SELECT
-  USING (auth.uid() = user_id);
+CREATE POLICY signal_coverage_profiles_user_read
+ON signal_coverage_profiles
+FOR SELECT
+USING (auth.uid() = user_id);
 
-CREATE POLICY IF NOT EXISTS cluster_drift_history_user_read
-  ON cluster_drift_history FOR SELECT
-  USING (auth.uid() = user_id);
+DROP POLICY IF EXISTS signal_reliability_scores_user_read
+ON signal_reliability_scores;
 
--- Service role has full access (analytics pipelines, admin)
-CREATE POLICY IF NOT EXISTS signal_coverage_profiles_service_all
-  ON signal_coverage_profiles FOR ALL
-  USING (auth.role() = 'service_role');
+CREATE POLICY signal_reliability_scores_user_read
+ON signal_reliability_scores
+FOR SELECT
+USING (auth.uid() = user_id);
 
-CREATE POLICY IF NOT EXISTS signal_reliability_scores_service_all
-  ON signal_reliability_scores FOR ALL
-  USING (auth.role() = 'service_role');
+DROP POLICY IF EXISTS cluster_stability_profiles_user_read
+ON cluster_stability_profiles;
 
-CREATE POLICY IF NOT EXISTS cluster_stability_profiles_service_all
-  ON cluster_stability_profiles FOR ALL
-  USING (auth.role() = 'service_role');
+CREATE POLICY cluster_stability_profiles_user_read
+ON cluster_stability_profiles
+FOR SELECT
+USING (auth.uid() = user_id);
 
-CREATE POLICY IF NOT EXISTS cluster_drift_history_service_all
-  ON cluster_drift_history FOR ALL
-  USING (auth.role() = 'service_role');
+DROP POLICY IF EXISTS cluster_drift_history_user_read
+ON cluster_drift_history;
 
+CREATE POLICY cluster_drift_history_user_read
+ON cluster_drift_history
+FOR SELECT
+USING (auth.uid() = user_id);
+
+-- =============================================================================
+-- SERVICE ROLE ACCESS
+-- =============================================================================
+
+DROP POLICY IF EXISTS signal_coverage_profiles_service_all
+ON signal_coverage_profiles;
+
+CREATE POLICY signal_coverage_profiles_service_all
+ON signal_coverage_profiles
+FOR ALL
+USING (auth.role() = 'service_role');
+
+DROP POLICY IF EXISTS signal_reliability_scores_service_all
+ON signal_reliability_scores;
+
+CREATE POLICY signal_reliability_scores_service_all
+ON signal_reliability_scores
+FOR ALL
+USING (auth.role() = 'service_role');
+
+DROP POLICY IF EXISTS cluster_stability_profiles_service_all
+ON cluster_stability_profiles;
+
+CREATE POLICY cluster_stability_profiles_service_all
+ON cluster_stability_profiles
+FOR ALL
+USING (auth.role() = 'service_role');
+
+DROP POLICY IF EXISTS cluster_drift_history_service_all
+ON cluster_drift_history;
+
+CREATE POLICY cluster_drift_history_service_all
+ON cluster_drift_history
+FOR ALL
+USING (auth.role() = 'service_role');
 -- ─────────────────────────────────────────────────────────────
 -- ANALYTICS VIEW: latest intelligence quality per user
 -- ─────────────────────────────────────────────────────────────

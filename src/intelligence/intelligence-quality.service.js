@@ -21,18 +21,18 @@
  *   - Analytics adapter is injected, never imported directly
  */
 
-const { evaluateSignalCoverage }     = require('../models/signal-coverage.model');
-const { evaluateSignalReliability }  = require('../models/signal-reliability.model');
-const { evaluateClusterStability }   = require('../models/cluster-stability.model');
-const { evaluateClusterDrift, evaluateLongitudinalDrift } = require('../models/cluster-drift.model');
-const { evaluateSignalSparsity }     = require('../models/signal-sparsity.model');
+const { evaluateSignalCoverage }     = require('./models/signal-coverage.model');
+const { evaluateSignalReliability }  = require('./models/signal-reliability.model');
+const { evaluateClusterStability }   = require('./models/cluster-stability.model');
+const { evaluateClusterDrift, evaluateLongitudinalDrift } = require('./models/cluster-drift.model');
+const { evaluateSignalSparsity }     = require('./models/signal-sparsity.model');
 const {
   explainSignalCoverage,
   explainSignalReliability,
   explainClusterStability,
   explainClusterDrift,
   explainAssessmentQuality,
-} = require('../models/intelligence-quality.explainability');
+} = require('./models/intelligence-quality.explainability');
 const {
   buildSignalCoverageEvaluatedEvent,
   buildLowSignalCoverageDetectedEvent,
@@ -41,7 +41,7 @@ const {
   buildReassessmentCompletedEvent,
   buildReliabilityThresholdCrossedEvent,
   emitIntelligenceQualityEvents,
-} = require('../models/intelligence-quality.analytics');
+} = require('./models/intelligence-quality.analytics');
 
 class IntelligenceQualityService {
   /**

@@ -1,0 +1,184 @@
+BEGIN;
+
+-- =============================================================================
+-- Migration: 20260616000008_a10_lineage_baseline_correction.sql
+-- Work Package: WP-DB-004C — Lineage Versioning Baseline Correction
+-- Corrective Package to WP-DB-004
+-- =============================================================================
+
+
+-- =============================================================================
+-- BLOCK 1: DEPENDENCY GUARDS
+-- =============================================================================
+
+DO $$
+BEGIN
+
+    -- governance.lineage_versions must exist
+    IF NOT EXISTS (
+        SELECT 1
+        FROM information_schema.tables
+        WHERE table_schema = 'governance'
+          AND table_name = 'lineage_versions'
+          AND table_type = 'BASE TABLE'
+    ) THEN
+        RAISE EXCEPTION
+            'WP-DB-004C dependency guard FAILED: table governance.lineage_versions does not exist.';
+    END IF;
+
+    -- Unique constraint required for Version 0 uniqueness assumption
+    IF NOT EXISTS (
+        SELECT 1
+        FROM pg_constraint c
+        JOIN pg_class cl
+            ON cl.oid = c.conrelid
+        JOIN pg_namespace n
+            ON n.oid = cl.relnamespace
+        WHERE n.nspname = 'governance'
+          AND cl.relname = 'lineage_versions'
+          AND c.conname = 'lineage_versions_signal_key_version_number_uq'
+          AND c.contype = 'u'
+    ) THEN
+        RAISE EXCEPTION
+            'WP-DB-004C dependency guard FAILED: lineage_versions_signal_key_version_number_uq does not exist.';
+    END IF;
+
+    -- signal_key must exist
+    IF NOT EXISTS (
+        SELECT 1
+        FROM information_schema.columns
+        WHERE table_schema = 'governance'
+          AND table_name = 'lineage_versions'
+          AND column_name = 'signal_key'
+    ) THEN
+        RAISE EXCEPTION
+            'WP-DB-004C dependency guard FAILED: signal_key column does not exist.';
+    END IF;
+
+    RAISE NOTICE 'WP-DB-004C dependency guards: ALL PASSED.';
+
+END
+$$;
+
+
+-- =============================================================================
+-- BLOCK 2: PRE-STATE CONSISTENCY GUARD
+-- =============================================================================
+
+DO $$
+DECLARE
+    v_existing_zero_count integer;
+BEGIN
+
+    SELECT COUNT(*)
+    INTO v_existing_zero_count
+    FROM governance.lineage_versions
+    WHERE version_number = 0;
+
+    IF v_existing_zero_count > 0 THEN
+
+        IF EXISTS (
+            SELECT signal_key
+            FROM governance.lineage_versions
+            WHERE version_number = 0
+            GROUP BY signal_key
+            HAVING COUNT(*) > 1
+        ) THEN
+            RAISE EXCEPTION
+                'WP-DB-004C pre-state guard FAILED: duplicate Version 0 baseline rows detected.';
+        END IF;
+
+        RAISE NOTICE
+            'WP-DB-004C pre-state guard: Version 0 rows already exist and satisfy uniqueness assumptions.';
+    ELSE
+        RAISE NOTICE
+            'WP-DB-004C pre-state guard PASSED: zero Version 0 rows found.';
+    END IF;
+
+END
+$$;
+
+
+-- =============================================================================
+-- BLOCK 3: AMENDMENT 1
+-- Admit Version 0 baseline values
+-- =============================================================================
+
+DO $$
+BEGIN
+
+    IF EXISTS (
+        SELECT 1
+        FROM pg_constraint c
+        JOIN pg_class cl
+            ON cl.oid = c.conrelid
+        JOIN pg_namespace n
+            ON n.oid = cl.relnamespace
+        WHERE n.nspname = 'governance'
+          AND cl.relname = 'lineage_versions'
+          AND c.conname = 'lineage_versions_version_number_ck'
+          AND c.contype = 'c'
+    ) THEN
+
+        ALTER TABLE governance.lineage_versions
+            DROP CONSTRAINT lineage_versions_version_number_ck;
+
+        ALTER TABLE governance.lineage_versions
+            ADD CONSTRAINT lineage_versions_version_number_ck
+                CHECK (version_number >= 0);
+
+        RAISE NOTICE
+            'WP-DB-004C: version_number constraint amended to permit Version 0.';
+
+    ELSE
+        RAISE EXCEPTION
+            'WP-DB-004C amendment guard FAILED: lineage_versions_version_number_ck not found.';
+    END IF;
+
+END
+$$;
+
+
+-- =============================================================================
+-- BLOCK 4: AMENDMENT 2
+-- Add legacy_classified_at
+-- =============================================================================
+
+DO $$
+BEGIN
+
+    IF NOT EXISTS (
+        SELECT 1
+        FROM information_schema.columns
+        WHERE table_schema = 'governance'
+          AND table_name = 'lineage_versions'
+          AND column_name = 'legacy_classified_at'
+    ) THEN
+
+        ALTER TABLE governance.lineage_versions
+            ADD COLUMN legacy_classified_at timestamptz;
+
+        RAISE NOTICE
+            'WP-DB-004C: legacy_classified_at column added.';
+
+    ELSE
+        RAISE NOTICE
+            'WP-DB-004C: legacy_classified_at already exists. Skipping.';
+    END IF;
+
+END
+$$;
+
+
+-- =============================================================================
+-- BLOCK 5: POST-AMENDMENT NOTE
+-- =============================================================================
+
+DO $$
+BEGIN
+    RAISE NOTICE
+        'WP-DB-004C completed successfully. UNIQUE(signal_key, version_number) continues to enforce at most one Version 0 row per signal_key.';
+END
+$$;
+
+COMMIT;

@@ -28,9 +28,9 @@ CREATE TABLE IF NOT EXISTS skill_embeddings (
 -- IVFFlat index for approximate nearest-neighbour search
 -- lists = sqrt(row count) — start with 100, tune as data grows
 CREATE INDEX IF NOT EXISTS idx_skill_embeddings_vector
-  ON skill_embeddings
-  USING ivfflat (embedding_vector vector_cosine_ops)
-  WITH (lists = 100);
+ON skill_embeddings
+USING ivfflat (embedding vector_cosine_ops)
+WITH (lists = 100);
 
 -- Exact index on skill name for quick lookups
 CREATE INDEX IF NOT EXISTS idx_skill_embeddings_name

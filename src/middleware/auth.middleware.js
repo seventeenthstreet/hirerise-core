@@ -1,4 +1,5 @@
 'use strict';
+console.log("✅ AUTH.MIDDLEWARE.JS LOADED FROM:", __filename);
 
 /**
  * src/middleware/auth.middleware.js
@@ -323,25 +324,34 @@ async function safeGetUser(rawToken) {
 }
 
 async function verifyToken(rawToken, req) {
-  const { data, error } =
-    await safeGetUser(rawToken);
+  console.log("\n🔥🔥🔥 VERIFY TOKEN EXECUTED 🔥🔥🔥");
 
- if (error || !data?.user) {
-  logger.error('[Auth Verify Failed]', {
-    error,
-    errorMessage: error?.message,
-    errorStatus: error?.status,
-    errorCode: error?.code,
-    rawTokenStart: rawToken?.slice(0, 30),
-    hasUser: !!data?.user,
-    path: req.path,
-    method: req.method,
-  });
+  const { data, error } = await safeGetUser(rawToken);
 
-  throw new Error(
-    error?.message || 'Invalid token'
-  );
-}
+  if (error || !data?.user) {
+    logger.error('[Auth Verify Failed]', {
+      error,
+      errorMessage: error?.message,
+      errorStatus: error?.status,
+      errorCode: error?.code,
+      rawTokenStart: rawToken?.slice(0, 30),
+      hasUser: !!data?.user,
+      path: req.path,
+      method: req.method,
+    });
+
+    console.error('\n========== AUTH VERIFY DEBUG ==========');
+    console.error('Supabase Error Message:', error?.message);
+    console.error('Supabase Error Status :', error?.status);
+    console.error('Supabase Error Code   :', error?.code);
+    console.error('Supabase Error Object :', error);
+    console.error('Has User              :', !!data?.user);
+    console.error('=======================================\n');
+
+    throw new Error(
+      error?.message || 'Invalid token'
+    );
+  }
 
   const user = data.user;
   const plan = await resolvePlan(user);
