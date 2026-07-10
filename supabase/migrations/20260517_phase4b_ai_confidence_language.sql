@@ -126,61 +126,79 @@ CREATE TRIGGER trg_ai_cl_log_immutable
 
 
 -- ─────────────────────────────────────────────────────────────────────────────
--- VIEW: ai_intelligence_snapshots
--- The ONLY surface AI routes are permitted to query for intelligence data.
--- Exposes sanitised deterministic outputs. Excludes raw scores and PII.
+-- VIEW: ai_intelligence_snapshots — DEFERRED (WP-DB-01A.8/9 reconciliation)
 --
--- Replace table references with your actual deterministic table names.
+-- This view originally read `FROM public.assessments a`. Investigation
+-- (WP-DB-01A.8) confirmed public.assessments does not exist anywhere in this
+-- repository, was never renamed, and has no canonical replacement:
+--   - docs/tables_inventory.csv (271 tables, all migrations) has no entry
+--     for `assessments`.
+--   - No other migration, function, or view references it.
+--   - The columns the view selects (domain_scores, capability_clusters,
+--     confidence_level, confidence_score, signal_count,
+--     covered_domain_count, weighted_reliability, explanation_summary,
+--     recommendation_metadata, status) do not match resume_analyses,
+--     chi_scores, or the Phase 4A tables created just above
+--     (signal_coverage_profiles, signal_reliability_scores,
+--     cluster_stability_profiles, cluster_drift_history) — those only carry
+--     a loose `assessment_id TEXT` session identifier, not a consolidated
+--     source table with this shape.
+--   - The migration itself contains template scaffolding language
+--     ("Replace table references with your actual deterministic table
+--     names."), confirming it was never adapted from reference/template
+--     code to this schema.
+--   - Nothing downstream in the migration chain depends on this view.
+--
+-- Per the minimum-change principle, this CREATE VIEW is commented out rather
+-- than rewritten against a guessed join or backed by an invented placeholder
+-- table — either would fabricate business logic (which table constitutes
+-- "an assessment", how confidence/coverage/reliability combine) that no
+-- source of truth in this repository specifies. The two real tables above
+-- (ai_explanation_snapshots, ai_confidence_language_log) are unaffected and
+-- still created normally. Re-enabling this view is tracked as follow-up
+-- work once the Phase 4B AI-governance data model is defined.
+--
+-- Original definition, preserved verbatim for history:
+--
+-- CREATE OR REPLACE VIEW public.ai_intelligence_snapshots AS
+-- SELECT
+--   a.id                                      AS assessment_id,
+--   a.user_id,
+--   a.engine_version                          AS snapshot_version,
+--   a.domain_scores                           AS domain_scores,
+--   a.capability_clusters                     AS capability_clusters,
+--   jsonb_build_object(
+--     'tier',     a.confidence_level,
+--     'composite', a.confidence_score
+--   )                                         AS confidence,
+--   jsonb_build_object(
+--     'signalCount',    a.signal_count,
+--     'coveredDomains', a.covered_domain_count
+--   )                                         AS coverage,
+--   jsonb_build_object(
+--     'weightedReliability', a.weighted_reliability
+--   )                                         AS reliability,
+--   jsonb_build_object(
+--     'summary', a.explanation_summary
+--   )                                         AS explanations,
+--   a.recommendation_metadata                 AS recommendation_metadata
+-- FROM public.assessments a
+-- WHERE
+--   a.status = 'completed'
+--   AND a.confidence_level IS NOT NULL;
+--
+-- COMMENT ON VIEW public.ai_intelligence_snapshots IS
+--   'Phase 4B — AI-safe view of deterministic intelligence outputs. '
+--   'Excludes: raw scores, PII (name/email), factor breakdowns, salary data. '
+--   'AI routes MUST use this view. Direct assessment table access is prohibited.';
 -- ─────────────────────────────────────────────────────────────────────────────
-
-CREATE OR REPLACE VIEW public.ai_intelligence_snapshots AS
-SELECT
-  a.id                                      AS assessment_id,
-  a.user_id,
-  -- Snapshot version from engine version registry
-  a.engine_version                          AS snapshot_version,
-  -- Domain scores: normalised (no rawScore)
-  a.domain_scores                           AS domain_scores,
-  -- Capability clusters: signal IDs only, no raw weights
-  a.capability_clusters                     AS capability_clusters,
-  -- Confidence: tier + composite (no factor breakdown)
-  jsonb_build_object(
-    'tier',     a.confidence_level,
-    'composite', a.confidence_score
-  )                                         AS confidence,
-  -- Coverage: counts only
-  jsonb_build_object(
-    'signalCount',    a.signal_count,
-    'coveredDomains', a.covered_domain_count
-  )                                         AS coverage,
-  -- Reliability: weighted score only
-  jsonb_build_object(
-    'weightedReliability', a.weighted_reliability
-  )                                         AS reliability,
-  -- Explanations: summary only (no per-factor detail)
-  jsonb_build_object(
-    'summary', a.explanation_summary
-  )                                         AS explanations,
-  -- Recommendation metadata: id, title, rank, affinity (no raw match scores)
-  a.recommendation_metadata                 AS recommendation_metadata
-
-FROM public.assessments a
-
-WHERE
-  -- Only completed assessments with valid confidence
-  a.status = 'completed'
-  AND a.confidence_level IS NOT NULL;
-
-COMMENT ON VIEW public.ai_intelligence_snapshots IS
-  'Phase 4B — AI-safe view of deterministic intelligence outputs. '
-  'Excludes: raw scores, PII (name/email), factor breakdowns, salary data. '
-  'AI routes MUST use this view. Direct assessment table access is prohibited.';
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- GRANT — service role access only
 -- Application users have no direct table access
+-- (GRANT on ai_intelligence_snapshots removed: the view above is deferred,
+-- so the object does not exist to grant on.)
 -- ─────────────────────────────────────────────────────────────────────────────
 
-GRANT SELECT ON public.ai_intelligence_snapshots TO service_role;
 GRANT INSERT ON public.ai_explanation_snapshots  TO service_role;
 GRANT INSERT ON public.ai_confidence_language_log TO service_role;

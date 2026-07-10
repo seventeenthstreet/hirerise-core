@@ -297,6 +297,16 @@ COMMENT ON FUNCTION public.fn_get_countries() IS
 --   (e.g., newly onboarded country with no regions seeded yet)
 -- =============================================================================
 
+-- Phase 1A (20260526000006_phase1a_operational_governance.sql) defined this
+-- function as fn_get_regions_for_country(p_country_code TEXT DEFAULT 'IN').
+-- Phase 2 intentionally makes country_code mandatory (see the explicit
+-- MISSING_PARAMETER check in the body below) — CREATE OR REPLACE FUNCTION
+-- cannot remove a parameter default from an existing signature, so the old
+-- definition is dropped first. Same argument type list (TEXT), same name;
+-- this only removes the default, it does not change return type,
+-- volatility, or security context.
+DROP FUNCTION IF EXISTS public.fn_get_regions_for_country(TEXT);
+
 CREATE OR REPLACE FUNCTION public.fn_get_regions_for_country(
   p_country_code TEXT
 )

@@ -582,9 +582,22 @@ CREATE OR REPLACE TRIGGER trg_immutable_key_academic_languages_code
 ALTER TABLE public.state_language_mapping
   ADD COLUMN IF NOT EXISTS deprecated_at TIMESTAMPTZ;
 
-ALTER TABLE public.state_language_mapping
-  ADD CONSTRAINT IF NOT EXISTS chk_state_language_mapping_deprecated_inactive
-    CHECK (deprecated_at IS NULL OR is_active = FALSE);
+-- ADD CONSTRAINT IF NOT EXISTS is not valid PostgreSQL syntax (no such
+-- variant exists for ADD CONSTRAINT). Reconciled via a pg_constraint
+-- existence check inside a DO block, preserving identical idempotency
+-- and identical constraint semantics.
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint
+    WHERE conname = 'chk_state_language_mapping_deprecated_inactive'
+      AND conrelid = 'public.state_language_mapping'::regclass
+  ) THEN
+    ALTER TABLE public.state_language_mapping
+      ADD CONSTRAINT chk_state_language_mapping_deprecated_inactive
+        CHECK (deprecated_at IS NULL OR is_active = FALSE);
+  END IF;
+END $$;
 
 COMMENT ON COLUMN public.state_language_mapping.deprecated_at IS
   'Set when this region-language mapping is retired. '
@@ -593,9 +606,20 @@ COMMENT ON COLUMN public.state_language_mapping.deprecated_at IS
 ALTER TABLE public.subject_stream_map
   ADD COLUMN IF NOT EXISTS deprecated_at TIMESTAMPTZ;
 
-ALTER TABLE public.subject_stream_map
-  ADD CONSTRAINT IF NOT EXISTS chk_subject_stream_map_deprecated_inactive
-    CHECK (deprecated_at IS NULL OR is_active = FALSE);
+-- Same reconciliation as above: ADD CONSTRAINT IF NOT EXISTS is not valid
+-- PostgreSQL syntax.
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint
+    WHERE conname = 'chk_subject_stream_map_deprecated_inactive'
+      AND conrelid = 'public.subject_stream_map'::regclass
+  ) THEN
+    ALTER TABLE public.subject_stream_map
+      ADD CONSTRAINT chk_subject_stream_map_deprecated_inactive
+        CHECK (deprecated_at IS NULL OR is_active = FALSE);
+  END IF;
+END $$;
 
 COMMENT ON COLUMN public.subject_stream_map.deprecated_at IS
   'Set when this subject-stream relationship is retired. '

@@ -842,7 +842,7 @@ AS $$
           sub.subject_code,
           sub.subject_category,
           lang.language_code
-        ) ORDER BY cm.country_code, ab.board_code, ast.stream_code, sub.subject_code)
+        ), E'\n' ORDER BY cm.country_code, ab.board_code, ast.stream_code, sub.subject_code)
         FROM public.countries_master cm
         JOIN public.academic_boards ab ON ab.country_id = cm.id AND ab.is_active
         JOIN public.academic_streams ast ON ast.board_id = ab.id AND ast.is_active
