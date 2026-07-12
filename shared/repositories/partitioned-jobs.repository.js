@@ -31,13 +31,38 @@ function normalizeId(value, field) {
 }
 
 class PartitionedJobRepository {
-  async createJob(jobId, jobData) {
+  // automation_jobs columns (see supabase/migrations/000_initial_schema.sql +
+  // 20260712073230_add_resume_id_to_automation_jobs.sql): id, user_id, status,
+  // attempts, max_attempts, worker_id, result, idempotency_key, resume_id,
+  // created_at, updated_at, claimed_at, completed_at, failed_at, deleted_at,
+  // last_error_code, last_error_message. There is no "type" or "input" column.
+  //
+  // createJob previously did `{ id, ...jobData, status: 'pending', ... }`,
+  // spreading the caller's raw camelCase object (which includes keys like
+  // `type`, `userId`, `resumeId`, `idempotencyKey`, and — from the
+  // salary/career controllers — `input`) straight into the insert body.
+  // None of those camelCase keys match real columns (the real columns are
+  // snake_case), and `type`/`input` have no column at all. PostgREST rejects
+  // unknown columns with PGRST204 ("Could not find the 'X' column ... in the
+  // schema cache") — see 20260520000001_add_engine_version_to_sessions.sql
+  // for a prior instance of the exact same failure mode in this codebase.
+  // Net effect: `user_id` and `idempotency_key` were never actually being
+  // persisted correctly, which is the root cause of "silently disabled
+  // duplicate detection" — the missing findByIdempotencyKey method (fixed
+  // below) could never have found a match anyway, because no row ever had
+  // those columns populated. Fixed by mapping only the fields that have real
+  // columns; `type`/`input` are intentionally dropped (no column exists for
+  // them, and adding one is out of scope for this fix).
+  async createJob(jobId, jobData = {}) {
     const safeJobId = normalizeId(jobId, 'jobId');
+    const { userId = null, idempotencyKey = null, resumeId = null } = jobData;
 
     await execute(
       supabase.from('automation_jobs').insert({
         id: safeJobId,
-        ...jobData,
+        user_id: userId,
+        idempotency_key: idempotencyKey,
+        resume_id: resumeId,
         status: 'pending',
         attempts: 0,
         max_attempts: 5,
@@ -49,6 +74,45 @@ class PartitionedJobRepository {
     );
 
     return safeJobId;
+  }
+
+  // Restores the idempotency lookup that api-service/src/controllers/
+  // resume.controller.js, salary.controller.js, and career.controller.js all
+  // already call as `jobRepo.findByIdempotencyKey?.(userId, idempotencyKey)`.
+  // The `?.` made the missing method fail silently instead of erroring.
+  //
+  // Reuses idx_automation_jobs_user_idempotency (user_id, idempotency_key,
+  // created_at DESC), which already exists in the schema — no migration
+  // needed for this lookup itself. Matches the same active-job status filter
+  // ('pending'/'processing') used by getPendingJobsForUser, since the intent
+  // (per the resume controller's existing comment) is to reuse an
+  // already-in-flight submission, not a finished or dead one.
+  async findByIdempotencyKey(userId, idempotencyKey) {
+    const safeUserId = normalizeId(userId, 'userId');
+    const safeIdempotencyKey = normalizeId(idempotencyKey, 'idempotencyKey');
+
+    const row = await execute(
+      supabase
+        .from('automation_jobs')
+        .select('id, resume_id, status, created_at')
+        .eq('user_id', safeUserId)
+        .eq('idempotency_key', safeIdempotencyKey)
+        .in('status', ['pending', 'processing'])
+        .is('deleted_at', null)
+        .order('created_at', { ascending: false })
+        .limit(1)
+        .maybeSingle(),
+      { method: 'findByIdempotencyKey' }
+    );
+
+    if (!row) return null;
+
+    return {
+      id: row.id,
+      resumeId: row.resume_id ?? null,
+      status: row.status,
+      createdAt: row.created_at,
+    };
   }
 
   async claimJob(jobId, workerId) {

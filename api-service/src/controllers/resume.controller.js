@@ -94,22 +94,13 @@ export async function submitResume(req, res, next) {
     const userId = req.user?.uid;
 
     if (!userId) {
-      // BEFORE: { error:'UNAUTHORIZED', message:'...', requestId, timestamp }
-      // AFTER:  { success:false, error:'...', message:'...', code:'UNAUTHORIZED', meta:{...}, error:'UNAUTHORIZED' }
       return sendError(res, 401, 'User authentication required', 'UNAUTHORIZED', {
         error: 'UNAUTHORIZED', // backward compat: old field shape preserved
       });
     }
 
-    const topic = process.env.PUBSUB_RESUME_TOPIC;
-    if (!topic) {
-      throw new Error('Missing PUBSUB_RESUME_TOPIC environment variable');
-    }
-
     const validation = validateResumeSubmission(req.body);
     if (!validation.valid) {
-      // BEFORE: { error:'VALIDATION_ERROR', message:validation.error, ...meta }
-      // AFTER:  { success:false, error:msg, message:msg, code, meta, error:'VALIDATION_ERROR' }
       return sendError(res, 400, validation.error, 'VALIDATION_ERROR', {
         error: 'VALIDATION_ERROR', // backward compat
       });
@@ -145,8 +136,6 @@ export async function submitResume(req, res, next) {
         requestId: req.requestId
       });
 
-      // BEFORE: { message, resumeId, jobId, statusUrl, requestId, timestamp }
-      // AFTER:  { success:true, data:{...}, meta:{...}, message, resumeId, jobId, statusUrl }
       return sendSuccess(res, 202,
         {
           message:   'Resume already submitted for processing',
@@ -154,7 +143,6 @@ export async function submitResume(req, res, next) {
           jobId:     existingJob.id,
           statusUrl: `/v1/resume/${existingJob.resumeId}/score`,
         },
-        // backward compat: flat fields preserved at top level
         {
           message:   'Resume already submitted for processing',
           resumeId:  existingJob.resumeId,
@@ -183,18 +171,33 @@ export async function submitResume(req, res, next) {
       idempotencyKey
     });
 
-    await publishEvent(
-      topic,
-      EventTypes.RESUME_SUBMITTED,
-      {
+    try {
+      await publishEvent(
+        EventTypes.RESUME_SUBMITTED,
+        {
+          userId,
+          resumeId,
+          jobId,
+          resumeStoragePath: sanitizedPath,
+          mimeType: sanitizedMimeType
+        },
+        { userId, resumeId, jobId }
+      );
+    } catch (publishError) {
+      // Resume + job rows already persisted above. Do not lose that data —
+      // log loudly and let the existing outbox retry/alerting infrastructure
+      // (shared/monitoring, shared/events outbox worker) pick this up rather
+      // than failing the request and orphaning the job silently.
+      logger.error('Failed to publish RESUME_SUBMITTED event', {
         userId,
         resumeId,
         jobId,
-        resumeStoragePath: sanitizedPath,
-        mimeType: sanitizedMimeType
-      },
-      { userId, resumeId, jobId }
-    );
+        error: publishError.message,
+        code: publishError.code,
+        requestId: req.requestId
+      });
+      throw publishError;
+    }
 
     logger.info('Resume submission accepted', {
       userId,
@@ -203,8 +206,6 @@ export async function submitResume(req, res, next) {
       requestId: req.requestId
     });
 
-    // BEFORE: { message, resumeId, jobId, statusUrl, requestId, timestamp }
-    // AFTER:  { success:true, data:{...}, meta:{...}, message, resumeId, jobId, statusUrl }
     return sendSuccess(res, 202,
       { message: 'Resume submitted for processing', resumeId, jobId, statusUrl: `/v1/resume/${resumeId}/score` },
       { message: 'Resume submitted for processing', resumeId, jobId, statusUrl: `/v1/resume/${resumeId}/score` }
@@ -224,8 +225,6 @@ export async function getResumeScore(req, res, next) {
     const { resumeId } = req.params;
 
     if (!userId) {
-      // BEFORE: { error:'UNAUTHORIZED', message:'...', ...meta }
-      // AFTER:  { success:false, error:'...', message:'...', code, meta, error:'UNAUTHORIZED' }
       return sendError(res, 401, 'User authentication required', 'UNAUTHORIZED', {
         error: 'UNAUTHORIZED',
       });
@@ -234,8 +233,6 @@ export async function getResumeScore(req, res, next) {
     const resume = await resumeRepo.findById(resumeId);
 
     if (!resume || resume.userId !== userId) {
-      // BEFORE: { error:'NOT_FOUND', message:'...', ...meta }
-      // AFTER:  { success:false, error:'...', message:'...', code:'NOT_FOUND', meta }
       return sendError(res, 404, 'Resume not found', 'NOT_FOUND', {
         error: 'NOT_FOUND',
       });
@@ -243,8 +240,6 @@ export async function getResumeScore(req, res, next) {
 
     if (resume.processingStatus === 'failed') {
       const failMsg = resume.processingError || 'Resume scoring failed';
-      // BEFORE: { resumeId, status:'failed', error:msg, ...meta }
-      // AFTER:  { success:false, error:msg, message:msg, data:{ resumeId, status }, meta, resumeId, status }
       return sendError(res, 200, failMsg, 'SCORING_FAILED', {
         resumeId,
         status: 'failed',
@@ -255,8 +250,6 @@ export async function getResumeScore(req, res, next) {
     // Guard: treat DB-internal 'complete' and canonical 'done' identically.
     // normalizeStatus() maps 'complete' → 'done' for all API responses.
     if (resume.processingStatus !== 'complete' && resume.processingStatus !== 'done') {
-      // BEFORE: { resumeId, status, message, ...meta }
-      // AFTER:  { success:true, data:{ resumeId, status, message }, meta, resumeId, status, message }
       const pendingMsg = 'Score not yet available';
       const publicStatus = normalizeStatus(resume.processingStatus);
       return sendSuccess(res, 202,
@@ -273,10 +266,7 @@ export async function getResumeScore(req, res, next) {
       });
     }
 
-    // BEFORE: { resumeId, status:'complete', score, ...meta }
-    // AFTER:  { resumeId, status:'done', score, ...meta }
     // 'complete' is deprecated. All API responses now use 'done'.
-    // Backward-compat: flat legacy fields preserved at top level for old clients.
     return sendSuccess(res, 200,
       { resumeId, status: 'done', score },
       { resumeId, status: 'done', score }
