@@ -1,0 +1,19 @@
+# Default owners
+
+-   @seventeenthstreet
+
+# Database
+
+/supabase/ @seventeenthstreet
+
+# Backend
+
+/src/ @seventeenthstreet
+
+# Documentation
+
+/docs/ @seventeenthstreet /supabase/docs/ @seventeenthstreet
+
+# CI/CD
+
+/.github/ @seventeenthstreet
