@@ -1297,16 +1297,31 @@ COMMENT ON FUNCTION public.fn_get_languages_for_region(TEXT, TEXT) IS
 -- ---------------------------------------------------------------------------
 
 CREATE TABLE IF NOT EXISTS public.academic_rpc_schema_registry (
-  id               BIGSERIAL    PRIMARY KEY,
-  rpc_name         TEXT         NOT NULL,
-  field_path       TEXT         NOT NULL,   -- dotted path, e.g. 'query_meta.taxonomy_hash'
-  field_type       TEXT         NOT NULL,   -- jsonb type descriptor
-  stability        TEXT         NOT NULL    -- 'stable' | 'additive' | 'deprecated'
-                   CHECK (stability IN ('stable', 'additive', 'deprecated')),
-  introduced_phase TEXT         NOT NULL,   -- e.g. 'phase2', 'phase2-hardening'
-  introduced_at    TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
-  notes            TEXT,
-  UNIQUE (rpc_name, field_path)
+  id                 BIGSERIAL    PRIMARY KEY,
+  rpc_name           TEXT         NOT NULL,
+  rpc_signature      TEXT,
+  field_path         TEXT         NOT NULL,
+  field_type         TEXT         NOT NULL,
+  stability          TEXT         NOT NULL
+                     CHECK (stability IN ('stable', 'additive', 'deprecated')),
+  introduced_phase   TEXT         NOT NULL,
+  introduced_at      TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+  notes              TEXT,
+  response_contract  JSONB        NOT NULL DEFAULT '{}'::jsonb,
+  taxonomy_hash      TEXT,
+  contract_version   TEXT         NOT NULL DEFAULT '1.0.0',
+  is_active          BOOLEAN      NOT NULL DEFAULT TRUE,
+
+ CONSTRAINT uq_academic_rpc_field
+UNIQUE (
+    rpc_name,
+    field_path
+),
+
+  CONSTRAINT chk_academic_rpc_contract_version
+    CHECK (
+      contract_version ~ '^[0-9]+\.[0-9]+\.[0-9]+$'
+    )
 );
 
 COMMENT ON TABLE public.academic_rpc_schema_registry IS
@@ -1318,6 +1333,21 @@ COMMENT ON TABLE public.academic_rpc_schema_registry IS
   'RULE-S4: query_meta is an additive namespace — frontend must use optional chaining. '
   'RULE-S5: rpc_version follows semver; major = breaking. '
   'RULE-S6: Cache keys must be (rpc_name, params, rpc_version).';
+
+COMMENT ON COLUMN public.academic_rpc_schema_registry.rpc_signature IS
+  'Canonical RPC function signature used for contract versioning.';
+
+COMMENT ON COLUMN public.academic_rpc_schema_registry.response_contract IS
+  'JSON contract describing the RPC response envelope.';
+
+COMMENT ON COLUMN public.academic_rpc_schema_registry.taxonomy_hash IS
+  'Academic taxonomy hash associated with this registered contract.';
+
+COMMENT ON COLUMN public.academic_rpc_schema_registry.contract_version IS
+  'Semantic version of the registered RPC contract.';
+
+COMMENT ON COLUMN public.academic_rpc_schema_registry.is_active IS
+  'Indicates whether this contract version is active.';
 
 -- Seed: fn_get_countries schema
 INSERT INTO public.academic_rpc_schema_registry
@@ -1534,45 +1564,48 @@ COMMENT ON TABLE public.academic_rpc_lifecycle IS
 --         Phase 1A version — deprecated by Phase 2
 -- ---------------------------------------------------------------------------
 
-INSERT INTO public.academic_rpc_lifecycle (
-  rpc_name,
-  rpc_signature,
-  lifecycle_status,
-  deprecated_since_phase,
-  deprecated_since_date,
-  removal_target_phase,
-  supported_until_date,
-  replacement_rpc,
-  replacement_phase,
-  rpc_version_at_removal,
-  replay_safe_until,
-  migration_notes
-) VALUES (
-  'fn_get_subjects_for_stream',
-  'fn_get_subjects_for_stream(UUID, BOOLEAN)',
-  'deprecated',
-  'phase2',
-  '2026-05-27',
-  'phase3',
-  -- Support window: allow one full sprint cycle after Phase 3 frontend hook milestone.
-  -- Frontend teams must complete migration by this date or request an extension
-  -- via a formal governance exception.
-  '2026-07-31',
-  'fn_get_subjects_for_stream(TEXT, TEXT, SMALLINT, TEXT)',
-  'phase2',
-  '2.0.0',
-  -- Replay safety: events ingested before Phase 2 go-live may reference
-  -- the UUID-based RPC. Replay pipeline must honour this RPC until this timestamp.
-  -- Set to Phase 2 go-live date end-of-day UTC to cover all pre-Phase-2 events.
-  '2026-05-27 23:59:59+00',
-  'Phase 1A signature exposed UUID stream_id as a frontend input — governance violation. '
-  'Phase 2 replacement uses business keys (board_code, stream_code, class_level, country_code). '
-  'Migration path: replace fn_get_subjects_for_stream(stream_id, include_optional) '
-  'with fn_get_subjects_for_stream(board_code, stream_code, class_level, country_code). '
-  'anon EXECUTE revoked in Phase 2 (Section 8 of 20260527000001). '
-  'authenticated EXECUTE revoked at Phase 3 hook integration milestone. '
-  'service_role EXECUTE retained indefinitely for internal tooling.'
-) ON CONFLICT (rpc_name, rpc_signature) DO NOTHING;
+-- SKIPPED (2026-07-20 drift reconciliation): live academic_rpc_lifecycle is a
+-- current-state registry with UNIQUE(rpc_name), already holding an 'active'
+-- row for fn_get_subjects_for_stream at rpc_version 2.0.0. This historical
+-- 'deprecated' entry would violate that constraint (not caught by the
+-- ON CONFLICT (rpc_name, rpc_signature) target below, since it's a
+-- different constraint). Decision: trust the live current-state data as
+-- authoritative and skip this historical seed. See
+-- 20260526999999_fix_academic_rpc_schema_registry_drift.sql for context.
+--
+-- INSERT INTO public.academic_rpc_lifecycle (
+--   rpc_name,
+--   rpc_signature,
+--   lifecycle_status,
+--   deprecated_since_phase,
+--   deprecated_since_date,
+--   removal_target_phase,
+--   supported_until_date,
+--   replacement_rpc,
+--   replacement_phase,
+--   rpc_version_at_removal,
+--   replay_safe_until,
+--   migration_notes
+-- ) VALUES (
+--   'fn_get_subjects_for_stream',
+--   'fn_get_subjects_for_stream(UUID, BOOLEAN)',
+--   'deprecated',
+--   'phase2',
+--   '2026-05-27',
+--   'phase3',
+--   '2026-07-31',
+--   'fn_get_subjects_for_stream(TEXT, TEXT, SMALLINT, TEXT)',
+--   'phase2',
+--   '2.0.0',
+--   '2026-05-27 23:59:59+00',
+--   'Phase 1A signature exposed UUID stream_id as a frontend input — governance violation. '
+--   'Phase 2 replacement uses business keys (board_code, stream_code, class_level, country_code). '
+--   'Migration path: replace fn_get_subjects_for_stream(stream_id, include_optional) '
+--   'with fn_get_subjects_for_stream(board_code, stream_code, class_level, country_code). '
+--   'anon EXECUTE revoked in Phase 2 (Section 8 of 20260527000001). '
+--   'authenticated EXECUTE revoked at Phase 3 hook integration milestone. '
+--   'service_role EXECUTE retained indefinitely for internal tooling.'
+-- ) ON CONFLICT (rpc_name, rpc_signature) DO NOTHING;
 
 -- ---------------------------------------------------------------------------
 -- H-6b · Lifecycle entry: Phase 1A fn_get_streams_for_board(TEXT, TEXT)
@@ -1585,36 +1618,39 @@ INSERT INTO public.academic_rpc_lifecycle (
 --   • Validated error codes
 -- ---------------------------------------------------------------------------
 
-INSERT INTO public.academic_rpc_lifecycle (
-  rpc_name,
-  rpc_signature,
-  lifecycle_status,
-  deprecated_since_phase,
-  deprecated_since_date,
-  removal_target_phase,
-  supported_until_date,
-  replacement_rpc,
-  replacement_phase,
-  rpc_version_at_removal,
-  replay_safe_until,
-  migration_notes
-) VALUES (
-  'fn_get_streams_for_board',
-  'fn_get_streams_for_board(TEXT, TEXT)',
-  'deprecated',
-  'phase2',
-  '2026-05-27',
-  'phase3',
-  '2026-07-31',
-  'fn_get_streams_for_board(TEXT, TEXT, SMALLINT)',
-  'phase2',
-  '2.0.0',
-  '2026-05-27 23:59:59+00',
-  'Phase 1A version lacks standard governance envelope and class_level filtering. '
-  'Phase 2 version is a CREATE OR REPLACE overload (same 2-arg base + optional 3rd arg). '
-  'Migration: pass class_level = NULL to Phase 2 version for equivalent behaviour. '
-  'No EXECUTE grant changes required — Phase 2 overload shares the same grant.'
-) ON CONFLICT (rpc_name, rpc_signature) DO NOTHING;
+-- SKIPPED (2026-07-20 drift reconciliation): same reason as H-6a above —
+-- live table already has an 'active' row for fn_get_streams_for_board.
+--
+-- INSERT INTO public.academic_rpc_lifecycle (
+--   rpc_name,
+--   rpc_signature,
+--   lifecycle_status,
+--   deprecated_since_phase,
+--   deprecated_since_date,
+--   removal_target_phase,
+--   supported_until_date,
+--   replacement_rpc,
+--   replacement_phase,
+--   rpc_version_at_removal,
+--   replay_safe_until,
+--   migration_notes
+-- ) VALUES (
+--   'fn_get_streams_for_board',
+--   'fn_get_streams_for_board(TEXT, TEXT)',
+--   'deprecated',
+--   'phase2',
+--   '2026-05-27',
+--   'phase3',
+--   '2026-07-31',
+--   'fn_get_streams_for_board(TEXT, TEXT, SMALLINT)',
+--   'phase2',
+--   '2.0.0',
+--   '2026-05-27 23:59:59+00',
+--   'Phase 1A version lacks standard governance envelope and class_level filtering. '
+--   'Phase 2 version is a CREATE OR REPLACE overload (same 2-arg base + optional 3rd arg). '
+--   'Migration: pass class_level = NULL to Phase 2 version for equivalent behaviour. '
+--   'No EXECUTE grant changes required — Phase 2 overload shares the same grant.'
+-- ) ON CONFLICT (rpc_name, rpc_signature) DO NOTHING;
 
 -- ---------------------------------------------------------------------------
 -- H-6c · Lifecycle entry: Phase 1A fn_get_languages_for_region(TEXT, TEXT)
@@ -1625,52 +1661,58 @@ INSERT INTO public.academic_rpc_lifecycle (
 -- This lifecycle entry documents the governance transition for audit purposes.
 -- ---------------------------------------------------------------------------
 
-INSERT INTO public.academic_rpc_lifecycle (
-  rpc_name,
-  rpc_signature,
-  lifecycle_status,
-  deprecated_since_phase,
-  deprecated_since_date,
-  removal_target_phase,
-  supported_until_date,
-  replacement_rpc,
-  replacement_phase,
-  rpc_version_at_removal,
-  replay_safe_until,
-  migration_notes
-) VALUES (
-  'fn_get_languages_for_region',
-  'fn_get_languages_for_region(TEXT, TEXT) [Phase 1A body]',
-  'removed',
-  'phase2',
-  '2026-05-27',
-  NULL,           -- already removed (CREATE OR REPLACE superseded it atomically)
-  NULL,
-  'fn_get_languages_for_region(TEXT, TEXT)',
-  'phase2',
-  '2.0.0',
-  '2026-05-27 23:59:59+00',
-  'Phase 1A body was replaced in-place by Phase 2 CREATE OR REPLACE. '
-  'Same signature — no caller migration required. '
-  'Phase 2 body adds governance envelope and deprecated_at guard. '
-  'Lifecycle entry retained for audit trail completeness.'
-) ON CONFLICT (rpc_name, rpc_signature) DO NOTHING;
+-- SKIPPED (2026-07-20 drift reconciliation): same reason as H-6a above —
+-- live table already has an 'active' row for fn_get_languages_for_region.
+--
+-- INSERT INTO public.academic_rpc_lifecycle (
+--   rpc_name,
+--   rpc_signature,
+--   lifecycle_status,
+--   deprecated_since_phase,
+--   deprecated_since_date,
+--   removal_target_phase,
+--   supported_until_date,
+--   replacement_rpc,
+--   replacement_phase,
+--   rpc_version_at_removal,
+--   replay_safe_until,
+--   migration_notes
+-- ) VALUES (
+--   'fn_get_languages_for_region',
+--   'fn_get_languages_for_region(TEXT, TEXT) [Phase 1A body]',
+--   'removed',
+--   'phase2',
+--   '2026-05-27',
+--   NULL,
+--   NULL,
+--   'fn_get_languages_for_region(TEXT, TEXT)',
+--   'phase2',
+--   '2.0.0',
+--   '2026-05-27 23:59:59+00',
+--   'Phase 1A body was replaced in-place by Phase 2 CREATE OR REPLACE. '
+--   'Same signature — no caller migration required. '
+--   'Phase 2 body adds governance envelope and deprecated_at guard. '
+--   'Lifecycle entry retained for audit trail completeness.'
+-- ) ON CONFLICT (rpc_name, rpc_signature) DO NOTHING;
 
 -- ---------------------------------------------------------------------------
 -- H-6d · Active lifecycle entries: Phase 2 RPCs
 -- Documents all Phase 2 public RPCs as 'active' for baseline tracking.
 -- ---------------------------------------------------------------------------
 
-INSERT INTO public.academic_rpc_lifecycle (
-  rpc_name, rpc_signature, lifecycle_status, replacement_phase, migration_notes
-) VALUES
-  ('fn_get_countries',           'fn_get_countries()',                                          'active', 'phase2', 'Phase 2 root taxonomy RPC. No predecessor.'),
-  ('fn_get_regions_for_country', 'fn_get_regions_for_country(TEXT)',                            'active', 'phase2', 'Phase 2. No Phase 1A predecessor.'),
-  ('fn_get_boards_for_region',   'fn_get_boards_for_region(TEXT, TEXT)',                        'active', 'phase2', 'Phase 2. No Phase 1A predecessor.'),
-  ('fn_get_streams_for_board',   'fn_get_streams_for_board(TEXT, TEXT, SMALLINT)',              'active', 'phase2', 'Phase 2. Supersedes Phase 1A 2-arg version.'),
-  ('fn_get_subjects_for_stream', 'fn_get_subjects_for_stream(TEXT, TEXT, SMALLINT, TEXT)',      'active', 'phase2', 'Phase 2. Supersedes Phase 1A UUID-based version.'),
-  ('fn_get_languages_for_region','fn_get_languages_for_region(TEXT, TEXT)',                     'active', 'phase2', 'Phase 2 body (CREATE OR REPLACE of Phase 1A signature).')
-ON CONFLICT (rpc_name, rpc_signature) DO NOTHING;
+-- SKIPPED (2026-07-20 drift reconciliation): all six rpc_names below already
+-- have 'active' current-state rows live. Trusting live data as authoritative.
+--
+-- INSERT INTO public.academic_rpc_lifecycle (
+--   rpc_name, rpc_signature, lifecycle_status, replacement_phase, migration_notes
+-- ) VALUES
+--   ('fn_get_countries',           'fn_get_countries()',                                          'active', 'phase2', 'Phase 2 root taxonomy RPC. No predecessor.'),
+--   ('fn_get_regions_for_country', 'fn_get_regions_for_country(TEXT)',                            'active', 'phase2', 'Phase 2. No Phase 1A predecessor.'),
+--   ('fn_get_boards_for_region',   'fn_get_boards_for_region(TEXT, TEXT)',                        'active', 'phase2', 'Phase 2. No Phase 1A predecessor.'),
+--   ('fn_get_streams_for_board',   'fn_get_streams_for_board(TEXT, TEXT, SMALLINT)',              'active', 'phase2', 'Phase 2. Supersedes Phase 1A 2-arg version.'),
+--   ('fn_get_subjects_for_stream', 'fn_get_subjects_for_stream(TEXT, TEXT, SMALLINT, TEXT)',      'active', 'phase2', 'Phase 2. Supersedes Phase 1A UUID-based version.'),
+--   ('fn_get_languages_for_region','fn_get_languages_for_region(TEXT, TEXT)',                     'active', 'phase2', 'Phase 2 body (CREATE OR REPLACE of Phase 1A signature).')
+-- ON CONFLICT (rpc_name, rpc_signature) DO NOTHING;
 
 
 -- =============================================================================
@@ -1794,8 +1836,20 @@ GRANT SELECT ON public.academic_rpc_schema_registry TO authenticated;
 GRANT SELECT, INSERT, UPDATE ON public.academic_rpc_lifecycle TO service_role;
 GRANT SELECT ON public.academic_rpc_lifecycle TO authenticated;
 
-GRANT USAGE, SELECT ON SEQUENCE public.academic_rpc_schema_registry_id_seq TO service_role;
-GRANT USAGE, SELECT ON SEQUENCE public.academic_rpc_lifecycle_id_seq TO service_role;
+-- GUARDED (2026-07-20 drift reconciliation): live tables use
+-- id UUID DEFAULT gen_random_uuid(), not BIGSERIAL, so no backing sequence
+-- exists to grant on. On a fresh local db reset (where these tables really
+-- are BIGSERIAL, per the CREATE TABLE above), the sequence does exist and
+-- this still grants correctly.
+DO $$
+BEGIN
+  IF EXISTS (SELECT 1 FROM pg_class WHERE relkind = 'S' AND relname = 'academic_rpc_schema_registry_id_seq') THEN
+    GRANT USAGE, SELECT ON SEQUENCE public.academic_rpc_schema_registry_id_seq TO service_role;
+  END IF;
+  IF EXISTS (SELECT 1 FROM pg_class WHERE relkind = 'S' AND relname = 'academic_rpc_lifecycle_id_seq') THEN
+    GRANT USAGE, SELECT ON SEQUENCE public.academic_rpc_lifecycle_id_seq TO service_role;
+  END IF;
+END $$;
 
 
 COMMIT;

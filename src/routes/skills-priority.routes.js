@@ -280,6 +280,7 @@ router.get(
       await getCache().set(
         cacheKey,
         JSON.stringify(result),
+        'EX',
         CACHE_TTL_SECONDS
       );
     } catch (error) {

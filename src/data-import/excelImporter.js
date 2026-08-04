@@ -181,43 +181,39 @@ async function importSkillCourses(rows) {
 }
 
 /* ─────────────────────────────────────────────
-   🔥 Import Career Paths
+   🚫 Retired: Import Career Paths (WP-CI-04)
+   ─────────────────────────────────────────────
+   The legacy `careerPaths` sheet/importCareerPaths() path wrote to the
+   retired `public.career_paths` table using from_role_id/to_role_id/
+   years_to_next — columns that never existed on `career_paths` (whose
+   real columns are from_role/to_role/avg_years/demand_score/
+   required_skills), so this path was already non-functional against
+   the live schema. `career_paths` has been dropped (see migration
+   20260723000001_retire_career_paths.sql). Career transition data is
+   now owned by `career_role_transitions` (keyed on `career_roles.role_id`
+   text slugs, not the `roles.id` UUIDs this importer resolves), which
+   has no equivalent bulk-import path in this repository. Retargeting
+   this importer to that table would require inventing a new role-slug
+   resolution and edge-attribute strategy not supported by any existing
+   repository code, so the sheet has been retired outright rather than
+   speculatively reimplemented. Use CareerGraph's governed write paths
+   for `career_role_transitions` instead.
 ───────────────────────────────────────────── */
-async function importCareerPaths(rows) {
-  const { data: roles } = await supabase
-    .from('roles')
-    .select('id, role_name');
-
-  const roleMap = new Map(
-    roles.map((r) => [r.role_name, r.id])
-  );
-
-  const paths = [];
-
-  rows.forEach((r) => {
-    const fromId = roleMap.get(r.from_role);
-    const toId = roleMap.get(r.to_role);
-
-    if (!fromId || !toId) return;
-
-    paths.push({
-      from_role_id: fromId,
-      to_role_id: toId,
-      years_to_next: parseInt(r.years_to_next, 10),
-    });
-  });
-
-  await batchInsert(
-    'career_paths',
-    paths,
-    'from_role_id,to_role_id'
-  );
-}
 
 /* ─────────────────────────────────────────────
    🚀 MAIN RUNNER
 ───────────────────────────────────────────── */
+
 async function run({ file, sheet }) {
+  if (sheet === 'careerPaths') {
+    throw new Error(
+      "Sheet 'careerPaths' was retired in WP-CI-04: the legacy " +
+      "career_paths table has been dropped. Career transition data " +
+      "is now owned by career_role_transitions; this importer has no " +
+      "bulk-import path for it."
+    );
+  }
+
   console.log(`🚀 Importing ${sheet} from ${file}`);
 
   const rows = await loadSheet(file, sheet);
@@ -237,10 +233,6 @@ async function run({ file, sheet }) {
 
     case 'skillCourses':
       await importSkillCourses(rows);
-      break;
-
-    case 'careerPaths':
-      await importCareerPaths(rows);
       break;
 
     default:

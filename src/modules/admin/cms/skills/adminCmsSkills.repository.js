@@ -9,7 +9,13 @@ const { normalizeText } = require('../../../../shared/utils/normalizeText');
 const { AppError, ErrorCodes } = require('../../../../middleware/errorHandler');
 const logger = require('../../../../utils/logger');
 
-function getSupabase() { return require('../../../../config/supabase'); }
+// BUGFIX (WP-ADMIN-03B): this previously returned the whole config/supabase.js
+// module object ({ supabase, getClient, withRetry, verifyConnection }) instead
+// of the Supabase client itself. Every call site does `supabase.from(TABLE)`,
+// which threw `TypeError: supabase.from is not a function` on the returned
+// object — the root cause of GET /admin/cms/skills (and every other method on
+// this repository) returning HTTP 500. Fixed to return the actual client.
+function getSupabase() { return require('../../../../config/supabase').supabase; }
 
 const TABLE = 'cms_skills';
 
@@ -89,16 +95,37 @@ class AdminCmsSkillsRepository {
     await supabase.from(TABLE).update({ soft_deleted: true, updated_by_admin_id: adminId }).eq('id', id);
   }
 
-  async list({ category, status, limit = 50, offset = 0 } = {}) {
+  /**
+   * @param {object}  opts
+   * @param {string}  [opts.category]
+   * @param {string}  [opts.status]
+   * @param {string}  [opts.search]  — matched against name, description, and
+   *                                   search_tokens via case-insensitive OR
+   * @param {number}  [opts.limit=50]
+   * @param {number}  [opts.offset=0]
+   * @returns {Promise<{ items: object[], total: number }>}
+   */
+  async list({ category, status, search, limit = 50, offset = 0 } = {}) {
     const supabase = getSupabase();
-    let q = supabase.from(TABLE).select('*').eq('soft_deleted', false)
+    // select('*', { count: 'exact' }) so total reflects the full filtered
+    // set, not just the current page (required for real pagination).
+    let q = supabase.from(TABLE).select('*', { count: 'exact' }).eq('soft_deleted', false)
       .order('name').range(offset, offset + limit - 1);
     if (category) q = q.eq('category', category);
     if (status)   q = q.eq('status', status);
+    if (search) {
+      const term = search.trim();
+      if (term) {
+        const like = `%${term}%`;
+        q = q.or(
+          `name.ilike.${like},description.ilike.${like},search_tokens.cs.{${term.toLowerCase()}}`
+        );
+      }
+    }
     // HARDENING T7: destructure and throw on error
-    const { data, error } = await q;
+    const { data, error, count } = await q;
     if (error) throw error;
-    return (data || []).map(r => this._toCamel(r));
+    return { items: (data || []).map(r => this._toCamel(r)), total: count ?? 0 };
   }
 
   async findById(id) {

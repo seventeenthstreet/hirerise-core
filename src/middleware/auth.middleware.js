@@ -50,6 +50,9 @@ console.log("✅ AUTH.MIDDLEWARE.JS LOADED FROM:", __filename);
  */
 
 const { createClient } = require('@supabase/supabase-js');
+// Node 20 has no native global WebSocket — required by RealtimeClient at
+// construction time even when realtime isn't used. See config/supabase.js.
+const WebSocket = require('ws');
 const logger = require('../utils/logger');
 const tokenCache = require('../core/tokenCache');
 const { requireAdmin } = require('./requireAdmin.middleware');
@@ -112,6 +115,9 @@ function getSupabaseAdmin() {
     auth: {
       persistSession: false,
       autoRefreshToken: false,
+    },
+    realtime: {
+      transport: WebSocket,
     },
   });
 
@@ -309,24 +315,88 @@ async function resolvePlan(user) {
 }
 
 async function safeGetUser(rawToken) {
-  return Promise.race([
-    getSupabaseAdmin().auth.getUser(rawToken),
-    new Promise((_, reject) =>
-      setTimeout(
-        () =>
-          reject(
-            new Error('SUPABASE_TIMEOUT')
-          ),
-        SUPABASE_TIMEOUT_MS
-      )
-    ),
-  ]);
+  // WP-DIAG-01 TEMP — diagnostic-only, remove alongside the other
+  // [WP-DIAG] log calls in this file once the investigation is closed.
+  const wpDiagStartedAt = Date.now();
+  logger.info('[WP-DIAG] safeGetUser start', {
+    rawTokenStart: rawToken?.slice(0, 12) ?? null,
+    timestamp: new Date(wpDiagStartedAt).toISOString(),
+  });
+
+  try {
+    const result = await Promise.race([
+      getSupabaseAdmin().auth.getUser(rawToken),
+      new Promise((_, reject) =>
+        setTimeout(
+          () =>
+            reject(
+              new Error('SUPABASE_TIMEOUT')
+            ),
+          SUPABASE_TIMEOUT_MS
+        )
+      ),
+    ]);
+
+    // WP-DIAG-01 TEMP
+    logger.info('[WP-DIAG] safeGetUser end', {
+      rawTokenStart: rawToken?.slice(0, 12) ?? null,
+      elapsedMs:     Date.now() - wpDiagStartedAt,
+      outcome:       result?.error ? 'supabase-error' : 'success',
+      timeout:       false,
+    });
+
+    return result;
+  } catch (err) {
+    // WP-DIAG-01 TEMP
+    logger.info('[WP-DIAG] safeGetUser end', {
+      rawTokenStart: rawToken?.slice(0, 12) ?? null,
+      elapsedMs:     Date.now() - wpDiagStartedAt,
+      outcome:       err?.message === 'SUPABASE_TIMEOUT' ? 'timeout' : 'error',
+      timeout:       err?.message === 'SUPABASE_TIMEOUT',
+      reason:        err?.message ?? null,
+    });
+    throw err;
+  }
 }
 
 async function verifyToken(rawToken, req) {
   console.log("\n🔥🔥🔥 VERIFY TOKEN EXECUTED 🔥🔥🔥");
 
-  const { data, error } = await safeGetUser(rawToken);
+  // WP-DIAG-01 TEMP — diagnostic-only, remove alongside the other
+  // [WP-DIAG] log calls in this file once the investigation is closed.
+  const wpDiagVerifyStartedAt = Date.now();
+  logger.info('[WP-DIAG] verifyToken start', {
+    requestId: req?.requestId ?? null,
+    path:      req?.path ?? null,
+    method:    req?.method ?? null,
+    timestamp: new Date(wpDiagVerifyStartedAt).toISOString(),
+  });
+
+  const wpDiagSupabaseStartedAt = Date.now();
+  let wpDiagSupabaseOutcome = 'success';
+  let data, error;
+  try {
+    ({ data, error } = await safeGetUser(rawToken));
+  } catch (err) {
+    wpDiagSupabaseOutcome = err?.message === 'SUPABASE_TIMEOUT' ? 'timeout' : 'error';
+    // WP-DIAG-01 TEMP
+    logger.info('[WP-DIAG] verifyToken end', {
+      requestId:         req?.requestId ?? null,
+      path:              req?.path ?? null,
+      elapsedMs:         Date.now() - wpDiagVerifyStartedAt,
+      supabaseDurationMs: Date.now() - wpDiagSupabaseStartedAt,
+      success:           false,
+      timeout:           wpDiagSupabaseOutcome === 'timeout',
+      reason:            err?.message ?? null,
+    });
+    throw err;
+  }
+  // WP-DIAG-01 TEMP
+  logger.info('[WP-DIAG] verifyToken supabase call finished', {
+    requestId:          req?.requestId ?? null,
+    supabaseDurationMs: Date.now() - wpDiagSupabaseStartedAt,
+    outcome:            wpDiagSupabaseOutcome,
+  });
 
   if (error || !data?.user) {
     logger.error('[Auth Verify Failed]', {
@@ -348,6 +418,16 @@ async function verifyToken(rawToken, req) {
     console.error('Has User              :', !!data?.user);
     console.error('=======================================\n');
 
+    // WP-DIAG-01 TEMP
+    logger.info('[WP-DIAG] verifyToken end', {
+      requestId: req?.requestId ?? null,
+      path:      req?.path ?? null,
+      elapsedMs: Date.now() - wpDiagVerifyStartedAt,
+      success:   false,
+      timeout:   false,
+      reason:    error?.message || 'Invalid token',
+    });
+
     throw new Error(
       error?.message || 'Invalid token'
     );
@@ -363,8 +443,19 @@ async function verifyToken(rawToken, req) {
     method: req.method,
   });
 
+  // WP-DIAG-01 TEMP
+  logger.info('[WP-DIAG] verifyToken end', {
+    requestId: req?.requestId ?? null,
+    userId:    claimSet.id,
+    path:      req?.path ?? null,
+    elapsedMs: Date.now() - wpDiagVerifyStartedAt,
+    success:   true,
+    timeout:   false,
+  });
+
   return claimSet;
 }
+
 
 function cacheVerifiedToken(rawToken, claimSet) {
   const payload = decodeJwtPayload(rawToken);
@@ -425,7 +516,21 @@ async function authenticate(req, res, next) {
       req
     );
 
-    req.user = claimSet;
+    // Patch — WP-DASH-04: buildClaimSet() returns an Object.freeze()'d
+    // claim set (by design, to protect the canonical authenticated
+    // identity from accidental mutation). Downstream middleware/routes
+    // (dashboard.route.js, requireTier.middleware.js,
+    // requirePaidPlan.middleware.js) legitimately attach request-scoped
+    // derived properties such as normalizedTier directly onto req.user.
+    // Assigning the frozen claimSet itself caused a TypeError on that
+    // write. req.user is therefore a shallow, request-scoped mutable
+    // clone of the frozen claim set: the canonical claimSet (and the
+    // copy persisted via cacheVerifiedToken below) stays frozen and
+    // untouched, while each request gets its own plain object to
+    // annotate. This changes no claim values, no auth/authz behavior,
+    // and no JWT/token-cache logic — only the mutability of the object
+    // reference assigned to req.user.
+    req.user = { ...claimSet };
     // OBS Phase 1+2: structured JWT verified event (verifyToken already logs
     // '[Auth] Verified' at info level; this adds requestId/hydrationId context)
     emitAuthEvent(req, 'JWT_VERIFIED', { userId: claimSet.id, plan: claimSet.plan, role: claimSet.role });

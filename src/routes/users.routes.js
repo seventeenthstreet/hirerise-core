@@ -40,6 +40,10 @@ const { getRemainingQuota } = require('../middleware/tierquota.middleware');
 const supabase = require('../lib/supabaseClient');
 const logger = require('../utils/logger');
 const freshnessCache = require('../utils/freshnessCache');
+// WP-AUTH-04: reuse the same session-reset primitive DELETE /me/direction
+// uses, so a reconciled (recreated-account) row and an explicit direction
+// reset behave identically with respect to stale onboarding_sessions state.
+const sessionService = require('../modules/student-onboarding/services/session.service');
 
 const router = express.Router();
 
@@ -194,6 +198,9 @@ router.get(
   asyncHandler(async (req, res) => {
     const userId = getUserId(req);
 
+    // WP-AV-02E — Log 1: immediately after authentication.
+    console.log("[users/me] request", { uid: userId });
+
     if (!userId) {
       return res.status(401).json({
         success: false,
@@ -250,6 +257,15 @@ router.get(
       .eq('id', userId)
       .maybeSingle();
 
+    // WP-AV-02E — Log 2: immediately after reading the user profile from the database.
+    console.log("[users/me] database", {
+      id: row?.id,
+      user_type: row?.user_type,
+      onboarding_completed: row?.onboarding_completed,
+      professional_onboarding_complete: row?.professional_onboarding_complete,
+      student_onboarding_complete: row?.student_onboarding_complete,
+    });
+
     if (error) {
       throw new AppError(error.message, ErrorCodes.INTERNAL_ERROR, 500, { code: error.code });
     }
@@ -284,9 +300,30 @@ router.get(
           // The users table has a row for this email but with a different UUID
           // (stale from a previous signup). Update the ID to match the current
           // Supabase Auth UUID so all subsequent lookups by userId resolve correctly.
+          //
+          // WP-AUTH-04: reattaching the row is not enough on its own — the
+          // preserved row carries onboarding state (user_type, user_direction,
+          // onboarding flags/step) from the account that was deleted. Left as
+          // -is, a recreated account inherits that obsolete state and can be
+          // routed straight past Direction Selection into a stale onboarding
+          // step, or skip onboarding entirely. Reset those fields the same
+          // way the explicit DELETE /me/direction path does, while leaving
+          // display_name/tier/subscription/payment fields untouched — this
+          // repair path is about auth identity, not billing or profile data.
           const { data: repairedRow, error: repairErr } = await supabase
             .from('users')
-            .update({ id: userId, updated_at: new Date().toISOString() })
+            .update({
+              id: userId,
+              updated_at: new Date().toISOString(),
+              user_type: null,
+              user_direction: null,
+              direction_set_at: null,
+              direction_reset_at: new Date().toISOString(),
+              onboarding_completed: false,
+              onboarding_step: null,
+              student_onboarding_complete: false,
+              professional_onboarding_complete: false,
+            })
             .eq('email', defaultProfile.email)
             .select(`
               id,email,display_name,role,user_type,career_goal,
@@ -321,8 +358,29 @@ router.get(
             }
             row = existingRow;
           } else {
-            logger.info('[UsersRoute] Stale ID repaired successfully', { userId, email: defaultProfile.email });
+            logger.info('[UsersRoute] Stale ID repaired — onboarding state reset', {
+              userId, email: defaultProfile.email,
+            });
             row = repairedRow;
+
+            // Mirror DELETE /me/direction: a fresh onboarding state on the
+            // users row must not resume a stale student_onboarding_sessions
+            // row left over from the deleted account. Idempotent (treats a
+            // missing session as success) and non-fatal — a reset failure is
+            // logged but must not block the user from logging in.
+            try {
+              await sessionService.resetSession(userId);
+            } catch (resetError) {
+              logger.error('[UsersRoute] Reconciliation: onboarding session reset failed', {
+                userId, err: resetError.message,
+              });
+            }
+
+            // Evict freshness caches so this request and the next GET /me /
+            // /app-entry read the reset state rather than a stale cache
+            // entry from the deleted account's session.
+            freshnessCache.del(`user-me:${userId}`);
+            freshnessCache.del(`app-entry:${userId}`);
           }
         } else {
           throw new AppError(upsertErr.message, ErrorCodes.INTERNAL_ERROR, 500, { code: upsertErr.code });
@@ -335,6 +393,49 @@ router.get(
     if (!row) {
       logger.error('[UsersRoute] row is null after fetch/upsert — returning minimal profile', { userId });
       row = buildDefaultProfile(req.user, userId);
+    }
+
+    // Legacy-value normalization: 'market' was a supported direction before
+    // the product narrowed to Student/Professional only. The DB constraint
+    // (users_user_type_check) now blocks *writing* 'market', but pre-existing
+    // rows created under the old model were never backfilled, so a legacy
+    // row can still carry it. Left as-is this is not cosmetic — every
+    // frontend gate that reads user_type (AppEntryPage, AuthGuard,
+    // OnboardingGuard, the onboarding orchestrator) branches on
+    // 'student' / 'professional' explicitly and has no case for anything
+    // else; the onboarding orchestrator in particular never resolves a UI
+    // variant for an unrecognized value, so affected users land on
+    // /onboarding and the loading spinner never clears.
+    //
+    // Treat it exactly like a null direction — the same "needs to
+    // (re)select" state DELETE /me/direction already produces — and repair
+    // the row in the background so this self-heals on first encounter
+    // rather than re-triggering the same check on every future request.
+    if (row.user_type === 'market') {
+      logger.warn('[UsersRoute] Legacy user_type=\'market\' detected — normalizing to null', {
+        userId, email: row.email,
+      });
+      row = { ...row, user_type: null };
+
+      supabase
+        .from('users')
+        .update({
+          user_type: null,
+          user_direction: null,
+          direction_reset_at: new Date().toISOString(),
+          updated_at: new Date().toISOString(),
+        })
+        .eq('id', userId)
+        .then(({ error: healErr }) => {
+          if (healErr) {
+            logger.error('[UsersRoute] Legacy market normalization write failed', {
+              userId, err: healErr.message,
+            });
+            return;
+          }
+          freshnessCache.del(`user-me:${userId}`);
+          freshnessCache.del(`app-entry:${userId}`);
+        });
     }
 
     const userDoc = normalizeUser(row, req.user, userId);
@@ -361,7 +462,7 @@ router.get(
       quota = null;
     }
 
-    return res.json({
+    const responseBody = {
       success: true,
       data: {
         user: { ...userDoc, subscriptionStatus },
@@ -374,7 +475,13 @@ router.get(
           resetDate: null,
         },
       },
-    });
+    };
+
+    // WP-AV-02E — Log 3: immediately before returning the response. Logging only —
+    // the response body below is unchanged from before this instrumentation pass.
+    console.log("[users/me] response", responseBody);
+
+    return res.json(responseBody);
   }),
 );
 

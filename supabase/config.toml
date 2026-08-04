@@ -15,3 +15,5 @@ max_frequency = "60s"
 # =========================
 [edge_runtime]
 policy = "oneshot"
+[db]
+port = 55022

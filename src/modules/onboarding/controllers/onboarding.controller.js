@@ -32,6 +32,20 @@ const {
   toFrontendShape,
 } = require('../../../services/resumeParser/resume.normalizer');
 
+// WP-PRO-07: Professional Profile Normalization Engine — Resume Upload is
+// one of the three acquisition methods this WP implements normalization
+// for (Task 3). This re-shapes the already-parsed HireRiseResume
+// (`structuredResume`, produced below) into the canonical Professional
+// Profile and persists it durably to user_profiles, without changing the
+// existing parsing pipeline or the sync response contract.
+const {
+  normalizeResumeUpload,
+} = require('../../../domain/professionalProfile/professionalProfile.normalizer');
+const {
+  saveProfessionalProfileSections,
+} = require('../../../domain/professionalProfile/professionalProfile.repository');
+const { ACQUISITION_METHODS } = require('../../../domain/professionalProfile/professionalProfile.schema');
+
 const {
   isWeakParse,
   extractWithAI,
@@ -215,6 +229,30 @@ const uploadCvDuringOnboarding = withAuth(
     const confidence = computeConfidence(structuredResume);
     const quality    = computeQuality(structuredResume);
 
+    // ── Professional Profile normalization (WP-PRO-07, Task 3) ─────────────
+    // Only normalize when parsing actually produced structured data — a
+    // failed/weak parse or a too-short resume must leave the Professional
+    // Profile's acquisition-time sections untouched rather than writing
+    // empty/invented values over whatever the user already had.
+    if (structuredResume) {
+      try {
+        const partialProfile = normalizeResumeUpload(structuredResume, {
+          resumeId:      uploadResult.resumeId,
+          fileUrl:       uploadResult.fileUrl,
+          parserVersion: PARSER_VERSION,
+        });
+        await saveProfessionalProfileSections(userId, partialProfile, {
+          source: ACQUISITION_METHODS.RESUME_UPLOAD,
+        });
+      } catch (err) {
+        logger.error('[OnboardingController] Professional Profile sync failed', {
+          userId,
+          resumeId: uploadResult.resumeId,
+          error: err.message,
+        });
+      }
+    }
+
     // ── Progress update ────────────────────────────────────────────────────
     const stepHistory = await mergeStepHistory(userId, 'cv_uploaded');
 
@@ -315,7 +353,10 @@ const saveCvDraft = withAuth(async (req, res, next, userId) => {
 });
 
 const generateCareerReport = withAuth(async (req, res, next, userId) => {
-  const result = await onboardingService.generateCareerReport(userId, req.body);
+  const creditCost     = req.creditCost     ?? 0;
+  const idempotencyKey = req.headers['idempotency-key'] ?? null;
+  const userTier       = req.user?.normalizedTier ?? req.user?.plan ?? 'free';
+  const result = await onboardingService.generateCareerReport(userId, creditCost, idempotencyKey, userTier);
   return res.status(200).json({ success: true, data: result });
 });
 
@@ -436,7 +477,41 @@ const getFunnelAnalytics = withAuth(async (req, res, next, userId) => {
   return res.status(200).json({ success: true, data: result });
 });
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Guided Builder backend support (WP-PRO-07, Task 4)
+//
+// No Guided Builder UI exists yet (per WP-PRO-05B §6, confirmed not found
+// anywhere in core/ or front/) — these two endpoints are backend scaffolding
+// for a future Guided Builder frontend to call. Both delegate entirely to
+// onboarding.guidedBuilder.service.js, which itself delegates entirely to
+// the shared professionalProfile normalizer/repository — no field-mapping
+// logic lives in this controller.
+// ─────────────────────────────────────────────────────────────────────────────
+
+const guidedBuilderService = require('../onboarding.guidedBuilder.service');
+
+const saveGuidedBuilderSection = withAuth(async (req, res, next, userId) => {
+  const { section } = req.params;
+  const result = await guidedBuilderService.saveGuidedSection(userId, section, req.body);
+  return res.status(200).json({ success: true, data: result });
+});
+
+const getGuidedBuilderProfile = withAuth(async (req, res, next, userId) => {
+  const profile = await guidedBuilderService.getGuidedBuilderPrefill(userId);
+  return res.status(200).json({ success: true, data: { profile } });
+});
+
 const completeOnboarding = withAuth(async (req, res, next, userId) => {
+  // WP-DIAG-01 TEMP — diagnostic-only, remove this whole block once the
+  // completion/auth investigation is closed.
+  const wpDiagStartedAt = Date.now();
+  logger.info('[WP-DIAG] completeOnboarding entered', {
+    requestId: req.requestId ?? null,
+    userId,
+    route:     req.originalUrl ?? req.path,
+    timestamp: new Date(wpDiagStartedAt).toISOString(),
+  });
+
   const stepHistory = await mergeStepHistory(userId, 'complete');
 
   const [{ data: progressRow }, { data: profileRow }] = await Promise.all([
@@ -444,9 +519,64 @@ const completeOnboarding = withAuth(async (req, res, next, userId) => {
     supabase.from('user_profiles').select('*').eq('id', userId).maybeSingle(),
   ]);
 
-  await persistCompletionIfReady(userId, progressRow || {}, profileRow || {});
+  // WP-DIAG-01 TEMP — counts only, no field values (mask sensitive data).
+  logger.info('[WP-DIAG] completeOnboarding rows loaded', {
+    requestId:         req.requestId ?? null,
+    userId,
+    educationCount:    Array.isArray(progressRow?.education) ? progressRow.education.length : 0,
+    experienceCount:   Array.isArray(progressRow?.experience) ? progressRow.experience.length
+                        : Array.isArray(profileRow?.experience) ? profileRow.experience.length : 0,
+    expectedRoleCount: Array.isArray(profileRow?.expected_role_ids) ? profileRow.expected_role_ids.length : 0,
+    careerHistoryCount: Array.isArray(profileRow?.career_history) ? profileRow.career_history.length : 0,
+  });
 
-  return res.status(200).json({ success: true, data: { step: 'complete', stepHistory } });
+  let completionResult;
+  try {
+    completionResult = await persistCompletionIfReady(userId, progressRow || {}, profileRow || {});
+  } catch (err) {
+    // WP-DIAG-01 TEMP
+    logger.warn('[WP-DIAG] completeOnboarding failed', {
+      requestId: req.requestId ?? null,
+      userId,
+      elapsedMs: Date.now() - wpDiagStartedAt,
+      error:     err.message,
+    });
+    throw err;
+  }
+
+  // WP-PRO-12A-2 FIX: completeOnboarding() previously always returned a
+  // hardcoded `{ step: 'complete', stepHistory }` payload regardless of
+  // whether onboarding was actually complete, and never populated the
+  // frontend's declared CompleteOnboardingResponse fields (`isComplete`,
+  // `completion`). It now reflects whatever persistCompletionIfReady()
+  // (backed by the unmodified evaluateCompletion()) actually determined.
+  const isComplete = completionResult?.isComplete === true;
+
+  // WP-DIAG-01 TEMP
+  logger.info('[WP-DIAG] completeOnboarding completed successfully', {
+    requestId:  req.requestId ?? null,
+    userId,
+    elapsedMs:  Date.now() - wpDiagStartedAt,
+    isComplete,
+  });
+
+  return res.status(200).json({
+    success: true,
+    data: {
+      step:        isComplete ? 'complete' : 'incomplete',
+      isComplete,
+      completion:  completionResult
+        ? {
+          isComplete:       completionResult.isComplete,
+          trackA:           completionResult.trackA,
+          trackAUpload:     completionResult.trackAUpload,
+          trackB:           completionResult.trackB,
+          alreadyCompleted: completionResult.alreadyCompleted,
+        }
+        : null,
+      stepHistory,
+    },
+  });
 });
 
 module.exports = {
@@ -475,4 +605,6 @@ module.exports = {
   getCareerReportStatus,
   getFunnelAnalytics,
   completeOnboarding,
+  saveGuidedBuilderSection,
+  getGuidedBuilderProfile,
 };

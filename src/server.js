@@ -197,10 +197,12 @@ const { errorHandler, notFoundHandler }   = require('./middleware/errorHandler')
 const { correlationMiddleware }           = require('./middleware/correlation.middleware');
 const { requestTimeout } = require('./middleware/requestTimeout.middleware');
 const { authenticate, requireAdmin }      = require('./middleware/auth.middleware');
+const { requireElevatedSession } = require('./middleware/requireElevatedSession.middleware');
 const { requireMasterAdmin }              = require('./middleware/requireMasterAdmin.middleware');
 const { requireContributor }              = require('./middleware/requireContributor.middleware');
 const { adminRateLimit, masterRateLimit } = require('./middleware/adminRateLimit.middleware');
 const { requireInternalToken }            = require('./middleware/internalToken.middleware');
+const tokenCache                          = require('./core/tokenCache');
 
 // ── Per-route AI rate limiter ─────────────────────────────────────────────────
 // Prevents a single user from exhausting the global bucket on high-cost AI
@@ -216,6 +218,24 @@ const aiRateLimit = rateLimit({
   message: {
     error: 'Too many AI inference requests. Please wait before retrying.',
     retryAfter: 60,
+  },
+  skip: () => IS_TEST,
+});
+
+// ── MFA rate limiter — WP-ADMIN-02C ─────────────────────────────────────────
+// Tighter than aiRateLimit: TOTP verification is a brute-force target.
+// registerFailedAttempt() in mfa.service.js also tracks a per-account lockout
+// independent of this — this is the transport-level throttle, that is the
+// account-level lockout. Both apply.
+const mfaRateLimit = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 10,
+  keyGenerator: (req) => req.user?.id || req.ip,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: {
+    error: 'Too many MFA requests. Please wait before retrying.',
+    retryAfter: 900,
   },
   skip: () => IS_TEST,
 });
@@ -4130,15 +4150,41 @@ const rateLimitMax      = parseInt(process.env.RATE_LIMIT_MAX_REQUESTS || '400',
 // so skipping the global IP limiter here does not reduce security.
 const AUTH_BOOT_PATHS = new Set(['/api/v1/app-entry', '/api/v1/users/me']);
 
+// WP-SEC-01: globalLimiter must run before routing (so unknown routes still
+// get a normal 404, not an auth check) and before authenticate() (so abuse
+// protection still applies to floods of invalid/anonymous requests, not just
+// verified ones). That means req.user is never set yet at keyGenerator time.
+//
+// Rather than decoding the JWT here (a second, competing identity/parsing
+// implementation — rejected in WP-SEC-01 Attempt 1) or moving authenticate()
+// ahead of routing (breaks 404 semantics — rejected in WP-SEC-01 Attempt 2),
+// this reuses the existing verified-token cache that authenticate() itself
+// reads and writes (src/core/tokenCache.js). If this exact bearer token has
+// already been verified on a prior request in this cache's TTL window (true
+// for essentially all real sessions, since the same JWT is reused across a
+// user's requests), we key the bucket by that already-authoritative uid.
+// First-time tokens, invalid tokens, and anonymous requests fall back to IP,
+// identical to previous behavior. No JWT is parsed or verified here — this is
+// a cache read of state authenticate() already produced.
+async function rateLimitIdentity(req) {
+  try {
+    const authHeader = req.headers?.authorization;
+    if (!authHeader?.startsWith('Bearer ')) return null;
+
+    const rawToken = authHeader.slice(7);
+    const cached = await tokenCache.get(rawToken);
+    return cached?.uid || cached?.id || null;
+  } catch {
+    return null;
+  }
+}
+
 const globalLimiter = rateLimit({
   windowMs: rateLimitWindowMs,
   max:      rateLimitMax,
   standardHeaders: true,
   legacyHeaders:   false,
-  // NOTE: keyGenerator runs before authenticate, so req.user?.uid is always
-  // undefined here. We key by IP as a fallback. If you move globalLimiter to
-  // run after authenticate, change this to: req.user?.uid || req.ip
-  keyGenerator: (req) => req.user?.uid || req.ip,
+  keyGenerator: async (req) => (await rateLimitIdentity(req)) || req.ip,
   skip: (req) => AUTH_BOOT_PATHS.has(req.path),
   // Use Redis store in production; default in-memory store in dev/test
   ...(IS_PRODUCTION && { store: new RedisRateLimitStore(rateLimitWindowMs) }),
@@ -4542,9 +4588,9 @@ registerRoute(
   require('./modules/skillGraph/skillGraph.routes')
 );
 
-app.use(`${API_PREFIX}/admin/graph`,               authenticate, requireAdmin, require('./modules/admin/graph/graphAdmin.routes'));
-app.use(`${API_PREFIX}/admin/graph-intelligence`,  authenticate, requireAdmin, require('./modules/admin/graph/graphIntelligence.routes'));
-app.use(`${API_PREFIX}/admin/platform-intelligence`, authenticate, requireAdmin, require('./modules/platform-intelligence/routes/platformIntelligence.routes'));
+app.use(`${API_PREFIX}/admin/graph`,               authenticate, requireAdmin, requireElevatedSession, require('./modules/admin/graph/graphAdmin.routes'));
+app.use(`${API_PREFIX}/admin/graph-intelligence`,  authenticate, requireAdmin, requireElevatedSession, require('./modules/admin/graph/graphIntelligence.routes'));
+app.use(`${API_PREFIX}/admin/platform-intelligence`, authenticate, requireAdmin, requireElevatedSession, require('./modules/platform-intelligence/routes/platformIntelligence.routes'));
 
 // WP-P2-01 — Source Intelligence Management (SIM).
 // Enterprise registry of external knowledge sources: metadata + governance
@@ -4552,7 +4598,7 @@ app.use(`${API_PREFIX}/admin/platform-intelligence`, authenticate, requireAdmin,
 // surface, not student/employer facing. See
 // modules/source-intelligence/server-registration.snippet.js for the full
 // route summary and the optional event-publisher wiring.
-app.use(`${API_PREFIX}/admin/source-intelligence`, authenticate, requireAdmin, require('./modules/source-intelligence').routes);
+app.use(`${API_PREFIX}/admin/source-intelligence`, authenticate, requireAdmin, requireElevatedSession, require('./modules/source-intelligence').routes);
 
 app.use(`${API_PREFIX}/chi-v2`,        authenticate, require('./modules/chiV2/chiV2.routes'));
 app.use(`${API_PREFIX}/salary`,        authenticate, require('./routes/salary.routes'));
@@ -4674,14 +4720,18 @@ app.use(`${API_PREFIX}/career-onboarding`,  authenticate, require('./routes/care
 // the route registry. Explicit mounts restore duplicate-guard protection and
 // make the route contract visible in logs.
 //
-// FIX: aiRateLimit applied to semantic-match endpoint — AI inference routes
-// share a dedicated 20 req/min bucket per UID to prevent one user exhausting
-// the global quota and degrading all others.
+// Phase 2D QUOTA BOUNDARY FIX: aiRateLimit removed from this mount.
+// semantic.routes.js already applies aiRateLimitShared per-handler on its
+// actual AI inference routes (/skills/similar, /career/advice, etc). Keeping
+// aiRateLimit here as well made it fire on EVERY /api/v1/* request that falls
+// through this bare-prefix mount (including /app-entry, /users/me, and any
+// other route mounted after this line) — see semantic.routes.js header comment:
+// "Do NOT move back to server.js mount level — that scope is too broad."
 // FIX: semantic.routes uses absolute internal paths (/skills/similar, /career/advice etc).
 // Mounting at a sub-path (e.g. /skills or /career) caused Express to strip that prefix,
 // making routes only reachable at doubled paths (/career/career/advice).
 // Correct mount is at API_PREFIX so paths resolve as intended.
-app.use(`${API_PREFIX}`,           authenticate, aiRateLimit, require('./routes/semantic.routes'));
+app.use(`${API_PREFIX}`,           authenticate, require('./routes/semantic.routes'));
 // The two mounts let Express match the correct prefix; the router uses relative paths internally.
 
 /**
@@ -4730,13 +4780,19 @@ if (process.env.FEATURE_EVENT_BUS === 'true') {
  *   GET  /api/v1/user/personalization-profile         → current signal profile
  *   POST /api/v1/user/update-behavior-profile         → manual profile refresh
  */
-// FIX: Explicit path mounts for personalization module — replaces broad API_PREFIX
-// mount. aiRateLimit applied since personalization profile endpoints invoke AI
-// inference on every request.
+// Phase 2D QUOTA BOUNDARY FIX: aiRateLimit removed from this mount — see
+// personalization.routes.js header comment ("PHASE 2D — QUOTA BOUNDARY FIX").
+// aiRateLimitShared is already applied per-handler inside that router, on the
+// AI inference routes only (/career/personalized-recommendations,
+// /user/personalization-profile, /user/update-behavior-profile).
+// Leaving aiRateLimit here made it fire on EVERY /api/v1/* request that falls
+// through this bare-prefix mount before reaching its real destination,
+// including the free onboarding operation POST /api/v1/users/me/direction and
+// unrelated boot-time calls like /app-entry and /users/me.
 // FIX: personalization.routes comment says "Preferred mount: app.use(API_PREFIX, ...)".
 // Sub-path mounts broke routing (same prefix-stripping issue as semantic.routes above).
 // Restored to correct API_PREFIX mount. /user/* and /career/* paths resolve correctly.
-app.use(`${API_PREFIX}`,           authenticate, aiRateLimit, require('./modules/personalization/personalization.routes'));
+app.use(`${API_PREFIX}`,           authenticate, require('./modules/personalization/personalization.routes'));
 
 /**
  * Career Copilot — RAG-Grounded Conversational AI
@@ -4845,6 +4901,12 @@ app.use(`${API_PREFIX}/market`, authenticate, require('./modules/labor-market-in
  *   GET /api/v1/analytics/snapshots/:metric → Historical snapshots
  */
 app.use(`${API_PREFIX}/career-health`, authenticate, require('./modules/careerHealthIndex/careerHealthIndex.routes'));
+
+/**
+ * Skill Prioritization Intelligence API
+ *   GET /api/v1/skills-priority/priority → ranked skill priorities for user
+ */
+app.use(`${API_PREFIX}/skills-priority`, authenticate, require('./routes/skills-priority.routes'));
 
 /**
  * AI Career Advisor
@@ -5011,13 +5073,20 @@ app.use(
 // Rate limit: 50 req/min per user (adminRateLimit).
 app.use(`${API_PREFIX}/admin`, adminRateLimit);
 
-app.use(`${API_PREFIX}/admin/metrics`,           authenticate, requireAdmin, require('./routes/admin/adminMetrics.routes'));
-app.use(`${API_PREFIX}/admin/ai`,                authenticate, requireAdmin, require('./routes/admin/ai-observability.routes'));
+app.use(`${API_PREFIX}/admin/metrics`,           authenticate, requireAdmin, requireElevatedSession, require('./routes/admin/adminMetrics.routes'));
+app.use(`${API_PREFIX}/admin/ai`,                authenticate, requireAdmin, requireElevatedSession, require('./routes/admin/ai-observability.routes'));
+// WP-ADMIN-02C: MFA routes — deliberately NOT gated by requireElevatedSession
+// (these are the routes that CREATE the elevated session) and use the
+// lighter isAdminRole check inside mfa.routes.js rather than requireAdmin's
+// full DB-verification path, to avoid a chicken-and-egg dependency during
+// enrollment. Mounted at its own specific sub-path per the earlier
+// bare-API_PREFIX rate-limiter lesson from this program.
+app.use(`${API_PREFIX}/admin/mfa`,               authenticate, mfaRateLimit, require('./modules/admin/mfa/mfa.routes'));
 // WP-7 — Phase 1 stubs (WP-13: replace stub bodies with real service calls)
-app.use(`${API_PREFIX}/system`,  authenticate, requireAdmin, systemHealthRoutes);
-app.use(`${API_PREFIX}/metrics`, authenticate, requireAdmin, xaiMetricsRoutes);
-app.use(`${API_PREFIX}/admin/jobs`,              authenticate, requireAdmin, require('./modules/admin/jobs/adminJobs.routes'));
-app.use(`${API_PREFIX}/admin/adaptive-weights`,  authenticate, requireAdmin, require('./modules/adaptiveWeight/adaptiveWeight.routes'));
+app.use(`${API_PREFIX}/system`,  authenticate, requireAdmin, requireElevatedSession, systemHealthRoutes);
+app.use(`${API_PREFIX}/metrics`, authenticate, requireAdmin, requireElevatedSession, xaiMetricsRoutes);
+app.use(`${API_PREFIX}/admin/jobs`,              authenticate, requireAdmin, requireElevatedSession, require('./modules/admin/jobs/adminJobs.routes'));
+app.use(`${API_PREFIX}/admin/adaptive-weights`,  authenticate, requireAdmin, requireElevatedSession, require('./modules/adaptiveWeight/adaptiveWeight.routes'));
 
 // Career Readiness — gated behind feature flag (marked DEAD-02).
 // To re-enable: set FEATURE_CAREER_READINESS=true in .env
@@ -5055,21 +5124,22 @@ if (process.env.FEATURE_CAREER_READINESS === 'true') {
  *   GET    /api/v1/admin/cms/salary-benchmarks      → List
  *   POST   /api/v1/admin/cms/import                 → Bulk JSON import (207 on partial)
  */
-app.use(`${API_PREFIX}/admin/cms/skills`,      authenticate, requireAdmin, require('./modules/admin/cms/skills/adminCmsSkills.routes'));
-app.use(`${API_PREFIX}/admin/cms/roles`,       authenticate, requireAdmin, require('./modules/admin/cms/roles/adminCmsRoles.routes'));
-app.use(`${API_PREFIX}/admin/cms/career-domains`,   authenticate, requireAdmin, careerDomainsModule.router);
-app.use(`${API_PREFIX}/admin/cms/skill-clusters`,   authenticate, requireAdmin, skillClustersModule.router);
-app.use(`${API_PREFIX}/admin/cms/job-families`,     authenticate, requireAdmin, jobFamiliesModule.router);
-app.use(`${API_PREFIX}/admin/cms/education-levels`, authenticate, requireAdmin, educationLevelsModule.router);
-app.use(`${API_PREFIX}/admin/cms/salary-benchmarks`, authenticate, requireAdmin, salaryBenchmarksModule.router);
-app.use(`${API_PREFIX}/admin/cms/import`,      authenticate, requireAdmin, require('./modules/admin/cms/import/adminCmsImport.routes'));
+app.use(`${API_PREFIX}/admin/users`,           authenticate, requireAdmin, requireElevatedSession, require('./modules/admin/users/adminUsers.routes'));
+app.use(`${API_PREFIX}/admin/cms/skills`,      authenticate, requireAdmin, requireElevatedSession, require('./modules/admin/cms/skills/adminCmsSkills.routes'));
+app.use(`${API_PREFIX}/admin/cms/roles`,       authenticate, requireAdmin, requireElevatedSession, require('./modules/admin/cms/roles/adminCmsRoles.routes'));
+app.use(`${API_PREFIX}/admin/cms/career-domains`,   authenticate, requireAdmin, requireElevatedSession, careerDomainsModule.router);
+app.use(`${API_PREFIX}/admin/cms/skill-clusters`,   authenticate, requireAdmin, requireElevatedSession, skillClustersModule.router);
+app.use(`${API_PREFIX}/admin/cms/job-families`,     authenticate, requireAdmin, requireElevatedSession, jobFamiliesModule.router);
+app.use(`${API_PREFIX}/admin/cms/education-levels`, authenticate, requireAdmin, requireElevatedSession, educationLevelsModule.router);
+app.use(`${API_PREFIX}/admin/cms/salary-benchmarks`, authenticate, requireAdmin, requireElevatedSession, salaryBenchmarksModule.router);
+app.use(`${API_PREFIX}/admin/cms/import`,      authenticate, requireAdmin, requireElevatedSession, require('./modules/admin/cms/import/adminCmsImport.routes'));
 
 /**
  * Admin CSV File Upload Import (authenticate + requireAdmin)
  *   POST /api/v1/admin/cms/import/csv/:datasetType
  *   Supported: skills | roles | jobFamilies | educationLevels
  */
-app.use(`${API_PREFIX}/admin/cms/import/csv`, authenticate, requireAdmin, require('./modules/admin/import/import.routes'));
+app.use(`${API_PREFIX}/admin/cms/import/csv`, authenticate, requireAdmin, requireElevatedSession, require('./modules/admin/import/import.routes'));
 
 /**
  * Contributor Submission + Approval Workflow
@@ -5093,7 +5163,7 @@ app.use(`${API_PREFIX}/admin/pending`, authenticate, requireContributor, require
  *   POST /api/v1/admin/contributors/promote  → grant contributor role
  *   POST /api/v1/admin/contributors/demote   → revoke contributor role
  */
-app.use(`${API_PREFIX}/admin/contributors`, authenticate, requireAdmin, require('./routes/admin/adminContributors.routes'));
+app.use(`${API_PREFIX}/admin/contributors`, authenticate, requireAdmin, requireElevatedSession, require('./routes/admin/adminContributors.routes'));
 
 /**
  * Salary Data API (authenticate — granular admin guard inside route)
@@ -5115,7 +5185,7 @@ app.use(`${API_PREFIX}/salary-data`, authenticate, require('./modules/salary/sal
  *   Body: multipart/form-data — field "file" (CSV, max 10 MB)
  *   Response: { success, created, updated, skipped, failed, total, rows[], importedAt }
  */
-app.use(`${API_PREFIX}/admin/import`, authenticate, requireAdmin, require('./modules/admin/import/adminImport.routes'));
+app.use(`${API_PREFIX}/admin/import`, authenticate, requireAdmin, requireElevatedSession, require('./modules/admin/import/adminImport.routes'));
 
 /**
  * CSV Salary Bulk Import (authenticate + requireAdmin)
@@ -5124,7 +5194,7 @@ app.use(`${API_PREFIX}/admin/import`, authenticate, requireAdmin, require('./mod
  *   Flow: multer → streaming csv-parser → role normalization → validate → batch Supabase write
  *   Returns HTTP 207 on partial success (some rows skipped/errored).
  */
-app.use(`${API_PREFIX}/admin/import/salaries`, authenticate, requireAdmin, require('./modules/salaryImport/salaryImport.routes'));
+app.use(`${API_PREFIX}/admin/import/salaries`, authenticate, requireAdmin, requireElevatedSession, require('./modules/salaryImport/salaryImport.routes'));
 
 /**
  * Role Alias Management (authenticate + requireAdmin)
@@ -5133,7 +5203,7 @@ app.use(`${API_PREFIX}/admin/import/salaries`, authenticate, requireAdmin, requi
  *
  * Used by CSV import + sync worker to normalize role names from external sources.
  */
-app.use(`${API_PREFIX}/admin/cms/role-aliases`, authenticate, requireAdmin, require('./modules/roleAliases/roleAlias.routes'));
+app.use(`${API_PREFIX}/admin/cms/role-aliases`, authenticate, requireAdmin, requireElevatedSession, require('./modules/roleAliases/roleAlias.routes'));
 
 /**
  * External API Registry (authenticate + requireMasterAdmin)

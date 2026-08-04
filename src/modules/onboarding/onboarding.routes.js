@@ -23,7 +23,7 @@
 
 const { Router } = require('express');
 const multer = require('multer');
-const { body } = require('express-validator');
+const { body, param } = require('express-validator');
 
 const { validate } = require('../../middleware/requestValidator');
 const { creditGuard } = require('../../middleware/creditGuard.middleware');
@@ -58,6 +58,8 @@ const {
   getCareerReportStatus,
   getFunnelAnalytics,
   completeOnboarding,
+  saveGuidedBuilderSection,
+  getGuidedBuilderProfile,
 } = require('./controllers/onboarding.controller');
 
 const router = Router();
@@ -268,6 +270,23 @@ router.post(
 // TRACK B
 // ─────────────────────────────────────────────────────────────
 router.post('/career-intent', saveCareerIntent);
+
+// ─────────────────────────────────────────────────────────────
+// GUIDED BUILDER (WP-PRO-07, Task 4 — backend support only;
+// no Guided Builder UI is implemented by this work package)
+// ─────────────────────────────────────────────────────────────
+router.get('/guided/profile', getGuidedBuilderProfile);
+router.post(
+  '/guided/:section',
+  validate([
+    param('section').isIn([
+      'personal_details', 'education', 'experience', 'skills',
+      'certifications', 'projects', 'languages',
+      'career_goals', 'employment_preferences',
+    ]),
+  ]),
+  saveGuidedBuilderSection
+);
 
 // ─────────────────────────────────────────────────────────────
 // ADMIN

@@ -152,8 +152,38 @@ function errorHandler(err, req, res, next) {
 /* ---------------- APP ERROR ---------------- */
 
 class AppError extends Error {
-  constructor(message, code = 'APP_ERROR', statusCode = 400, metadata = null) {
+  // FIX (WP-ERR-01): two incompatible call conventions exist for this
+  // constructor across the codebase:
+  //   (message, statusCode:number, metadata:object, code:string)  — majority,
+  //     used by resume/salary/careerGraph/admin/careerHealthIndex etc.
+  //   (message, code:string, statusCode:number, metadata:object)  — minority,
+  //     used by roles.service/onboarding.careerReport/userDirection etc.
+  // The previous signature only matched the minority convention, so every
+  // majority-style call passed its metadata object where a numeric statusCode
+  // was expected. normalizeStatusCode() then silently fell back to 500 for
+  // ALL of those — turning intended 404/400/422 responses into 500s (e.g.
+  // GET /api/v1/career-health, GET /api/v1/career-opportunities/score).
+  // Detecting the argument shape at the single construction point fixes
+  // every call site without having to touch ~100 call sites individually.
+  constructor(message, a, b, c) {
     super(message ?? DEFAULT_MESSAGE);
+
+    let statusCode;
+    let metadata;
+    let code;
+
+    if (typeof a === 'number') {
+      // (message, statusCode, metadata, code)
+      statusCode = a;
+      metadata   = b ?? null;
+      code       = c ?? 'APP_ERROR';
+    } else {
+      // (message, code, statusCode, metadata)
+      code       = a ?? 'APP_ERROR';
+      statusCode = typeof b === 'number' ? b : 400;
+      metadata   = c ?? null;
+    }
+
     this.name          = 'AppError';
     this.code          = code;
     this.statusCode    = normalizeStatusCode({ statusCode });
@@ -163,23 +193,23 @@ class AppError extends Error {
   }
 
   static badRequest(message, code = 'BAD_REQUEST', meta) {
-    return new AppError(message || 'Bad request', code, 400, meta);
+    return new AppError(message || 'Bad request', 400, meta, code);
   }
 
   static unauthorized(message, code = 'UNAUTHORIZED', meta) {
-    return new AppError(message || 'Unauthorized', code, 401, meta);
+    return new AppError(message || 'Unauthorized', 401, meta, code);
   }
 
   static forbidden(message, code = 'FORBIDDEN', meta) {
-    return new AppError(message || 'Forbidden', code, 403, meta);
+    return new AppError(message || 'Forbidden', 403, meta, code);
   }
 
   static notFound(message, code = 'NOT_FOUND', meta) {
-    return new AppError(message || 'Resource not found', code, 404, meta);
+    return new AppError(message || 'Resource not found', 404, meta, code);
   }
 
   static conflict(message, code = 'CONFLICT', meta) {
-    return new AppError(message || 'Conflict', code, 409, meta);
+    return new AppError(message || 'Conflict', 409, meta, code);
   }
 }
 

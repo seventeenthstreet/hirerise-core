@@ -19,6 +19,16 @@ const {
 } = require('../../middleware/errorHandler');
 const logger = require('../../utils/logger');
 
+// WP-PRO-08: Professional Onboarding Definition Engine. getProgress()
+// no longer hardcodes step logic — steps[] and currentStep are derived
+// from the canonical definition (professional-onboarding.definition.js)
+// via these pure helpers. Analytics remains a *consumer* of the
+// definition, never an owner of it (WP-PRO-02B §3, Option D rejected).
+const {
+  buildSteps,
+  computeCurrentStep,
+} = require('./professional-onboarding.progression');
+
 // ───────────────────────────────────────────────────────────────────────────────
 // Table References
 // ───────────────────────────────────────────────────────────────────────────────
@@ -349,12 +359,22 @@ async function getProgress(userId) {
   }
 
   try {
-    // Read both tables in parallel — same pattern used by getChiReady
-    const [progressRes, usersRes] = await Promise.all([
+    // Read all three tables in parallel — same pattern used by getChiReady.
+    // WP-PRO-08: the column list and the added user_profiles read exist
+    // solely to feed the definition engine's step-completion derivation
+    // (professional-onboarding.progression.js#isStepComplete) and the
+    // existing, unchanged evaluateCompletion() (onboarding.helpers.js) —
+    // every one of these columns is already read by evaluateCompletion or
+    // by uploadCvDuringOnboarding elsewhere in this module; none is new.
+    const [progressRes, usersRes, profileRes] = await Promise.all([
       supabase
         .from(TABLE_ONBOARDING_PROGRESS)
         // completed_at does not exist — use onboarding_completed_at
-        .select('step, step_history, onboarding_completed_at, updated_at')
+        .select(
+          'step, step_history, onboarding_completed_at, updated_at, ' +
+          'confidence, cv_resume_id, personal_details, full_name, ' +
+          'education, experience, career_report'
+        )
         .eq('id', userId)
         .maybeSingle(),
 
@@ -364,21 +384,56 @@ async function getProgress(userId) {
         .select('onboarding_completed')
         .eq('id', userId)
         .maybeSingle(),
+
+      supabase
+        .from(TABLE_USER_PROFILES)
+        // WP-AV-03C: display_name added. computeStepStates() below feeds
+        // this row straight into the same evaluateCompletion() used by
+        // persistCompletionIfReady() (WP-AV-03C primary fix), which now
+        // reads profile.display_name for trackAUpload. Without it here,
+        // GET /progress would keep showing Resume-Upload users as
+        // incomplete even though their real completion state (persisted
+        // via the controller's separate select('*') read) is correct —
+        // a display/consistency defect in this endpoint only, not the
+        // Dashboard-entry gate (that reads `users.onboarding_completed`
+        // directly; see appEntry.route.js). No other column changed.
+        .select('career_history, expected_role_ids, display_name')
+        .eq('id', userId)
+        .maybeSingle(),
     ]);
 
     if (progressRes.error) throw progressRes.error;
 
     const progress = progressRes.data;
     const user     = usersRes.data;
+    const profile  = profileRes.data || {};
 
     // New user — no progress row yet.  Return a safe empty default so the
     // frontend can start fresh without treating this as an error.
+    //
+    // WP-PRO-08: this branch previously returned completedSteps: [] with
+    // no steps[]/currentStep at all — the direct cause of the "0 of 0
+    // steps" defect. It now routes through the same buildSteps()/
+    // computeCurrentStep() helpers as the populated-row branch below, so
+    // the "no progress row" and "has progress row" paths can never drift
+    // from each other (WP-PRO-03A §3 boundary requirement).
     if (!progress) {
+      const { isComplete, steps } = buildSteps({
+        completedSteps: [],
+        progress:       {},
+        profile,
+      });
+
       return {
         userId,
         step:               null,
         completedSteps:     [],
-        onboardingCompleted: user?.onboarding_completed ?? false,
+        onboardingCompleted: user?.onboarding_completed ?? isComplete ?? false,
+        steps,
+        currentStep:        computeCurrentStep(steps),
+        // WP-PRO-08: OnboardingProgressResponse (features/onboarding/types)
+        // declares isComplete but no code path populated it before this WP.
+        isComplete,
       };
     }
 
@@ -386,13 +441,29 @@ async function getProgress(userId) {
       ? progress.step_history.map((h) => (typeof h === 'string' ? h : h?.step)).filter(Boolean)
       : [];
 
+    const { isComplete, steps } = buildSteps({
+      completedSteps: stepHistory,
+      progress,
+      profile,
+    });
+
     return {
       userId,
       step:               progress.step ?? null,
       completedSteps:     stepHistory,
-      onboardingCompleted: user?.onboarding_completed ?? (progress.step === 'completed'),
+      onboardingCompleted: user?.onboarding_completed ?? (progress.step === 'completed' || isComplete),
       completedAt:        progress.onboarding_completed_at ?? null,
       updatedAt:          progress.updated_at ?? null,
+      // WP-PRO-08: additive fields — Progress API Contract (WP-PRO-03A §4).
+      // `step` is retained unchanged above for any undiscovered consumer;
+      // `currentStep` is the correct field name the frontend's
+      // hooks/useOnboarding.ts selector already reads
+      // (raw.currentStep ?? raw.steps?.[0]?.stepId ?? null).
+      steps,
+      currentStep: computeCurrentStep(steps),
+      // WP-PRO-08: OnboardingProgressResponse (features/onboarding/types)
+      // declares isComplete but no code path populated it before this WP.
+      isComplete,
     };
   } catch (err) {
     logger.error('[OnboardingAnalytics] getProgress failed', {

@@ -11,6 +11,7 @@
  *   createOrResume(userId)  → { session, created }
  *   getSession(userId)      → SessionShape
  *   updateProgression(...)  → SessionShape
+ *   resetSession(userId)    → { session, reset }
  */
 
 const { supabase }    = require('../../../config/supabase');
@@ -215,10 +216,61 @@ async function updateProgression(userId, { completedStep, nextStep, completedSte
   return shapeSession(data);
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// resetSession
+// WP-ONBOARD-02A — restores an existing session to its initial state.
+// Called only from the explicit direction-reset flow (DELETE /me/direction),
+// never from login, resume, or dashboard navigation.
+//
+// Idempotent by design: if the user has no session row yet, that is treated
+// as success (there is nothing to reset) rather than an error.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * @param {string} userId
+ * @returns {Promise<{ session: SessionShape|null, reset: boolean }>}
+ */
+async function resetSession(userId) {
+  const { data, error } = await supabase
+    .from(TABLE)
+    .update({
+      current_step:    'education',
+      completed_steps: [],
+      is_complete:     false,
+    })
+    .eq('user_id', userId)
+    .select('*')
+    .maybeSingle();
+
+  if (error) {
+    logger.error(
+      { userId, err: error.message },
+      '[SessionService] resetSession: update failed',
+    );
+    throw new SessionServiceError(
+      'Failed to reset onboarding session.',
+      'DB_RESET_ERROR',
+    );
+  }
+
+  if (!data) {
+    // No existing session — nothing to reset. Idempotent success.
+    logger.info(
+      { userId },
+      '[SessionService] resetSession: no existing session, treated as success',
+    );
+    return { session: null, reset: false };
+  }
+
+  logger.info({ userId }, '[SessionService] session reset');
+  return { session: shapeSession(data), reset: true };
+}
+
 module.exports = {
   createOrResume,
   getSession,
   updateProgression,
+  resetSession,
   SessionServiceError,
   // Exported for testing
   shapeSession,

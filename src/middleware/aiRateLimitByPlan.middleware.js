@@ -42,6 +42,14 @@ function buildKey(plan, uid) {
   return `ai_rate_plan:${plan}:${uid}:${todayKey()}`;
 }
 
+// Development-only bypass gate (WP-PRO-10C-A). Never true in production,
+// regardless of how the flag is set — production must ignore this flag.
+const AI_RATE_LIMIT_DEV_BYPASS = process.env.AI_RATE_LIMIT_DEV_BYPASS === 'true';
+
+function isDevBypassActive() {
+  return process.env.NODE_ENV !== 'production' && AI_RATE_LIMIT_DEV_BYPASS;
+}
+
 // Phase 2B.1 — normalized to V2 canonical envelope.
 // retryAfter lives in meta.retryAfter; root-level retryAfterSeconds removed.
 function limitResponse(limit, plan) {
@@ -108,6 +116,22 @@ async function aiRateLimitByPlan(req, res, next) {
     (req.user.roles ?? []).includes('admin');
 
   if (isAdmin) return next();
+
+  // ─── Development bypass ───────────────────────────────────────
+  // Local-development-only escape hatch so engineers aren't blocked by the
+  // per-plan daily AI quota while iterating. Requires BOTH:
+  //   1. NODE_ENV !== 'production'
+  //   2. AI_RATE_LIMIT_DEV_BYPASS=true (explicit opt-in, defaults to off)
+  // Production ignores this flag unconditionally — the check_rate_limit
+  // RPC and all existing plan-limit behaviour are untouched either way.
+  if (isDevBypassActive()) {
+    logger.warn('[aiRateLimitByPlan] Development bypass active', {
+      uid,
+      path: req.path,
+      environment: process.env.NODE_ENV || 'development',
+    });
+    return next();
+  }
 
   const plan  = normalizeTier(req.user.plan);
   const limit = PLAN_LIMITS[plan] ?? PLAN_LIMITS.free;

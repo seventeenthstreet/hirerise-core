@@ -91,8 +91,8 @@ BEGIN
       label          text    NOT NULL,
       effective_date date    NOT NULL DEFAULT CURRENT_DATE,
       deprecated     boolean NOT NULL DEFAULT false,
-      tos_url        text    DEFAULT NULL,
-      privacy_url    text    DEFAULT NULL,
+      tos_url        text    NOT NULL,
+      privacy_url    text    NOT NULL,
       created_at     timestamptz NOT NULL DEFAULT now(),
       CONSTRAINT uq_consent_versions_version UNIQUE (version)
     );
@@ -206,13 +206,19 @@ BEGIN
     WHERE deprecated = false
   ) THEN
     -- Use the real schema columns confirmed from the existing HireRise database.
-    INSERT INTO public.consent_versions (version, label, effective_date, deprecated)
-    VALUES (
-      '1.0',
-      'HireRise Phase 1.6 initial consent version',
-      CURRENT_DATE,
-      false
-    );
+    -- Routed through public.seed_consent_versions() (defined in 000_initial_schema.sql)
+    -- rather than a bare INSERT, since that function already validates and requires
+    -- tos_url/privacy_url before writing a row.
+    -- TODO: replace these placeholder legal-doc URLs with the real ToS/Privacy URLs
+    -- before this runs against any real environment.
+    PERFORM public.seed_consent_versions(jsonb_build_array(jsonb_build_object(
+      'version',        '1.0',
+      'label',          'HireRise Phase 1.6 initial consent version',
+      'effective_date', CURRENT_DATE::text,
+      'deprecated',     false,
+      'tos_url',        'https://hirerise.com/legal/terms/v1.0',
+      'privacy_url',    'https://hirerise.com/legal/privacy/v1.0'
+    )));
     RAISE NOTICE 'consent_versions: seed row inserted (version=1.0).';
   ELSE
     RAISE NOTICE 'consent_versions: active row(s) already exist — seed INSERT skipped.';

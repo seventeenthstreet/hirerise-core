@@ -93,6 +93,54 @@ CREATE TABLE IF NOT EXISTS public.signal_category_hierarchy (
 
 );
 
+-- Backfill columns for the case where signal_category_hierarchy already
+-- existed (as an older/smaller table) before this migration. CREATE TABLE
+-- IF NOT EXISTS above is a no-op against a pre-existing table, so none of
+-- the inline column definitions above actually get applied to it — every
+-- column needs an explicit idempotent ADD COLUMN here, or later statements
+-- (COMMENT ON COLUMN, indexes, etc.) fail with "column does not exist".
+ALTER TABLE public.signal_category_hierarchy
+  ADD COLUMN IF NOT EXISTS id                  uuid        PRIMARY KEY DEFAULT gen_random_uuid(),
+  ADD COLUMN IF NOT EXISTS category_key        text        NOT NULL,
+  ADD COLUMN IF NOT EXISTS display_name        text        NOT NULL,
+  ADD COLUMN IF NOT EXISTS parent_category_key text        DEFAULT NULL,
+  ADD COLUMN IF NOT EXISTS depth               integer     NOT NULL DEFAULT 0,
+  ADD COLUMN IF NOT EXISTS applicable_domains  text[]      NOT NULL DEFAULT ARRAY['student'],
+  ADD COLUMN IF NOT EXISTS legacy_enum_value   text        DEFAULT NULL,
+  ADD COLUMN IF NOT EXISTS accepts_signals     boolean     NOT NULL DEFAULT true,
+  ADD COLUMN IF NOT EXISTS is_leaf             boolean     NOT NULL DEFAULT true,
+  ADD COLUMN IF NOT EXISTS description         text        DEFAULT NULL,
+  ADD COLUMN IF NOT EXISTS sort_order          integer     NOT NULL DEFAULT 0,
+  ADD COLUMN IF NOT EXISTS created_at          timestamptz NOT NULL DEFAULT now(),
+  ADD COLUMN IF NOT EXISTS updated_at          timestamptz NOT NULL DEFAULT now(),
+  ADD COLUMN IF NOT EXISTS deprecated_at       timestamptz DEFAULT NULL;
+
+-- depth's range CHECK was only declared inline in CREATE TABLE too — same
+-- backfill problem, so guard it the same way as the other constraints.
+ALTER TABLE public.signal_category_hierarchy
+  DROP CONSTRAINT IF EXISTS chk_category_depth_range;
+ALTER TABLE public.signal_category_hierarchy
+  ADD CONSTRAINT chk_category_depth_range
+    CHECK (depth >= 0 AND depth <= 5);
+
+ALTER TABLE public.signal_category_hierarchy
+  DROP CONSTRAINT IF EXISTS chk_parent_not_self;
+ALTER TABLE public.signal_category_hierarchy
+  ADD CONSTRAINT chk_parent_not_self
+    CHECK (parent_category_key IS NULL OR parent_category_key <> category_key);
+
+-- Ensure uq_category_key exists even if the table pre-dates this migration
+-- (CREATE TABLE IF NOT EXISTS above is a no-op on an existing table, so the
+-- inline UNIQUE constraint from the table definition never gets applied to
+-- it — without this guard the self-referential FK below has no unique
+-- constraint on category_key to reference and fails with SQLSTATE 42830).
+ALTER TABLE public.signal_category_hierarchy
+  DROP CONSTRAINT IF EXISTS uq_category_key;
+
+ALTER TABLE public.signal_category_hierarchy
+  ADD CONSTRAINT uq_category_key
+    UNIQUE (category_key);
+
 -- Self-referential FK — deferred to allow inserts within the same transaction
 ALTER TABLE public.signal_category_hierarchy
   DROP CONSTRAINT IF EXISTS fk_parent_category;
@@ -170,59 +218,59 @@ GRANT SELECT, INSERT, UPDATE   ON public.signal_category_hierarchy TO service_ro
 SET CONSTRAINTS fk_parent_category DEFERRED;
 
 INSERT INTO public.signal_category_hierarchy
-  (category_key, display_name, parent_category_key, depth,
+  (category_key, display_name, parent_category_key, level, depth,
    applicable_domains, legacy_enum_value, accepts_signals, is_leaf, sort_order)
 VALUES
-  -- Root categories (depth 0)
-  ('cognitive_capability',     'Cognitive Capability',      NULL, 0,
+  -- Root categories (depth 0 -> level 'domain')
+  ('cognitive_capability',     'Cognitive Capability',      NULL, 'domain', 0,
    ARRAY['student','professional'], NULL,           false, false, 1),
-  ('social_behavioral',        'Social & Behavioural',      NULL, 0,
+  ('social_behavioral',        'Social & Behavioural',      NULL, 'domain', 0,
    ARRAY['student','professional'], NULL,           false, false, 2),
-  ('technical_professional',   'Technical & Professional',  NULL, 0,
+  ('technical_professional',   'Technical & Professional',  NULL, 'domain', 0,
    ARRAY['student','professional','employer'], NULL, false, false, 3),
-  ('academic_affinity',        'Academic Affinity',         NULL, 0,
+  ('academic_affinity',        'Academic Affinity',         NULL, 'domain', 0,
    ARRAY['student'],                           NULL, false, false, 4),
-  ('creative_adaptive',        'Creative & Adaptive',       NULL, 0,
+  ('creative_adaptive',        'Creative & Adaptive',       NULL, 'domain', 0,
    ARRAY['student','professional'],            NULL, false, false, 5),
-  ('career_readiness',         'Career Readiness',          NULL, 0,
+  ('career_readiness',         'Career Readiness',          NULL, 'domain', 0,
    ARRAY['student','professional'],            NULL, false, false, 6),
-  ('workforce_intelligence',   'Workforce Intelligence',    NULL, 0,
+  ('workforce_intelligence',   'Workforce Intelligence',    NULL, 'domain', 0,
    ARRAY['professional','employer','workforce'], NULL, false, false, 7),
 
-  -- Cognitive Capability children (depth 1)
-  ('analytical_reasoning',  'Analytical Reasoning',   'cognitive_capability', 1,
+  -- Cognitive Capability children (depth 1 -> level 'category')
+  ('analytical_reasoning',  'Analytical Reasoning',   'cognitive_capability', 'category', 1,
    ARRAY['student','professional'], 'reasoning',      true, true, 1),
-  ('systems_thinking',      'Systems Thinking',       'cognitive_capability', 1,
+  ('systems_thinking',      'Systems Thinking',       'cognitive_capability', 'category', 1,
    ARRAY['student','professional'], 'cognitive_style', true, true, 2),
-  ('creative_problem_solving','Creative Problem Solving','cognitive_capability',1,
+  ('creative_problem_solving','Creative Problem Solving','cognitive_capability', 'category', 1,
    ARRAY['student','professional'], 'creative',        true, true, 3),
 
-  -- Social & Behavioural children (depth 1)
-  ('collaboration',         'Collaboration',          'social_behavioral', 1,
+  -- Social & Behavioural children (depth 1 -> level 'category')
+  ('collaboration',         'Collaboration',          'social_behavioral', 'category', 1,
    ARRAY['student','professional'], 'social',          true, true, 1),
-  ('communication_skills',  'Communication Skills',   'social_behavioral', 1,
+  ('communication_skills',  'Communication Skills',   'social_behavioral', 'category', 1,
    ARRAY['student','professional'], 'social',          true, true, 2),
-  ('adaptability',          'Adaptability',           'social_behavioral', 1,
+  ('adaptability',          'Adaptability',           'social_behavioral', 'category', 1,
    ARRAY['student','professional'], 'behavioral',      true, true, 3),
 
-  -- Technical & Professional children (depth 1)
-  ('technical_aptitude',    'Technical Aptitude',     'technical_professional', 1,
+  -- Technical & Professional children (depth 1 -> level 'category')
+  ('technical_aptitude',    'Technical Aptitude',     'technical_professional', 'category', 1,
    ARRAY['student','professional'], 'technical',       true, true, 1),
-  ('stem_performance',      'STEM Performance',       'technical_professional', 1,
+  ('stem_performance',      'STEM Performance',       'technical_professional', 'category', 1,
    ARRAY['student'],               'technical',        true, true, 2),
 
-  -- Academic Affinity children (depth 1)
-  ('stem_affinity',         'STEM Subject Affinity',  'academic_affinity', 1,
+  -- Academic Affinity children (depth 1 -> level 'category')
+  ('stem_affinity',         'STEM Subject Affinity',  'academic_affinity', 'category', 1,
    ARRAY['student'],               'subject_affinity', true, true, 1),
-  ('humanities_affinity',   'Humanities Affinity',    'academic_affinity', 1,
+  ('humanities_affinity',   'Humanities Affinity',    'academic_affinity', 'category', 1,
    ARRAY['student'],               'subject_affinity', true, true, 2),
-  ('commerce_affinity',     'Commerce Affinity',      'academic_affinity', 1,
+  ('commerce_affinity',     'Commerce Affinity',      'academic_affinity', 'category', 1,
    ARRAY['student'],               'subject_affinity', true, true, 3),
 
-  -- Career Readiness children (depth 1)
-  ('leadership_development','Leadership Development', 'career_readiness', 1,
+  -- Career Readiness children (depth 1 -> level 'category')
+  ('leadership_development','Leadership Development', 'career_readiness', 'category', 1,
    ARRAY['student','professional'], 'behavioral',      true, true, 1),
-  ('professional_exposure', 'Professional Exposure',  'career_readiness', 1,
+  ('professional_exposure', 'Professional Exposure',  'career_readiness', 'category', 1,
    ARRAY['student','professional'], 'meta',            true, true, 2)
 
 ON CONFLICT (category_key) DO NOTHING;
@@ -300,6 +348,82 @@ CREATE TABLE IF NOT EXISTS public.signal_ontology_edges (
     CHECK (NOT (source_type = target_type AND source_key = target_key))
 
 );
+
+-- Backfill columns for the case where signal_ontology_edges already existed
+-- (1A's narrower topology) before this migration. CREATE TABLE IF NOT EXISTS
+-- above is a no-op against a pre-existing table, so none of the inline column
+-- definitions above actually get applied to it — same pattern as the
+-- signal_category_hierarchy backfill above.
+ALTER TABLE public.signal_ontology_edges
+  ADD COLUMN IF NOT EXISTS source_type      text          NOT NULL,
+  ADD COLUMN IF NOT EXISTS target_type      text          NOT NULL,
+  ADD COLUMN IF NOT EXISTS edge_weight      numeric(5,4)  NOT NULL DEFAULT 0.5,
+  ADD COLUMN IF NOT EXISTS rationale        text          NOT NULL,
+  ADD COLUMN IF NOT EXISTS is_bidirectional boolean       NOT NULL DEFAULT false,
+  ADD COLUMN IF NOT EXISTS updated_at       timestamptz   NOT NULL DEFAULT now(),
+  ADD COLUMN IF NOT EXISTS deprecated_at    timestamptz   DEFAULT NULL;
+
+-- 1A's source_node_type/target_node_type are legacy discriminator columns,
+-- NOT NULL with no default, restricted to ('signal','category') only. The
+-- new source_type/target_type columns above supersede them but do not
+-- populate them. New-vocabulary edges (career_area/role/skill/programme)
+-- have no legacy-compatible value to backfill these with, so relax the
+-- NOT NULL rather than invent a value — additive fix per ADR-DB-001, keeps
+-- any existing 1A rows/queries against these columns intact.
+ALTER TABLE public.signal_ontology_edges
+  ALTER COLUMN source_node_type DROP NOT NULL,
+  ALTER COLUMN target_node_type DROP NOT NULL;
+
+ALTER TABLE public.signal_ontology_edges
+  DROP CONSTRAINT IF EXISTS chk_ontology_source_type;
+ALTER TABLE public.signal_ontology_edges
+  ADD CONSTRAINT chk_ontology_source_type
+    CHECK (source_type IN ('signal','category','career_area','role','skill','programme'));
+
+ALTER TABLE public.signal_ontology_edges
+  DROP CONSTRAINT IF EXISTS chk_ontology_target_type;
+ALTER TABLE public.signal_ontology_edges
+  ADD CONSTRAINT chk_ontology_target_type
+    CHECK (target_type IN ('signal','category','career_area','role','skill','programme'));
+
+ALTER TABLE public.signal_ontology_edges
+  DROP CONSTRAINT IF EXISTS chk_ontology_edge_weight_range;
+ALTER TABLE public.signal_ontology_edges
+  ADD CONSTRAINT chk_ontology_edge_weight_range
+    CHECK (edge_weight BETWEEN 0.0 AND 1.0);
+
+-- edge_type is the SAME column in both designs but with mutually exclusive
+-- vocabularies (1A: is_a/related_to/derived_from; foundation layer:
+-- predicts/requires/correlates_with/subsumes/develops/evidenced_by). Neither
+-- vocabulary is being discarded — widen to the union so both sprints' values
+-- remain valid, per ADR-DB-001 (no schema redesign / no choosing between
+-- Sprint 1A and Intelligence Foundation).
+ALTER TABLE public.signal_ontology_edges
+  DROP CONSTRAINT IF EXISTS chk_ontology_edge_type;
+ALTER TABLE public.signal_ontology_edges
+  ADD CONSTRAINT chk_ontology_edge_type
+    CHECK (edge_type IN (
+      'is_a', 'related_to', 'derived_from',
+      'predicts', 'requires', 'correlates_with',
+      'subsumes', 'develops', 'evidenced_by'
+    ));
+
+-- New self-loop guard on the new type columns (1A's chk_ontology_no_self_loop
+-- already covers source_node_type/target_node_type separately — this is
+-- additive, not a replacement).
+ALTER TABLE public.signal_ontology_edges
+  DROP CONSTRAINT IF EXISTS chk_no_self_loop;
+ALTER TABLE public.signal_ontology_edges
+  ADD CONSTRAINT chk_no_self_loop
+    CHECK (NOT (source_type = target_type AND source_key = target_key));
+
+-- New unique constraint on the new type columns — additive alongside 1A's
+-- uq_signal_ontology_edges_unique (source_key, target_key, edge_type, taxonomy_version).
+ALTER TABLE public.signal_ontology_edges
+  DROP CONSTRAINT IF EXISTS uq_ontology_edge;
+ALTER TABLE public.signal_ontology_edges
+  ADD CONSTRAINT uq_ontology_edge
+    UNIQUE (source_type, source_key, target_type, target_key, edge_type, taxonomy_version);
 
 COMMENT ON TABLE public.signal_ontology_edges IS
   'Phase 2A.1: Minimum viable intelligence ontology. '

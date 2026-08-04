@@ -1,7 +1,36 @@
 'use strict';
 
-import { createClient } from '@supabase/supabase-js';
-import { logger } from '../../../shared/logger/index.js';
+/**
+ * WP-PRO-09N FIX:
+ *
+ * This file previously used ESM `import`/`export` syntax inside a package
+ * that has no `"type": "module"` (the other 680+ files in src/ are all
+ * CommonJS, using `require`/`module.exports`). Every consumer of this
+ * module (`services/resumeParser/index.js`,
+ * `modules/onboarding/controllers/onboarding.controller.js`) loads it with
+ * `require(...)` and destructures `{ parseResumeText, mapParsedToOnboardingShape }`
+ * — names that were never even defined here (only an unrelated `parseResume`
+ * was exported, via `export`, which CommonJS `require()` cannot see at all).
+ * The practical effect: `parseResumeText` and `mapParsedToOnboardingShape`
+ * resolved to `undefined` everywhere they were imported, so the mature,
+ * purpose-built extraction engine in `regexUtils.js` (extractName,
+ * extractExperience, extractEducation, extractLocation, etc.) was never
+ * actually invoked by the Resume Upload pipeline.
+ *
+ * This fix (a) converts the module to standard CommonJS so it can be
+ * `require()`'d correctly, and (b) implements `parseResumeText` and
+ * `mapParsedToOnboardingShape` by wiring together the existing regex-based
+ * extractors — no new parser, no AI, no architecture change.
+ */
+
+const { createClient } = require('@supabase/supabase-js');
+// Node 20 has no native global WebSocket — required by RealtimeClient at
+// construction time even when realtime isn't used. See config/supabase.js.
+const WebSocket = require('ws');
+const logger = require('../../../shared/logger/index.js');
+const regexUtils = require('./regexUtils');
+const { aliasMap: SKILL_ALIAS_MAP } = require('./skillDictionary');
+const { ROLE_ENTRIES } = require('./roleDictionary');
 
 let supabaseClient = null;
 const MAX_TEXT_LENGTH = 50000;
@@ -24,6 +53,9 @@ function getSupabaseClient() {
       persistSession: false,
       autoRefreshToken: false,
     },
+    realtime: {
+      transport: WebSocket,
+    },
     global: {
       headers: {
         'x-client-info': 'resume-worker-parser',
@@ -37,7 +69,7 @@ function getSupabaseClient() {
 /**
  * Parse resume from Supabase Storage
  */
-export async function parseResume(storagePath, mimeType) {
+async function parseResume(storagePath, mimeType) {
   if (!storagePath || typeof storagePath !== 'string') {
     throw new Error('Invalid storagePath');
   }
@@ -237,3 +269,200 @@ function estimateYearsExperience(experienceLines) {
 
   return maxYear > minYear ? maxYear - minYear : null;
 }
+
+/* =========================================================================
+   parseResumeText() / mapParsedToOnboardingShape()
+
+   WP-PRO-09N: these two functions are the missing wiring layer. They were
+   referenced everywhere (onboarding.controller.js, resumeParser/index.js,
+   resume.normalizer.js) but never defined, so the mature extractors in
+   regexUtils.js sat orphaned. Implemented here using ONLY the existing
+   extraction functions — no new parser, no AI.
+========================================================================= */
+
+/**
+ * Canonicalize a single raw skill token.
+ *
+ * WP-PRO-09N FIX: the previous behaviour (implicit — since this function
+ * did not exist, nothing called the dictionary at all) would have dropped
+ * any skill without an exact alias match if it had been wired up the
+ * obvious way (filter-to-dictionary-hits-only). skillDictionary.js is
+ * heavily biased toward software-engineering terms (JavaScript, TypeScript,
+ * Docker, Kubernetes, ...) with only one marketing entry ("SEO"), so a
+ * naive dictionary-filter approach would silently discard legitimate,
+ * resume-declared skills like "Digital Marketing", "Brand Strategy",
+ * "Content Marketing", "CRM", "Email Marketing", "Social Media", and
+ * "Analytics" for any non-tech resume.
+ *
+ * This function instead uses the dictionary ONLY to canonicalize known
+ * aliases (e.g. "js" → "JavaScript"); any token that isn't a recognised
+ * alias is kept as-is (trimmed) rather than discarded, so real,
+ * resume-declared skills are never silently dropped.
+ *
+ * @param {string} rawSkill
+ * @returns {string|null}
+ */
+function canonicalizeSkill(rawSkill) {
+  const trimmed = String(rawSkill ?? '').trim();
+  if (!trimmed) return null;
+
+  const alias = SKILL_ALIAS_MAP.get(trimmed.toLowerCase());
+  if (alias) return alias.canonical;
+
+  return trimmed;
+}
+
+/**
+ * Detect candidate roles from the full resume text via keyword scoring.
+ * Used ONLY as a last-resort title fallback when the experience section is
+ * empty (see resume.normalizer.js — experience section title always wins).
+ *
+ * @param {string} textLower
+ * @returns {string[]} canonical role names, best match first
+ */
+function detectRoles(textLower) {
+  const scored = ROLE_ENTRIES
+    .map((entry) => ({
+      canonical: entry.canonical,
+      score: entry.keywords.filter((kw) => textLower.includes(kw)).length,
+    }))
+    .filter((r) => r.score > 0)
+    .sort((a, b) => b.score - a.score);
+
+  return scored.map((r) => r.canonical);
+}
+
+/**
+ * Rough parse-confidence heuristic (0–1), used for
+ * HireRiseResume.metadata.parsingConfidence.
+ */
+function computeConfidenceScore({ email, skills, experience }) {
+  let score = 0;
+  if (email) score += 0.34;
+  if (skills.length >= 3) score += 0.33;
+  if (experience.length >= 1) score += 0.33;
+  return Math.round(score * 100) / 100;
+}
+
+/**
+ * Parse raw resume text into a flat, deterministic structure using the
+ * existing regexUtils.js extractors. This is the function
+ * `services/resumeParser/index.js` has always claimed to export.
+ *
+ * @param {string} resumeText
+ * @returns {object} raw parsed resume (consumed by mapParsedToOnboardingShape
+ *   and by resume.normalizer.js's normalizeFromParsed)
+ */
+function parseResumeText(resumeText) {
+  const safeText = String(resumeText ?? '').slice(0, MAX_TEXT_LENGTH);
+
+  const lines = safeText
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+
+  // Section-bucketed lines — used only for the Skills section, since
+  // extractExperience/extractEducation do their own header-detection over
+  // the full text.
+  const sections = classifySections(lines);
+
+  const rawSkillTokens = extractSkills(sections.skills ?? []);
+  const skills = [...new Set(
+    rawSkillTokens
+      .map(canonicalizeSkill)
+      .filter(Boolean)
+  )];
+
+  const experience = regexUtils.extractExperience(safeText);
+  const education = regexUtils.extractEducation(safeText);
+  const location = regexUtils.extractLocation(safeText);
+  const name = regexUtils.extractName(safeText);
+  const email = regexUtils.extractEmail(safeText);
+  const phone = regexUtils.extractPhone(safeText);
+  const yearsOfExperience = regexUtils.extractYearsOfExperience(safeText);
+
+  const textLower = safeText.toLowerCase();
+  const detectedRoles = detectRoles(textLower);
+
+  const professionalSummaryLines = sections.summary ?? [];
+  const professionalSummary = professionalSummaryLines.length
+    ? professionalSummaryLines.join(' ').slice(0, 600)
+    : null;
+
+  const certifications = sections.certifications ?? [];
+
+  logger.info('[ResumeParser] parseResumeText complete', {
+    hasName: !!name,
+    hasEmail: !!email,
+    skillCount: skills.length,
+    experienceCount: experience.length,
+    educationCount: education.length,
+  });
+
+  return {
+    rawText: safeText,
+    name,
+    email,
+    phone,
+    location,
+    professionalSummary,
+    skills,
+    experience,
+    education,
+    certifications,
+    detectedRoles,
+    industry: regexUtils.extractIndustry(safeText),
+    educationLevel: regexUtils.extractEducationLevel(safeText),
+    yearsOfExperience,
+    confidenceScore: computeConfidenceScore({ email, skills, experience }),
+    parsedAt: new Date().toISOString(),
+  };
+}
+
+/**
+ * Reshape parseResumeText() output into the "onboarding shape" consumed by
+ * resume.normalizer.js's normalizeFromOnboardingShape(). Pure reshaping —
+ * no re-parsing, no new field derivation beyond what parseResumeText already
+ * produced.
+ *
+ * @param {object} parsed - output of parseResumeText()
+ * @returns {object} onboardingShape
+ */
+function mapParsedToOnboardingShape(parsed) {
+  if (!parsed || typeof parsed !== 'object') {
+    return {
+      personalDetails: {},
+      skills: [],
+      parsedResume: { experience: [], education: [], certifications: [] },
+    };
+  }
+
+  return {
+    personalDetails: {
+      fullName: parsed.name ?? null,
+      email: parsed.email ?? null,
+      phone: parsed.phone ?? null,
+      city: parsed.location?.city ?? null,
+      country: parsed.location?.country ?? null,
+      professionalSummary: parsed.professionalSummary ?? null,
+    },
+    skills: parsed.skills ?? [],
+    parsedResume: {
+      experience: parsed.experience ?? [],
+      education: parsed.education ?? [],
+      certifications: parsed.certifications ?? [],
+    },
+  };
+}
+
+module.exports = {
+  parseResume,
+  parseResumeText,
+  mapParsedToOnboardingShape,
+  // exported for tests / reuse
+  classifySections,
+  extractSkills,
+  estimateYearsExperience,
+  canonicalizeSkill,
+  detectRoles,
+};

@@ -83,7 +83,7 @@ async function deductCredits(userId, amount) {
 
   const { data, error } = await supabase.rpc('consume_ai_credits', {
     p_user_id: userId,
-    p_cost: cost,
+    p_amount: cost,
   });
 
   if (error) {

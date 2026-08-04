@@ -4,6 +4,9 @@ require('dotenv').config();
 
 const { createClient } = require('@supabase/supabase-js');
 const logger = require('./src/utils/logger');
+// Node 20 has no native global WebSocket — required by RealtimeClient at
+// construction time even when realtime isn't used.
+const WebSocket = require('ws');
 
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
@@ -18,6 +21,9 @@ const MAX_RETRIES = parseInt(process.env.SUPABASE_MAX_RETRIES || '2', 10);
 // ✅ CLIENT
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY, {
   auth: { persistSession: false },
+  realtime: {
+    transport: WebSocket,
+  },
   global: {
     fetch: (url, options) => {
       return Promise.race([

@@ -28,6 +28,46 @@ const {
   triggerProvisionalChi,
 } = require('./onboarding.helpers');
 
+// WP-PRO-07: Professional Profile Normalization Engine.
+// Every intake step that captures acquisition-time profile data now also
+// routes it through the canonical normalizer + repository, so the durable
+// Professional Profile (user_profiles + professional_profile jsonb) stays
+// in sync with the existing onboarding_progress writes below — without
+// changing onboarding_progress's own shape/consumers (WP-PRO-05B §6:
+// Career Report / CV Generator still read onboarding_progress unchanged).
+const {
+  normalizePersonalInformation,
+  normalizeEducation,
+  normalizeExperience,
+  normalizeSkills,
+  normalizeCareerGoals,
+} = require('../../domain/professionalProfile/professionalProfile.normalizer');
+const {
+  saveProfessionalProfileSections,
+} = require('../../domain/professionalProfile/professionalProfile.repository');
+const { ACQUISITION_METHODS } = require('../../domain/professionalProfile/professionalProfile.schema');
+
+/**
+ * Write to the canonical Professional Profile without ever letting a
+ * normalization/persistence failure break the onboarding step itself — the
+ * existing onboarding_progress write (this WP's "do not redesign onboarding"
+ * boundary) remains the source of truth for step-completion regardless of
+ * whether the durable profile write succeeds. Failures are logged, not
+ * swallowed silently.
+ */
+async function syncProfessionalProfile(userId, partialProfile) {
+  try {
+    await saveProfessionalProfileSections(userId, partialProfile, {
+      source: ACQUISITION_METHODS.ONBOARDING_INTAKE,
+    });
+  } catch (error) {
+    logger.error('[OnboardingIntake] Professional Profile sync failed', {
+      userId,
+      error: error.message,
+    });
+  }
+}
+
 const TABLE_PROGRESS = 'onboarding_progress';
 const TABLE_USERS    = 'users';
 const TABLE_PROFILES = 'user_profiles';
@@ -237,6 +277,15 @@ async function saveEducationAndExperience(userId, payload) {
 
   await persistCompletionIfReady(userId, progress, profile);
 
+  // WP-PRO-07: this is the write-path gap WP-PRO-04 §6 flagged — Education/
+  // Experience previously only ever landed in onboarding_progress (transient).
+  // They now also land in the canonical Professional Profile (durable).
+  await syncProfessionalProfile(userId, {
+    ...normalizeEducation(education),
+    ...normalizeExperience(experience),
+    ...normalizeSkills(skills),
+  });
+
   return { userId, step: 'education_experience_saved' };
 }
 
@@ -274,6 +323,10 @@ async function savePersonalDetails(userId, payload) {
 
   await writeProgress(userId, 'personal_details_saved', { personal_details: payload });
 
+  // WP-PRO-07: sync into the canonical Professional Profile (durable
+  // user_profiles columns) alongside the existing transient progress write.
+  await syncProfessionalProfile(userId, normalizePersonalInformation(payload));
+
   return { userId, step: 'personal_details_saved' };
 }
 
@@ -288,12 +341,16 @@ async function saveCareerIntent(userId, payload) {
     throw new AppError('expectedRoleIds required', 400, { payload }, ErrorCodes.VALIDATION_ERROR);
   }
 
+  // WP-PRO-07: expected_role_ids is written through the canonical
+  // Professional Profile normalizer/repository — this WP designates it the
+  // authoritative Career Goals target for new writes (see
+  // professionalProfile.normalizer.js#normalizeCareerGoals for the
+  // three-location-fragmentation context). The legacy users.career_goal and
+  // user_profiles.data.career_goals locations are untouched by this engine.
   await Promise.all([
-    safeUpsert(TABLE_PROFILES, {
-      id:                userId,
-      expected_role_ids: payload.expectedRoleIds,
-      updated_at:        nowISO(),
-    }),
+    syncProfessionalProfile(userId, normalizeCareerGoals({
+      expectedRoleIds: payload.expectedRoleIds,
+    })),
 
     writeProgress(userId, 'career_intent_saved'),
   ]);

@@ -13,9 +13,9 @@
  *
  *   user_direction itself is NOT in the GET /me response or the ETag token.
  *   However, setting a direction also causes the frontend to redirect to
- *   /education/onboarding, /dashboard, or /market-insights — which immediately
- *   triggers GET /me.  If the user had previously been issued an ETag and
- *   their profile data hasn't changed, GET /me would return 304 correctly.
+ *   /onboarding or /dashboard — which immediately triggers GET /me. If the
+ *   user had previously been issued an ETag and their profile data hasn't
+ *   changed, GET /me would return 304 correctly.
  *
  *   The ACTUAL risk here is indirect: in future, user_type may be derived from
  *   user_direction and included in the response. More importantly, this is the
@@ -24,6 +24,30 @@
  *
  *   Defensive fix: always bump updated_at on direction save. The cost is one
  *   extra column in an already-executing UPDATE. No correctness risk.
+ *
+ * WP-ONBOARD-01 — Direction Redirect Regression Fix:
+ *   DIRECTION_ROUTES.education previously pointed to '/education/onboarding',
+ *   a route that no longer exists in the frontend router (front/src/routes/
+ *   index.tsx only exposes '/onboarding' and its children). DIRECTION_ROUTES
+ *   .market previously pointed to '/market-insights', which likewise has no
+ *   matching route — AppEntryPage.tsx's own routing decision tree already
+ *   documents this and falls back to '/dashboard' for the market direction.
+ *   Both targets are corrected below to the routes the frontend router
+ *   actually serves: '/onboarding' (the canonical onboarding entry — the
+ *   WelcomePage orchestrator at that path routes students on to the correct
+ *   student sub-step) and '/dashboard' for market, matching AppEntryPage's
+ *   existing fallback. 'career' was already correct ('/dashboard') and is
+ *   unchanged.
+ *
+ * WP-ONBOARD-02A — Onboarding Session Resume Regression Fix:
+ *   DELETE /me/direction cleared users.user_type / users.user_direction but
+ *   left any existing student_onboarding_sessions row untouched. If the user
+ *   re-selected 'student', the stale session was resumed from wherever it had
+ *   been left off (e.g. 'activities') instead of restarting at 'education'.
+ *   Fix: after the users row is cleared, the corresponding onboarding session
+ *   (if any) is reset to its initial state via sessionService.resetSession().
+ *   This only runs on the explicit reset path — normal login, resume, and
+ *   dashboard navigation are untouched.
  *
  * Endpoints:
  *   POST   /api/v1/users/me/direction
@@ -40,15 +64,16 @@ const { asyncHandler } = require('../utils/helpers');
 const { AppError, ErrorCodes } = require('../middleware/errorHandler');
 const logger = require('../utils/logger');
 const freshnessCache = require('../utils/freshnessCache');
+const sessionService = require('../modules/student-onboarding/services/session.service');
 
 const router = express.Router();
 
 const VALID_DIRECTIONS = Object.freeze(['education', 'career', 'market']);
 
 const DIRECTION_ROUTES = Object.freeze({
-  education: '/education/onboarding',
+  education: '/onboarding',
   career: '/dashboard',
-  market: '/market-insights',
+  market: '/dashboard',
 });
 
 const DIRECTION_USER_TYPE = Object.freeze({
@@ -222,6 +247,34 @@ router.delete(
 
     if (!data) {
       throw new AppError(`User ${userId} not found`, ErrorCodes.NOT_FOUND, 404, {});
+    }
+
+    // WP-ONBOARD-02A FIX: the users row is cleared above, but any existing
+    // student_onboarding_sessions row for this user is untouched by that
+    // update — it lives in a separate table. Left as-is, re-selecting
+    // 'student' would resume the stale session from wherever it was left
+    // (e.g. 'activities') instead of restarting at 'education'.
+    //
+    // Reset it to its initial state now, as part of this same explicit
+    // reset request. Idempotent: if no session exists yet, resetSession()
+    // treats that as success rather than an error. If the reset itself
+    // fails, that is surfaced as a request error and logged — it is not
+    // swallowed — but the already-committed users update above is not
+    // rolled back, matching this route's existing (non-transactional)
+    // error-handling behavior.
+    try {
+      await sessionService.resetSession(userId);
+    } catch (resetError) {
+      logger.error(
+        { userId, err: resetError.message },
+        '[IntentGateway] Direction reset: onboarding session reset failed',
+      );
+      throw new AppError(
+        resetError.message,
+        ErrorCodes.INTERNAL_ERROR,
+        resetError.status || 500,
+        { code: resetError.code },
+      );
     }
 
     // FIX: evict freshness cache — mirrors the POST path.

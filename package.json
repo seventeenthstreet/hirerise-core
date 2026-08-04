@@ -26,6 +26,8 @@
   "dependencies": {
     "@anthropic-ai/sdk": "^0.78.0",
     "@extractus/article-extractor": "^8.0.20",
+    "otplib": "^12.0.1",
+    "qrcode": "^1.5.4",
     "@google/generative-ai": "^0.24.1",
     "@supabase/supabase-js": "^2.99.2",
     "axios": "^1.15.0",
@@ -55,6 +57,7 @@
     "stripe": "^20.4.0",
     "unpdf": "^1.6.0",
     "winston": "^3.11.0",
+    "ws": "^8.18.0",
     "zod": "^3.25.76",
     "rate-limit-redis": "^4.2.0"
   },

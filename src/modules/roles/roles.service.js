@@ -17,6 +17,14 @@ const {
   DEFAULT_SEARCH_LIMIT,
 } = require('./roles.types');
 
+// Career Role Resolution (WP-PRO-10B): the free-text-title → canonical
+// role-id lookup is shared infrastructure (shared/, not a *.service.js
+// file) so it can also be required directly by other *.service.js files
+// (e.g. onboarding.careerReport.service.js) without violating
+// local/no-service-importing-service. Re-exported here for any existing
+// callers that import it from this module.
+const { resolveExpectedRoleIdsFromTitle } = require('../../shared/utils/roleCatalog');
+
 const ROLES_TABLE = 'roles';
 const PROFILES_TABLE = 'user_profiles';
 const ONBOARDING_TABLE = 'onboarding_progress';
@@ -69,9 +77,9 @@ async function validateRolesExist(roleIds = []) {
   if (invalidIds.length) {
     throw new AppError(
       'Invalid role IDs',
+      ErrorCodes.VALIDATION_ERROR,
       400,
-      { invalidIds },
-      ErrorCodes.VALIDATION_ERROR
+      { invalidIds }
     );
   }
 
@@ -134,7 +142,7 @@ async function getRoleById(roleId) {
   }
 
   if (!data) {
-    throw new AppError('Role not found', 404);
+    throw new AppError('Role not found', ErrorCodes.NOT_FOUND, 404);
   }
 
   return mapRole(data);
@@ -150,27 +158,27 @@ async function saveOnboardingRoles(userId, plan, payload = {}) {
   if (!currentRoleId) {
     throw new AppError(
       'Current role is required',
+      ErrorCodes.VALIDATION_ERROR,
       400,
-      {},
-      ErrorCodes.VALIDATION_ERROR
+      {}
     );
   }
 
   if (previousRoleIds.length > MAX_PREVIOUS_ROLES) {
     throw new AppError(
       `Maximum ${MAX_PREVIOUS_ROLES} previous roles allowed`,
+      ErrorCodes.VALIDATION_ERROR,
       400,
-      {},
-      ErrorCodes.VALIDATION_ERROR
+      {}
     );
   }
 
   if (expectedRoleIds.length > expectedLimit) {
     throw new AppError(
       'Quota exceeded',
+      ErrorCodes.FORBIDDEN,
       403,
-      { allowed: expectedLimit },
-      ErrorCodes.FORBIDDEN
+      { allowed: expectedLimit }
     );
   }
 
@@ -236,4 +244,5 @@ module.exports = {
   getUserProfile,
   validateRolesExist,
   getExpectedRoleLimit,
+  resolveExpectedRoleIdsFromTitle,
 };

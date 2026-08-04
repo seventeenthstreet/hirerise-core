@@ -45,6 +45,7 @@ async function setCachedRadar(cacheKey, payload) {
     await getCache().set(
       cacheKey,
       JSON.stringify(payload),
+      'EX',
       CACHE_TTL_SECONDS
     );
   } catch (error) {

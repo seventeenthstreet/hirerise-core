@@ -29,6 +29,11 @@
 
 const Anthropic = require('@anthropic-ai/sdk');
 const { createClient } = require('@supabase/supabase-js');
+// Node 20 has no native global WebSocket — required by RealtimeClient at
+// construction time even when realtime isn't used. This module is required
+// eagerly by student-onboarding.routes.js at server boot, so without this
+// the whole server crashes on startup. See config/supabase.js.
+const WebSocket = require('ws');
 
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
@@ -36,6 +41,7 @@ const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 const supabase = createClient(
   process.env.SUPABASE_URL,
   process.env.SUPABASE_SERVICE_ROLE_KEY,
+  { realtime: { transport: WebSocket } },
 );
 
 // ─────────────────────────────────────────────────────────────────────────────

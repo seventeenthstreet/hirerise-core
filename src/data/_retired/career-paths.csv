@@ -1,0 +1,60 @@
+from_role,to_role,years_to_next,role_family
+Junior Software Engineer,Software Engineer,2,Technology
+Software Engineer,Senior Software Engineer,3,Technology
+Senior Software Engineer,Staff Engineer,3,Technology
+Staff Engineer,Principal Engineer,3,Technology
+Principal Engineer,Engineering Manager,3,Technology
+Engineering Manager,Director of Engineering,4,Technology
+Director of Engineering,VP of Engineering,4,Technology
+VP of Engineering,Chief Technology Officer,4,Technology
+
+Junior Data Analyst,Data Analyst,2,Technology
+Data Analyst,Senior Data Analyst,3,Technology
+Senior Data Analyst,Data Scientist,2,Technology
+Data Scientist,Senior Data Scientist,3,Technology
+Senior Data Scientist,Machine Learning Engineer,2,Technology
+
+Machine Learning Engineer,Senior Machine Learning Engineer,3,Technology
+Senior Machine Learning Engineer,Lead ML Engineer,2,Technology
+Lead ML Engineer,ML Engineering Manager,3,Technology
+
+Junior Product Manager,Product Manager,2,Management
+Product Manager,Senior Product Manager,3,Management
+Senior Product Manager,Director of Product,3,Management
+Director of Product,VP of Product,4,Management
+VP of Product,Chief Product Officer,4,Management
+
+Junior UX Designer,UX Designer,2,Technology
+UX Designer,Senior UX Designer,3,Technology
+Senior UX Designer,Lead UX Designer,2,Technology
+Lead UX Designer,Design Manager,3,Technology
+Design Manager,Head of Design,3,Technology
+Head of Design,Chief Design Officer,4,Technology
+
+DevOps Engineer,Senior DevOps Engineer,3,Technology
+Senior DevOps Engineer,Lead DevOps Engineer,2,Technology
+Lead DevOps Engineer,DevOps Manager,3,Technology
+DevOps Manager,VP of Infrastructure,4,Technology
+
+Backend Engineer,Senior Software Engineer,3,Technology
+Frontend Engineer,Senior Software Engineer,3,Technology
+Full Stack Engineer,Senior Software Engineer,3,Technology
+
+QA Engineer,Senior QA Engineer,3,Technology
+Senior QA Engineer,QA Lead,2,Technology
+QA Lead,QA Manager,3,Technology
+
+Security Engineer,Senior Security Engineer,3,Technology
+Senior Security Engineer,Security Lead,2,Technology
+Security Lead,Security Manager,3,Technology
+
+Junior Marketing Analyst,Marketing Analyst,2,Marketing
+Marketing Analyst,Growth Manager,3,Marketing
+Growth Manager,Marketing Manager,3,Marketing
+Marketing Manager,Senior Marketing Manager,2,Marketing
+Senior Marketing Manager,Marketing Director,4,Marketing
+Marketing Director,Chief Marketing Officer,4,Marketing
+
+Product Marketing Manager,Senior Product Marketing Manager,3,Marketing
+Senior Product Marketing Manager,Director of Product Marketing,4,Marketing
+Director of Product Marketing,VP of Marketing,4,Marketing

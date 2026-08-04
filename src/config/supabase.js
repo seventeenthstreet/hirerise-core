@@ -13,6 +13,14 @@
 
 const { createClient } = require('@supabase/supabase-js');
 
+// Node 20 has no native global WebSocket (stable only from Node 22+).
+// @supabase/supabase-js's RealtimeClient requires one at construction time
+// regardless of whether realtime features are used, and throws synchronously
+// if none is found — crashing the whole process on boot. This repo's
+// engines field pins Node to >=20 <21, so we always need to supply one
+// explicitly via the `ws` package rather than relying on a native global.
+const WebSocket = require('ws');
+
 let logger;
 try {
   logger =
@@ -64,6 +72,9 @@ function getClient() {
     auth: {
       persistSession: false,
       autoRefreshToken: false,
+    },
+    realtime: {
+      transport: WebSocket,
     },
     global: {
       fetch: async (url, options = {}) => {

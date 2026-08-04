@@ -81,3 +81,12 @@ get-firebase-token.mjs
 test-tier-integration.js
 firestore-backup.json
 backups/
+
+# --- Add to .gitignore: untracked credential files found at repo root ---
+claudeapi key.txt
+googlesheets api.txt
+supa api.txt
+supa data password.txt
+*api key*.txt
+*api*.txt
+*password*.txt

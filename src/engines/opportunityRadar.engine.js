@@ -32,7 +32,7 @@ const RADAR_RPC = 'get_opportunity_radar';
 const inFlightRefreshes = new Set();
 
 async function getRadarVersion() {
-  if (!cache) return 'v1';
+  if (!getCache()) return 'v1';
 
   try {
     const version = await getCache()?.get('radar:version');
@@ -59,7 +59,7 @@ async function getOpportunityRadar(userId, opts = {}) {
 
   const cacheKey = await buildCacheKey(userId, normalizedOpts);
 
-  if (cache) {
+  if (getCache()) {
     try {
       const cached = await getCache()?.get(cacheKey);
       if (cached) {
@@ -156,7 +156,7 @@ function refreshRadarAsync(userId, opts = {}) {
 }
 
 async function invalidateOpportunityRadar(userId) {
-  if (!cache) return;
+  if (!getCache()) return;
 
   try {
     const version = await getRadarVersion();
@@ -166,7 +166,7 @@ async function invalidateOpportunityRadar(userId) {
     const keys = [];
 
     do {
-      const result = await cache.scan(cursor, 'MATCH', pattern, 'COUNT', 100);
+      const result = await getCache().scan(cursor, 'MATCH', pattern, 'COUNT', 100);
       cursor = result[0];
       keys.push(...result[1]);
     } while (cursor !== '0');
@@ -183,7 +183,7 @@ async function invalidateOpportunityRadar(userId) {
 }
 
 async function bumpRadarVersion() {
-  if (!cache) return;
+  if (!getCache()) return;
 
   try {
     await getCache()?.set('radar:version', `v${Date.now()}`);
@@ -238,7 +238,7 @@ function emptyRadar(errorCode) {
 }
 
 async function writeCacheSafe(cacheKey, payload, userId) {
-  if (!cache) return;
+  if (!getCache()) return;
 
   try {
     await getCache()?.set(cacheKey, JSON.stringify(payload), 'EX', CACHE_TTL);

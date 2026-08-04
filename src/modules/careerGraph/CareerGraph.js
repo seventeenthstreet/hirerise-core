@@ -6,6 +6,9 @@
  */
 
 const { createClient } = require('@supabase/supabase-js');
+// Node 20 has no native global WebSocket — required by RealtimeClient at
+// construction time even when realtime isn't used. See config/supabase.js.
+const WebSocket = require('ws');
 
 const supabase =
   global.__HIRERISE_SUPABASE__ ||
@@ -14,6 +17,7 @@ const supabase =
     process.env.SUPABASE_SERVICE_ROLE_KEY,
     {
       auth: { persistSession: false, autoRefreshToken: false },
+      realtime: { transport: WebSocket },
     }
   ));
 

@@ -11,8 +11,14 @@ const anthropic = require('../../../config/anthropic.client');
 const { supabase } = require('../../../config/supabase');
 const cacheManager = require('../../../core/cache/cache.manager');
 const engine = require('../../../engines/career-digital-twin.engine');
-const careerPathEngine = require('../../../engines/career-path.engine');
 const opportunityEngine = require('../../../engines/career-opportunity.engine');
+// RETIRED (WP-CI-01): `engines/career-path.engine.js` has been removed.
+// It was previously required here as `careerPathEngine` to call
+// `.getProgressionChain(role, industry)` below — a method that never
+// existed on that module's exports (only `predictCareerPath` was
+// exported). Every call therefore threw a TypeError, caught by the
+// surrounding try/catch, leaving `careerChain` at its initialized `[]`.
+// The call is replaced below with that same always-`[]` result.
 const { getUserVector } = require('../../../services/userVector.utils');
 
 const {
@@ -244,7 +250,7 @@ async function runSimulation({
   let opportunityRoles = [];
   try {
     const [chain, opp] = await Promise.all([
-      careerPathEngine.getProgressionChain(role, industry).catch(() => []),
+      Promise.resolve([]), // always [] previously; see RETIRED note above.
       opportunityEngine.analyzeCareerOpportunities({
         role,
         skills,

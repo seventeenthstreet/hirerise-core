@@ -213,10 +213,6 @@ async function generateCV(userId, creditCost, idempotencyKey = null) {
 
     cvContent = parsed;
 
-    if (creditCost > 0) {
-      await deductCredits(userId, creditCost, idempotencyKey);
-    }
-
     logAIInteraction({
       module: 'generateCV',
       status: 'success',

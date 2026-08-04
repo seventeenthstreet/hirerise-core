@@ -69,17 +69,34 @@ const updateSkill = asyncHandler(async (req, res) => {
 // ── GET /api/v1/admin/cms/skills ─────────────────────────────────────────────
 
 const listSkills = asyncHandler(async (req, res) => {
-  const { limit, category } = req.query;
+  const { limit, offset, category, search } = req.query;
 
   const result = await skillsService.listSkills({
     limit:    limit ? Math.min(parseInt(limit, 10), 500) : 100,
+    offset:   offset ? Math.max(parseInt(offset, 10), 0) : 0,
     category: category || undefined,
+    search:   search || undefined,
   });
 
   return res.status(200).json({ success: true, data: { items: result.skills, total: result.total } });
 });
 
-module.exports = { createSkill, updateSkill, listSkills };
+// ── GET /api/v1/admin/cms/skills/:skillId ────────────────────────────────────
+
+const getSkill = asyncHandler(async (req, res) => {
+  const skill = await skillsService.getSkill(req.params.skillId);
+  return res.status(200).json({ success: true, data: skill });
+});
+
+// ── DELETE /api/v1/admin/cms/skills/:skillId ─────────────────────────────────
+
+const deleteSkill = asyncHandler(async (req, res) => {
+  const adminId = req.user.id;
+  await skillsService.deleteSkill(req.params.skillId, adminId);
+  return res.status(200).json({ success: true, data: { skillId: req.params.skillId, softDeleted: true } });
+});
+
+module.exports = { createSkill, updateSkill, listSkills, getSkill, deleteSkill };
 
 
 

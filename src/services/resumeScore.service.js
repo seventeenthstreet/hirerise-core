@@ -301,6 +301,29 @@ async function performScoring(userId) {
 // PUBLIC API
 // ─────────────────────────────────────────────────────────────────────────
 
+// FIX (WP-CACHE-01): getCache() returns either the real ioredis client or
+// the in-memory fallback depending on Redis availability. The real ioredis
+// client only understands its native `SET key value EX seconds` syntax and
+// only stores strings — it does not accept a bare numeric TTL as the 3rd
+// argument (that produced "ERR syntax error" from Redis) and does not
+// serialize JS objects for you. These helpers speak that dialect on every
+// call; MemoryCache tolerates the same calls (it ignores the extra 'EX'
+// token and falls back to its own defaultTTL, which matches
+// CACHE_TTL_SECONDS here) so both backends stay correct.
+function serializeCacheValue(value) {
+  return JSON.stringify(value);
+}
+
+function deserializeCacheValue(raw) {
+  if (raw == null) return null;
+  if (typeof raw !== 'string') return raw; // already an object (MemoryCache path)
+  try {
+    return JSON.parse(raw);
+  } catch {
+    return null;
+  }
+}
+
 async function calculate(userId) {
   if (!userId) {
     throw new Error('userId required');
@@ -308,7 +331,7 @@ async function calculate(userId) {
 
   const cacheKey = `resumeScore:${userId}`;
 
-  const cached = await getCache().get(cacheKey);
+  const cached = deserializeCacheValue(await getCache().get(cacheKey));
   if (cached) {
     return cached;
   }
@@ -316,7 +339,7 @@ async function calculate(userId) {
   return lockService.executeWithLock(
     `lock:${userId}`,
     async () => {
-      const cachedAgain = await getCache().get(cacheKey);
+      const cachedAgain = deserializeCacheValue(await getCache().get(cacheKey));
       if (cachedAgain) {
         return cachedAgain;
       }
@@ -325,7 +348,8 @@ async function calculate(userId) {
 
       await getCache().set(
         cacheKey,
-        result,
+        serializeCacheValue(result),
+        'EX',
         CACHE_TTL_SECONDS
       );
 
@@ -340,7 +364,9 @@ async function invalidate(userId) {
     return;
   }
 
-  await getCache().delete(`resumeScore:${userId}`);
+  // ioredis exposes `.del()`, not `.delete()` — MemoryCache defines both as
+  // aliases, so `.del()` is the one call that works against either backend.
+  await getCache().del(`resumeScore:${userId}`);
 }
 
 module.exports = {

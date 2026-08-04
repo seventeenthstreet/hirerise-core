@@ -232,6 +232,7 @@ async function setMemoryCache(cacheKey, payload) {
     await getCache().set(
       cacheKey,
       JSON.stringify(payload),
+      'EX',
       CACHE_TTL_SECONDS
     );
   } catch (_) {}
@@ -353,7 +354,7 @@ async function invalidateJobCache(
   const cacheKey = buildCacheKey(userId, role, country);
 
   try {
-    await getCache().delete(cacheKey);
+    await getCache().del(cacheKey);
   } catch (_) {}
 
   logger.debug('[JobFetcher] Cache invalidated', {

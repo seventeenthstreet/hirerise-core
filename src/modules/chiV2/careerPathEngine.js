@@ -2,8 +2,16 @@
 
 const { supabase } = require('../../config/supabase');
 const { bfsCareerPath } = require('./chiV2.engine');
-const { predictCareerPath } = require('../../engines/career-path.engine');
 const logger = require('../../utils/logger');
+
+// RETIRED (WP-CI-01): this wrapper previously called
+// `predictCareerPath` from `engines/career-path.engine.js` to populate
+// `career_path_prediction` below. That engine's function threw a
+// ReferenceError on every call (undeclared `cache` identifier — see
+// repository audit), so `career_path_prediction` was already `null` on
+// every real invocation, caught by the try/catch that used to wrap this
+// call. `engines/career-path.engine.js` has been removed as dead code;
+// this field is set directly to preserve that exact observed output.
 
 const DEFAULT_TRANSITION = Object.freeze({
   years_required: 2,
@@ -219,18 +227,8 @@ async function recommendCareerPath(currentRoleId, targetRoleId) {
     0
   );
 
-  let csvPrediction = null;
-
-  try {
-    const roleName = enriched[0]?.role_name;
-    if (roleName) {
-      csvPrediction = await predictCareerPath({ role: roleName });
-    }
-  } catch (error) {
-    logger.warn('[CareerPathEngine] CSV prediction degraded', {
-      error: error.message
-    });
-  }
+  // Always null: see RETIRED note above `enrichPath` import block.
+  const csvPrediction = null;
 
   logger.info('[CareerPathEngine] Completed', {
     steps: bfs.steps,

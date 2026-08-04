@@ -128,22 +128,61 @@ async function updateSkill(skillId, updates, adminId) {
 // ── List Skills ──────────────────────────────────────────────────────────────
 
 /**
- * List all active skills in the CMS catalog.
+ * List active skills in the CMS catalog.
  *
- * @param {object} options — { limit, category }
+ * BUGFIX (WP-ADMIN-BE-01): previously called `skillsRepo.find(filters, ...)`,
+ * a method that does not exist on AdminCmsSkillsRepository — every call to
+ * this function, and therefore GET /admin/cms/skills, threw a TypeError at
+ * runtime. Repointed to the repository's actual `list()` method, which also
+ * already supports offset-based pagination and search — neither of which
+ * were previously reachable from this service.
+ *
+ * @param {object} options — { limit, offset, category, search }
  * @returns {Promise<{ skills: object[], total: number }>}
  */
-async function listSkills({ limit = 100, category } = {}) {
-  const filters = [];
-  if (category) {
-    filters.push({ field: 'category', op: '==', value: category });
-  }
-
-  const result = await skillsRepo.find(filters, { limit });
-  return { skills: result.docs, total: result.count };
+async function listSkills({ limit = 100, offset = 0, category, search } = {}) {
+  const result = await skillsRepo.list({ category, search, limit, offset });
+  return { skills: result.items, total: result.total };
 }
 
-module.exports = { createSkill, updateSkill, listSkills };
+// ── Get Skill ────────────────────────────────────────────────────────────────
+
+/**
+ * Fetch a single skill by id.
+ *
+ * @param {string} skillId
+ * @returns {Promise<object>}
+ * @throws {AppError} 404 if not found or soft-deleted
+ */
+async function getSkill(skillId) {
+  const skill = await skillsRepo.findById(skillId);
+  if (!skill || skill.softDeleted) {
+    throw AppError.notFound('Skill not found', ErrorCodes.NOT_FOUND, { skillId });
+  }
+  return skill;
+}
+
+// ── Delete Skill (soft) ─────────────────────────────────────────────────────
+
+/**
+ * Soft-delete a skill. Mirrors the pattern already implemented at the
+ * repository layer (`soft_deleted` flag) but previously never exposed
+ * through the service/controller/route chain.
+ *
+ * @param {string} skillId
+ * @param {string} adminId — req.user.id
+ * @returns {Promise<void>}
+ * @throws {AppError} 404 if the skill doesn't exist or is already deleted
+ */
+async function deleteSkill(skillId, adminId) {
+  const existing = await skillsRepo.findById(skillId);
+  if (!existing || existing.softDeleted) {
+    throw AppError.notFound('Skill not found', ErrorCodes.NOT_FOUND, { skillId });
+  }
+  await skillsRepo.softDelete(skillId, adminId);
+}
+
+module.exports = { createSkill, updateSkill, listSkills, getSkill, deleteSkill };
 
 
 

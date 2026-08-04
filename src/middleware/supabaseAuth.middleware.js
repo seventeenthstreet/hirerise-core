@@ -34,6 +34,10 @@
 'use strict';
 
 const { createClient } = require('@supabase/supabase-js');
+// Node 20 (this repo's pinned engine) has no native global WebSocket.
+// @supabase/supabase-js's RealtimeClient requires one at construction time
+// even when realtime is unused, and throws synchronously without it.
+const WebSocket = require('ws');
 
 // ── Supabase admin client (service-role) ──────────────────────────────────────
 // Lazy-initialised once — safe for long-lived server processes.
@@ -57,6 +61,9 @@ function getSupabaseAdmin() {
       autoRefreshToken:  false,
       persistSession:    false,
       detectSessionInUrl: false,
+    },
+    realtime: {
+      transport: WebSocket,
     },
   });
 

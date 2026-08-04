@@ -20,7 +20,13 @@
  * │ POST   │ /admin/cms/skills             │ Create skill (dedup check)  │
  * │ PATCH  │ /admin/cms/skills/:skillId    │ Update skill                │
  * │ GET    │ /admin/cms/skills             │ List skills                 │
+ * │ GET    │ /admin/cms/skills/:skillId    │ Get skill detail            │
+ * │ DELETE │ /admin/cms/skills/:skillId    │ Soft-delete (archive) skill │
  * └──────────────────────────────────────────────────────────────────────┘
+ *
+ * WP-ADMIN-BE-01: added GET /:skillId and DELETE /:skillId, and offset/
+ * search query params on GET / — the repository already supported
+ * findById/softDelete/offset/search, but none were routed before this.
  */
 
 const express = require('express');
@@ -109,11 +115,35 @@ router.get(
     query('limit')
       .optional()
       .isInt({ min: 1, max: 500 }).withMessage('limit must be 1-500'),
+    query('offset')
+      .optional()
+      .isInt({ min: 0 }).withMessage('offset must be >= 0'),
     query('category')
       .optional()
       .isIn(['technical', 'soft', 'domain', 'tool', 'language', 'framework']),
+    query('search')
+      .optional()
+      .isString().trim().isLength({ max: 150 }).withMessage('search must be at most 150 characters'),
   ]),
   ctrl.listSkills
+);
+
+// ── GET /admin/cms/skills/:skillId ───────────────────────────────────────────
+router.get(
+  '/:skillId',
+  validate([
+    param('skillId').isString().trim().notEmpty(),
+  ]),
+  ctrl.getSkill
+);
+
+// ── DELETE /admin/cms/skills/:skillId ────────────────────────────────────────
+router.delete(
+  '/:skillId',
+  validate([
+    param('skillId').isString().trim().notEmpty(),
+  ]),
+  ctrl.deleteSkill
 );
 
 module.exports = router;

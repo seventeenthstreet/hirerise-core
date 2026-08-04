@@ -878,7 +878,48 @@ function _parseExperienceSection(sectionLines) {
     let title   = '';
     let company = '';
 
+    // ── Bug fix (WP-PRO-09N): a date line that also carries a trailing
+    // location fragment (e.g. "New York, NY | 2021 – Present") was being
+    // treated as LAYOUT B ("Title – Company" inline with the date) purely
+    // because SOME non-date text remained on the line. That leftover text
+    // is frequently just a location, not a title/company pair — while the
+    // real title + company were sitting on the two lines immediately
+    // before the anchor (LAYOUT A). Blindly trusting `isInline` discarded
+    // those real title/company lines and used the location string as the
+    // title instead, with company left blank.
+    //
+    // Fix: only trust the inline reading when the leftover content on the
+    // date line actually contains a recognised title/company separator
+    // (dash, "at", or pipe). If it doesn't, and there are usable preceding
+    // lines, fall back to the LAYOUT A (preceding-lines) reading, which is
+    // far more likely to hold the real title/company.
+    const blockStartForCheck = a === 0 ? 0 : anchors[a - 1].lineIdx + 1;
+    const preLinesForCheck   = sectionLines.slice(blockStartForCheck, lineIdx).filter(Boolean);
+
+    let useInlineLayout = isInline;
     if (isInline) {
+      DATE_RANGE_RE.lastIndex = 0;
+      const strippedForCheck = sectionLines[lineIdx]
+        .replace(DATE_RANGE_RE, '')
+        .replace(/\(\s*\)/g, '')
+        .replace(/\[\s*\]/g, '')
+        .replace(/,\s*$/, '')
+        .trim();
+      DATE_RANGE_RE.lastIndex = 0;
+
+      const hasSeparator =
+        TITLE_COMPANY_DASH_RE.test(strippedForCheck) ||
+        TITLE_COMPANY_AT_RE.test(strippedForCheck) ||
+        TITLE_COMPANY_PIPE_RE.test(strippedForCheck);
+
+      if (!hasSeparator && preLinesForCheck.length >= 1) {
+        // No "Title – Company" pattern on the date line itself, and we have
+        // real preceding lines to fall back on — prefer LAYOUT A.
+        useInlineLayout = false;
+      }
+    }
+
+    if (useInlineLayout) {
       // ── LAYOUT B: title and company are on the SAME line as the date ──────
       // Strip the date range (and surrounding parens/brackets) from the line
       // to isolate "Title – Company".
