@@ -13,6 +13,11 @@
  * SECURITY:
  *   Admin role required (requireAdminRole — same pattern as ai-observability.routes.js).
  *   No credentials in response. No user data in response.
+ *
+ * WP-ADMIN-COMP-02: previously returned the raw health object with no
+ * envelope, which the frontend's apiRequest() R1 rule parses as a
+ * failure on every successful response. Now wrapped in { success: true,
+ * data: health }. SystemHealthResponse shape is unchanged.
  */
 
 const express = require('express');
@@ -38,15 +43,18 @@ router.use(requireAdminRole);
 router.get('/health', async (req, res) => {
   try {
     const health = await getSystemHealthStatus();
-    return res.status(200).json(health);
+    return res.status(200).json({ success: true, data: health });
   } catch (err) {
     // If the health check itself throws, report degraded rather than 500.
     return res.status(200).json({
-      status:         'degraded',
-      environment:    process.env.NODE_ENV || 'unknown',
-      build_version:  process.env.BUILD_VERSION || 'unknown',
-      error_rate_24h: 0,
-      checked_at:     new Date().toISOString(),
+      success: true,
+      data: {
+        status:         'degraded',
+        environment:    process.env.NODE_ENV || 'unknown',
+        build_version:  process.env.BUILD_VERSION || 'unknown',
+        error_rate_24h: 0,
+        checked_at:     new Date().toISOString(),
+      },
     });
   }
 });

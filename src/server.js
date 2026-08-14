@@ -5075,6 +5075,24 @@ app.use(`${API_PREFIX}/admin`, adminRateLimit);
 
 app.use(`${API_PREFIX}/admin/metrics`,           authenticate, requireAdmin, requireElevatedSession, require('./routes/admin/adminMetrics.routes'));
 app.use(`${API_PREFIX}/admin/ai`,                authenticate, requireAdmin, requireElevatedSession, require('./routes/admin/ai-observability.routes'));
+// WP-ADMIN-04F-08: Enterprise Permission Administration API — transport
+// layer only, consuming the certified Registry/Assignment/Evaluation
+// foundation (WP-ADMIN-04F-03/05/06). Router-level gate matches every
+// other admin route module; per-route gating additionally requires the
+// certified requirePermission(RESOURCES.ADMINISTRATION, action) grant
+// (see modules/admin/permissions/routes/permissionAdmin.routes.js).
+app.use(`${API_PREFIX}/admin/permissions`,       authenticate, requireAdmin, requireElevatedSession, require('./modules/admin/permissions/routes/permissionAdmin.routes'));
+// WP-ADMIN-05A: Enterprise Administrator Management — transport layer only,
+// consuming the certified Administrator Lifecycle (WP-ADMIN-04F-18B) and
+// Bootstrap (WP-ADMIN-04F-18D, never exposed here) foundations.
+// WP-ADMIN-05A-R1: router-level requireMasterAdmin removed — it made every
+// operation MASTER_ADMIN-only, which over-restricted List/View/Suspend/
+// Reactivate beyond the approved policy. requireAdmin's own certified
+// admin_principals verification (status='active' + session TTL) is the
+// baseline gate for this router now; requireMasterAdmin is applied only at
+// the individual route level, on Grant and Revoke — see
+// administrators.routes.js.
+app.use(`${API_PREFIX}/admin/administrators`,    authenticate, requireAdmin, requireElevatedSession, require('./modules/admin/administrators/administrators.routes'));
 // WP-ADMIN-02C: MFA routes — deliberately NOT gated by requireElevatedSession
 // (these are the routes that CREATE the elevated session) and use the
 // lighter isAdminRole check inside mfa.routes.js rather than requireAdmin's

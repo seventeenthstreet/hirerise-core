@@ -22,8 +22,15 @@
  *   No user data in responses — aggregate counts and rates only.
  *
  * FRONTEND COMPATIBILITY:
- *   Response shapes are identical to the WP-7 stubs.
- *   useXaiMetrics() and useXaiDashboard() require ZERO changes.
+ *   WP-ADMIN-COMP-02: both endpoints previously returned the raw metrics
+ *   object with no envelope. The frontend's apiRequest() parser enforces
+ *   a canonical { success: true, data } envelope (R1 rule) on every
+ *   response and rejects anything else as a failure -- so every
+ *   successful 200 response was being parsed as an error by
+ *   useXaiMetrics()/useXaiDashboard(). Both endpoints now wrap their
+ *   payload in { success: true, data: metrics }. The `metrics` object
+ *   shape itself is unchanged, so XaiUsageMetrics/XaiTierDistributionMetrics
+ *   types and the hooks require zero further changes.
  */
 
 const express = require('express');
@@ -52,7 +59,7 @@ router.get('/xai-usage', async (req, res) => {
       date_to:   req.query.date_to,
     };
     const metrics = await xaiMetricsService.getUsageMetrics(filters);
-    return res.status(200).json(metrics);
+    return res.status(200).json({ success: true, data: metrics });
   } catch (err) {
     return res.status(500).json({ success: false, error: 'Failed to fetch XAI usage metrics' });
   }
@@ -67,7 +74,7 @@ router.get('/xai-tier', async (req, res) => {
       date_to:   req.query.date_to,
     };
     const metrics = await xaiMetricsService.getTierDistribution(filters);
-    return res.status(200).json(metrics);
+    return res.status(200).json({ success: true, data: metrics });
   } catch (err) {
     return res.status(500).json({ success: false, error: 'Failed to fetch XAI tier metrics' });
   }
