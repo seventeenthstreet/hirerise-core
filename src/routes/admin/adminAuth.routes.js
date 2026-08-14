@@ -16,7 +16,9 @@
  *   POST /session      → refresh admin session
  *   GET  /me           → get current admin principal info
  *   POST /grant        → MASTER_ADMIN grants admin access
- *   POST /revoke       → MASTER_ADMIN revokes admin access
+ *   POST /suspend      → MASTER_ADMIN suspends admin access (reversible)
+ *   POST /reactivate   → MASTER_ADMIN reactivates a suspended admin
+ *   POST /revoke       → MASTER_ADMIN revokes admin access (terminal)
  *   GET  /principals   → list all active admin principals
  *
  * Notes:
@@ -32,6 +34,9 @@ const { validate } = require('../../middleware/requestValidator');
 const { requireAdmin } = require('../../middleware/auth.middleware');
 const { asyncHandler } = require('../../utils/helpers');
 const adminPrincipalRepo = require('../../modules/admin/repository/adminPrincipal.repository');
+const {
+  InvalidLifecycleTransitionError,
+} = require('../../domain/admin/lifecycle/adminLifecycle.states');
 const logger = require('../../utils/logger');
 
 const router = express.Router();
@@ -211,7 +216,14 @@ router.post(
       });
     }
 
-    await adminPrincipalRepo.revoke(targetUid, actorId);
+    try {
+      await adminPrincipalRepo.revoke(targetUid, actorId);
+    } catch (err) {
+      if (err instanceof InvalidLifecycleTransitionError) {
+        return res.status(409).json({ success: false, message: err.message });
+      }
+      throw err;
+    }
 
     logger.info('[AdminAuth] Access revoked', {
       targetUserId: targetUid,
@@ -221,6 +233,106 @@ router.post(
     return res.json({
       success: true,
       message: `Admin access revoked for ${targetUid}`,
+    });
+  })
+);
+
+// ─────────────────────────────────────────────────────────────────────────────
+// POST /suspend — MASTER_ADMIN suspends admin access (reversible)
+// ─────────────────────────────────────────────────────────────────────────────
+router.post(
+  '/suspend',
+  requireAdmin,
+  validate([
+    body('uid').isString().trim().notEmpty().withMessage('uid is required'),
+    body('reason').optional().isString().trim().isLength({ max: 500 }),
+  ]),
+  asyncHandler(async (req, res) => {
+    const actorId = getAuthenticatedUserId(req);
+
+    if (!actorId) {
+      return unauthenticated(res);
+    }
+
+    if (!isMasterAdmin(req)) {
+      return res.status(403).json({
+        success: false,
+        message: 'Only MASTER_ADMIN can suspend admin access.',
+      });
+    }
+
+    const targetUid = req.body.uid;
+
+    if (targetUid === actorId) {
+      return res.status(400).json({
+        success: false,
+        message: 'Cannot suspend your own access.',
+      });
+    }
+
+    try {
+      await adminPrincipalRepo.suspend(targetUid, actorId, req.body.reason ?? null);
+    } catch (err) {
+      if (err instanceof InvalidLifecycleTransitionError) {
+        return res.status(409).json({ success: false, message: err.message });
+      }
+      throw err;
+    }
+
+    logger.info('[AdminAuth] Access suspended', {
+      targetUserId: targetUid,
+      suspendedBy: actorId,
+    });
+
+    return res.json({
+      success: true,
+      message: `Admin access suspended for ${targetUid}`,
+    });
+  })
+);
+
+// ─────────────────────────────────────────────────────────────────────────────
+// POST /reactivate — MASTER_ADMIN reactivates a suspended admin
+// ─────────────────────────────────────────────────────────────────────────────
+router.post(
+  '/reactivate',
+  requireAdmin,
+  validate([
+    body('uid').isString().trim().notEmpty().withMessage('uid is required'),
+  ]),
+  asyncHandler(async (req, res) => {
+    const actorId = getAuthenticatedUserId(req);
+
+    if (!actorId) {
+      return unauthenticated(res);
+    }
+
+    if (!isMasterAdmin(req)) {
+      return res.status(403).json({
+        success: false,
+        message: 'Only MASTER_ADMIN can reactivate admin access.',
+      });
+    }
+
+    const targetUid = req.body.uid;
+
+    try {
+      await adminPrincipalRepo.reactivate(targetUid, actorId);
+    } catch (err) {
+      if (err instanceof InvalidLifecycleTransitionError) {
+        return res.status(409).json({ success: false, message: err.message });
+      }
+      throw err;
+    }
+
+    logger.info('[AdminAuth] Access reactivated', {
+      targetUserId: targetUid,
+      reactivatedBy: actorId,
+    });
+
+    return res.json({
+      success: true,
+      message: `Admin access reactivated for ${targetUid}`,
     });
   })
 );

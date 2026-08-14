@@ -88,4 +88,83 @@ const updateUserRole = asyncHandler(async (req, res) => {
   return res.status(200).json({ success: true, data: user });
 });
 
-module.exports = { listUsers, getUser, updateUserRole };
+// ── PATCH /api/v1/admin/users/:userId/profile (WP-ADMIN-COMP-04) ─────────
+
+/**
+ * Body fields are already restricted to the allow-listed keys by
+ * express-validator at the route layer (adminUsers.routes.js) — anything
+ * else is a 400 before this handler ever runs.
+ */
+const updateUserProfile = asyncHandler(async (req, res) => {
+  const { userId } = req.params;
+
+  const user = await usersService.updateUserProfile(userId, req.body, req.user?.id);
+
+  logger.info('[AdminUsers] Updated user profile', {
+    adminId: req.user?.id,
+    targetUserId: userId,
+    fields: Object.keys(req.body || {}),
+  });
+
+  return res.status(200).json({ success: true, data: user });
+});
+
+// ── PATCH /api/v1/admin/users/:userId/status (WP-ADMIN-COMP-04) ──────────
+
+/**
+ * `action` is already restricted to 'enable' | 'disable' by the route-level
+ * `isIn()` validator. An admin cannot disable their own account, mirroring
+ * the existing self-role-change guard in updateUserRole() above — the same
+ * accidental-self-lockout concern applies here, even more so.
+ */
+const updateUserStatus = asyncHandler(async (req, res) => {
+  const { userId } = req.params;
+  const { action } = req.body;
+
+  if (userId === req.user?.id) {
+    throw AppError.forbidden(
+      'You cannot change your own account status.',
+      ErrorCodes.FORBIDDEN,
+      { userId }
+    );
+  }
+
+  const user = await usersService.setUserAccountStatus(userId, action, req.user?.id);
+
+  logger.info('[AdminUsers] Updated user account status', {
+    adminId: req.user?.id,
+    targetUserId: userId,
+    action,
+  });
+
+  return res.status(200).json({ success: true, data: user });
+});
+
+// ── GET /api/v1/admin/users/:userId/audit-history (WP-ADMIN-COMP-04) ─────
+
+const getUserAuditHistory = asyncHandler(async (req, res) => {
+  const { userId } = req.params;
+  const { limit } = req.query;
+
+  const events = await usersService.getUserAuditHistory(
+    userId,
+    limit ? Math.min(parseInt(limit, 10), 200) : 50
+  );
+
+  logger.info('[AdminUsers] Viewed user audit history', {
+    adminId: req.user?.id,
+    targetUserId: userId,
+    count: events.length,
+  });
+
+  return res.status(200).json({ success: true, data: { items: events } });
+});
+
+module.exports = {
+  listUsers,
+  getUser,
+  updateUserRole,
+  updateUserProfile,
+  updateUserStatus,
+  getUserAuditHistory,
+};

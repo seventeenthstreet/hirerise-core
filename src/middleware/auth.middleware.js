@@ -159,24 +159,46 @@ const PUBLIC_PREFIXES = [
 /**
  * Returns true when the request path should bypass JWT verification.
  *
- * Mount-aware: Express strips the mount prefix before setting req.path, so
- * this function normalises both the full form ('/api/v1/health') and the
- * stripped form ('/health') to a bare suffix before matching.
+ * BUGFIX (WP-DIAG): must be called with the request's ORIGINAL, un-mounted
+ * path (req.originalUrl), never req.path. `authenticate` is mounted
+ * per-route throughout server.js (e.g.
+ * `app.use('/api/v1/admin/graph', authenticate, ...)`), and Express strips
+ * the matched mount prefix from `req.path`/`req.url` before invoking
+ * per-route middleware. That meant a request to
+ * GET /api/v1/admin/graph/health arrived at this function as bare
+ * '/health' — an exact match against PUBLIC_EXACT — so `authenticate`
+ * treated an authenticated admin sub-route as the public load-balancer
+ * health check, skipped JWT verification entirely, and left req.user
+ * unset. The next middleware (requireAdmin) then correctly rejected the
+ * now-unauthenticated request with 401 UNAUTHORIZED. Same collision for
+ * any route ending in /metrics, /health/*, /webhooks/*, /internal/* under
+ * a non-public mount (graphAdmin's /health + /metrics were the two hit in
+ * practice, but the flaw was in the matcher, not those two routes).
+ *
+ * Using req.originalUrl (unaffected by mount-stripping, always the full
+ * path from the true request root) and matching only against the API
+ * prefix's immediate suffix means a same-named sub-route nested under an
+ * unrelated, non-public mount can never again be mistaken for the actual
+ * top-level public endpoint.
  *
  * Examples that all return true:
- *   isPublicPath('/health')           ← per-route mount, stripped path
- *   isPublicPath('/api/v1/health')    ← edge-case where full path is passed
- *   isPublicPath('/health/deep')
- *   isPublicPath('/webhooks/stripe')
- *   isPublicPath('/internal/ai-job')
+ *   isPublicPath('/api/v1/health')       ← real public endpoint
+ *   isPublicPath('/api/v1/health/deep')
+ *   isPublicPath('/api/v1/webhooks/stripe')
+ *   isPublicPath('/api/v1/internal/ai-job')
+ *
+ * Examples that now correctly return false (previously false positives):
+ *   isPublicPath('/api/v1/admin/graph/health')
+ *   isPublicPath('/api/v1/admin/graph/metrics')
  */
 function isPublicPath(reqPath = '') {
-  // Normalise: strip /api/v1 prefix when present so both forms resolve
-  // to a bare '/suffix' and the same Set/prefix checks apply regardless
-  // of whether authenticate is mounted globally or per-route.
-  const suffix = reqPath.startsWith(API_PREFIX)
-    ? reqPath.slice(API_PREFIX.length) || '/'
-    : reqPath;
+  // Strip query string (originalUrl includes it; req.path never did) and
+  // the /api/v1 prefix, so the remaining suffix reflects the FULL path
+  // from the true app root, not a mount-relative fragment.
+  const withoutQuery = reqPath.split('?')[0];
+  const suffix = withoutQuery.startsWith(API_PREFIX)
+    ? withoutQuery.slice(API_PREFIX.length) || '/'
+    : withoutQuery;
 
   if (PUBLIC_EXACT.has(suffix)) return true;
 
@@ -477,7 +499,7 @@ async function authenticate(req, res, next) {
       req.hydrationId = req.headers['x-hydration-id'] ?? null;
     }
 
-    if (isPublicPath(req.path)) {
+    if (isPublicPath(req.originalUrl)) {
       return next();
     }
 
@@ -624,4 +646,7 @@ module.exports = Object.freeze({
   requireEmailVerified,
   requireAdmin,
   requireRole,
+  // Exported for regression testing (WP-DIAG mount-collision bugfix) only —
+  // not intended as a general-purpose API for other modules.
+  isPublicPath,
 });

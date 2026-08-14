@@ -20,21 +20,28 @@
  * WP-ADMIN-04E introduces no new authorization middleware — the PATCH route
  * below is gated by exactly the same chain as the two GET routes.
  *
- * ┌──────────────────────────────────────────────────────────────────────┐
- * │ Method │ Path                     │ Description                     │
- * ├──────────────────────────────────────────────────────────────────────┤
- * │ GET    │ /admin/users             │ List users (paginated+searchable)│
- * │ GET    │ /admin/users/:id         │ Get user detail                  │
- * │ PATCH  │ /admin/users/:id/role    │ Update a user's application role │
- * └──────────────────────────────────────────────────────────────────────┘
+ * ┌────────────────────────────────────────────────────────────────────────────┐
+ * │ Method │ Path                          │ Description                       │
+ * ├────────────────────────────────────────────────────────────────────────────┤
+ * │ GET    │ /admin/users                  │ List users (paginated+searchable) │
+ * │ GET    │ /admin/users/:id              │ Get user detail                   │
+ * │ PATCH  │ /admin/users/:id/role         │ Update a user's application role  │
+ * │ PATCH  │ /admin/users/:id/profile      │ Update application-level profile  │
+ * │ PATCH  │ /admin/users/:id/status       │ Enable/disable the account        │
+ * │ GET    │ /admin/users/:id/audit-history│ Read this user's admin_logs trail │
+ * └────────────────────────────────────────────────────────────────────────────┘
  *
- * WP-ADMIN-04E — Role Management Foundation: the one write endpoint this
- * WP is scoped to. `role` is validated with `isIn(usersRepo.ROLES)` — the
- * same values public.users.role's own users_role_check CHECK constraint
- * allows (see adminUsers.repository.js) — so there is exactly one place in
- * this codebase that lists the allowed roles for this endpoint. Account
- * status, MFA, password, session, and audit-history management remain
- * explicitly out of scope (see WP-ADMIN-04E "Out of Scope").
+ * WP-ADMIN-04E — Role Management Foundation: the original write endpoint.
+ * `role` is validated with `isIn(usersRepo.ROLES)` — the same values
+ * public.users.role's own users_role_check CHECK constraint allows (see
+ * adminUsers.repository.js) — so there is exactly one place in this
+ * codebase that lists the allowed roles for this endpoint.
+ *
+ * WP-ADMIN-COMP-04 — adds /profile, /status, and /audit-history. MFA reset,
+ * password reset, a separate "lock" action, and session management remain
+ * explicitly unsupported — see adminUsers.repository.js's module doc
+ * comment and the WP-ADMIN-COMP-04 Completion Report for the repository
+ * evidence behind each of those decisions.
  */
 
 const express = require('express');
@@ -81,6 +88,66 @@ router.patch(
       .isIn(usersRepo.ROLES).withMessage(`role must be one of: ${usersRepo.ROLES.join(', ')}`),
   ]),
   ctrl.updateUserRole
+);
+
+// ── PATCH /admin/users/:userId/profile (WP-ADMIN-COMP-04 — Edit Profile) ──
+// Allow-listed application-level public.users fields only — see
+// adminUsers.repository.js's PROFILE_FIELDS / module doc comment for why
+// user_type and anything Auth-related are excluded.
+const PROFILE_FIELD_VALIDATORS = [
+  body('displayName').optional().isString().trim().isLength({ max: 200 }),
+  body('careerGoal').optional({ nullable: true }).isString().trim().isLength({ max: 500 }),
+  body('targetRole').optional({ nullable: true }).isString().trim().isLength({ max: 200 }),
+  body('experienceYears').optional({ nullable: true }).isFloat({ min: 0, max: 80 }),
+  body('industry').optional({ nullable: true }).isString().trim().isLength({ max: 200 }),
+  body('location').optional({ nullable: true }).isString().trim().isLength({ max: 200 }),
+];
+
+router.patch(
+  '/:userId/profile',
+  validate([
+    param('userId').isString().trim().notEmpty(),
+    ...PROFILE_FIELD_VALIDATORS,
+    // Reject any key not in the allow-list rather than silently dropping
+    // it, so an unexpected field is a visible 400, not a quiet no-op.
+    body().custom((value) => {
+      const allowed = new Set(['displayName', 'careerGoal', 'targetRole', 'experienceYears', 'industry', 'location']);
+      const unknown = Object.keys(value || {}).filter((k) => !allowed.has(k));
+      if (unknown.length) {
+        throw new Error(`Unsupported field(s): ${unknown.join(', ')}`);
+      }
+      if (Object.keys(value || {}).length === 0) {
+        throw new Error('At least one profile field is required.');
+      }
+      return true;
+    }),
+  ]),
+  ctrl.updateUserProfile
+);
+
+// ── PATCH /admin/users/:userId/status (WP-ADMIN-COMP-04 — Enable/Disable) ─
+// The single account-status mutation, backed by Supabase Auth's
+// banned_until (see adminUsers.repository.js#setAccountStatus). There is
+// deliberately no separate "lock" action — see that method's doc comment.
+router.patch(
+  '/:userId/status',
+  validate([
+    param('userId').isString().trim().notEmpty(),
+    body('action')
+      .isString().trim().notEmpty()
+      .isIn(['enable', 'disable']).withMessage("action must be 'enable' or 'disable'"),
+  ]),
+  ctrl.updateUserStatus
+);
+
+// ── GET /admin/users/:userId/audit-history (WP-ADMIN-COMP-04) ────────────
+router.get(
+  '/:userId/audit-history',
+  validate([
+    param('userId').isString().trim().notEmpty(),
+    query('limit').optional().isInt({ min: 1, max: 200 }).withMessage('limit must be 1-200'),
+  ]),
+  ctrl.getUserAuditHistory
 );
 
 module.exports = router;

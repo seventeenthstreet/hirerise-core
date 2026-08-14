@@ -230,6 +230,37 @@ class PermissionRegistry {
     return listLifecycleStages();
   }
 
+  // ── Governance Write Passthrough ────────────────────────────────────
+  // WP-ADMIN-04F-04 (Enterprise Permission Governance Services) requires
+  // that "the Governance Service must never bypass the Registry" for
+  // persistence updates (Governance -> Registry -> Repository ->
+  // Database). Prior to that WP the Registry was read-only by design
+  // (see this file's header). This single method is the "integration
+  // strictly required" the Governance WP calls for: it performs no
+  // lifecycle validation itself (that is the Governance layer's job,
+  // per this WP's own "NOT a governance workflow engine" boundary) — it
+  // only forwards an already-validated status change to the Repository
+  // and re-decorates the result, so Governance never needs a direct
+  // Repository reference.
+
+  /**
+   * Applies an already-governance-validated Permission Status change and
+   * returns the updated catalog entry. Callers (the Governance Service)
+   * are responsible for validating the transition before calling this —
+   * this method trusts its input and performs no lifecycle-transition
+   * validation of its own.
+   *
+   * @param {string} id
+   * @param {import('../permission.types').PermissionStatus} status
+   * @returns {Promise<PermissionRegistryEntry|null>} null if id does not exist
+   */
+  async applyLifecycleTransition(id, status) {
+    requireNonEmptyString(id, 'id');
+    requireNonEmptyString(status, 'status');
+    const updated = await this._repository.update(id, { status });
+    return updated ? this._toRegistryEntry(updated) : null;
+  }
+
   // ── Registry Validation ─────────────────────────────────────────────
 
   /**
