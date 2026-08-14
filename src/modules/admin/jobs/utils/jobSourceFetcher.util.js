@@ -241,7 +241,23 @@ async function fetchJobRecords(sourceType, sourceUrl, options = {}) {
   }
 }
 
-module.exports = { fetchJobRecords };
+/**
+ * parseJobRecordsFromCsvText — WP-ADMIN-COMP-06-R2.
+ *
+ * Same normalisation as fetchCsv() (parseCsvText + normaliseCsvRow), but
+ * for CSV text already in memory (e.g. an uploaded file buffer) instead
+ * of a URL to fetch. No network I/O, no new parsing logic — reuses the
+ * exact same parseCsvText/normaliseCsvRow this module already uses for
+ * URL-based CSV/Google Sheets sync, so uploaded and URL-fetched CSVs are
+ * normalised identically.
+ */
+function parseJobRecordsFromCsvText(text, options = {}) {
+  const rows = parseCsvText(text, options.delimiter ?? ',');
+  logger.info(`[jobSourceFetcher] CSV rows parsed from upload: ${rows.length}`);
+  return rows.map(normaliseCsvRow);
+}
+
+module.exports = { fetchJobRecords, parseJobRecordsFromCsvText };
 
 
 

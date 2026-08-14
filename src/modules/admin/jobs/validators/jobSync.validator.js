@@ -191,7 +191,35 @@ function validateJobRecord(record) {
   };
 }
 
-module.exports = { validateSyncRequest, validateJobRecord };
+// ---------------------------------------------------------------------------
+// validateCsvUploadOptions — WP-ADMIN-COMP-06-R2
+// ---------------------------------------------------------------------------
+
+/**
+ * Normalises the optional multipart form fields (`delimiter`,
+ * `skipHeader`) that accompany a CSV file upload. Multipart fields
+ * always arrive as strings (unlike the JSON `options` object
+ * validateSyncRequest handles), so booleans need explicit parsing —
+ * everything else (default delimiter, defaulting skipHeader to true)
+ * mirrors validateSyncRequest's options handling exactly, so an
+ * uploaded CSV and a URL-fetched CSV normalise identically.
+ */
+function validateCsvUploadOptions(fields = {}) {
+  const delimiter = isString(fields.delimiter) && fields.delimiter.length === 1
+    ? fields.delimiter : ',';
+
+  const skipHeaderRaw = fields.skipHeader;
+  const skipHeader =
+    skipHeaderRaw === undefined || skipHeaderRaw === null
+      ? true
+      : skipHeaderRaw === 'false' || skipHeaderRaw === false
+        ? false
+        : true;
+
+  return { value: { delimiter, skipHeader }, error: null };
+}
+
+module.exports = { validateSyncRequest, validateJobRecord, validateCsvUploadOptions };
 
 
 

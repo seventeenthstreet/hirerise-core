@@ -10,14 +10,20 @@ const MAX_STORED_ERRORS = 100;
 const DEFAULT_LIST_LIMIT = 20;
 const MAX_LIST_LIMIT = 100;
 
+// WP-ADMIN-COMP-06 bugfix: config/supabase.js exports
+// { supabase, getClient, withRetry, verifyConnection } — returning the
+// whole module (as before) made every `supabase.from(...)` call below
+// throw "TypeError: supabase.from is not a function". Same bug class
+// already fixed in adminCmsSkills.repository.js (WP-ADMIN-03B).
 function getSupabase() {
-  return require('../../../../config/supabase');
+  return require('../../../../config/supabase').supabase;
 }
 
 class SyncLogRepository {
   async create(payload) {
     const {
       sourceType,
+      sourceOrigin,
       sourceUrl,
       totalRecords,
       successCount,
@@ -36,7 +42,14 @@ class SyncLogRepository {
       throw new Error('Invalid numeric values in sync log payload');
     }
 
-    const safeOrigin = this._safeOrigin(sourceUrl);
+    // WP-ADMIN-COMP-06-R2: callers now pass a pre-computed, already-safe
+    // `sourceOrigin` (a URL origin for URL-based syncs, or a
+    // `uploaded:<filename>` identifier for CSV uploads — see
+    // jobSync.service.js) instead of a raw sourceUrl. `sourceUrl` is kept
+    // as a fallback for any external caller still passing the old shape,
+    // in which case it's run through the same _safeOrigin() URL parsing
+    // this repository always used.
+    const safeOrigin = sourceOrigin || this._safeOrigin(sourceUrl);
 
     const row = {
       type: 'JOB_SYNC',

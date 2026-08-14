@@ -7,8 +7,13 @@
 
 const logger = require('../../../../utils/logger');
 
+// WP-ADMIN-COMP-06 bugfix: config/supabase.js exports
+// { supabase, getClient, withRetry, verifyConnection } — returning the
+// whole module (as before) made every `supabase.from(...)` call below
+// throw "TypeError: supabase.from is not a function". Same bug class
+// already fixed in adminCmsSkills.repository.js (WP-ADMIN-03B).
 function getSupabase() {
-  return require('../../../../config/supabase');
+  return require('../../../../config/supabase').supabase;
 }
 
 const LOCK_ID = 'jobSync';
