@@ -424,12 +424,51 @@ async function importGraphDataset({
 
   const supabase = getSupabase();
   let imported = 0;
+  let replaced = 0;
   const writeErrors = [];
+
+  // WP-ADMIN-COMP-08-R22: `mode` previously had no effect on the write
+  // path at all — Replace and Append both reached the identical
+  // `supabase.from(schema.collection).upsert(clean)` call below, which has
+  // no `onConflict` target (public.roles has no PRIMARY KEY, so PostgREST
+  // cannot infer one), so any row whose composite_key already matched an
+  // active roles row failed with "duplicate key value violates unique
+  // constraint uq_roles_composite_key" regardless of the mode the admin
+  // selected. That generic upsert is UNCHANGED here for every dataset/mode
+  // combination except this one: Roles + Replace now calls the dedicated
+  // replace_import_roles() RPC (see migration
+  // 20260814090000_r22_roles_replace_mode_composite_key_resolution.sql),
+  // which soft-deletes any conflicting ACTIVE role (matched by
+  // composite_key / normalized_name / (role_name, agency) under a
+  // different role_id) before writing, then upserts by role_id — all
+  // inside one atomic function call per chunk. Append is not touched:
+  // it must keep failing loudly on a genuine duplicate rather than
+  // silently overwriting data (R22 §9.2 / §7 non-goals).
+  const useReplaceRoles = datasetType === 'roles' && mode === 'replace';
 
   for (let i = 0; i < importableRows.length; i += BATCH_SIZE) {
     const chunk = importableRows.slice(i, i + BATCH_SIZE);
 
     const clean = chunk.map(({ __rowNum, ...r }) => r);
+
+    if (useReplaceRoles) {
+      const { data, error } = await supabase.rpc('replace_import_roles', {
+        p_rows: clean,
+      });
+
+      if (error) {
+        writeErrors.push({
+          row: 0,
+          type: 'write',
+          message: error.message,
+        });
+      } else {
+        const chunkTotal = Number(data?.total ?? clean.length);
+        imported += chunkTotal;
+        replaced += Number(data?.replaced ?? 0);
+      }
+      continue;
+    }
 
     const { error } = await supabase
       .from(schema.collection)
@@ -464,6 +503,9 @@ async function importGraphDataset({
     importedAt: new Date().toISOString(),
     mode,
     adminId,
+    // Additive field: only meaningful for Roles + Replace. Existing
+    // consumers of `imported`/`skipped`/`errorCount` are unaffected.
+    ...(useReplaceRoles ? { replaced } : {}),
   };
 
   await logImportEvent({

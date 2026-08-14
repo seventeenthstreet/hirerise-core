@@ -30,9 +30,15 @@ jest.mock('../../../../utils/logger', () => ({
   debug: jest.fn(),
 }));
 
-function makeMockSupabase({ upsertError = null } = {}) {
+function makeMockSupabase({ upsertError = null, rpcError = null, rpcResult = null } = {}) {
   const upsertSpy = jest.fn(() => Promise.resolve({ data: null, error: upsertError }));
-  const mockSupabase = { from: null, upsertSpy };
+  // WP-ADMIN-COMP-08-R22: Roles + Replace no longer calls
+  // .from('roles').upsert(...) — it calls the replace_import_roles() RPC.
+  // Tests that exercise replace mode assert against rpcSpy instead.
+  const rpcSpy = jest.fn(() =>
+    Promise.resolve({ data: rpcResult, error: rpcError })
+  );
+  const mockSupabase = { from: null, rpc: rpcSpy, upsertSpy, rpcSpy };
 
   mockSupabase.from = jest.fn((table) => {
     const builder = {
@@ -154,11 +160,18 @@ describe('WP-ADMIN-COMP-08-R18 — Roles CSV normalized_name write-path fix', ()
   });
 
   describe('T4 — Replace mode', () => {
-    it('populates normalized_name on the write path in replace mode', async () => {
+    it('populates normalized_name on the replace_import_roles RPC payload, not the plain upsert path', async () => {
+      // WP-ADMIN-COMP-08-R22: Roles + Replace now calls the dedicated
+      // replace_import_roles() RPC instead of .from('roles').upsert(...) —
+      // see graphImport.service.js and the R22 migration. This supersedes
+      // the pre-R22 assumption (that Replace and Append reached the same
+      // upsert call) which was itself the root cause of R22's defect.
       const { parseCSVBuffer } = require('../../import/csvParser.util');
       parseCSVBuffer.mockReturnValue([{ role_id: 'r1', role_name: 'Product Manager' }]);
 
-      const mockSupabase = makeMockSupabase();
+      const mockSupabase = makeMockSupabase({
+        rpcResult: { inserted: 1, updated: 0, replaced: 0, total: 1 },
+      });
       jest.doMock('../../../../config/supabase', () => ({ supabase: mockSupabase }));
       const { importGraphDataset } = require('../graphImport.service');
 
@@ -171,9 +184,10 @@ describe('WP-ADMIN-COMP-08-R18 — Roles CSV normalized_name write-path fix', ()
 
       expect(result.imported).toBe(1);
       expect(result.mode).toBe('replace');
-      expect(mockSupabase.upsertSpy).toHaveBeenCalledWith([
-        expect.objectContaining({ normalized_name: 'product manager' }),
-      ]);
+      expect(mockSupabase.upsertSpy).not.toHaveBeenCalled();
+      expect(mockSupabase.rpcSpy).toHaveBeenCalledWith('replace_import_roles', {
+        p_rows: [expect.objectContaining({ normalized_name: 'product manager' })],
+      });
     });
   });
 
