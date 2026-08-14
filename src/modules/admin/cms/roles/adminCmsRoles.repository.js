@@ -6,7 +6,7 @@
 
 const { normalizeText, normalizeForComposite } = require('../../../../shared/utils/normalizeText');
 const { AppError, ErrorCodes } = require('../../../../middleware/errorHandler');
-const supabase = require('../../../../config/supabase'); // ✅ avoid re-require per call
+const { supabase } = require('../../../../config/supabase'); // ✅ avoid re-require per call
 
 const TABLE = 'cms_roles';
 

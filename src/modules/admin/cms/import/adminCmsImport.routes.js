@@ -117,14 +117,28 @@ router.post(
     // ─────────────────────────────────────
     // 📤 RESPONSE
     // ─────────────────────────────────────
-    return res.status(statusCode).json({
+    // CONTRACT FIX (WP-ADMIN-COMP-03 §22): when success is false (partial/no
+    // insert), the response previously had no `error` object, so none of the
+    // frontend's 3 known error-wire-shapes matched it — `duplicates`/`errors`
+    // were silently discarded and replaced with a generic fallback message.
+    // Adding a conformant V2 `error.details` alongside the existing top-level
+    // `duplicates`/`errors` keys (kept for backward compatibility) is the
+    // smallest fix that lets the Import UI actually show what happened; it
+    // changes no status codes and no import/business logic.
+    const responseBody = {
       success: result.inserted > 0,
 
+      // `duplicates`/`errors` moved inside `data` (in addition to being kept
+      // at top level for backward compatibility) because apiRequest's
+      // success parser only returns `raw.data` — anything outside it was
+      // being silently dropped on 207 partial-success responses.
       data: {
         total: result.total,
         inserted: result.inserted,
         skipped: result.skipped,
         insertedIds: result.insertedIds,
+        duplicates: result.duplicates,
+        errors: result.errors,
       },
 
       duplicates: result.duplicates,
@@ -137,7 +151,28 @@ router.post(
         sourceAgency: agency,
         importedAt: new Date().toISOString(),
       },
-    });
+    };
+
+    if (!responseBody.success) {
+      // Use the frontend's existing known BackendErrorCode values (CONFLICT,
+      // VALIDATION_ERROR) rather than inventing new ones — an unrecognised
+      // code falls through mapErrorCodeToCategory's default to a generic
+      // 'system' category, which would show a worse message than the
+      // accurate 'conflict'/'validation' categories these cases deserve.
+      const isAllDuplicate = result.duplicates.length > 0 && result.errors.length === 0;
+      responseBody.error = {
+        code: isAllDuplicate ? 'CONFLICT' : 'VALIDATION_ERROR',
+        message: isAllDuplicate
+          ? 'All rows were duplicates — nothing was imported.'
+          : 'Import failed validation — nothing was imported.',
+        details: {
+          duplicates: result.duplicates,
+          errors: result.errors,
+        },
+      };
+    }
+
+    return res.status(statusCode).json(responseBody);
   })
 );
 

@@ -188,8 +188,14 @@ const careerDomainsModule = {
 
       if (error) throw error;
 
+      // V2 contract: every success:true response must include a `data` key
+      // (see src/shared/response/index.js). This handler predates that
+      // contract and omitted it, which the frontend API client treats as a
+      // hard parse failure (R1 violation) — fixed as the smallest correction
+      // needed to make the Archive action work, per WP-ADMIN-COMP-03 §22.
       return res.json({
         success: true,
+        data: null,
         message: 'Career domain deleted successfully',
       });
 

@@ -17,7 +17,7 @@ const express = require('express');
 const logger  = require('../../../utils/logger');
 const { sendSuccess } = require('../../../shared/response');
 
-function getSupabase() { return require('../../../config/supabase'); }
+function getSupabase() { return require('../../../config/supabase').supabase; }
 
 // Map datasetType → Supabase table name
 const TABLE_MAP = {
