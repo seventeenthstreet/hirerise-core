@@ -15,7 +15,7 @@ const { AppError, ErrorCodes } = require('../../../middleware/errorHandler');
 const logger = require('../../../utils/logger');
 const { redis } = require('../../../config/redisClient');
 const { setCache } = require('../../../utils/cache.util');
-const supabase = require('../../../config/supabase');
+const { supabase } = require('../../../config/supabase');
 const { GRAPH_DATASET_TYPES } = require('./graph.constants');
 
 let importGraphDataset;
@@ -25,7 +25,7 @@ let getImportLogs;
 let getDatasetStatuses;
 let getGraphHealth;
 let getGraphAlerts;
-let getCareerGraphStats;
+let getLegacyBulkGraphStats;
 
 try {
   ({
@@ -36,7 +36,10 @@ try {
     getDatasetStatuses,
     getGraphHealth,
     getGraphAlerts,
-    getCareerGraphStats,
+    // WP-ADMIN-COMP-08-R21: renamed from getCareerGraphStats() — this
+    // reads Legacy Bulk Graph tables (roles/role_transitions), not the
+    // canonical Career Graph. See graphImport.service.js for rationale.
+    getLegacyBulkGraphStats,
   } = require('./graphImport.service'));
 } catch (e) {
   const stub = async () => {
@@ -50,7 +53,7 @@ try {
   getDatasetStatuses = stub;
   getGraphHealth = stub;
   getGraphAlerts = stub;
-  getCareerGraphStats = stub;
+  getLegacyBulkGraphStats = stub;
 }
 
 const ALLOWED_MIMES = new Set([
@@ -330,8 +333,11 @@ const graphAlerts = asyncHandler(async (_req, res) => {
   res.json({ success: true, data: alerts });
 });
 
+// WP-ADMIN-COMP-08-R21: route/response contract (GET /admin/graph/stats)
+// is unchanged — only the underlying service symbol was renamed to
+// accurately reflect that it reads Legacy Bulk Graph tables.
 const graphStats = asyncHandler(async (_req, res) => {
-  const stats = await getCareerGraphStats();
+  const stats = await getLegacyBulkGraphStats();
   res.json({ success: true, data: stats });
 });
 

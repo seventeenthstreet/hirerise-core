@@ -10,7 +10,7 @@ const logger = require('../../../utils/logger');
 const { getCache, setCache } = require('../../../utils/cache.util');
 
 function getClient() {
-  return require('../../../config/supabase');
+  return require('../../../config/supabase').supabase;
 }
 
 // ─────────────────────────────────────────────────────────────

@@ -173,7 +173,20 @@ class FakeQueryBuilder {
     return this;
   }
 
-  range() {
+  // WP-ADMIN-05D — Permission History: additively extended to actually
+  // slice by [from, to] (inclusive), matching the real Supabase client's
+  // `.range(from, to)` semantics used for offset pagination throughout
+  // this codebase (see e.g. administrators.repository.js#listPrincipals,
+  // permission.repository.js#list). Previously a no-op — safe to make
+  // this real: no existing repository test (grep-verified at the time
+  // of this change) asserted offset-skipping behavior against this
+  // mock, so nothing relied on the old no-op. `.limit(n)` remains a
+  // separate, independent slice for callers that use it instead of
+  // `.range()` (real Supabase does not allow combining both in one
+  // query either).
+  range(from, to) {
+    this._rangeFrom = from;
+    this._rangeTo = to;
     return this;
   }
 
@@ -250,15 +263,23 @@ class FakeQueryBuilder {
       });
     }
 
-    if (this._limitN != null) {
+    // `count` must reflect the full filtered/sorted result set (matching
+    // Supabase's `{ count: 'exact' }` semantics — the total available,
+    // not the size of the returned page), so it's captured before either
+    // `.range()` or `.limit()` narrows `matched` to the current page.
+    const totalCount = matched.length;
+
+    if (this._rangeFrom != null) {
+      matched = matched.slice(this._rangeFrom, (this._rangeTo ?? matched.length - 1) + 1);
+    } else if (this._limitN != null) {
       matched = matched.slice(0, this._limitN);
     }
 
     if (this._single) {
-      return { data: matched[0] ?? null, error: null, count: matched.length };
+      return { data: matched[0] ?? null, error: null, count: totalCount };
     }
 
-    return { data: matched, error: null, count: matched.length };
+    return { data: matched, error: null, count: totalCount };
   }
 
   then(resolve, reject) {
