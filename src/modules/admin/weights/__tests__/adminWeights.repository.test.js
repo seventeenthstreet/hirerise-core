@@ -29,6 +29,7 @@ function makeQueryBuilder() {
   const state = {
     filters: {},
     isFilters: {},
+    notFilters: {},
     order: null,
     insertPayload: undefined,
     updatePayload: undefined,
@@ -45,10 +46,17 @@ function makeQueryBuilder() {
       state.filters[field] = value;
       return builder;
     }),
-    // .is(field, null) — used by findById() (none) and approve()'s
-    // conditional eligibility guard (approved_at/deprecated_at IS NULL).
+    // .is(field, null) — used by findById() (none), approve()'s and
+    // deprecate()'s conditional eligibility guards (approved_at/
+    // deprecated_at IS NULL).
     is: jest.fn((field, value) => {
       state.isFilters[field] = value;
+      return builder;
+    }),
+    // .not(field, 'is', null) — used by deprecate()'s conditional
+    // eligibility guard (approved_at IS NOT NULL).
+    not: jest.fn((field, operator, value) => {
+      state.notFilters[field] = { operator, value };
       return builder;
     }),
     insert: jest.fn((payload) => {
@@ -91,6 +99,7 @@ function makeQueryBuilder() {
         lastQuery = {
           filters: { ...state.filters },
           isFilters: { ...state.isFilters },
+          notFilters: { ...state.notFilters },
           updatePayload: state.updatePayload,
         };
         if (mockUpdateError) {
@@ -554,6 +563,77 @@ describe('AdminWeightsRepository — WP-ADMIN-COMP-08-R23', () => {
       mockUpdateError = { message: 'connection refused', details: 'pg_connect failed' };
 
       await expect(repo.approve('v-1', 'admin-1')).rejects.toMatchObject({
+        name: 'AppError',
+        statusCode: 500,
+        code: 'INTERNAL_ERROR',
+      });
+    });
+  });
+
+  describe('deprecate() — WP-ADMIN-COMP-08-R26', () => {
+    it('updates signal_weight_versions (not a different table)', async () => {
+      mockUpdateResult = versionRow({ id: 'v-1', deprecated_at: '2026-08-16T00:00:00.000Z' });
+      await repo.deprecate('v-1');
+      expect(mockSupabase.from).toHaveBeenCalledWith('signal_weight_versions');
+    });
+
+    it('sets deprecated_at as an application-supplied ISO timestamp', async () => {
+      mockUpdateResult = versionRow({ id: 'v-1', deprecated_at: '2026-08-16T00:00:00.000Z' });
+      await repo.deprecate('v-1');
+
+      expect(typeof lastUpdatePayload.deprecated_at).toBe('string');
+      expect(new Date(lastUpdatePayload.deprecated_at).toString()).not.toBe('Invalid Date');
+    });
+
+    it('never sets approved_by, approved_at, or any other column', async () => {
+      mockUpdateResult = versionRow({ id: 'v-1', deprecated_at: '2026-08-16T00:00:00.000Z' });
+      await repo.deprecate('v-1');
+
+      expect(Object.keys(lastUpdatePayload)).toEqual(['deprecated_at']);
+    });
+
+    it('filters by id', async () => {
+      mockUpdateResult = versionRow({ id: 'v-1', deprecated_at: '2026-08-16T00:00:00.000Z' });
+      await repo.deprecate('v-1');
+      expect(lastQuery.filters).toEqual({ id: 'v-1' });
+    });
+
+    it('applies the conditional eligibility guard: approved_at IS NOT NULL AND deprecated_at IS NULL', async () => {
+      mockUpdateResult = versionRow({ id: 'v-1', deprecated_at: '2026-08-16T00:00:00.000Z' });
+      await repo.deprecate('v-1');
+
+      expect(lastQuery.notFilters).toEqual({ approved_at: { operator: 'is', value: null } });
+      expect(lastQuery.isFilters).toEqual({ deprecated_at: null });
+    });
+
+    it('returns the mapped, deprecated row on success', async () => {
+      mockUpdateResult = versionRow({
+        id: 'v-1',
+        approved_by: 'admin-1',
+        approved_at: '2026-06-01T00:00:00.000Z',
+        deprecated_at: '2026-08-16T00:00:00.000Z',
+      });
+
+      const result = await repo.deprecate('v-1');
+
+      expect(result).toMatchObject({
+        id: 'v-1',
+        deprecatedAt: '2026-08-16T00:00:00.000Z',
+        isDeprecated: true,
+      });
+      expect(result.weights).toBeUndefined();
+    });
+
+    it('returns null (not an error) when the conditional UPDATE matches zero rows — id missing, still a draft, or already deprecated', async () => {
+      mockUpdateResult = null;
+      const result = await repo.deprecate('v-1');
+      expect(result).toBeNull();
+    });
+
+    it('wraps a Supabase error in AppError with ErrorCodes.INTERNAL_ERROR, never leaking the raw error', async () => {
+      mockUpdateError = { message: 'connection refused', details: 'pg_connect failed' };
+
+      await expect(repo.deprecate('v-1')).rejects.toMatchObject({
         name: 'AppError',
         statusCode: 500,
         code: 'INTERNAL_ERROR',

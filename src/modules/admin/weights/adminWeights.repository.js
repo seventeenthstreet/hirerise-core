@@ -4,7 +4,17 @@
  * adminWeights.repository.js — Signal Weight / Model Version Registry
  *
  * WP-ADMIN-COMP-08-R23 (read-only foundation) + R24 (draft creation) +
- * R25 (approval)
+ * R25 (approval) + R26 (deprecation)
+ *
+ * R26 adds exactly one write path — deprecate() — closing the one
+ * confirmed-missing lifecycle capability identified by the R26 discovery
+ * report (WP-ADMIN-COMP-08-R26 — Deprecation Pre-Implementation
+ * Discovery & Contract Validation). It mirrors approve()'s
+ * conditional-atomic-update pattern exactly (see that method's doc
+ * comment for the shared rationale). deprecate() never touches
+ * `fn_get_active_model_version()` — a deprecated row simply stops
+ * qualifying on that RPC's very next call, purely because the RPC
+ * itself filters on `deprecated_at IS NULL`.
  *
  * Reads from, and — as of R24 — inserts draft rows into, and — as of R25
  * — transitions a draft to approved in, the existing, certified
@@ -295,6 +305,59 @@ class AdminWeightsRepository {
       .maybeSingle();
 
     if (error) throw this._handleError(error, 'approve');
+
+    return this._toCamel(data);
+  }
+
+  /**
+   * Deprecate an eligible (approved, not-yet-deprecated) version.
+   *
+   * WP-ADMIN-COMP-08-R26. The only write this method performs is
+   * setting `deprecated_at` on a row that, at the moment the UPDATE
+   * actually executes, is still approved and not already deprecated —
+   * enforced by the `.not('approved_at', 'is', null).is('deprecated_at',
+   * null)` conditional filter below, not merely by a prior read. This
+   * mirrors approve()'s own conditional-atomic-update guard exactly (see
+   * that method's doc comment) and is what prevents a second, concurrent
+   * deprecation from double-deprecating a row between the service
+   * layer's `findById()` eligibility check and this mutation.
+   *
+   * The `approved_at IS NOT NULL` condition is included at the SQL
+   * level, in addition to the service layer's own draft-vs-approved
+   * check, for the same defense-in-depth reason approve() checks both
+   * `approved_at IS NULL` and `deprecated_at IS NULL` rather than relying
+   * on the service layer alone (R26 discovery report, §I).
+   *
+   * Does not set a `deprecated_by` column — none exists on this table
+   * (confirmed against the migration's CREATE TABLE and both
+   * redefinitions of `fn_signal_weight_version_protect()`); the actor is
+   * recorded only in the admin audit log, exactly as the R26 discovery
+   * report's actor-identity analysis (§C) concludes. Does not change
+   * `approved_by`, `approved_at`, `effective_from`, `version_tag`, or
+   * `weights`, does not create a new version, and does not touch
+   * `fn_get_active_model_version()` or explicitly activate any other
+   * row — any resulting change in which row that RPC resolves as active
+   * is a pure, automatic consequence of its own existing WHERE clause,
+   * not something this method computes or triggers.
+   *
+   * @param {string} id
+   * @returns {Promise<object|null>} the deprecated version, or null if
+   *   no row both has this id AND is still eligible (approved, not
+   *   already deprecated) at UPDATE time
+   */
+  async deprecate(id) {
+    const { data, error } = await supabase
+      .from(TABLE)
+      .update({
+        deprecated_at: new Date().toISOString(),
+      })
+      .eq('id', id)
+      .not('approved_at', 'is', null)
+      .is('deprecated_at', null)
+      .select(LIST_COLUMNS)
+      .maybeSingle();
+
+    if (error) throw this._handleError(error, 'deprecate');
 
     return this._toCamel(data);
   }

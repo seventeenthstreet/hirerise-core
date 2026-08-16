@@ -36,6 +36,7 @@ jest.mock('../adminWeights.service', () => ({
   getActiveVersion: jest.fn(),
   createVersion: jest.fn(),
   approveVersion: jest.fn(),
+  deprecateVersion: jest.fn(),
 }));
 
 const weightsService = require('../adminWeights.service');
@@ -374,6 +375,99 @@ describe('adminWeights.routes — WP-ADMIN-COMP-08-R23 + R24', () => {
     });
   });
 
+  describe('POST /admin/weights/:id/deprecate — WP-ADMIN-COMP-08-R26', () => {
+    const versionId = '11111111-1111-4111-8111-111111111111';
+
+    it('200s with the deprecated version for an eligible approved version', async () => {
+      const deprecated = versionRow({
+        id: versionId,
+        deprecatedAt: '2026-08-16T00:00:00.000Z',
+        isDeprecated: true,
+      });
+      weightsService.deprecateVersion.mockResolvedValue(deprecated);
+
+      const res = await request(app).post(`/api/v1/admin/weights/${versionId}/deprecate`).send();
+
+      expect(res.status).toBe(200);
+      expect(res.body).toEqual({ success: true, data: deprecated });
+      expect(weightsService.deprecateVersion).toHaveBeenCalledWith(versionId, 'admin-1');
+    });
+
+    it('takes the version id only from the path, and the actor only from req.user.id — ignores any body fields', async () => {
+      weightsService.deprecateVersion.mockResolvedValue(versionRow({ id: versionId }));
+
+      await request(app)
+        .post(`/api/v1/admin/weights/${versionId}/deprecate`)
+        .send({
+          id: 'different-id',
+          deprecatedAt: '2020-01-01T00:00:00.000Z',
+        });
+
+      expect(weightsService.deprecateVersion).toHaveBeenCalledWith(versionId, 'admin-1');
+    });
+
+    it('does not require any request body lifecycle fields', async () => {
+      weightsService.deprecateVersion.mockResolvedValue(versionRow({ id: versionId }));
+
+      const res = await request(app).post(`/api/v1/admin/weights/${versionId}/deprecate`);
+
+      expect(res.status).toBe(200);
+      expect(weightsService.deprecateVersion).toHaveBeenCalledWith(versionId, 'admin-1');
+    });
+
+    it('400s on a non-UUID id and never calls the service', async () => {
+      const res = await request(app).post('/api/v1/admin/weights/not-a-uuid/deprecate').send();
+
+      expect(res.status).toBe(400);
+      expect(weightsService.deprecateVersion).not.toHaveBeenCalled();
+    });
+
+    it('404s with NOT_FOUND when the service reports the version does not exist', async () => {
+      const { AppError, ErrorCodes } = require('../../../../middleware/errorHandler');
+      weightsService.deprecateVersion.mockRejectedValue(
+        new AppError('Model version not found', 404, { id: versionId }, ErrorCodes.NOT_FOUND)
+      );
+
+      const res = await request(app).post(`/api/v1/admin/weights/${versionId}/deprecate`).send();
+
+      expect(res.status).toBe(404);
+      expect(res.body.error.code).toBe('NOT_FOUND');
+    });
+
+    it('409s with CONFLICT when the service reports a draft (never-approved) version', async () => {
+      const { AppError, ErrorCodes } = require('../../../../middleware/errorHandler');
+      weightsService.deprecateVersion.mockRejectedValue(
+        new AppError('This model version has never been approved and cannot be deprecated.', 409, {}, ErrorCodes.CONFLICT)
+      );
+
+      const res = await request(app).post(`/api/v1/admin/weights/${versionId}/deprecate`).send();
+
+      expect(res.status).toBe(409);
+      expect(res.body.error.code).toBe('CONFLICT');
+    });
+
+    it('409s with CONFLICT when the service reports an already-deprecated version', async () => {
+      const { AppError, ErrorCodes } = require('../../../../middleware/errorHandler');
+      weightsService.deprecateVersion.mockRejectedValue(
+        new AppError('This model version has already been deprecated.', 409, {}, ErrorCodes.CONFLICT)
+      );
+
+      const res = await request(app).post(`/api/v1/admin/weights/${versionId}/deprecate`).send();
+
+      expect(res.status).toBe(409);
+      expect(res.body.error.code).toBe('CONFLICT');
+    });
+
+    it('surfaces a service failure as a 500 through the error handler, not a raw throw', async () => {
+      weightsService.deprecateVersion.mockRejectedValue(new Error('boom'));
+
+      const res = await request(app).post(`/api/v1/admin/weights/${versionId}/deprecate`).send();
+
+      expect(res.status).toBe(500);
+      expect(res.body.success).toBe(false);
+    });
+  });
+
   describe('regression boundary — R24/R25-updated write-surface scope', () => {
     it('registers no write verb other than POST on /admin/weights', async () => {
       const app2 = buildApp();
@@ -411,10 +505,22 @@ describe('adminWeights.routes — WP-ADMIN-COMP-08-R23 + R24', () => {
       ]);
     });
 
-    it('the service mock exposes exactly the four expected operations (no unexpected extra service calls introduced by R25)', () => {
+    it('registers no PUT/PATCH/DELETE on /admin/weights/:id/deprecate, and no bare :id route at all', async () => {
+      const app2 = buildApp();
+      const versionId = '11111111-1111-4111-8111-111111111111';
+
+      const putRes = await request(app2).put(`/api/v1/admin/weights/${versionId}/deprecate`).send({});
+      const patchRes = await request(app2).patch(`/api/v1/admin/weights/${versionId}/deprecate`).send({});
+      const deleteRes = await request(app2).delete(`/api/v1/admin/weights/${versionId}/deprecate`);
+
+      expect([putRes.status, patchRes.status, deleteRes.status]).toEqual([404, 404, 404]);
+    });
+
+    it('the service mock exposes exactly the five expected operations (no unexpected extra service calls introduced by R26)', () => {
       expect(Object.keys(weightsService).sort()).toEqual([
         'approveVersion',
         'createVersion',
+        'deprecateVersion',
         'getActiveVersion',
         'listVersions',
       ]);

@@ -8,6 +8,16 @@
  * Backend Foundation.
  * WP-ADMIN-COMP-08-R24 — Draft (unapproved) Version Creation.
  * WP-ADMIN-COMP-08-R25 — Version Approval (Draft → Approved).
+ * WP-ADMIN-COMP-08-R26 — Version Deprecation (Approved → Deprecated).
+ * Added per the R26 discovery report's finding that deprecation was the
+ * one confirmed-missing lifecycle write (no explicit activation
+ * endpoint was added — see that report's Executive Summary:
+ * fn_get_active_model_version() already performs activation as a pure
+ * function of approved_at/deprecated_at/effective_from, so no
+ * activation mutation is needed). No single-active governance redesign
+ * is included either — the discovery report documents that as a
+ * separate, out-of-scope finding, not something R26 is required to fix
+ * (see that report §G).
  *
  * Follows WP-ADMIN-COMP-08-R22 (verdict C — Dormant infrastructure): the
  * `public.signal_weight_versions` governance registry and its resolution
@@ -18,11 +28,11 @@
  * capability on top of that: creating a new draft row. Nothing else.
  *
  * ── SCOPE BOUNDARY (R24, updated for R25) ─────────────────────────────────
- * This module implements two GET endpoints (R23) and two POST endpoints
- * (R24 create, R25 approve) and nothing else. It deliberately does NOT
- * implement: edit version, delete version, activate version, deactivate
- * version, deprecate version, restore version, bulk mutation, or
- * automatic runtime adoption of an active version. There is no explicit
+ * This module implements two GET endpoints (R23) and three POST
+ * endpoints (R24 create, R25 approve, R26 deprecate). It deliberately
+ * does NOT implement: edit version, delete version, activate version,
+ * restore version, bulk mutation, or automatic runtime adoption of an
+ * active version. There is no explicit
  * activation operation — R25's approval only sets `approved_by`/
  * `approved_at`; whether an approved version is ever resolvable as active
  * remains entirely governed by the pre-existing, untouched
@@ -74,14 +84,15 @@
  * identity is accepted from the request body or query string — it is
  * always taken from `req.user` (set by `authenticate`).
  *
- * ┌────────────────────────────────────────────────────────────────────────┐
- * │ Method │ Path                        │ Description                     │
- * ├────────────────────────────────────────────────────────────────────────┤
- * │ GET    │ /admin/weights              │ List registry versions          │
- * │ GET    │ /admin/weights/active       │ Resolve the active version      │
- * │ POST   │ /admin/weights              │ Create a draft (unapproved)     │
- * │ POST   │ /admin/weights/:id/approve  │ Approve an eligible draft (R25) │
- * └────────────────────────────────────────────────────────────────────────┘
+ * ┌──────────────────────────────────────────────────────────────────────────┐
+ * │ Method │ Path                          │ Description                     │
+ * ├──────────────────────────────────────────────────────────────────────────┤
+ * │ GET    │ /admin/weights                │ List registry versions          │
+ * │ GET    │ /admin/weights/active         │ Resolve the active version      │
+ * │ POST   │ /admin/weights                │ Create a draft (unapproved)     │
+ * │ POST   │ /admin/weights/:id/approve    │ Approve an eligible draft (R25) │
+ * │ POST   │ /admin/weights/:id/deprecate  │ Deprecate an approved row (R26) │
+ * └──────────────────────────────────────────────────────────────────────────┘
  *
  * Filtering (R23 §4): both GET routes accept the same two optional query
  * params — `intelligenceDomain` and `modelType` — validated against the
@@ -218,6 +229,14 @@ const approveValidators = [
   param('id').isUUID().withMessage('id must be a valid UUID'),
 ];
 
+// R26: deprecation body — identical shape/rationale to approveValidators.
+// The version id comes only from the path; no request-body field is
+// read by the deprecation handler at all (see
+// adminWeights.controller.js's deprecateVersion()).
+const deprecateValidators = [
+  param('id').isUUID().withMessage('id must be a valid UUID'),
+];
+
 // ── GET /admin/weights ───────────────────────────────────────────────────
 router.get('/', validate(filterValidators), ctrl.listVersions);
 
@@ -229,5 +248,8 @@ router.post('/', validate(createValidators), ctrl.createVersion);
 
 // ── POST /admin/weights/:id/approve — WP-ADMIN-COMP-08-R25 ──────────────
 router.post('/:id/approve', validate(approveValidators), ctrl.approveVersion);
+
+// ── POST /admin/weights/:id/deprecate — WP-ADMIN-COMP-08-R26 ────────────
+router.post('/:id/deprecate', validate(deprecateValidators), ctrl.deprecateVersion);
 
 module.exports = router;

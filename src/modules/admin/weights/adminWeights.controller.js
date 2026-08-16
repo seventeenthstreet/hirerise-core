@@ -24,6 +24,12 @@
  * comes only from req.user.id (set by the authenticate middleware) — no
  * lifecycle field is ever read from req.body here.
  *
+ * deprecateVersion() (R26) follows the identical envelope/identity
+ * pattern as approveVersion() — 200 + { success, data }, id from
+ * req.params.id only, actor from req.user.id only (used solely for the
+ * audit log — see service doc comment; no lifecycle field is read from
+ * req.body, matching approveVersion()).
+ *
  * @module modules/admin/weights/adminWeights.controller
  */
 
@@ -141,4 +147,32 @@ const approveVersion = asyncHandler(async (req, res) => {
   });
 });
 
-module.exports = { listVersions, getActiveVersion, createVersion, approveVersion };
+// ── POST /api/v1/admin/weights/:id/deprecate ─────────────────────────────
+
+const deprecateVersion = asyncHandler(async (req, res) => {
+  const { id } = req.params;
+  const adminId = req.user?.id;
+
+  const deprecated = await weightsService.deprecateVersion(id, adminId);
+
+  logger.info('[AdminWeights] Deprecated model version', {
+    adminId: adminId || null,
+    versionId: deprecated.id,
+    intelligenceDomain: deprecated.intelligenceDomain,
+    modelType: deprecated.modelType,
+    versionTag: deprecated.versionTag,
+  });
+
+  return res.status(200).json({
+    success: true,
+    data: deprecated,
+  });
+});
+
+module.exports = {
+  listVersions,
+  getActiveVersion,
+  createVersion,
+  approveVersion,
+  deprecateVersion,
+};

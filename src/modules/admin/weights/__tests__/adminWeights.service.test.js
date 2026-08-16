@@ -16,6 +16,7 @@ jest.mock('../adminWeights.repository', () => ({
   create: jest.fn(),
   findById: jest.fn(),
   approve: jest.fn(),
+  deprecate: jest.fn(),
 }));
 
 jest.mock('../../../../utils/adminAuditLogger', () => ({
@@ -352,6 +353,157 @@ describe('adminWeights.service — WP-ADMIN-COMP-08-R23', () => {
       const dbError = new Error('boom');
       weightsRepo.approve.mockRejectedValue(dbError);
       await expect(service.approveVersion('v-draft', 'admin-1')).rejects.toBe(dbError);
+    });
+  });
+
+  describe('deprecateVersion() — WP-ADMIN-COMP-08-R26', () => {
+    function approvedRow(overrides = {}) {
+      return versionRow({
+        id: 'v-approved',
+        approvedBy: 'admin-0',
+        approvedAt: '2026-06-01T00:00:00.000Z',
+        deprecatedAt: null,
+        isApproved: true,
+        isDeprecated: false,
+        ...overrides,
+      });
+    }
+
+    it('deprecates an eligible approved version and returns the deprecated version', async () => {
+      weightsRepo.findById.mockResolvedValue(approvedRow());
+      const deprecated = versionRow({
+        id: 'v-approved',
+        deprecatedAt: '2026-08-16T00:00:00.000Z',
+        isDeprecated: true,
+      });
+      weightsRepo.deprecate.mockResolvedValue(deprecated);
+
+      const result = await service.deprecateVersion('v-approved', 'admin-1');
+
+      expect(weightsRepo.findById).toHaveBeenCalledWith('v-approved');
+      expect(weightsRepo.deprecate).toHaveBeenCalledWith('v-approved');
+      expect(result).toBe(deprecated);
+    });
+
+    it('throws a 404 AppError with ErrorCodes.NOT_FOUND when the version does not exist, without calling deprecate()', async () => {
+      weightsRepo.findById.mockResolvedValue(null);
+
+      await expect(service.deprecateVersion('missing', 'admin-1')).rejects.toMatchObject({
+        name: 'AppError',
+        statusCode: 404,
+        code: 'NOT_FOUND',
+      });
+      expect(weightsRepo.deprecate).not.toHaveBeenCalled();
+    });
+
+    it('throws a 409 AppError with ErrorCodes.CONFLICT when the version is still a draft (never approved), without calling deprecate()', async () => {
+      weightsRepo.findById.mockResolvedValue(
+        versionRow({
+          id: 'v-draft',
+          approvedBy: null,
+          approvedAt: null,
+          deprecatedAt: null,
+          isApproved: false,
+          isDeprecated: false,
+        })
+      );
+
+      await expect(service.deprecateVersion('v-draft', 'admin-1')).rejects.toMatchObject({
+        name: 'AppError',
+        statusCode: 409,
+        code: 'CONFLICT',
+      });
+      expect(weightsRepo.deprecate).not.toHaveBeenCalled();
+    });
+
+    it('throws a 409 AppError with ErrorCodes.CONFLICT when already deprecated, without calling deprecate()', async () => {
+      weightsRepo.findById.mockResolvedValue(
+        approvedRow({ deprecatedAt: '2026-07-01T00:00:00.000Z', isDeprecated: true })
+      );
+
+      await expect(service.deprecateVersion('v-approved', 'admin-1')).rejects.toMatchObject({
+        name: 'AppError',
+        statusCode: 409,
+        code: 'CONFLICT',
+      });
+      expect(weightsRepo.deprecate).not.toHaveBeenCalled();
+    });
+
+    it('does not rewrite deprecation history: a repeated deprecation attempt is rejected before touching deprecate()', async () => {
+      weightsRepo.findById.mockResolvedValue(
+        approvedRow({ deprecatedAt: '2026-07-01T00:00:00.000Z', isDeprecated: true })
+      );
+
+      await expect(service.deprecateVersion('v-approved', 'second-admin')).rejects.toMatchObject({
+        statusCode: 409,
+      });
+      expect(weightsRepo.deprecate).not.toHaveBeenCalled();
+    });
+
+    it('allows deprecating a version that currently resolves as active (does not block on that basis)', async () => {
+      weightsRepo.findById.mockResolvedValue(approvedRow());
+      weightsRepo.deprecate.mockResolvedValue(
+        versionRow({ id: 'v-approved', deprecatedAt: '2026-08-16T00:00:00.000Z', isDeprecated: true })
+      );
+
+      await expect(service.deprecateVersion('v-approved', 'admin-1')).resolves.toBeTruthy();
+      expect(weightsRepo.deprecate).toHaveBeenCalledWith('v-approved');
+    });
+
+    it('throws a 409 AppError with ErrorCodes.CONFLICT when eligibility is lost between the read and the atomic update (race)', async () => {
+      weightsRepo.findById.mockResolvedValue(approvedRow());
+      weightsRepo.deprecate.mockResolvedValue(null);
+
+      await expect(service.deprecateVersion('v-approved', 'admin-1')).rejects.toMatchObject({
+        name: 'AppError',
+        statusCode: 409,
+        code: 'CONFLICT',
+      });
+    });
+
+    it('fires a fire-and-forget MODEL_VERSION_DEPRECATED audit log entry on success', async () => {
+      weightsRepo.findById.mockResolvedValue(approvedRow());
+      weightsRepo.deprecate.mockResolvedValue(
+        versionRow({
+          id: 'v-approved',
+          versionTag: 'v2.0.0',
+          modelType: 'signal_weights',
+          intelligenceDomain: 'professional',
+          deprecatedAt: '2026-08-16T00:00:00.000Z',
+          isDeprecated: true,
+        })
+      );
+
+      await service.deprecateVersion('v-approved', 'admin-1');
+
+      expect(logAdminAction).toHaveBeenCalledWith(
+        expect.objectContaining({
+          adminId: 'admin-1',
+          action: 'MODEL_VERSION_DEPRECATED',
+          entityType: 'signal_weight_version',
+          entityId: 'v-approved',
+        })
+      );
+    });
+
+    it('does not fire an audit log entry when deprecation fails', async () => {
+      weightsRepo.findById.mockResolvedValue(null);
+
+      await expect(service.deprecateVersion('missing', 'admin-1')).rejects.toBeTruthy();
+      expect(logAdminAction).not.toHaveBeenCalled();
+    });
+
+    it('propagates an unexpected findById() repository failure unchanged (no swallowing)', async () => {
+      const dbError = new Error('boom');
+      weightsRepo.findById.mockRejectedValue(dbError);
+      await expect(service.deprecateVersion('v-approved', 'admin-1')).rejects.toBe(dbError);
+    });
+
+    it('propagates an unexpected deprecate() repository failure unchanged (no swallowing)', async () => {
+      weightsRepo.findById.mockResolvedValue(approvedRow());
+      const dbError = new Error('boom');
+      weightsRepo.deprecate.mockRejectedValue(dbError);
+      await expect(service.deprecateVersion('v-approved', 'admin-1')).rejects.toBe(dbError);
     });
   });
 });
