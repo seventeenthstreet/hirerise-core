@@ -5105,10 +5105,12 @@ app.use(`${API_PREFIX}/system`,  authenticate, requireAdmin, requireElevatedSess
 app.use(`${API_PREFIX}/metrics`, authenticate, requireAdmin, requireElevatedSession, xaiMetricsRoutes);
 app.use(`${API_PREFIX}/admin/jobs`,              authenticate, requireAdmin, requireElevatedSession, require('./modules/admin/jobs/adminJobs.routes'));
 app.use(`${API_PREFIX}/admin/adaptive-weights`,  authenticate, requireAdmin, requireElevatedSession, require('./modules/adaptiveWeight/adaptiveWeight.routes'));
-// WP-ADMIN-COMP-08-R23 — read-only signal weight / model version governance
-// registry admin surface. Separate system from /admin/adaptive-weights
-// above (different table, different keyspace, no version/approval/
-// deprecation lifecycle) — see adminWeights.routes.js module docstring.
+// WP-ADMIN-COMP-08-R23 (read-only) + R24 (draft version creation) — signal
+// weight / model version governance registry admin surface. Separate
+// system from /admin/adaptive-weights above (different table, different
+// keyspace) — see adminWeights.routes.js module docstring. R24 adds
+// POST / for draft creation only; approval/activation/deprecation remain
+// unimplemented.
 app.use(`${API_PREFIX}/admin/weights`,           authenticate, requireAdmin, requireElevatedSession, require('./modules/admin/weights/adminWeights.routes'));
 
 // Career Readiness — gated behind feature flag (marked DEAD-02).

@@ -2,23 +2,34 @@
 
 /**
  * adminWeights.service.js — Signal Weight / Model Version Registry
- * (read-only business logic)
  *
- * WP-ADMIN-COMP-08-R23
+ * WP-ADMIN-COMP-08-R23 (read-only foundation) + R24 (draft creation)
  *
  * Thin orchestration layer over adminWeights.repository.js. Contains
- * exactly two operations, both read-only:
- *   - listVersions()  — registry listing (Capability A)
+ * three operations:
+ *   - listVersions()   — registry listing (Capability A, read-only)
  *   - getActiveVersion() — authoritative active-version resolution
- *     (Capability B)
+ *     (Capability B, read-only)
+ *   - createVersion()  — draft (unapproved) version creation (R24)
  *
- * No write, approval, activation, deactivation, or deprecation operation
- * exists in this file or anywhere in this module (see adminWeights.routes.js
- * module docstring for the full R23 scope boundary).
+ * No approval, activation, or deprecation operation exists in this file
+ * or anywhere in this module. createVersion() can only ever produce a
+ * draft — see its doc comment and adminWeights.repository.js's create().
  */
 
 const weightsRepo = require('./adminWeights.repository');
 const { AppError, ErrorCodes } = require('../../../middleware/errorHandler');
+
+// Required to create a draft version. `domainOverrides`, `weightRationale`,
+// and `effectiveFrom` are optional (DB supplies defaults — see
+// repository.create()).
+const REQUIRED_CREATE_FIELDS = [
+  'versionTag',
+  'modelType',
+  'intelligenceDomain',
+  'description',
+  'weights',
+];
 
 /**
  * @param {object} [opts]
@@ -68,4 +79,68 @@ async function getActiveVersion({ intelligenceDomain, modelType } = {}) {
   return active;
 }
 
-module.exports = { listVersions, getActiveVersion };
+/**
+ * Creates a new draft (unapproved) model version.
+ *
+ * WP-ADMIN-COMP-08-R24. Validates that the required fields are present,
+ * then strips `approvedBy`/`approvedAt`/`deprecatedAt` from whatever the
+ * caller supplied before forwarding to the repository — defense in depth
+ * alongside the route-level `.not().exists()` guards in
+ * adminWeights.routes.js, since the repository itself also independently
+ * forces those three fields to `null` regardless of input (see
+ * adminWeights.repository.js `create()`).
+ *
+ * Does not approve, activate, or deprecate the created row. Does not
+ * call or affect `fn_get_active_model_version()`.
+ *
+ * @param {object} payload — see REQUIRED_CREATE_FIELDS plus the optional
+ *   `domainOverrides`, `weightRationale`, `effectiveFrom` fields.
+ * @returns {Promise<object>} the created draft version
+ * @throws {AppError} 400 VALIDATION_ERROR when a required field is missing
+ * @throws {AppError} 409 CONFLICT when the (intelligenceDomain, modelType,
+ *   versionTag) combination already exists (surfaced by the repository
+ *   from the DB's uq_model_version_per_domain_type constraint)
+ */
+async function createVersion(payload = {}) {
+  const missing = REQUIRED_CREATE_FIELDS.filter(
+    (field) => payload[field] === undefined || payload[field] === null || payload[field] === ''
+  );
+
+  if (missing.length > 0) {
+    throw new AppError(
+      `Missing required field(s): ${missing.join(', ')}`,
+      400,
+      { fields: missing },
+      ErrorCodes.VALIDATION_ERROR
+    );
+  }
+
+  const {
+    versionTag,
+    modelType,
+    intelligenceDomain,
+    description,
+    weights,
+    domainOverrides,
+    weightRationale,
+    effectiveFrom,
+  } = payload;
+
+  // Draft-only: never forwarded even if present on `payload` (route-level
+  // validation already rejects these, but the service does not trust
+  // that as the sole guard).
+  const created = await weightsRepo.create({
+    versionTag,
+    modelType,
+    intelligenceDomain,
+    description,
+    weights,
+    domainOverrides,
+    weightRationale,
+    effectiveFrom,
+  });
+
+  return created;
+}
+
+module.exports = { listVersions, getActiveVersion, createVersion };

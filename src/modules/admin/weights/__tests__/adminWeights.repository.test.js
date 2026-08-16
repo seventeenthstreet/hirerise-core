@@ -1,26 +1,29 @@
 'use strict';
 
 /**
- * adminWeights.repository.test.js — WP-ADMIN-COMP-08-R23
+ * adminWeights.repository.test.js — WP-ADMIN-COMP-08-R23 + R24
  *
  * Exercises AdminWeightsRepository against a local, minimal chainable
  * fake of the Supabase client — scoped to exactly what this repository
  * calls (.from().select().order().eq() for list(), .rpc() for
- * getActiveModelVersion()). Not reused from the studentIntelligence
- * testHelpers supabaseMock (under knowledge-runtime) because that fake is
- * scoped to BaseRepository's camelCase-remapping query shape, which this
- * repository deliberately does not use (see repository module docstring
- * for why).
+ * getActiveModelVersion(), .from().insert().select().single() for R24's
+ * create()). Not reused from the studentIntelligence testHelpers
+ * supabaseMock (under knowledge-runtime) because that fake is scoped to
+ * BaseRepository's camelCase-remapping query shape, which this repository
+ * deliberately does not use (see repository module docstring for why).
  */
 
 let mockRows;
 let mockError;
 let mockRpcResult;
 let mockRpcError;
+let mockInsertResult;
+let mockInsertError;
 let lastQuery;
+let lastInsertPayload;
 
 function makeQueryBuilder() {
-  const state = { filters: {}, order: null };
+  const state = { filters: {}, order: null, insertPayload: undefined };
   const builder = {
     select: jest.fn(() => builder),
     order: jest.fn((field, opts) => {
@@ -31,7 +34,22 @@ function makeQueryBuilder() {
       state.filters[field] = value;
       return builder;
     }),
+    insert: jest.fn((payload) => {
+      state.insertPayload = payload;
+      lastInsertPayload = payload;
+      return builder;
+    }),
+    single: jest.fn(() => builder),
     then: (resolve, reject) => {
+      // ── INSERT branch (R24 create()) ──────────────────────────────
+      if (state.insertPayload !== undefined) {
+        if (mockInsertError) {
+          return Promise.resolve({ data: null, error: mockInsertError }).then(resolve, reject);
+        }
+        return Promise.resolve({ data: mockInsertResult, error: null }).then(resolve, reject);
+      }
+
+      // ── SELECT/list() branch (unchanged from R23) ─────────────────
       lastQuery = { filters: { ...state.filters }, order: state.order };
 
       if (mockError) {
@@ -98,7 +116,10 @@ describe('AdminWeightsRepository — WP-ADMIN-COMP-08-R23', () => {
     mockError = null;
     mockRpcResult = null;
     mockRpcError = null;
+    mockInsertResult = null;
+    mockInsertError = null;
     lastQuery = null;
+    lastInsertPayload = null;
   });
 
   describe('list()', () => {
@@ -206,10 +227,169 @@ describe('AdminWeightsRepository — WP-ADMIN-COMP-08-R23', () => {
       expect(result).toBeNull();
     });
 
+    it('returns null when the RPC resolves a truthy composite object with no valid row id (all-null fields)', async () => {
+      // Reproduces the confirmed runtime response for
+      // GET /admin/weights/active?intelligenceDomain=professional: a
+      // PL/pgSQL `SELECT * INTO result; RETURN result;` composite-typed
+      // function returns a row of all-NULL fields (not a true SQL NULL)
+      // when the SELECT matches zero rows. This must normalize to null
+      // exactly like the true-SQL-NULL case above, not fall through to
+      // _toCamel() and be returned as if it were a resolved version.
+      mockRpcResult = {
+        id: null,
+        version_tag: null,
+        model_type: null,
+        intelligence_domain: null,
+        description: null,
+        approved_by: null,
+        approved_at: null,
+        effective_from: null,
+        deprecated_at: null,
+        created_at: null,
+      };
+
+      const result = await repo.getActiveModelVersion({ intelligenceDomain: 'professional' });
+
+      expect(result).toBeNull();
+      // The RPC must still be the sole resolution path — this is a
+      // result-normalization fix, not a fallback to a direct table query.
+      expect(mockSupabase.rpc).toHaveBeenCalledWith('fn_get_active_model_version', {
+        p_intelligence_domain: 'professional',
+      });
+      expect(mockSupabase.from).not.toHaveBeenCalled();
+    });
+
     it('wraps an RPC error in AppError with ErrorCodes.INTERNAL_ERROR, never leaking the raw error', async () => {
       mockRpcError = { message: 'function does not exist', details: null };
 
       await expect(repo.getActiveModelVersion()).rejects.toMatchObject({
+        name: 'AppError',
+        statusCode: 500,
+        code: 'INTERNAL_ERROR',
+      });
+    });
+  });
+
+  describe('create() — WP-ADMIN-COMP-08-R24', () => {
+    function draftInput(overrides = {}) {
+      return {
+        versionTag: 'v2.0.0',
+        modelType: 'signal_weights',
+        intelligenceDomain: 'professional',
+        description: 'Draft weights for professional domain',
+        weights: { systems_thinker: { weight: 0.8 } },
+        ...overrides,
+      };
+    }
+
+    it('inserts into signal_weight_versions (not a different table)', async () => {
+      mockInsertResult = versionRow({ id: 'v-draft', approved_by: null, approved_at: null });
+      await repo.create(draftInput());
+      expect(mockSupabase.from).toHaveBeenCalledWith('signal_weight_versions');
+    });
+
+    it('forces approved_by, approved_at, and deprecated_at to null regardless of caller input', async () => {
+      mockInsertResult = versionRow({ id: 'v-draft', approved_by: null, approved_at: null });
+
+      await repo.create(
+        draftInput({
+          // Even if a caller somehow reaches this layer with these set,
+          // the repository must not forward them.
+          approvedBy: 'someone',
+          approvedAt: '2026-01-01T00:00:00.000Z',
+          deprecatedAt: '2026-01-01T00:00:00.000Z',
+        })
+      );
+
+      expect(lastInsertPayload).toMatchObject({
+        approved_by: null,
+        approved_at: null,
+        deprecated_at: null,
+      });
+    });
+
+    it('omits optional fields entirely (does not send undefined) when not provided, so DB defaults apply', async () => {
+      mockInsertResult = versionRow({ id: 'v-draft', approved_by: null, approved_at: null });
+      await repo.create(draftInput());
+
+      expect(lastInsertPayload).not.toHaveProperty('domain_overrides');
+      expect(lastInsertPayload).not.toHaveProperty('weight_rationale');
+      expect(lastInsertPayload).not.toHaveProperty('effective_from');
+    });
+
+    it('forwards optional fields when provided', async () => {
+      mockInsertResult = versionRow({ id: 'v-draft', approved_by: null, approved_at: null });
+      await repo.create(
+        draftInput({
+          domainOverrides: { academic: 1.0 },
+          weightRationale: { systems_thinker: 'because' },
+          effectiveFrom: '2026-09-01T00:00:00.000Z',
+        })
+      );
+
+      expect(lastInsertPayload).toMatchObject({
+        domain_overrides: { academic: 1.0 },
+        weight_rationale: { systems_thinker: 'because' },
+        effective_from: '2026-09-01T00:00:00.000Z',
+      });
+    });
+
+    it('maps the required fields from camelCase to snake_case on insert', async () => {
+      mockInsertResult = versionRow({ id: 'v-draft', approved_by: null, approved_at: null });
+      await repo.create(draftInput());
+
+      expect(lastInsertPayload).toMatchObject({
+        version_tag: 'v2.0.0',
+        model_type: 'signal_weights',
+        intelligence_domain: 'professional',
+        description: 'Draft weights for professional domain',
+        weights: { systems_thinker: { weight: 0.8 } },
+      });
+    });
+
+    it('returns the created draft, camelCase-mapped like list()/getActiveModelVersion()', async () => {
+      mockInsertResult = versionRow({
+        id: 'v-draft',
+        version_tag: 'v2.0.0',
+        intelligence_domain: 'professional',
+        approved_by: null,
+        approved_at: null,
+        deprecated_at: null,
+      });
+
+      const result = await repo.create(draftInput());
+
+      expect(result).toMatchObject({
+        id: 'v-draft',
+        versionTag: 'v2.0.0',
+        intelligenceDomain: 'professional',
+        approvedBy: null,
+        approvedAt: null,
+        deprecatedAt: null,
+        isApproved: false,
+        isDeprecated: false,
+      });
+      expect(result.weights).toBeUndefined();
+    });
+
+    it('wraps a Postgres unique-violation (23505) as AppError 409 CONFLICT, not INTERNAL_ERROR', async () => {
+      mockInsertError = {
+        code: '23505',
+        message: 'duplicate key value violates unique constraint "uq_model_version_per_domain_type"',
+        details: 'Key (intelligence_domain, model_type, version_tag)=(professional, signal_weights, v2.0.0) already exists.',
+      };
+
+      await expect(repo.create(draftInput())).rejects.toMatchObject({
+        name: 'AppError',
+        statusCode: 409,
+        code: 'CONFLICT',
+      });
+    });
+
+    it('wraps any other insert error in AppError with ErrorCodes.INTERNAL_ERROR, never leaking the raw error', async () => {
+      mockInsertError = { message: 'connection refused', details: 'pg_connect failed' };
+
+      await expect(repo.create(draftInput())).rejects.toMatchObject({
         name: 'AppError',
         statusCode: 500,
         code: 'INTERNAL_ERROR',

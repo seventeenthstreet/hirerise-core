@@ -1,18 +1,19 @@
 'use strict';
 
 /**
- * adminWeights.service.test.js — WP-ADMIN-COMP-08-R23
+ * adminWeights.service.test.js — WP-ADMIN-COMP-08-R23 + R24
  *
  * Pure orchestration tests: the repository is mocked, so these assert
  * that the service composes it correctly (including the no-active-version
- * 404 contract) rather than re-testing Supabase itself. Mirrors the
- * mocking shape already used by
- * modules/admin/users/__tests__/adminUsers.service.test.js.
+ * 404 contract, and R24's required-field validation for createVersion())
+ * rather than re-testing Supabase itself. Mirrors the mocking shape
+ * already used by modules/admin/users/__tests__/adminUsers.service.test.js.
  */
 
 jest.mock('../adminWeights.repository', () => ({
   list: jest.fn(),
   getActiveModelVersion: jest.fn(),
+  create: jest.fn(),
 }));
 
 const weightsRepo = require('../adminWeights.repository');
@@ -112,6 +113,106 @@ describe('adminWeights.service — WP-ADMIN-COMP-08-R23', () => {
       const dbError = new Error('boom');
       weightsRepo.getActiveModelVersion.mockRejectedValue(dbError);
       await expect(service.getActiveVersion({})).rejects.toBe(dbError);
+    });
+  });
+
+  describe('createVersion() — WP-ADMIN-COMP-08-R24', () => {
+    function draftPayload(overrides = {}) {
+      return {
+        versionTag: 'v2.0.0',
+        modelType: 'signal_weights',
+        intelligenceDomain: 'professional',
+        description: 'Draft weights for professional domain',
+        weights: { systems_thinker: { weight: 0.8 } },
+        ...overrides,
+      };
+    }
+
+    it('forwards a valid payload to the repository and returns the created draft', async () => {
+      const created = versionRow({
+        id: 'v-draft',
+        intelligenceDomain: 'professional',
+        approvedBy: null,
+        approvedAt: null,
+        isApproved: false,
+      });
+      weightsRepo.create.mockResolvedValue(created);
+
+      const result = await service.createVersion(draftPayload());
+
+      expect(weightsRepo.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          versionTag: 'v2.0.0',
+          modelType: 'signal_weights',
+          intelligenceDomain: 'professional',
+          description: 'Draft weights for professional domain',
+          weights: { systems_thinker: { weight: 0.8 } },
+        })
+      );
+      expect(result).toBe(created);
+    });
+
+    it('forwards optional fields (domainOverrides, weightRationale, effectiveFrom) when provided', async () => {
+      weightsRepo.create.mockResolvedValue(versionRow({ id: 'v-draft' }));
+
+      await service.createVersion(
+        draftPayload({
+          domainOverrides: { academic: 1.0 },
+          weightRationale: { systems_thinker: 'because' },
+          effectiveFrom: '2026-09-01T00:00:00.000Z',
+        })
+      );
+
+      expect(weightsRepo.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          domainOverrides: { academic: 1.0 },
+          weightRationale: { systems_thinker: 'because' },
+          effectiveFrom: '2026-09-01T00:00:00.000Z',
+        })
+      );
+    });
+
+    it.each(['versionTag', 'modelType', 'intelligenceDomain', 'description', 'weights'])(
+      'throws a 400 VALIDATION_ERROR when %s is missing, without calling the repository',
+      async (field) => {
+        const payload = draftPayload();
+        delete payload[field];
+
+        await expect(service.createVersion(payload)).rejects.toMatchObject({
+          name: 'AppError',
+          statusCode: 400,
+          code: 'VALIDATION_ERROR',
+        });
+        expect(weightsRepo.create).not.toHaveBeenCalled();
+      }
+    );
+
+    it('never forwards approvedBy/approvedAt/deprecatedAt even if present on the payload', async () => {
+      weightsRepo.create.mockResolvedValue(versionRow({ id: 'v-draft' }));
+
+      await service.createVersion(
+        draftPayload({
+          approvedBy: 'someone',
+          approvedAt: '2026-01-01T00:00:00.000Z',
+          deprecatedAt: '2026-01-01T00:00:00.000Z',
+        })
+      );
+
+      const forwarded = weightsRepo.create.mock.calls[0][0];
+      expect(forwarded.approvedBy).toBeUndefined();
+      expect(forwarded.approvedAt).toBeUndefined();
+      expect(forwarded.deprecatedAt).toBeUndefined();
+    });
+
+    it('propagates a repository failure unchanged (e.g. 409 CONFLICT on duplicate)', async () => {
+      const conflictError = Object.assign(new Error('duplicate'), {
+        name: 'AppError',
+        statusCode: 409,
+        code: 'CONFLICT',
+      });
+      weightsRepo.create.mockRejectedValue(conflictError);
+
+      await expect(service.createVersion(draftPayload())).rejects.toBe(conflictError);
     });
   });
 });
