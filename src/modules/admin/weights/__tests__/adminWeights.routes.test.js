@@ -35,6 +35,7 @@ jest.mock('../adminWeights.service', () => ({
   listVersions: jest.fn(),
   getActiveVersion: jest.fn(),
   createVersion: jest.fn(),
+  approveVersion: jest.fn(),
 }));
 
 const weightsService = require('../adminWeights.service');
@@ -287,7 +288,93 @@ describe('adminWeights.routes — WP-ADMIN-COMP-08-R23 + R24', () => {
     });
   });
 
-  describe('regression boundary — R24-updated write-surface scope', () => {
+  describe('POST /admin/weights/:id/approve — WP-ADMIN-COMP-08-R25', () => {
+    const versionId = '11111111-1111-4111-8111-111111111111';
+
+    it('200s with the approved version for an eligible draft', async () => {
+      const approved = versionRow({
+        id: versionId,
+        approvedBy: 'admin-1',
+        approvedAt: '2026-08-16T00:00:00.000Z',
+        isApproved: true,
+      });
+      weightsService.approveVersion.mockResolvedValue(approved);
+
+      const res = await request(app).post(`/api/v1/admin/weights/${versionId}/approve`).send();
+
+      expect(res.status).toBe(200);
+      expect(res.body).toEqual({ success: true, data: approved });
+      expect(weightsService.approveVersion).toHaveBeenCalledWith(versionId, 'admin-1');
+    });
+
+    it('takes the version id only from the path, and the actor only from req.user.id — ignores any body fields', async () => {
+      weightsService.approveVersion.mockResolvedValue(versionRow({ id: versionId }));
+
+      await request(app)
+        .post(`/api/v1/admin/weights/${versionId}/approve`)
+        .send({
+          id: 'different-id',
+          approvedBy: 'someone-else',
+          approvedAt: '2020-01-01T00:00:00.000Z',
+        });
+
+      expect(weightsService.approveVersion).toHaveBeenCalledWith(versionId, 'admin-1');
+    });
+
+    it('400s on a non-UUID id and never calls the service', async () => {
+      const res = await request(app).post('/api/v1/admin/weights/not-a-uuid/approve').send();
+
+      expect(res.status).toBe(400);
+      expect(weightsService.approveVersion).not.toHaveBeenCalled();
+    });
+
+    it('404s with NOT_FOUND when the service reports the version does not exist', async () => {
+      const { AppError, ErrorCodes } = require('../../../../middleware/errorHandler');
+      weightsService.approveVersion.mockRejectedValue(
+        new AppError('Model version not found', 404, { id: versionId }, ErrorCodes.NOT_FOUND)
+      );
+
+      const res = await request(app).post(`/api/v1/admin/weights/${versionId}/approve`).send();
+
+      expect(res.status).toBe(404);
+      expect(res.body.error.code).toBe('NOT_FOUND');
+    });
+
+    it('409s with CONFLICT when the service reports an already-approved version', async () => {
+      const { AppError, ErrorCodes } = require('../../../../middleware/errorHandler');
+      weightsService.approveVersion.mockRejectedValue(
+        new AppError('This model version has already been approved and cannot be approved again.', 409, {}, ErrorCodes.CONFLICT)
+      );
+
+      const res = await request(app).post(`/api/v1/admin/weights/${versionId}/approve`).send();
+
+      expect(res.status).toBe(409);
+      expect(res.body.error.code).toBe('CONFLICT');
+    });
+
+    it('409s with CONFLICT when the service reports a deprecated version', async () => {
+      const { AppError, ErrorCodes } = require('../../../../middleware/errorHandler');
+      weightsService.approveVersion.mockRejectedValue(
+        new AppError('This model version has been deprecated and can no longer be approved.', 409, {}, ErrorCodes.CONFLICT)
+      );
+
+      const res = await request(app).post(`/api/v1/admin/weights/${versionId}/approve`).send();
+
+      expect(res.status).toBe(409);
+      expect(res.body.error.code).toBe('CONFLICT');
+    });
+
+    it('surfaces a service failure as a 500 through the error handler, not a raw throw', async () => {
+      weightsService.approveVersion.mockRejectedValue(new Error('boom'));
+
+      const res = await request(app).post(`/api/v1/admin/weights/${versionId}/approve`).send();
+
+      expect(res.status).toBe(500);
+      expect(res.body.success).toBe(false);
+    });
+  });
+
+  describe('regression boundary — R24/R25-updated write-surface scope', () => {
     it('registers no write verb other than POST on /admin/weights', async () => {
       const app2 = buildApp();
       const putRes = await request(app2).put('/api/v1/admin/weights').send({});
@@ -302,7 +389,7 @@ describe('adminWeights.routes — WP-ADMIN-COMP-08-R23 + R24', () => {
       expect([putRes.status, patchRes.status, deleteRes.status]).toEqual([404, 404, 404]);
     });
 
-    it('registers no write verb at all on /admin/weights/active (R24 does not touch this route)', async () => {
+    it('registers no write verb at all on /admin/weights/active (R24/R25 do not touch this route)', async () => {
       const app2 = buildApp();
       const postRes = await request(app2).post('/api/v1/admin/weights/active').send({});
       const patchRes = await request(app2).patch('/api/v1/admin/weights/active').send({});
@@ -310,8 +397,23 @@ describe('adminWeights.routes — WP-ADMIN-COMP-08-R23 + R24', () => {
       expect([postRes.status, patchRes.status]).toEqual([404, 404]);
     });
 
-    it('the service mock exposes exactly the three expected operations (no unexpected extra service calls introduced by R24)', () => {
+    it('registers no PUT/PATCH/DELETE on /admin/weights/:id/approve, and no bare :id route at all', async () => {
+      const app2 = buildApp();
+      const versionId = '11111111-1111-4111-8111-111111111111';
+
+      const putRes = await request(app2).put(`/api/v1/admin/weights/${versionId}/approve`).send({});
+      const patchRes = await request(app2).patch(`/api/v1/admin/weights/${versionId}/approve`).send({});
+      const deleteRes = await request(app2).delete(`/api/v1/admin/weights/${versionId}/approve`);
+      const getIdRes = await request(app2).get(`/api/v1/admin/weights/${versionId}`);
+
+      expect([putRes.status, patchRes.status, deleteRes.status, getIdRes.status]).toEqual([
+        404, 404, 404, 404,
+      ]);
+    });
+
+    it('the service mock exposes exactly the four expected operations (no unexpected extra service calls introduced by R25)', () => {
       expect(Object.keys(weightsService).sort()).toEqual([
+        'approveVersion',
         'createVersion',
         'getActiveVersion',
         'listVersions',

@@ -4,7 +4,8 @@
  * adminWeights.controller.js — HTTP handlers for the Signal Weight /
  * Model Version Registry
  *
- * WP-ADMIN-COMP-08-R23 (read-only foundation) + R24 (draft creation)
+ * WP-ADMIN-COMP-08-R23 (read-only foundation) + R24 (draft creation) +
+ * R25 (approval)
  *
  * Response envelope matches the existing HireRise convention (see
  * adminUsers.controller.js / adminCmsSkills.controller.js):
@@ -15,6 +16,13 @@
  * createVersion() follows adminCmsRoles.controller.js's createRole()
  * convention for a creation response: 201 + { success, data, meta }
  * (vs. the 200 used by this module's existing GET handlers).
+ *
+ * approveVersion() (R25) returns 200 + { success, data } — a lifecycle
+ * transition on an existing resource, not a creation, so it follows the
+ * GET handlers' envelope shape rather than createVersion()'s 201+meta
+ * one. The version id comes only from req.params.id; the approving actor
+ * comes only from req.user.id (set by the authenticate middleware) — no
+ * lifecycle field is ever read from req.body here.
  *
  * @module modules/admin/weights/adminWeights.controller
  */
@@ -111,4 +119,26 @@ const createVersion = asyncHandler(async (req, res) => {
   });
 });
 
-module.exports = { listVersions, getActiveVersion, createVersion };
+// ── POST /api/v1/admin/weights/:id/approve ───────────────────────────────
+
+const approveVersion = asyncHandler(async (req, res) => {
+  const { id } = req.params;
+  const adminId = req.user?.id;
+
+  const approved = await weightsService.approveVersion(id, adminId);
+
+  logger.info('[AdminWeights] Approved model version', {
+    adminId: adminId || null,
+    versionId: approved.id,
+    intelligenceDomain: approved.intelligenceDomain,
+    modelType: approved.modelType,
+    versionTag: approved.versionTag,
+  });
+
+  return res.status(200).json({
+    success: true,
+    data: approved,
+  });
+});
+
+module.exports = { listVersions, getActiveVersion, createVersion, approveVersion };

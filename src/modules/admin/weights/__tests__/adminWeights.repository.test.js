@@ -19,11 +19,22 @@ let mockRpcResult;
 let mockRpcError;
 let mockInsertResult;
 let mockInsertError;
+let mockUpdateResult;
+let mockUpdateError;
 let lastQuery;
 let lastInsertPayload;
+let lastUpdatePayload;
 
 function makeQueryBuilder() {
-  const state = { filters: {}, order: null, insertPayload: undefined };
+  const state = {
+    filters: {},
+    isFilters: {},
+    order: null,
+    insertPayload: undefined,
+    updatePayload: undefined,
+    single: false,
+    maybeSingle: false,
+  };
   const builder = {
     select: jest.fn(() => builder),
     order: jest.fn((field, opts) => {
@@ -34,12 +45,38 @@ function makeQueryBuilder() {
       state.filters[field] = value;
       return builder;
     }),
+    // .is(field, null) — used by findById() (none) and approve()'s
+    // conditional eligibility guard (approved_at/deprecated_at IS NULL).
+    is: jest.fn((field, value) => {
+      state.isFilters[field] = value;
+      return builder;
+    }),
     insert: jest.fn((payload) => {
       state.insertPayload = payload;
       lastInsertPayload = payload;
       return builder;
     }),
-    single: jest.fn(() => builder),
+    // .update() — used by approve() (R25). This fake does not simulate
+    // Postgres's own conditional-WHERE row matching in JS (that would
+    // just be re-testing Postgres); it exists so repository tests can
+    // assert the correct filters/payload were sent and that the mapped
+    // return value (including the null-on-ineligible-row case) is
+    // handled correctly.
+    update: jest.fn((payload) => {
+      state.updatePayload = payload;
+      lastUpdatePayload = payload;
+      return builder;
+    }),
+    single: jest.fn(() => {
+      state.single = true;
+      return builder;
+    }),
+    // .maybeSingle() — used by findById() and approve() (R25); unlike
+    // .single(), resolves to `null` (not an error) when zero rows match.
+    maybeSingle: jest.fn(() => {
+      state.maybeSingle = true;
+      return builder;
+    }),
     then: (resolve, reject) => {
       // ── INSERT branch (R24 create()) ──────────────────────────────
       if (state.insertPayload !== undefined) {
@@ -49,7 +86,20 @@ function makeQueryBuilder() {
         return Promise.resolve({ data: mockInsertResult, error: null }).then(resolve, reject);
       }
 
-      // ── SELECT/list() branch (unchanged from R23) ─────────────────
+      // ── UPDATE branch (R25 approve()) ───────────────────────────────
+      if (state.updatePayload !== undefined) {
+        lastQuery = {
+          filters: { ...state.filters },
+          isFilters: { ...state.isFilters },
+          updatePayload: state.updatePayload,
+        };
+        if (mockUpdateError) {
+          return Promise.resolve({ data: null, error: mockUpdateError }).then(resolve, reject);
+        }
+        return Promise.resolve({ data: mockUpdateResult, error: null }).then(resolve, reject);
+      }
+
+      // ── SELECT/list()/findById() branch (unchanged from R23) ───────
       lastQuery = { filters: { ...state.filters }, order: state.order };
 
       if (mockError) {
@@ -66,6 +116,10 @@ function makeQueryBuilder() {
           const dir = opts?.ascending === false ? -1 : 1;
           return a[field] < b[field] ? -1 * dir : a[field] > b[field] ? 1 * dir : 0;
         });
+      }
+
+      if (state.single || state.maybeSingle) {
+        return Promise.resolve({ data: rows[0] ?? null, error: null }).then(resolve, reject);
       }
 
       return Promise.resolve({ data: rows, error: null }).then(resolve, reject);
@@ -118,8 +172,11 @@ describe('AdminWeightsRepository — WP-ADMIN-COMP-08-R23', () => {
     mockRpcError = null;
     mockInsertResult = null;
     mockInsertError = null;
+    mockUpdateResult = null;
+    mockUpdateError = null;
     lastQuery = null;
     lastInsertPayload = null;
+    lastUpdatePayload = null;
   });
 
   describe('list()', () => {
@@ -390,6 +447,113 @@ describe('AdminWeightsRepository — WP-ADMIN-COMP-08-R23', () => {
       mockInsertError = { message: 'connection refused', details: 'pg_connect failed' };
 
       await expect(repo.create(draftInput())).rejects.toMatchObject({
+        name: 'AppError',
+        statusCode: 500,
+        code: 'INTERNAL_ERROR',
+      });
+    });
+  });
+
+  describe('findById() — WP-ADMIN-COMP-08-R25', () => {
+    it('queries signal_weight_versions by id and returns the mapped row', async () => {
+      mockRows = [versionRow({ id: 'v-1', approved_by: null, approved_at: null })];
+
+      const result = await repo.findById('v-1');
+
+      expect(mockSupabase.from).toHaveBeenCalledWith('signal_weight_versions');
+      expect(lastQuery.filters).toEqual({ id: 'v-1' });
+      expect(result).toMatchObject({ id: 'v-1', isApproved: false });
+    });
+
+    it('excludes the weights/domain_overrides/weight_rationale JSONB columns, same as list()', async () => {
+      mockRows = [versionRow({ id: 'v-1' })];
+      const result = await repo.findById('v-1');
+      expect(result.weights).toBeUndefined();
+      expect(result.domainOverrides).toBeUndefined();
+      expect(result.weightRationale).toBeUndefined();
+    });
+
+    it('returns null (not an error) when no row matches the id', async () => {
+      mockRows = [];
+      const result = await repo.findById('does-not-exist');
+      expect(result).toBeNull();
+    });
+
+    it('wraps a Supabase error in AppError with ErrorCodes.INTERNAL_ERROR, never leaking the raw error', async () => {
+      mockError = { message: 'connection refused', details: 'pg_connect failed' };
+
+      await expect(repo.findById('v-1')).rejects.toMatchObject({
+        name: 'AppError',
+        statusCode: 500,
+        code: 'INTERNAL_ERROR',
+      });
+    });
+  });
+
+  describe('approve() — WP-ADMIN-COMP-08-R25', () => {
+    it('updates signal_weight_versions (not a different table)', async () => {
+      mockUpdateResult = versionRow({ id: 'v-1', approved_by: 'admin-1' });
+      await repo.approve('v-1', 'admin-1');
+      expect(mockSupabase.from).toHaveBeenCalledWith('signal_weight_versions');
+    });
+
+    it('sets approved_by from the given actor and approved_at as an application-supplied ISO timestamp', async () => {
+      mockUpdateResult = versionRow({ id: 'v-1', approved_by: 'admin-1' });
+      await repo.approve('v-1', 'admin-1');
+
+      expect(lastUpdatePayload.approved_by).toBe('admin-1');
+      expect(typeof lastUpdatePayload.approved_at).toBe('string');
+      expect(new Date(lastUpdatePayload.approved_at).toString()).not.toBe('Invalid Date');
+    });
+
+    it('never sets deprecated_at or any other column', async () => {
+      mockUpdateResult = versionRow({ id: 'v-1', approved_by: 'admin-1' });
+      await repo.approve('v-1', 'admin-1');
+
+      expect(Object.keys(lastUpdatePayload).sort()).toEqual(['approved_at', 'approved_by']);
+    });
+
+    it('filters by id', async () => {
+      mockUpdateResult = versionRow({ id: 'v-1', approved_by: 'admin-1' });
+      await repo.approve('v-1', 'admin-1');
+      expect(lastQuery.filters).toEqual({ id: 'v-1' });
+    });
+
+    it('applies the conditional eligibility guard: approved_at IS NULL AND deprecated_at IS NULL', async () => {
+      mockUpdateResult = versionRow({ id: 'v-1', approved_by: 'admin-1' });
+      await repo.approve('v-1', 'admin-1');
+      expect(lastQuery.isFilters).toEqual({ approved_at: null, deprecated_at: null });
+    });
+
+    it('returns the mapped, approved row on success', async () => {
+      mockUpdateResult = versionRow({
+        id: 'v-1',
+        approved_by: 'admin-1',
+        approved_at: '2026-08-16T00:00:00.000Z',
+        deprecated_at: null,
+      });
+
+      const result = await repo.approve('v-1', 'admin-1');
+
+      expect(result).toMatchObject({
+        id: 'v-1',
+        approvedBy: 'admin-1',
+        approvedAt: '2026-08-16T00:00:00.000Z',
+        isApproved: true,
+      });
+      expect(result.weights).toBeUndefined();
+    });
+
+    it('returns null (not an error) when the conditional UPDATE matches zero rows — id missing or row no longer an eligible draft', async () => {
+      mockUpdateResult = null;
+      const result = await repo.approve('v-1', 'admin-1');
+      expect(result).toBeNull();
+    });
+
+    it('wraps a Supabase error in AppError with ErrorCodes.INTERNAL_ERROR, never leaking the raw error', async () => {
+      mockUpdateError = { message: 'connection refused', details: 'pg_connect failed' };
+
+      await expect(repo.approve('v-1', 'admin-1')).rejects.toMatchObject({
         name: 'AppError',
         statusCode: 500,
         code: 'INTERNAL_ERROR',

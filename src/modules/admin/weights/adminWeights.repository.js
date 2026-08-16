@@ -3,20 +3,27 @@
 /**
  * adminWeights.repository.js — Signal Weight / Model Version Registry
  *
- * WP-ADMIN-COMP-08-R23 (read-only foundation) + R24 (draft creation)
+ * WP-ADMIN-COMP-08-R23 (read-only foundation) + R24 (draft creation) +
+ * R25 (approval)
  *
- * Reads from, and — as of R24 — inserts draft rows into, the existing,
- * certified `public.signal_weight_versions` registry
+ * Reads from, and — as of R24 — inserts draft rows into, and — as of R25
+ * — transitions a draft to approved in, the existing, certified
+ * `public.signal_weight_versions` registry
  * (supabase/migrations/20260601000001_governance_foundation_
  * RECONSTRUCTED.sql, extended by .../20260601000004_governance_
  * refinements.sql and .../20260601000005_migration_1a_04_weight_versions_
  * amendment.sql) and calls the existing, authoritative
  * `public.fn_get_active_model_version(p_intelligence_domain, p_model_type)`
  * RPC for active-version resolution. No new table, column, migration, or
- * RPC is introduced by R24. `create()` is the only write this repository
- * performs, and it can only ever produce a draft row — `approved_by`,
- * `approved_at`, and `deprecated_at` are never accepted from the caller
- * and are always forced to `null` on insert (see `create()` doc comment).
+ * RPC is introduced by R24 or R25. `create()` can only ever produce a
+ * draft row — `approved_by`, `approved_at`, and `deprecated_at` are
+ * never accepted from the caller and are always forced to `null` on
+ * insert (see `create()` doc comment). `approve()` (R25) is the only
+ * write path that can ever set `approved_by`/`approved_at`, and only on
+ * a row that is still an eligible draft at the moment its conditional
+ * UPDATE executes (see `approve()` doc comment). Neither write path — nor
+ * anything else in this repository — sets `deprecated_at` or touches
+ * `fn_get_active_model_version()`.
  *
 
  * Pattern note: this mirrors modules/admin/cms/roles/adminCmsRoles.repository.js
@@ -209,6 +216,85 @@ class AdminWeightsRepository {
       .single();
 
     if (error) throw this._handleError(error, 'create');
+
+    return this._toCamel(data);
+  }
+
+  /**
+   * Fetch a single registry version by id.
+   *
+   * WP-ADMIN-COMP-08-R25. Read-only — used by the service layer to
+   * distinguish "not found" from "found but ineligible" before the
+   * approval mutation is attempted. Mapped identically to list() (same
+   * LIST_COLUMNS — the R23 §10 JSONB-exclusion policy applies here too).
+   *
+   * @param {string} id
+   * @returns {Promise<object|null>} the version, or null if no row has
+   *   this id
+   */
+  async findById(id) {
+    const { data, error } = await supabase
+      .from(TABLE)
+      .select(LIST_COLUMNS)
+      .eq('id', id)
+      .maybeSingle();
+
+    if (error) throw this._handleError(error, 'findById');
+
+    return this._toCamel(data);
+  }
+
+  /**
+   * Approve an eligible draft version.
+   *
+   * WP-ADMIN-COMP-08-R25. The only write this method performs is setting
+   * `approved_by`/`approved_at` on a row that, at the moment the UPDATE
+   * actually executes, is still an eligible draft — enforced by the
+   * `.is('approved_at', null).is('deprecated_at', null)` conditional
+   * filter below, not merely by a prior read. This is the final
+   * atomic-safety guard called out by the R25 contract: it is what
+   * prevents a second, concurrent approval from double-approving (or
+   * approving a since-deprecated) row between the service layer's
+   * `findById()` eligibility check and this mutation. A caller should
+   * always read the row first (via `findById()`) to distinguish 404
+   * (row doesn't exist) from 409 (row exists but is ineligible) — this
+   * method alone cannot tell those two cases apart, since both make the
+   * conditional UPDATE match zero rows.
+   *
+   * `approved_at` is supplied by the application (`new Date()`), not by
+   * a database default or trigger — the schema's `approved_at` column
+   * has no default other than NULL, and the existing immutability
+   * trigger (`fn_signal_weight_version_protect()`) only *protects*
+   * `version_tag`/`model_type`/`weights`/`effective_from`/`created_at`
+   * once `approved_at` is set; it does not itself set `approved_at`.
+   *
+   * Does not introduce activation, `is_active`, or any change to
+   * `fn_get_active_model_version()` — a newly approved row simply
+   * becomes eligible for that existing function's own resolution logic.
+   *
+   * @param {string} id
+   * @param {string} approvedBy — the authenticated admin actor id
+   *   (`req.user.id`); always taken from server-side identity, never
+   *   from the request body (enforced by the caller, not re-validated
+   *   here)
+   * @returns {Promise<object|null>} the approved version, or null if no
+   *   row both has this id AND is still an eligible (non-approved,
+   *   non-deprecated) draft at UPDATE time
+   */
+  async approve(id, approvedBy) {
+    const { data, error } = await supabase
+      .from(TABLE)
+      .update({
+        approved_by: approvedBy,
+        approved_at: new Date().toISOString(),
+      })
+      .eq('id', id)
+      .is('approved_at', null)
+      .is('deprecated_at', null)
+      .select(LIST_COLUMNS)
+      .maybeSingle();
+
+    if (error) throw this._handleError(error, 'approve');
 
     return this._toCamel(data);
   }

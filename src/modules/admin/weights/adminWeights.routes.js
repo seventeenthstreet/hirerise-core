@@ -7,6 +7,7 @@
  * WP-ADMIN-COMP-08-R23 — Signal Weight / Model Version Read-Only Admin
  * Backend Foundation.
  * WP-ADMIN-COMP-08-R24 — Draft (unapproved) Version Creation.
+ * WP-ADMIN-COMP-08-R25 — Version Approval (Draft → Approved).
  *
  * Follows WP-ADMIN-COMP-08-R22 (verdict C — Dormant infrastructure): the
  * `public.signal_weight_versions` governance registry and its resolution
@@ -16,16 +17,21 @@
  * registry as a READ-ONLY admin surface. R24 adds exactly one write
  * capability on top of that: creating a new draft row. Nothing else.
  *
- * ── R24 SCOPE BOUNDARY ───────────────────────────────────────────────────
- * This module implements two GET endpoints (R23) and one POST endpoint
- * (R24) and nothing else. It deliberately does NOT implement: edit
- * version, delete version, approve version, activate version, deactivate
+ * ── SCOPE BOUNDARY (R24, updated for R25) ─────────────────────────────────
+ * This module implements two GET endpoints (R23) and two POST endpoints
+ * (R24 create, R25 approve) and nothing else. It deliberately does NOT
+ * implement: edit version, delete version, activate version, deactivate
  * version, deprecate version, restore version, bulk mutation, or
- * automatic runtime adoption of an active version. A version created here
- * can never resolve as active — `fn_get_active_model_version()` hard-
- * requires `approved_at IS NOT NULL`, and this module never sets that
- * column (see adminWeights.repository.js `create()`). It also does NOT
- * modify, mount, or integrate with:
+ * automatic runtime adoption of an active version. There is no explicit
+ * activation operation — R25's approval only sets `approved_by`/
+ * `approved_at`; whether an approved version is ever resolvable as active
+ * remains entirely governed by the pre-existing, untouched
+ * `fn_get_active_model_version()` (its `effective_from <= now()` check in
+ * particular). A version created but never approved here can never
+ * resolve as active — `fn_get_active_model_version()` hard-requires
+ * `approved_at IS NOT NULL` (see adminWeights.repository.js `create()`
+ * and, for the approval path, `approve()`). It also does NOT modify,
+ * mount, or integrate with:
  *   - src/modules/adaptiveWeight/*        (separate live system — a
  *     different registry, different keyspace, no version/approval/
  *     deprecation lifecycle; see R22 §3/§7)
@@ -68,13 +74,14 @@
  * identity is accepted from the request body or query string — it is
  * always taken from `req.user` (set by `authenticate`).
  *
- * ┌──────────────────────────────────────────────────────────────────────┐
- * │ Method │ Path                   │ Description                        │
- * ├──────────────────────────────────────────────────────────────────────┤
- * │ GET    │ /admin/weights         │ List registry versions              │
- * │ GET    │ /admin/weights/active  │ Resolve the currently active version│
- * │ POST   │ /admin/weights         │ Create a draft (unapproved) version │
- * └──────────────────────────────────────────────────────────────────────┘
+ * ┌────────────────────────────────────────────────────────────────────────┐
+ * │ Method │ Path                        │ Description                     │
+ * ├────────────────────────────────────────────────────────────────────────┤
+ * │ GET    │ /admin/weights              │ List registry versions          │
+ * │ GET    │ /admin/weights/active       │ Resolve the active version      │
+ * │ POST   │ /admin/weights              │ Create a draft (unapproved)     │
+ * │ POST   │ /admin/weights/:id/approve  │ Approve an eligible draft (R25) │
+ * └────────────────────────────────────────────────────────────────────────┘
  *
  * Filtering (R23 §4): both GET routes accept the same two optional query
  * params — `intelligenceDomain` and `modelType` — validated against the
@@ -99,7 +106,7 @@
  */
 
 const express = require('express');
-const { query, body } = require('express-validator');
+const { query, body, param } = require('express-validator');
 const { validate } = require('../../../middleware/requestValidator');
 const ctrl = require('./adminWeights.controller');
 
@@ -202,6 +209,15 @@ const createValidators = [
   body('id').not().exists(),
 ];
 
+// R25: approval body — the version id comes only from the path
+// (req.params.id, validated below) and the approving actor only from
+// req.user.id; no request-body field is read by the approval handler at
+// all (see adminWeights.controller.js's approveVersion()), so there is
+// nothing to validate on the body here.
+const approveValidators = [
+  param('id').isUUID().withMessage('id must be a valid UUID'),
+];
+
 // ── GET /admin/weights ───────────────────────────────────────────────────
 router.get('/', validate(filterValidators), ctrl.listVersions);
 
@@ -210,5 +226,8 @@ router.get('/active', validate(filterValidators), ctrl.getActiveVersion);
 
 // ── POST /admin/weights ──────────────────────────────────────────────────
 router.post('/', validate(createValidators), ctrl.createVersion);
+
+// ── POST /admin/weights/:id/approve — WP-ADMIN-COMP-08-R25 ──────────────
+router.post('/:id/approve', validate(approveValidators), ctrl.approveVersion);
 
 module.exports = router;

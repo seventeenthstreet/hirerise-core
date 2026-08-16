@@ -14,9 +14,16 @@ jest.mock('../adminWeights.repository', () => ({
   list: jest.fn(),
   getActiveModelVersion: jest.fn(),
   create: jest.fn(),
+  findById: jest.fn(),
+  approve: jest.fn(),
+}));
+
+jest.mock('../../../../utils/adminAuditLogger', () => ({
+  logAdminAction: jest.fn().mockResolvedValue(undefined),
 }));
 
 const weightsRepo = require('../adminWeights.repository');
+const { logAdminAction } = require('../../../../utils/adminAuditLogger');
 const service = require('../adminWeights.service');
 
 function versionRow(overrides = {}) {
@@ -213,6 +220,138 @@ describe('adminWeights.service — WP-ADMIN-COMP-08-R23', () => {
       weightsRepo.create.mockRejectedValue(conflictError);
 
       await expect(service.createVersion(draftPayload())).rejects.toBe(conflictError);
+    });
+  });
+
+  describe('approveVersion() — WP-ADMIN-COMP-08-R25', () => {
+    function draftRow(overrides = {}) {
+      return versionRow({
+        id: 'v-draft',
+        approvedBy: null,
+        approvedAt: null,
+        deprecatedAt: null,
+        isApproved: false,
+        isDeprecated: false,
+        ...overrides,
+      });
+    }
+
+    it('approves an eligible draft and returns the approved version', async () => {
+      weightsRepo.findById.mockResolvedValue(draftRow());
+      const approved = versionRow({ id: 'v-draft', approvedBy: 'admin-1', isApproved: true });
+      weightsRepo.approve.mockResolvedValue(approved);
+
+      const result = await service.approveVersion('v-draft', 'admin-1');
+
+      expect(weightsRepo.findById).toHaveBeenCalledWith('v-draft');
+      expect(weightsRepo.approve).toHaveBeenCalledWith('v-draft', 'admin-1');
+      expect(result).toBe(approved);
+    });
+
+    it('forwards only req.user.id-sourced adminId as the approving actor', async () => {
+      weightsRepo.findById.mockResolvedValue(draftRow());
+      weightsRepo.approve.mockResolvedValue(versionRow({ id: 'v-draft' }));
+
+      await service.approveVersion('v-draft', 'admin-42');
+
+      expect(weightsRepo.approve).toHaveBeenCalledWith('v-draft', 'admin-42');
+    });
+
+    it('throws a 404 AppError with ErrorCodes.NOT_FOUND when the version does not exist, without calling approve()', async () => {
+      weightsRepo.findById.mockResolvedValue(null);
+
+      await expect(service.approveVersion('missing', 'admin-1')).rejects.toMatchObject({
+        name: 'AppError',
+        statusCode: 404,
+        code: 'NOT_FOUND',
+      });
+      expect(weightsRepo.approve).not.toHaveBeenCalled();
+    });
+
+    it('throws a 409 AppError with ErrorCodes.CONFLICT when already approved, without calling approve()', async () => {
+      weightsRepo.findById.mockResolvedValue(
+        draftRow({ approvedAt: '2026-06-01T00:00:00.000Z', approvedBy: 'admin-0', isApproved: true })
+      );
+
+      await expect(service.approveVersion('v-draft', 'admin-1')).rejects.toMatchObject({
+        name: 'AppError',
+        statusCode: 409,
+        code: 'CONFLICT',
+      });
+      expect(weightsRepo.approve).not.toHaveBeenCalled();
+    });
+
+    it('throws a 409 AppError with ErrorCodes.CONFLICT when deprecated, without calling approve()', async () => {
+      weightsRepo.findById.mockResolvedValue(
+        draftRow({ deprecatedAt: '2026-07-01T00:00:00.000Z', isDeprecated: true })
+      );
+
+      await expect(service.approveVersion('v-draft', 'admin-1')).rejects.toMatchObject({
+        name: 'AppError',
+        statusCode: 409,
+        code: 'CONFLICT',
+      });
+      expect(weightsRepo.approve).not.toHaveBeenCalled();
+    });
+
+    it('does not rewrite approval history: a repeated approval attempt is rejected before touching approve()', async () => {
+      weightsRepo.findById.mockResolvedValue(
+        draftRow({ approvedAt: '2026-06-01T00:00:00.000Z', approvedBy: 'first-admin', isApproved: true })
+      );
+
+      await expect(service.approveVersion('v-draft', 'second-admin')).rejects.toMatchObject({
+        statusCode: 409,
+      });
+      expect(weightsRepo.approve).not.toHaveBeenCalled();
+    });
+
+    it('throws a 409 AppError with ErrorCodes.CONFLICT when eligibility is lost between the read and the atomic update (race)', async () => {
+      weightsRepo.findById.mockResolvedValue(draftRow());
+      weightsRepo.approve.mockResolvedValue(null);
+
+      await expect(service.approveVersion('v-draft', 'admin-1')).rejects.toMatchObject({
+        name: 'AppError',
+        statusCode: 409,
+        code: 'CONFLICT',
+      });
+    });
+
+    it('fires a fire-and-forget MODEL_VERSION_APPROVED audit log entry on success', async () => {
+      weightsRepo.findById.mockResolvedValue(draftRow());
+      weightsRepo.approve.mockResolvedValue(
+        versionRow({ id: 'v-draft', versionTag: 'v2.0.0', modelType: 'signal_weights', intelligenceDomain: 'professional' })
+      );
+
+      await service.approveVersion('v-draft', 'admin-1');
+
+      expect(logAdminAction).toHaveBeenCalledWith(
+        expect.objectContaining({
+          adminId: 'admin-1',
+          action: 'MODEL_VERSION_APPROVED',
+          entityType: 'signal_weight_version',
+          entityId: 'v-draft',
+        })
+      );
+    });
+
+    it('does not fire an audit log entry when approval fails', async () => {
+      weightsRepo.findById.mockResolvedValue(null);
+
+      await expect(service.approveVersion('missing', 'admin-1')).rejects.toBeTruthy();
+      expect(logAdminAction).not.toHaveBeenCalled();
+    });
+
+    it('propagates an unexpected findById() repository failure unchanged (no swallowing)', async () => {
+      const dbError = new Error('boom');
+      weightsRepo.findById.mockRejectedValue(dbError);
+      await expect(service.approveVersion('v-draft', 'admin-1')).rejects.toBe(dbError);
+    });
+
+    it('propagates an unexpected approve() repository failure unchanged (no swallowing)', async () => {
+      weightsRepo.findById.mockResolvedValue(draftRow());
+      const dbError = new Error('boom');
+      weightsRepo.approve.mockRejectedValue(dbError);
+      await expect(service.approveVersion('v-draft', 'admin-1')).rejects.toBe(dbError);
     });
   });
 });

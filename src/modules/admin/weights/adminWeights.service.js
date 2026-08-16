@@ -3,22 +3,28 @@
 /**
  * adminWeights.service.js — Signal Weight / Model Version Registry
  *
- * WP-ADMIN-COMP-08-R23 (read-only foundation) + R24 (draft creation)
+ * WP-ADMIN-COMP-08-R23 (read-only foundation) + R24 (draft creation) +
+ * R25 (approval)
  *
  * Thin orchestration layer over adminWeights.repository.js. Contains
- * three operations:
+ * four operations:
  *   - listVersions()   — registry listing (Capability A, read-only)
  *   - getActiveVersion() — authoritative active-version resolution
  *     (Capability B, read-only)
  *   - createVersion()  — draft (unapproved) version creation (R24)
+ *   - approveVersion() — governed Draft → Approved transition (R25)
  *
- * No approval, activation, or deprecation operation exists in this file
- * or anywhere in this module. createVersion() can only ever produce a
- * draft — see its doc comment and adminWeights.repository.js's create().
+ * No activation or deprecation operation exists in this file or anywhere
+ * in this module. createVersion() can only ever produce a draft — see
+ * its doc comment and adminWeights.repository.js's create(). approveVersion()
+ * implements exactly the Draft → Approved transition and nothing further
+ * — it never touches `fn_get_active_model_version()` or any
+ * active-version resolution logic (see its doc comment).
  */
 
 const weightsRepo = require('./adminWeights.repository');
 const { AppError, ErrorCodes } = require('../../../middleware/errorHandler');
+const { logAdminAction } = require('../../../utils/adminAuditLogger');
 
 // Required to create a draft version. `domainOverrides`, `weightRationale`,
 // and `effectiveFrom` are optional (DB supplies defaults — see
@@ -143,4 +149,104 @@ async function createVersion(payload = {}) {
   return created;
 }
 
-module.exports = { listVersions, getActiveVersion, createVersion };
+/**
+ * Approves an existing, eligible draft model version.
+ *
+ * WP-ADMIN-COMP-08-R25. This is a governed lifecycle transition
+ * (Draft → Approved) only — it does not activate the version.
+ * `fn_get_active_model_version()` (untouched by R25) remains the sole
+ * authority for whether an approved version is currently eligible as
+ * active; that depends on `effective_from`, which this operation never
+ * sets or changes.
+ *
+ * Lifecycle contract, in order:
+ *   1. `id` does not resolve to any row           → 404 NOT_FOUND
+ *   2. row exists but is already approved         → 409 CONFLICT
+ *   3. row exists but is deprecated                → 409 CONFLICT
+ *   4. row exists, is an eligible draft            → approve it
+ *
+ * Approval is not idempotent: a second approval attempt on an already-
+ * approved row is rejected (409), and never re-writes `approvedBy`/
+ * `approvedAt` — approval is a governance event, not an upsert.
+ *
+ * The `findById()` read above only decides which error to throw for an
+ * already-ineligible row; it is not the mechanism that prevents a
+ * concurrent double-approval. That protection is `weightsRepo.approve()`'s
+ * own conditional UPDATE (`approved_at IS NULL AND deprecated_at IS
+ * NULL`), which is re-checked here: if eligibility was lost between the
+ * read and the mutation (a race with another concurrent approval/
+ * deprecation), `approve()` resolves `null` even though the row was
+ * found and eligible a moment ago, and that is likewise surfaced as 409
+ * CONFLICT rather than silently succeeding or being misreported as 404.
+ *
+ * @param {string} id
+ * @param {string} adminId — `req.user.id` of the authenticated actor;
+ *   this is the only source of the approval actor identity (never taken
+ *   from the request body)
+ * @returns {Promise<object>} the approved version
+ * @throws {AppError} 404 NOT_FOUND when no version has this id
+ * @throws {AppError} 409 CONFLICT when the version is already approved,
+ *   is deprecated, or lost eligibility to a concurrent request
+ */
+async function approveVersion(id, adminId) {
+  const existing = await weightsRepo.findById(id);
+
+  if (!existing) {
+    throw new AppError(
+      'Model version not found',
+      404,
+      { id },
+      ErrorCodes.NOT_FOUND
+    );
+  }
+
+  if (existing.approvedAt) {
+    throw new AppError(
+      'This model version has already been approved and cannot be approved again.',
+      409,
+      { id, approvedAt: existing.approvedAt, approvedBy: existing.approvedBy },
+      ErrorCodes.CONFLICT
+    );
+  }
+
+  if (existing.deprecatedAt) {
+    throw new AppError(
+      'This model version has been deprecated and can no longer be approved.',
+      409,
+      { id, deprecatedAt: existing.deprecatedAt },
+      ErrorCodes.CONFLICT
+    );
+  }
+
+  const approved = await weightsRepo.approve(id, adminId);
+
+  if (!approved) {
+    // Eligibility was lost between the read above and the repository's
+    // own conditional UPDATE (concurrent approval/deprecation) — that
+    // atomic guard, not this read, is the actual source of truth.
+    throw new AppError(
+      'This model version was approved or deprecated by another request. Refresh and try again.',
+      409,
+      { id },
+      ErrorCodes.CONFLICT
+    );
+  }
+
+  // Fire-and-forget — logAdminAction() never throws, so a logging
+  // failure can never fail the request that already succeeded.
+  void logAdminAction({
+    adminId,
+    action: 'MODEL_VERSION_APPROVED',
+    entityType: 'signal_weight_version',
+    entityId: id,
+    metadata: {
+      versionTag: approved.versionTag,
+      modelType: approved.modelType,
+      intelligenceDomain: approved.intelligenceDomain,
+    },
+  });
+
+  return approved;
+}
+
+module.exports = { listVersions, getActiveVersion, createVersion, approveVersion };
