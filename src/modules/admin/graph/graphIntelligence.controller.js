@@ -334,11 +334,11 @@ const searchRoles = asyncHandler(async (req, res) => {
   try {
     let query = supabase
       .from('roles')
-      .select('role_id, role_name, name')
+      .select('role_id, role_name')
       .limit(limitInt);
 
     if (q) {
-      query = query.or(`role_name.ilike.%${q}%,name.ilike.%${q}%`);
+      query = query.ilike('role_name', `%${q}%`);
     }
 
     const { data = [], error } = await query;
