@@ -34,6 +34,13 @@ const ACTIONS = Object.freeze({
   // one-time deployment bootstrap" from an ordinary ADMIN_GRANTED event
   // performed by another Administrator.
   BOOTSTRAPPED: 'ADMIN_BOOTSTRAPPED',
+  // WP-ADMIN-IMP-07 — additive only, mirrors BOOTSTRAPPED above. Recorded
+  // when admin_principals authority was established successfully but the
+  // derived Auth app_metadata projection (adminAuthSync.js) failed, so the
+  // audit trail can show DB-authority-established and
+  // Auth-authority-synchronized as two independently verifiable facts
+  // rather than conflating a sync failure with a verification failure.
+  AUTH_SYNC_FAILED: 'ADMIN_AUTH_SYNC_FAILED',
 });
 
 /**

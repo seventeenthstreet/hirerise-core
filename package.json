@@ -26,8 +26,6 @@
   "dependencies": {
     "@anthropic-ai/sdk": "^0.78.0",
     "@extractus/article-extractor": "^8.0.20",
-    "otplib": "^12.0.1",
-    "qrcode": "^1.5.4",
     "@google/generative-ai": "^0.24.1",
     "@supabase/supabase-js": "^2.99.2",
     "axios": "^1.15.0",
@@ -48,18 +46,20 @@
     "natural": "^8.1.1",
     "node-cache": "^5.1.2",
     "openai": "^6.33.0",
+    "otplib": "^12.0.1",
     "pdf-lib": "^1.17.1",
     "pdf-parse": "^1.1.4",
     "pdf2json": "^4.0.3",
     "pdfjs-dist": "^5.6.205",
+    "qrcode": "^1.5.4",
+    "rate-limit-redis": "^4.2.0",
     "redis": "^4.7.0",
     "stopword": "^2.0.8",
     "stripe": "^20.4.0",
     "unpdf": "^1.6.0",
     "winston": "^3.11.0",
     "ws": "^8.18.0",
-    "zod": "^3.25.76",
-    "rate-limit-redis": "^4.2.0"
+    "zod": "^3.25.76"
   },
   "devDependencies": {
     "@babel/generator": "^7.29.1",

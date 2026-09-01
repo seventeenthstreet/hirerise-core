@@ -14,19 +14,19 @@
 // MOCKS
 // ─────────────────────────────────────────────────────────────
 
-jest.mock('../../../config/supabase', () => ({
+jest.mock('../../../../config/supabase', () => ({
   supabase: {
     rpc: jest.fn(),
   },
 }));
 
-jest.mock('../../../utils/logger', () => ({
+jest.mock('../../../../utils/logger', () => ({
   info:  jest.fn(),
   warn:  jest.fn(),
   error: jest.fn(),
 }));
 
-const { supabase } = require('../../../config/supabase');
+const { supabase } = require('../../../../config/supabase');
 const { getSignalLineage } = require('../adminSignalLineage.controller');
 
 // ─────────────────────────────────────────────────────────────
@@ -78,6 +78,29 @@ function makeRpcRow(overrides = {}) {
   };
 }
 
+/**
+ * getSignalLineage is wrapped by asyncHandler (src/utils/helpers.js), which
+ * does NOT return the promise chain it kicks off — it fires
+ * `Promise.resolve().then(() => fn(req, res, next)).catch(next)` and returns
+ * `undefined` synchronously. That means:
+ *   - `await getSignalLineage(req, res)` does not actually wait for the
+ *     controller's internal async work (the RPC call, the res.json() call)
+ *     to finish — it only awaits `undefined`, which resolves after a single
+ *     microtask tick, while the real work may still be pending further
+ *     microtask hops later (or a macrotask, given the mocked RPC promise).
+ *   - Rejections inside the controller never surface as a rejected promise
+ *     to the caller; they are forwarded to `next(err)` instead.
+ *
+ * flushAsyncHandler() waits a macrotask tick (setImmediate), which runs only
+ * after every currently-queued microtask (including nested ones inside the
+ * wrapped controller) has drained — giving the internal Promise chain time
+ * to fully settle before assertions run, without changing anything about
+ * asyncHandler itself.
+ */
+function flushAsyncHandler() {
+  return new Promise((resolve) => setImmediate(resolve));
+}
+
 // ─────────────────────────────────────────────────────────────
 // TESTS
 // ─────────────────────────────────────────────────────────────
@@ -95,8 +118,12 @@ describe('getSignalLineage — valid request', () => {
 
     const req = makeReq('skills.data_analysis.advanced');
     const res = makeRes();
+    const next = jest.fn();
 
-    await getSignalLineage(req, res);
+    getSignalLineage(req, res, next);
+    await flushAsyncHandler();
+
+    expect(next).not.toHaveBeenCalled();
 
     expect(supabase.rpc).toHaveBeenCalledWith(
       'fn_get_signal_lineage_summary',
@@ -137,7 +164,12 @@ describe('getSignalLineage — valid request', () => {
     supabase.rpc.mockResolvedValueOnce({ data: [makeRpcRow()], error: null });
 
     const res = makeRes();
-    await getSignalLineage(makeReq(), res);
+    const next = jest.fn();
+
+    getSignalLineage(makeReq(), res, next);
+    await flushAsyncHandler();
+
+    expect(next).not.toHaveBeenCalled();
 
     const [call] = res.json.mock.calls;
     const lineageItem = call[0].data.lineage[0];
@@ -151,7 +183,12 @@ describe('getSignalLineage — valid request', () => {
     });
 
     const res = makeRes();
-    await getSignalLineage(makeReq(), res);
+    const next = jest.fn();
+
+    getSignalLineage(makeReq(), res, next);
+    await flushAsyncHandler();
+
+    expect(next).not.toHaveBeenCalled();
 
     const lineageItem = res.json.mock.calls[0][0].data.lineage[0];
     expect(lineageItem.proposedBy).toBeNull();
@@ -169,7 +206,12 @@ describe('getSignalLineage — valid request', () => {
     supabase.rpc.mockResolvedValueOnce({ data: [nullableRow], error: null });
 
     const res = makeRes();
-    await getSignalLineage(makeReq(), res);
+    const next = jest.fn();
+
+    getSignalLineage(makeReq(), res, next);
+    await flushAsyncHandler();
+
+    expect(next).not.toHaveBeenCalled();
 
     const row = res.json.mock.calls[0][0].data.lineage[0];
     expect(row.successorSignalKey).toBeNull();
@@ -183,7 +225,12 @@ describe('getSignalLineage — valid request', () => {
   it('includes duration_ms in meta', async () => {
     supabase.rpc.mockResolvedValueOnce({ data: [], error: null });
     const res = makeRes();
-    await getSignalLineage(makeReq(), res);
+    const next = jest.fn();
+
+    getSignalLineage(makeReq(), res, next);
+    await flushAsyncHandler();
+
+    expect(next).not.toHaveBeenCalled();
 
     const meta = res.json.mock.calls[0][0].meta;
     expect(typeof meta.duration_ms).toBe('number');
@@ -198,7 +245,12 @@ describe('getSignalLineage — empty result', () => {
     supabase.rpc.mockResolvedValueOnce({ data: [], error: null });
 
     const res = makeRes();
-    await getSignalLineage(makeReq('skills.unknown.key'), res);
+    const next = jest.fn();
+
+    getSignalLineage(makeReq('skills.unknown.key'), res, next);
+    await flushAsyncHandler();
+
+    expect(next).not.toHaveBeenCalled();
 
     expect(res.json).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -216,7 +268,12 @@ describe('getSignalLineage — empty result', () => {
     supabase.rpc.mockResolvedValueOnce({ data: null, error: null });
 
     const res = makeRes();
-    await getSignalLineage(makeReq('skills.unknown.key'), res);
+    const next = jest.fn();
+
+    getSignalLineage(makeReq('skills.unknown.key'), res, next);
+    await flushAsyncHandler();
+
+    expect(next).not.toHaveBeenCalled();
 
     const payload = res.json.mock.calls[0][0];
     expect(payload.success).toBe(true);
@@ -238,8 +295,16 @@ describe('getSignalLineage — RPC failure', () => {
     const res = makeRes();
     const next = jest.fn();
 
-    // asyncHandler forwards thrown errors to next()
-    await expect(getSignalLineage(req, res, next)).rejects.toMatchObject({
+    // asyncHandler forwards thrown errors to next() — it does not reject
+    // the promise returned to the caller (it doesn't return that promise
+    // at all). Assert on what next() was called with, matching the
+    // production contract.
+    getSignalLineage(req, res, next);
+    await flushAsyncHandler();
+
+    expect(res.json).not.toHaveBeenCalled();
+    expect(next).toHaveBeenCalledTimes(1);
+    expect(next.mock.calls[0][0]).toMatchObject({
       statusCode: 500,
     });
   });
@@ -251,12 +316,13 @@ describe('getSignalLineage — RPC failure', () => {
       error: { message: rawSupabaseMsg },
     });
 
-    let thrownError;
-    try {
-      await getSignalLineage(makeReq(), makeRes());
-    } catch (err) {
-      thrownError = err;
-    }
+    const next = jest.fn();
+
+    getSignalLineage(makeReq(), makeRes(), next);
+    await flushAsyncHandler();
+
+    expect(next).toHaveBeenCalledTimes(1);
+    const thrownError = next.mock.calls[0][0];
 
     // The AppError message presented externally should not leak the Supabase detail
     expect(thrownError).toBeDefined();
@@ -270,8 +336,13 @@ describe('getSignalLineage — secondary validation guard', () => {
   it('throws 400 / VALIDATION_ERROR when signal_key is empty string after trim', async () => {
     const req = makeReq('   ');  // whitespace only — would be caught by route validator in prod
     const res = makeRes();
+    const next = jest.fn();
 
-    await expect(getSignalLineage(req, res)).rejects.toMatchObject({
+    getSignalLineage(req, res, next);
+    await flushAsyncHandler();
+
+    expect(next).toHaveBeenCalledTimes(1);
+    expect(next.mock.calls[0][0]).toMatchObject({
       statusCode: 400,
     });
 

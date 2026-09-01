@@ -43,6 +43,7 @@ function makeReq(overrides = {}) {
 
 describe('permissionAssignment.controller', () => {
   let assignmentService;
+  let enrichAssignmentsWithIdentity;
   let controller;
   let next;
 
@@ -54,7 +55,15 @@ describe('permissionAssignment.controller', () => {
       listAssignments: jest.fn(),
       getAssignments: jest.fn(),
     };
-    controller = createPermissionAssignmentController(assignmentService);
+    // Blocker 3A — identity enrichment is injected and mocked here as an
+    // identity passthrough (each assignment gains a `principal` built
+    // from its own principalId) so pre-existing assertions on the rest
+    // of the assignment shape stay stable; enrichment's own behavior is
+    // covered by identity/__tests__/assignmentIdentity.test.js.
+    enrichAssignmentsWithIdentity = jest.fn((assignments) =>
+      Promise.resolve(assignments.map((a) => ({ ...a, principal: { id: a.principalId, email: null, displayName: null } })))
+    );
+    controller = createPermissionAssignmentController(assignmentService, enrichAssignmentsWithIdentity);
     next = jest.fn();
     logAdminAction.mockReset();
     logAdminAction.mockResolvedValue();
@@ -242,7 +251,7 @@ describe('permissionAssignment.controller', () => {
   });
 
   describe('listAssignments', () => {
-    it('returns 200 with all Assignments for a Permission', async () => {
+    it('returns 200 with all Assignments for a Permission, each enriched with its principal', async () => {
       assignmentService.listAssignments.mockResolvedValue([{ principalId: 'u1' }, { principalId: 'u2' }]);
       const req = makeReq({ query: { resource: 'job_listing', action: 'view' } });
       const res = makeRes();
@@ -250,15 +259,21 @@ describe('permissionAssignment.controller', () => {
       await controller.listAssignments(req, res, next);
 
       expect(assignmentService.listAssignments).toHaveBeenCalledWith({ resource: 'job_listing', action: 'view' });
+      expect(enrichAssignmentsWithIdentity).toHaveBeenCalledWith([{ principalId: 'u1' }, { principalId: 'u2' }]);
       expect(res.json).toHaveBeenCalledWith({
         success: true,
-        data: { assignments: [{ principalId: 'u1' }, { principalId: 'u2' }] },
+        data: {
+          assignments: [
+            { principalId: 'u1', principal: { id: 'u1', email: null, displayName: null } },
+            { principalId: 'u2', principal: { id: 'u2', email: null, displayName: null } },
+          ],
+        },
       });
     });
   });
 
   describe('getAssignmentsForPrincipal', () => {
-    it('returns 200 with all Assignments held by a Principal', async () => {
+    it('returns 200 with all Assignments held by a Principal, each enriched with its principal', async () => {
       assignmentService.getAssignments.mockResolvedValue([{ principalId: 'u1', permissionIdentity: 'job_listing:view' }]);
       const req = makeReq({ params: { principalId: 'u1' } });
       const res = makeRes();
@@ -268,7 +283,40 @@ describe('permissionAssignment.controller', () => {
       expect(assignmentService.getAssignments).toHaveBeenCalledWith({ principalId: 'u1' });
       expect(res.json).toHaveBeenCalledWith({
         success: true,
-        data: { assignments: [{ principalId: 'u1', permissionIdentity: 'job_listing:view' }] },
+        data: {
+          assignments: [
+            {
+              principalId: 'u1',
+              permissionIdentity: 'job_listing:view',
+              principal: { id: 'u1', email: null, displayName: null },
+            },
+          ],
+        },
+      });
+    });
+
+    it('still returns the assignment, with a safe fallback principal, when identity resolution finds no match', async () => {
+      assignmentService.getAssignments.mockResolvedValue([{ principalId: 'ghost', permissionIdentity: 'job_listing:view' }]);
+      enrichAssignmentsWithIdentity.mockResolvedValueOnce([
+        { principalId: 'ghost', permissionIdentity: 'job_listing:view', principal: { id: 'ghost', email: null, displayName: null } },
+      ]);
+      const req = makeReq({ params: { principalId: 'ghost' } });
+      const res = makeRes();
+
+      await controller.getAssignmentsForPrincipal(req, res, next);
+
+      expect(res.status).not.toHaveBeenCalledWith(500);
+      expect(res.json).toHaveBeenCalledWith({
+        success: true,
+        data: {
+          assignments: [
+            {
+              principalId: 'ghost',
+              permissionIdentity: 'job_listing:view',
+              principal: { id: 'ghost', email: null, displayName: null },
+            },
+          ],
+        },
       });
     });
   });

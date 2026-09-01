@@ -68,6 +68,7 @@
 
 const { authorizationEvaluationEngine: defaultEvaluationEngine } = require('../evaluation/permission.evaluation.engine');
 const { permissionGrantResolver: defaultGrantResolver } = require('../resolver/permissionGrant.resolver');
+const { ROLES } = require('../resolver/roles.constants');
 const { AUTHORIZATION_DECISIONS, VALID_RESOURCES, VALID_ACTIONS } = require('../permission.constants');
 const {
   AuthorizationMiddlewareError,
@@ -128,12 +129,48 @@ function resolveAuthenticatedUserId(req) {
  * `src/middleware/requireAdminRoleClaim.middleware.js` (`req.user.role`
  * falling back to `req.user.customClaims.role`). Introduces no new
  * identity or Role model — this is read-only, purely to hand the
- * Principal's existing Role to the Grant Resolver (WP-ADMIN-04F-10);
- * this middleware never branches on the Role value itself.
+ * Principal's existing Role to the Grant Resolver (WP-ADMIN-04F-10).
+ *
+ * ── Administrator-lifecycle / Permission-RBAC adapter (root-cause fix) ──
+ * `req.user.role` is populated by `auth.middleware.js#buildClaimSet()`
+ * directly from Supabase Auth `app_metadata.role`. For an ordinary
+ * Administrator that value already sits inside the certified Permission
+ * RBAC vocabulary (`../resolver/roles.constants.js`'s `admin` /
+ * `super_admin`), because `src/modules/admin/bootstrap/adminAuthSync.js`
+ * projects `admin_principals.role` — the Administrator *lifecycle*
+ * role — verbatim into that same Auth field. But `admin_principals.role`
+ * also carries `MASTER_ADMIN`, a value the Permission RBAC vocabulary
+ * deliberately does not define (`roles.constants.js`'s own header: this
+ * integration is scoped to "no Role redesign"). Left untranslated, a
+ * Master Admin's `req.user.role` of `'MASTER_ADMIN'` is simply an
+ * unmapped Role as far as `RolePermissionResolver` is concerned — it
+ * resolves to zero Role-derived Permissions, and, absent an explicit
+ * Assignment, every Permission check denies. That is the exact defect
+ * this WP fixes: the Master Admin's own `administration:view` check
+ * failing with "Principal lacks a Permission Grant".
+ *
+ * This is the single, centralized boundary that translates that one
+ * Administrator-lifecycle-only value into its Permission-RBAC
+ * equivalent for Role-derived-grant purposes only: `MASTER_ADMIN` is
+ * treated as `ROLES.SUPER_ADMIN`, the existing top of the Permission
+ * RBAC vocabulary (already granted the complete Permission Catalog —
+ * see `../resolver/rolePermission.mapping.js`), since a Master Admin
+ * holds at least a Super Admin's authority. Nothing here adds
+ * `MASTER_ADMIN` to `./roles.constants.js`'s `ROLES`/`VALID_ROLES`, and
+ * no Permission catalog/mapping change is required or made. Every other
+ * Role value — including `admin`/`super_admin`/`user`/`contributor`
+ * themselves — passes through unchanged; this function still performs
+ * no branching beyond that single translation, and every consumer
+ * outside the Permission domain (`requireAdmin`, `requireMasterAdmin`,
+ * `adminAuthSync`, the Admin User Directory's role-assignment
+ * restriction) keeps reading the raw, untranslated `req.user.role`
+ * exactly as before — this adapter is local to Permission-Grant
+ * resolution and has no effect on Administrator lifecycle authorization.
  * @private
  */
 function resolveAuthenticatedUserRole(req) {
-  return req?.user?.role ?? req?.user?.customClaims?.role ?? null;
+  const role = req?.user?.role ?? req?.user?.customClaims?.role ?? null;
+  return role === 'MASTER_ADMIN' ? ROLES.SUPER_ADMIN : role;
 }
 
 /**

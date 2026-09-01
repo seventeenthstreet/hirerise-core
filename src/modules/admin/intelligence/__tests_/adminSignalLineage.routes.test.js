@@ -23,7 +23,7 @@ const request = require('supertest');
 // ─────────────────────────────────────────────────────────────
 
 // Mock authenticate — sets req.user on all calls unless overridden per test
-jest.mock('../../../middleware/auth.middleware', () => ({
+jest.mock('../../../../middleware/auth.middleware', () => ({
   authenticate: (req, _res, next) => {
     req.user = { uid: 'admin-uid-123', email: 'admin@hirerise.com', role: 'admin' };
     next();
@@ -45,7 +45,7 @@ jest.mock('../adminSignalLineage.controller', () => ({
   ),
 }));
 
-const { authenticate, requireAdmin } = require('../../../middleware/auth.middleware');
+const { authenticate, requireAdmin } = require('../../../../middleware/auth.middleware');
 const { getSignalLineage }           = require('../adminSignalLineage.controller');
 const router                         = require('../adminSignalLineage.routes');
 

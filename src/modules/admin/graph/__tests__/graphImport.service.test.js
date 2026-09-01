@@ -656,9 +656,10 @@ describe('graphImport.service', () => {
       });
 
       expect(result.imported).toBe(1);
-      expect(upsertSpy).toHaveBeenCalledWith([
-        expect.objectContaining({ skill_id: 's2', skill_name: 'TypeScript', old_id: 'legacy-002' }),
-      ]);
+      expect(upsertSpy).toHaveBeenCalledWith(
+        [expect.objectContaining({ skill_id: 's2', skill_name: 'TypeScript', old_id: 'legacy-002' })],
+        { onConflict: 'skill_id' }
+      );
     });
   });
 });

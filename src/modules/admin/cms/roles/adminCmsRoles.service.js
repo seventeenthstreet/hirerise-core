@@ -106,14 +106,22 @@ async function updateRole(roleId, updates, adminId) {
 // LIST ROLES (SUPABASE STYLE)
 // ─────────────────────────────────────────────
 async function listRoles({ limit = 100, jobFamilyId } = {}) {
-  const result = await rolesRepo.listRoles({
+  // Bug fix: the repository's method is `list(...)`, not `listRoles(...)` —
+  // it doesn't exist, causing "rolesRepo.listRoles is not a function".
+  // It also returns a plain array (no Supabase count() query behind it),
+  // not a { data, count } envelope, so `total` is derived from the
+  // returned array's length rather than a separate `result.count` field
+  // that never existed. This reflects the current page's size, not a true
+  // cross-page total — the frontend Roles page does not render pagination
+  // or a total-count display, so this doesn't surface anything misleading.
+  const roles = await rolesRepo.list({
     limit,
     jobFamilyId,
   });
 
   return {
-    roles: result.data,
-    total: result.count,
+    roles,
+    total: roles.length,
   };
 }
 

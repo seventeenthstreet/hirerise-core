@@ -9,6 +9,13 @@
  * delegated verbatim to the certified repository (no reimplementation),
  * that the certified InvalidLifecycleTransitionError is surfaced as a 409,
  * and that an Administrator can never suspend/revoke themselves.
+ *
+ * Admin Authorization Role Reconciliation: also asserts the Auth
+ * app_metadata projection (adminAuthSync.js#syncAdminRoleToAuth, mocked
+ * below) is invoked for grant/reactivate only, always AFTER the
+ * admin_principals mutation has already resolved, and that a sync failure
+ * is surfaced on the response and recorded as its own audit event rather
+ * than thrown.
  */
 
 jest.mock('../../repository/adminPrincipal.repository', () => ({
@@ -25,8 +32,18 @@ jest.mock('../administrators.repository', () => ({
   listLifecycleAuditEvents: jest.fn(),
 }));
 
+jest.mock('../../bootstrap/adminAuthSync', () => ({
+  syncAdminRoleToAuth: jest.fn(),
+}));
+
+jest.mock('../../../../utils/adminAuditLogger', () => ({
+  logAdminAction: jest.fn().mockResolvedValue(undefined),
+}));
+
 const principalRepo = require('../../repository/adminPrincipal.repository');
 const directoryRepo = require('../administrators.repository');
+const { syncAdminRoleToAuth } = require('../../bootstrap/adminAuthSync');
+const { logAdminAction } = require('../../../../utils/adminAuditLogger');
 const { InvalidLifecycleTransitionError } = require('../../../../domain/admin/lifecycle/adminLifecycle.states');
 const service = require('../administrators.service');
 
@@ -48,6 +65,7 @@ describe('administrators.service', () => {
     jest.clearAllMocks();
     directoryRepo.getUserProfiles.mockResolvedValue(new Map());
     directoryRepo.listLifecycleAuditEvents.mockResolvedValue([]);
+    syncAdminRoleToAuth.mockResolvedValue({ synchronized: true, error: null });
   });
 
   describe('listAdministrators', () => {
@@ -121,6 +139,13 @@ describe('administrators.service', () => {
   });
 
   describe('self-lockout guard', () => {
+    it('refuses to grant/change your own role without calling the repository', async () => {
+      await expect(service.grantAdministrator('master-1', 'admin', 'master-1')).rejects.toMatchObject({
+        statusCode: 403,
+      });
+      expect(principalRepo.grant).not.toHaveBeenCalled();
+    });
+
     it('refuses to suspend yourself without calling the repository', async () => {
       await expect(service.suspendAdministrator('master-1', 'master-1')).rejects.toMatchObject({
         statusCode: 403,
@@ -133,6 +158,166 @@ describe('administrators.service', () => {
         statusCode: 403,
       });
       expect(principalRepo.revoke).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('MASTER_ADMIN target protection', () => {
+    // A different MASTER_ADMIN principal (uid !== actorId), so the
+    // self-lockout guard above does not fire — this exercises the
+    // separate target-role check.
+    function masterAdminTargetRow(overrides = {}) {
+      return principalRow({ uid: 'other-master', role: 'MASTER_ADMIN', ...overrides });
+    }
+
+    it('refuses to suspend a MASTER_ADMIN target without calling the repository', async () => {
+      principalRepo.getPrincipal.mockResolvedValue(masterAdminTargetRow());
+
+      await expect(service.suspendAdministrator('other-master', 'master-1')).rejects.toMatchObject({
+        statusCode: 403,
+      });
+      expect(principalRepo.suspend).not.toHaveBeenCalled();
+    });
+
+    it('refuses to reactivate a MASTER_ADMIN target without calling the repository', async () => {
+      principalRepo.getPrincipal.mockResolvedValue(masterAdminTargetRow({ status: 'suspended' }));
+
+      await expect(service.reactivateAdministrator('other-master', 'master-1')).rejects.toMatchObject({
+        statusCode: 403,
+      });
+      expect(principalRepo.reactivate).not.toHaveBeenCalled();
+    });
+
+    it('refuses to revoke a MASTER_ADMIN target without calling the repository', async () => {
+      principalRepo.getPrincipal.mockResolvedValue(masterAdminTargetRow());
+
+      await expect(service.revokeAdministrator('other-master', 'master-1')).rejects.toMatchObject({
+        statusCode: 403,
+      });
+      expect(principalRepo.revoke).not.toHaveBeenCalled();
+    });
+
+    it('still allows a MASTER_ADMIN operator to revoke an ordinary ADMIN target', async () => {
+      principalRepo.getPrincipal.mockResolvedValue(principalRow({ uid: 'target-1', role: 'admin' }));
+
+      await service.revokeAdministrator('target-1', 'master-1');
+
+      expect(principalRepo.revoke).toHaveBeenCalledWith('target-1', 'master-1');
+    });
+  });
+
+  describe('Auth app_metadata projection (Admin Authorization Role Reconciliation)', () => {
+    beforeEach(() => {
+      principalRepo.getPrincipal.mockResolvedValue(principalRow());
+      // Insulate against the preceding describe block's
+      // `.mockRejectedValue(...)` (not `...Once`) on principalRepo.suspend —
+      // jest.clearAllMocks() clears call history but not a previously set
+      // implementation, so these mutation mocks are explicitly reset back
+      // to a resolved default here regardless of prior test ordering.
+      principalRepo.grant.mockResolvedValue(undefined);
+      principalRepo.suspend.mockResolvedValue(undefined);
+      principalRepo.reactivate.mockResolvedValue(undefined);
+      principalRepo.revoke.mockResolvedValue(undefined);
+    });
+
+    describe('grantAdministrator', () => {
+      it('syncs the granted role to Auth only after admin_principals.grant() has resolved', async () => {
+        const callOrder = [];
+        principalRepo.grant.mockImplementation(async () => { callOrder.push('grant'); });
+        syncAdminRoleToAuth.mockImplementation(async () => { callOrder.push('sync'); return { synchronized: true, error: null }; });
+
+        await service.grantAdministrator('target-1', 'admin', 'master-1');
+
+        expect(callOrder).toEqual(['grant', 'sync']);
+        expect(syncAdminRoleToAuth).toHaveBeenCalledWith('target-1', 'admin');
+      });
+
+      it('surfaces authSynchronized/authSyncError on the returned detail', async () => {
+        syncAdminRoleToAuth.mockResolvedValue({ synchronized: true, error: null });
+
+        const result = await service.grantAdministrator('target-1', 'admin', 'master-1');
+
+        expect(result).toMatchObject({ authSynchronized: true, authSyncError: null });
+      });
+
+      it('records ADMIN_AUTH_SYNC_FAILED and surfaces the failure without throwing', async () => {
+        syncAdminRoleToAuth.mockResolvedValue({ synchronized: false, error: 'no auth user' });
+
+        const result = await service.grantAdministrator('target-1', 'admin', 'master-1');
+
+        expect(result).toMatchObject({ authSynchronized: false, authSyncError: 'no auth user' });
+        expect(logAdminAction).toHaveBeenCalledWith(
+          expect.objectContaining({
+            action: 'ADMIN_AUTH_SYNC_FAILED',
+            adminId: 'master-1',
+            entityId: 'target-1',
+            metadata: expect.objectContaining({ stage: 'auth_metadata_sync', role: 'admin', error: 'no auth user' }),
+          })
+        );
+      });
+
+      it('does not call syncAdminRoleToAuth when the admin_principals mutation itself fails', async () => {
+        principalRepo.grant.mockRejectedValueOnce(new InvalidLifecycleTransitionError('grant', 'revoked'));
+
+        await expect(service.grantAdministrator('target-1', 'admin', 'master-1')).rejects.toMatchObject({
+          statusCode: 409,
+        });
+        expect(syncAdminRoleToAuth).not.toHaveBeenCalled();
+      });
+
+      it('does not record an audit event when sync succeeds', async () => {
+        syncAdminRoleToAuth.mockResolvedValue({ synchronized: true, error: null });
+
+        await service.grantAdministrator('target-1', 'admin', 'master-1');
+
+        expect(logAdminAction).not.toHaveBeenCalled();
+      });
+    });
+
+    describe('reactivateAdministrator', () => {
+      it('syncs Auth using the principal\'s existing role (reactivate does not change role)', async () => {
+        principalRepo.getPrincipal.mockResolvedValue(principalRow({ role: 'super_admin' }));
+
+        await service.reactivateAdministrator('target-1', 'master-1');
+
+        expect(syncAdminRoleToAuth).toHaveBeenCalledWith('target-1', 'super_admin');
+      });
+
+      it('surfaces a sync failure without throwing', async () => {
+        syncAdminRoleToAuth.mockResolvedValue({ synchronized: false, error: 'write failed' });
+
+        const result = await service.reactivateAdministrator('target-1', 'master-1');
+
+        expect(result).toMatchObject({ authSynchronized: false, authSyncError: 'write failed' });
+      });
+
+      it('does not call syncAdminRoleToAuth when the reactivate transition itself fails', async () => {
+        principalRepo.reactivate.mockRejectedValueOnce(new InvalidLifecycleTransitionError('reactivate', 'revoked'));
+
+        await expect(service.reactivateAdministrator('target-1', 'master-1')).rejects.toMatchObject({
+          statusCode: 409,
+        });
+        expect(syncAdminRoleToAuth).not.toHaveBeenCalled();
+      });
+    });
+
+    describe('suspendAdministrator / revokeAdministrator — no Auth projection', () => {
+      it('suspend() never calls syncAdminRoleToAuth', async () => {
+        await service.suspendAdministrator('target-1', 'master-1', 'policy violation');
+        expect(syncAdminRoleToAuth).not.toHaveBeenCalled();
+      });
+
+      it('revoke() never calls syncAdminRoleToAuth', async () => {
+        await service.revokeAdministrator('target-1', 'master-1');
+        expect(syncAdminRoleToAuth).not.toHaveBeenCalled();
+      });
+
+      it('suspend()/revoke() responses carry no authSynchronized field', async () => {
+        const suspendResult = await service.suspendAdministrator('target-1', 'master-1');
+        const revokeResult = await service.revokeAdministrator('target-1', 'master-1');
+
+        expect(suspendResult.authSynchronized).toBeUndefined();
+        expect(revokeResult.authSynchronized).toBeUndefined();
+      });
     });
   });
 });

@@ -32,10 +32,27 @@
  * └────────────────────────────────────────────────────────────────────────────┘
  *
  * WP-ADMIN-04E — Role Management Foundation: the original write endpoint.
- * `role` is validated with `isIn(usersRepo.ROLES)` — the same values
- * public.users.role's own users_role_check CHECK constraint allows (see
- * adminUsers.repository.js) — so there is exactly one place in this
- * codebase that lists the allowed roles for this endpoint.
+ *
+ * Admin Authorization Role Reconciliation: `role` is validated with
+ * `isIn(usersRepo.ASSIGNABLE_ROLES)` — 'user', 'contributor', and 'editor'
+ * only (WP-ADMIN-04G added 'editor') — rather than the full
+ * users_role_check value set. Administrator authority (admin / super_admin
+ * / MASTER_ADMIN) can never be granted through this endpoint; it is
+ * granted/revoked exclusively through admin_principals via
+ * /admin/administrators/:uid/grant|revoke (administrators.routes.js), which
+ * remains the sole authoritative Administrator lifecycle and the sole path
+ * that projects Administrator roles into Supabase Auth app_metadata (see
+ * administrators.service.js / adminAuthSync.js).
+ *
+ * WP-ADMIN-04G — this endpoint's ordinary roles (user/contributor/editor)
+ * are now ALSO projected into Supabase Auth app_metadata, via
+ * adminUsers.service.js#updateUserRole() -> ordinaryRoleSync.js — using a
+ * separate, generalized projection helper
+ * (shared/auth/roleAuthProjection.js) reused by, but never shared as a
+ * calling path with, the Administrator lifecycle's own sync. See
+ * adminUsers.repository.js's module doc comment for the full rationale.
+ * usersRepo.ASSIGNABLE_ROLES remains the single source of truth for the
+ * allowed values here.
  *
  * WP-ADMIN-COMP-04 — adds /profile, /status, and /audit-history. MFA reset,
  * password reset, a separate "lock" action, and session management remain
@@ -85,7 +102,21 @@ router.patch(
     param('userId').isString().trim().notEmpty(),
     body('role')
       .isString().trim().notEmpty()
-      .isIn(usersRepo.ROLES).withMessage(`role must be one of: ${usersRepo.ROLES.join(', ')}`),
+      // Note: this withMessage() text is not guaranteed to reach the HTTP
+      // response body — errorHandler.js's serializeError() intentionally
+      // returns only { code, message } for the top-level AppError, not the
+      // per-field validation details from requestValidator.js. It is still
+      // useful for server-side logs and documents the reasoning here. The
+      // frontend never sends a prohibited value in the first place (see
+      // lib/api/adminUsers.ts's ADMIN_USER_ROLES), so this is a
+      // defense-in-depth backend guard, not a user-facing message.
+      .isIn(usersRepo.ASSIGNABLE_ROLES)
+      .withMessage(
+        `role must be one of: ${usersRepo.ASSIGNABLE_ROLES.join(', ')} — ` +
+        'the ordinary role vocabulary (WP-ADMIN-04G). Administrator roles ' +
+        '(admin, super_admin, MASTER_ADMIN) must be granted via ' +
+        'Administrator Management, not the User Directory.'
+      ),
   ]),
   ctrl.updateUserRole
 );

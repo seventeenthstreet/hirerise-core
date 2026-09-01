@@ -72,12 +72,52 @@
  *     listLifecycleAuditEvents(uid) / permissionHistory.repository.js's
  *     reader, applied to entity_type = 'user' (the entity_type
  *     adminUsers.service.js's role-update audit write already uses).
+ *
+ * Admin Authorization Role Reconciliation — User Directory / Administrator
+ * authority-boundary fix:
+ *   `ROLES` (below) remains the full set of values public.users.role
+ *   accepts at the DATABASE level, per its `users_role_check` CHECK
+ *   constraint (see supabase/migrations/..._wp_admin_04g_02_editor_role.sql
+ *   for the 'editor' addition) — that constraint is not changed here. It is
+ *   kept only as documentation of the DB's own second line of defense, and
+ *   is no longer what this endpoint's route-level validator accepts.
+ *
+ *   `ASSIGNABLE_ROLES` is the single source of truth for what
+ *   PATCH /admin/users/:userId/role may actually set (see
+ *   adminUsers.routes.js `isIn(ASSIGNABLE_ROLES)`). Administrator
+ *   authority (admin / super_admin / MASTER_ADMIN) is intentionally
+ *   excluded: that authority is granted/revoked exclusively through
+ *   admin_principals via the Administrator Management lifecycle
+ *   (administrators.service.js), which is the established authoritative
+ *   record. Allowing this ordinary User Directory endpoint to also set
+ *   those values would let it silently mint Administrator authority that
+ *   never touches admin_principals and is therefore invisible to that
+ *   lifecycle, its audit trail, and its Auth app_metadata projection.
+ *   Demoting an existing Administrator is the admin_principals `revoke`
+ *   transition (administrators.service.js#revokeAdministrator), not a
+ *   value this endpoint sets.
+ *
+ * WP-ADMIN-04G — Ordinary Role Synchronization:
+ *   'editor' is added to ASSIGNABLE_ROLES. Unlike the prior reconciliation,
+ *   this endpoint's write path (adminUsers.service.js#updateUserRole())
+ *   now also projects the assigned role onto Auth app_metadata via
+ *   ordinaryRoleSync.js#syncOrdinaryRoleToAuth() — see that module and
+ *   adminUsers.service.js for the synchronization contract. ASSIGNABLE_ROLES
+ *   remains the single boundary that keeps Administrator roles out of this
+ *   endpoint and therefore out of that synchronization call as well.
  */
 
-// WP-ADMIN-04E — the full set of values public.users.role accepts, per its
-// `users_role_check` CHECK constraint. Single source of truth for role
-// validation on this route — see adminUsers.routes.js `isIn(ROLES)`.
-const ROLES = Object.freeze(['user', 'admin', 'super_admin', 'MASTER_ADMIN', 'contributor']);
+// The full set of values public.users.role accepts, per its
+// `users_role_check` CHECK constraint. Kept for documentation of the DB's
+// own defense-in-depth layer only — see ASSIGNABLE_ROLES below for what
+// this endpoint's route-level validator actually accepts.
+const ROLES = Object.freeze(['user', 'admin', 'super_admin', 'MASTER_ADMIN', 'contributor', 'editor']);
+
+// Admin Authorization Role Reconciliation / WP-ADMIN-04G — the roles the
+// ordinary User Directory role-update endpoint may assign. Deliberately
+// excludes admin / super_admin / MASTER_ADMIN — see the module doc comment
+// above.
+const ASSIGNABLE_ROLES = Object.freeze(['user', 'contributor', 'editor']);
 
 function getSupabase() { return require('../../../config/supabase').supabase; }
 
@@ -315,3 +355,4 @@ class AdminUsersRepository {
 
 module.exports = new AdminUsersRepository();
 module.exports.ROLES = ROLES;
+module.exports.ASSIGNABLE_ROLES = ASSIGNABLE_ROLES;

@@ -20,12 +20,23 @@
  * how adminUsers.routes.js / adminCmsSkills.routes.js are tested.
  *
  * What IS covered here: the router wires the two GET endpoints (R23) and
- * the one POST endpoint (R24) to the controller; request validation
- * rejects invalid values before the controller ever runs; and — the
- * regression-boundary requirement, now updated for R24 — /admin/weights
- * legitimately accepts POST as of R24, while /admin/weights/active still
- * accepts no write verb at all (R24 does not touch it), and PUT/PATCH/
- * DELETE remain unregistered on every path.
+ * the mutation endpoints (R24 create, R25 approve, R26 deprecate) to the
+ * controller; request validation rejects invalid values before the
+ * controller ever runs; and — the regression-boundary requirement, now
+ * updated for R24 — /admin/weights legitimately accepts POST as of R24,
+ * while /admin/weights/active still accepts no write verb at all (R24
+ * does not touch it), and PUT/PATCH/DELETE remain unregistered on every
+ * path.
+ *
+ * WP-ADMIN-COMP-08-R27: the stub req.user below is MASTER_ADMIN (not the
+ * plain `admin` used before R27) because the three mutation routes now
+ * carry route-level `requireMasterAdmin`, matching this suite's existing
+ * convention of not re-testing authorization middleware here (see the
+ * module comment above) — the actor id is kept as `admin-1` so every
+ * existing `toHaveBeenCalledWith(..., 'admin-1')` assertion is unaffected.
+ * The dedicated ADMIN-vs-MASTER_ADMIN authorization matrix (denied vs.
+ * allowed) lives in adminWeights.routes.authorization.test.js, following
+ * the administrators.routes.authorization.test.js convention.
  */
 
 const express = require('express');
@@ -47,7 +58,8 @@ function buildApp() {
   const app = express();
   app.use(express.json());
   app.use((req, res, next) => {
-    req.user = { id: 'admin-1', role: 'admin' };
+    // MASTER_ADMIN as of R27 — see the module docstring note above.
+    req.user = { id: 'admin-1', uid: 'admin-1', role: 'MASTER_ADMIN' };
     next();
   });
   app.use('/api/v1/admin/weights', weightsRoutes);

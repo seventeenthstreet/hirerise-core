@@ -70,6 +70,7 @@ const ADMIN_AND_SUPER_ADMIN_GRANTS = Object.freeze(
 const ROLE_PERMISSION_MAP = Object.freeze({
   [ROLES.USER]: Object.freeze([]),
   [ROLES.CONTRIBUTOR]: Object.freeze([]),
+  [ROLES.EDITOR]: Object.freeze([]),
   [ROLES.ADMIN]: ADMIN_AND_SUPER_ADMIN_GRANTS,
   [ROLES.SUPER_ADMIN]: ADMIN_AND_SUPER_ADMIN_GRANTS,
 });

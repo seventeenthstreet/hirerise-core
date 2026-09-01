@@ -246,6 +246,9 @@ const {
 
 const { secretsRouter }    = require('./modules/secrets');
 const marketIntelRouter    = require('./modules/marketIntelligence/marketIntelligence.routes');
+const intelligenceSecretsRouter = require('./modules/intelligenceSecrets/intelligenceSecrets.routes');
+const intelligenceConfigRouter = require('./modules/intelligenceConfig/intelligenceConfig.routes');
+const intelligenceProvidersRouter = require('./modules/intelligenceProviders/intelligenceProviders.routes');
 const { skillDemandRouter } = require('./modules/skillDemand');
 const directionRouter      = require('./routes/userDirection.routes');
 
@@ -5150,6 +5153,7 @@ if (process.env.FEATURE_CAREER_READINESS === 'true') {
  *   POST   /api/v1/admin/cms/import                 → Bulk JSON import (207 on partial)
  */
 app.use(`${API_PREFIX}/admin/users`,           authenticate, requireAdmin, requireElevatedSession, require('./modules/admin/users/adminUsers.routes'));
+app.use(`${API_PREFIX}/admin/credits`,         authenticate, requireAdmin, requireElevatedSession, require('./modules/admin/credits/adminCredits.routes'));
 app.use(`${API_PREFIX}/admin/cms/skills`,      authenticate, requireAdmin, requireElevatedSession, require('./modules/admin/cms/skills/adminCmsSkills.routes'));
 app.use(`${API_PREFIX}/admin/cms/roles`,       authenticate, requireAdmin, requireElevatedSession, require('./modules/admin/cms/roles/adminCmsRoles.routes'));
 app.use(`${API_PREFIX}/admin/cms/career-domains`,   authenticate, requireAdmin, requireElevatedSession, careerDomainsModule.router);
@@ -5172,13 +5176,21 @@ app.use(`${API_PREFIX}/admin/cms/import/csv`, authenticate, requireAdmin, requir
  *   admin+      → approve/reject; writes approved entries to live tables
  *
  *   POST   /api/v1/admin/pending              → contributor submits entry
- *   GET    /api/v1/admin/pending              → list (admin: all, contributor: own)
+ *   GET    /api/v1/admin/pending              → list (admin/editor: all, contributor: own)
  *   GET    /api/v1/admin/pending/:id          → single entry
+ *   PATCH  /api/v1/admin/pending/:id          → editor edits a still-pending entry's payload
  *   POST   /api/v1/admin/pending/:id/approve  → admin approves → writes to live table
  *   POST   /api/v1/admin/pending/:id/reject   → admin rejects with reason
  *   DELETE /api/v1/admin/pending/:id          → contributor withdraws own submission
+ *
+ * WP-ADMIN-COMP-EDITOR-01: the mount point previously applied
+ * requireContributor to every sub-route, which rejected Editor (and its
+ * new PATCH /:id capability) before the request ever reached the router.
+ * Each route below now carries its own specific guard (requireContributor,
+ * requireContributorOrEditor, requireEditor, or requireAdmin — see
+ * adminPending.routes.js), so the mount point only needs `authenticate`.
  */
-app.use(`${API_PREFIX}/admin/pending`, authenticate, requireContributor, require('./routes/admin/adminPending.routes'));
+app.use(`${API_PREFIX}/admin/pending`, authenticate, require('./routes/admin/adminPending.routes'));
 
 /**
  * Contributor Management (authenticate + requireAdmin)
@@ -5278,6 +5290,69 @@ app.use(`${API_PREFIX}/admin/secrets`, authenticate, requireMasterAdmin, secrets
  *   POST   /api/v1/admin/market-intelligence/fetch        → Manually trigger data fetch
  */
 app.use(`${API_PREFIX}/admin/market-intelligence`, authenticate, requireMasterAdmin, marketIntelRouter);
+
+/**
+ * Intelligence Secret Configuration (authenticate + requireMasterAdmin ONLY)
+ *
+ * WP-ADMIN-INTEL-03 — administers AI provider credentials (Anthropic,
+ * OpenAI, Gemini, Grok/XAI, Mistral) through the existing Secrets Manager.
+ * Provider identity is server-controlled (intelligenceSecrets.config.js);
+ * arbitrary secret names cannot be supplied by the client. No endpoint
+ * returns a decrypted value. Mutation endpoints reuse the existing
+ * Secrets Manager mutation rate limit (10 requests/hour/admin UID).
+ *
+ *   GET    /api/v1/admin/intelligence/secrets                 → List providers + safe status
+ *   GET    /api/v1/admin/intelligence/secrets/:provider/status → Single provider status
+ *   POST   /api/v1/admin/intelligence/secrets/:provider        → Create or update credential
+ *   DELETE /api/v1/admin/intelligence/secrets/:provider        → Delete credential
+ */
+app.use(`${API_PREFIX}/admin/intelligence/secrets`, authenticate, requireMasterAdmin, intelligenceSecretsRouter);
+
+/**
+ * Intelligence Non-Secret Configuration (authenticate + requireMasterAdmin ONLY)
+ *
+ * WP-ADMIN-INTEL-04 — administers ordinary, non-secret Intelligence
+ * configuration (currently: AI_PROVIDER_PRIORITY, the resume-extraction
+ * provider fallback order) through a minimal, Intelligence-scoped
+ * override store. Distinct from /admin/intelligence/secrets above: this
+ * router never touches the Secrets Manager and never returns/accepts a
+ * provider credential. `:key` is validated server-side against a fixed
+ * definitions registry (intelligenceConfig.definitions.js); arbitrary
+ * keys cannot be read or written. Mutation endpoints are rate-limited to
+ * 10 requests/hour/admin UID (intelligenceConfigMutationRateLimit).
+ *
+ *   GET    /api/v1/admin/intelligence/config      → List settings + effective values
+ *   GET    /api/v1/admin/intelligence/config/:key → Single setting + effective value
+ *   PUT    /api/v1/admin/intelligence/config/:key → Set administrative override
+ *   DELETE /api/v1/admin/intelligence/config/:key → Reset (fall back to env/default)
+ */
+app.use(`${API_PREFIX}/admin/intelligence/config`, authenticate, requireMasterAdmin, intelligenceConfigRouter);
+
+/**
+ * Intelligence Provider Registry ("Add Provider") (authenticate + requireMasterAdmin ONLY)
+ *
+ * WP-ADMIN-INTEL-06 - lets a MASTER_ADMIN register a new AI provider from
+ * the Intelligence Administration UI without a frontend code change.
+ * Merges the five built-in, code/env-managed providers (unchanged, still
+ * sourced from intelligenceSecrets.config.js) with admin-registered custom
+ * providers from public.intelligence_provider_registry into a single
+ * list. Registering a provider here is configuration only - it does NOT
+ * make the provider executable; `runtimeSupported` / `runtimeStatus` on
+ * each list entry honestly reports whether a matching adapter module
+ * exists in aiProviderManager.PROVIDER_REGISTRY. Credentials follow the
+ * same write-only Secrets Manager model as /admin/intelligence/secrets -
+ * no endpoint here ever returns a decrypted value. Mutation endpoints are
+ * rate-limited to 10 requests/hour/admin UID
+ * (intelligenceProviderMutationRateLimit).
+ *
+ *   GET    /api/v1/admin/intelligence/providers                    -> List built-in + custom providers, merged status
+ *   GET    /api/v1/admin/intelligence/providers/:providerKey       -> Single provider status
+ *   POST   /api/v1/admin/intelligence/providers                    -> Register a new custom provider (+ optional credential)
+ *   PATCH  /api/v1/admin/intelligence/providers/:providerKey       -> Update a custom provider's non-secret configuration
+ *   POST   /api/v1/admin/intelligence/providers/:providerKey/credential -> Set/replace a custom provider's credential
+ *   DELETE /api/v1/admin/intelligence/providers/:providerKey       -> Remove a custom provider (registry row + stored credential)
+ */
+app.use(`${API_PREFIX}/admin/intelligence/providers`, authenticate, requireMasterAdmin, intelligenceProvidersRouter);
 
 /**
  * Daily Engagement System

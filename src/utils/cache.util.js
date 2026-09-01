@@ -26,7 +26,16 @@ async function setCache(key, value, ttl = DEFAULT_TTL) {
   }
 }
 
+async function deleteCache(key) {
+  try {
+    await redisClient.del(key);
+  } catch (err) {
+    logger.warn('[Cache] Delete failed', { key, error: err.message });
+  }
+}
+
 module.exports = {
   getCache,
   setCache,
+  deleteCache,
 };

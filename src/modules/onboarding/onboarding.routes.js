@@ -29,7 +29,26 @@ const { validate } = require('../../middleware/requestValidator');
 const { creditGuard } = require('../../middleware/creditGuard.middleware');
 const { tierQuota } = require('../../middleware/tierquota.middleware');
 const { aiRateLimitByPlan } = require('../../middleware/aiRateLimitByPlan.middleware');
-const { verifyAdmin } = require('../../middleware/verifyAdmin.middleware');
+
+/**
+ * Blocker 1:
+ *
+ * This route was previously protected by the JWT-only verifyAdmin middleware.
+ * The onboarding router is mounted with authenticate only, so there was no
+ * outer DB-backed admin lifecycle check.
+ *
+ * requireAdministrator preserves the historical role boundary:
+ *   - admin       → allowed
+ *   - super_admin → allowed
+ *   - MASTER_ADMIN → denied
+ *
+ * while additionally verifying the administrator's lifecycle state through
+ * admin_principals.
+ */
+const {
+  requireAdministrator,
+} = require('../../middleware/requireAdministrator.middleware');
+
 const logger = require('../../utils/logger');
 
 const {
@@ -74,76 +93,78 @@ const ALLOWED_ONBOARDING_MIMES = new Set([
   'text/plain',
 ]);
 
-const ALLOWED_ONBOARDING_EXTS = new Set(['.pdf', '.doc', '.docx', '.json', '.txt']);
+const ALLOWED_ONBOARDING_EXTS = new Set([
+  '.pdf',
+  '.doc',
+  '.docx',
+  '.json',
+  '.txt',
+]);
 
-// FIX: Use multer.MulterError so the error handler returns 400, not 500.
-//      Previously: cb(new Error('Unsupported file type')) → no statusCode → falls
-//      through to global errorHandler as a 500.
-//      Now: cb(new multer.MulterError('LIMIT_UNEXPECTED_FILE', message)) → caught
-//      by the inline multerErrorMiddleware below → clean 400 response.
 const upload = multer({
   storage: multer.memoryStorage(),
   limits: {
-    fileSize: 10 * 1024 * 1024, // 10 MB
+    fileSize: 10 * 1024 * 1024,
     files: 1,
   },
   fileFilter: (_req, file, cb) => {
     const ext = path.extname(file.originalname || '').toLowerCase();
-    if (!ALLOWED_ONBOARDING_MIMES.has(file.mimetype) || !ALLOWED_ONBOARDING_EXTS.has(ext)) {
-      // Task 4: standardized message — matches VALIDATION_MESSAGES.INVALID_FORMAT
+
+    if (
+      !ALLOWED_ONBOARDING_MIMES.has(file.mimetype) ||
+      !ALLOWED_ONBOARDING_EXTS.has(ext)
+    ) {
       return cb(
         new multer.MulterError(
           'LIMIT_UNEXPECTED_FILE',
-          `Unsupported file type "${ext || file.mimetype}". Upload a PDF, DOCX, or TXT file.`
-        )
+          `Unsupported file type "${ext || file.mimetype}". Upload a PDF, DOCX, or TXT file.`,
+        ),
       );
     }
+
     cb(null, true);
   },
 });
 
-// ─────────────────────────────────────────────────────────────
-// Task 4: Standardized validation message constants
-// Single source of truth — used by multerErrorMiddleware and
-// any handler that needs to surface a file-validation error.
-// ─────────────────────────────────────────────────────────────
 const VALIDATION_MESSAGES = Object.freeze({
-  MISSING_FILE:   'No resume file provided.',
-  INVALID_FORMAT: 'Unsupported file type. Upload a PDF, DOC, DOCX, or TXT file.',
+  MISSING_FILE: 'No resume file provided.',
+  INVALID_FORMAT:
+    'Unsupported file type. Upload a PDF, DOC, DOCX, or TXT file.',
   FILE_TOO_LARGE: 'File exceeds 10MB limit.',
   TOO_MANY_FILES: 'Too many files. Upload one file at a time.',
 });
 
-// FIX: Inline multer error middleware — must be placed after every multer route
-// that can throw. Converts MulterError → structured 400 JSON so clients get
-// actionable error messages instead of a raw 500.
 function multerErrorMiddleware(err, req, res, next) {
   if (err instanceof multer.MulterError) {
-    // Task 4: all multer errors map to standardized messages
     const messageMap = {
-      LIMIT_FILE_SIZE:       VALIDATION_MESSAGES.FILE_TOO_LARGE,
+      LIMIT_FILE_SIZE: VALIDATION_MESSAGES.FILE_TOO_LARGE,
       LIMIT_UNEXPECTED_FILE: VALIDATION_MESSAGES.INVALID_FORMAT,
-      LIMIT_FILE_COUNT:      VALIDATION_MESSAGES.TOO_MANY_FILES,
+      LIMIT_FILE_COUNT: VALIDATION_MESSAGES.TOO_MANY_FILES,
     };
+
     return res.status(400).json({
       success: false,
       error: {
-        code:    'VALIDATION_ERROR',
-        message: messageMap[err.code] ?? `Upload error: ${err.message}`,
+        code: 'VALIDATION_ERROR',
+        message:
+          messageMap[err.code] ?? `Upload error: ${err.message}`,
       },
     });
   }
+
   return next(err);
 }
 
 // ─────────────────────────────────────────────────────────────
 // PUBLIC ROUTES
 // ─────────────────────────────────────────────────────────────
+
 router.get('/teaser-chi', getTeaserChi);
 
 // ─────────────────────────────────────────────────────────────
 // SHARED
 // ─────────────────────────────────────────────────────────────
+
 router.get('/progress', getProgress);
 router.get('/chi-ready', getChiReady);
 router.get('/career-report/status', getCareerReportStatus);
@@ -154,22 +175,36 @@ router.get('/cv-url', getCvSignedUrl);
 // ─────────────────────────────────────────────────────────────
 // TRACK A
 // ─────────────────────────────────────────────────────────────
-router.post('/consent',
+
+router.post(
+  '/consent',
   validate([
     body('consentGiven').isBoolean(),
-    body('consentVersion').optional().isString().trim().isLength({ max: 20 }),
+    body('consentVersion')
+      .optional()
+      .isString()
+      .trim()
+      .isLength({ max: 20 }),
   ]),
-  saveConsent
+  saveConsent,
 );
 
-router.post('/quick-start',
+router.post(
+  '/quick-start',
   validate([
-    body('jobTitle').isString().trim().notEmpty().isLength({ max: 150 }),
-    body('company').isString().trim().notEmpty().isLength({ max: 150 }),
-    body('startDate')
-      .matches(/^\d{4}-(0[1-9]|1[0-2])$/),
+    body('jobTitle')
+      .isString()
+      .trim()
+      .notEmpty()
+      .isLength({ max: 150 }),
+    body('company')
+      .isString()
+      .trim()
+      .notEmpty()
+      .isLength({ max: 150 }),
+    body('startDate').matches(/^\d{4}-(0[1-9]|1[0-2])$/),
   ]),
-  saveQuickStart
+  saveQuickStart,
 );
 
 router.post('/education-experience', saveEducationAndExperience);
@@ -178,12 +213,12 @@ router.post(
   '/import-linkedin',
   upload.single('linkedinProfile'),
   importLinkedIn,
-  multerErrorMiddleware
+  multerErrorMiddleware,
 );
 
 router.post(
   '/import-linkedin/confirm',
-  confirmLinkedInImport
+  confirmLinkedInImport,
 );
 
 router.patch('/draft', saveDraft);
@@ -197,7 +232,7 @@ router.post(
   aiRateLimitByPlan,
   tierQuota('careerReport'),
   creditGuard('careerReport'),
-  generateCareerReport
+  generateCareerReport,
 );
 
 router.post('/personal-details', savePersonalDetails);
@@ -207,7 +242,7 @@ router.post(
   aiRateLimitByPlan,
   tierQuota('generateCV'),
   creditGuard('generateCV'),
-  generateCV
+  generateCV,
 );
 
 router.post('/skip-cv', skipCv);
@@ -216,85 +251,85 @@ router.post(
   '/validate-cv',
   upload.single('resume'),
   validateCvFileEndpoint,
-  multerErrorMiddleware
+  multerErrorMiddleware,
 );
 
 // ─────────────────────────────────────────────────────────────
 // SYNC CV UPLOAD
 //
 // POST /api/v1/onboarding/upload-cv          ← canonical
-// POST /api/v1/onboarding/upload-cv-sync     ← alias (Task 3)
+// POST /api/v1/onboarding/upload-cv-sync     ← alias
 //
 // MODE: sync
 // • Parses the CV immediately during the request.
 // • Returns parsedData + structuredResume in the response body.
-// • No polling required — result is available in this response.
-// • Contrast: POST /api/v1/resumes is ASYNC and returns a jobId
-//   that must be polled at GET /api/v1/resumes/:id/status.
-//
-// Form-data field: resume (PDF | DOC | DOCX | TXT, max 10 MB)
+// • No polling required.
 // ─────────────────────────────────────────────────────────────
 
-// Task 6: UPLOAD FLOW log injected via lightweight middleware so it
-// fires before the controller regardless of which alias is used.
 function logSyncUpload(req, _res, next) {
   logger.info('[UPLOAD FLOW] Sync onboarding upload triggered', {
-    route:    req.originalUrl,
-    userId:   req.user?.id ?? req.user?.uid ?? null,
+    route: req.originalUrl,
+    userId: req.user?.id ?? req.user?.uid ?? null,
     fileName: req.file?.originalname ?? null,
   });
+
   next();
 }
 
-// Canonical route
 router.post(
   '/upload-cv',
   upload.single('resume'),
   logSyncUpload,
   uploadCvDuringOnboarding,
-  multerErrorMiddleware
+  multerErrorMiddleware,
 );
 
-// Task 3: Alias — identical middleware stack, zero logic duplication.
-// Maps directly to the same controller function; clients may use
-// either URL interchangeably.
 router.post(
   '/upload-cv-sync',
   upload.single('resume'),
   logSyncUpload,
   uploadCvDuringOnboarding,
-  multerErrorMiddleware
+  multerErrorMiddleware,
 );
 
 // ─────────────────────────────────────────────────────────────
 // TRACK B
 // ─────────────────────────────────────────────────────────────
+
 router.post('/career-intent', saveCareerIntent);
 
 // ─────────────────────────────────────────────────────────────
-// GUIDED BUILDER (WP-PRO-07, Task 4 — backend support only;
-// no Guided Builder UI is implemented by this work package)
+// GUIDED BUILDER
 // ─────────────────────────────────────────────────────────────
+
 router.get('/guided/profile', getGuidedBuilderProfile);
+
 router.post(
   '/guided/:section',
   validate([
     param('section').isIn([
-      'personal_details', 'education', 'experience', 'skills',
-      'certifications', 'projects', 'languages',
-      'career_goals', 'employment_preferences',
+      'personal_details',
+      'education',
+      'experience',
+      'skills',
+      'certifications',
+      'projects',
+      'languages',
+      'career_goals',
+      'employment_preferences',
     ]),
   ]),
-  saveGuidedBuilderSection
+  saveGuidedBuilderSection,
 );
 
 // ─────────────────────────────────────────────────────────────
 // ADMIN
 // ─────────────────────────────────────────────────────────────
+
 router.get(
   '/analytics/funnel',
-  verifyAdmin,
-  getFunnelAnalytics
+  requireAdministrator,
+  getFunnelAnalytics,
 );
 
 router.post('/complete', completeOnboarding);

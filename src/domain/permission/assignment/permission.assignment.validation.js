@@ -12,6 +12,20 @@
  * still runs, unchanged, inside Evaluation when the Service calls
  * `evaluate()`; this module only catches malformed Assignment requests
  * early, with an Assignment-specific error.
+ *
+ * ── BLOCKER 3B — OPTION A (frozen product decision) ─────────────────
+ * `principalId` is validated here for SHAPE only (non-empty string),
+ * deliberately never for principal type, role, or Administrator
+ * lifecycle membership. Per the frozen Option A contract, a Permission
+ * Assignment principal is any valid `public.users.id` — `user`,
+ * `contributor`, `admin`, `super_admin`, and `MASTER_ADMIN` are all
+ * equally eligible Assignment targets. This module does not import or
+ * consult `admin_principals` in any form, and must not gain such a
+ * check without a superseding product decision (see Blocker 3B's
+ * Decision Analysis Report). An existence check against `public.users`
+ * (as opposed to this shape check) would require persistence this
+ * Assignment layer does not yet have — that is explicitly a Blocker 3C
+ * concern, not part of this validation.
  */
 
 const { InvalidAssignmentError } = require('./permission.assignment.errors');

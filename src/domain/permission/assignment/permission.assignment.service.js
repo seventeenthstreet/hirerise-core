@@ -45,6 +45,22 @@
  *   3. Separately asks `assignmentPolicy.isAssignable(entry.status)` —
  *      this, not Evaluation's Decision, is the actual grantability
  *      determination, per this WP's review.
+ *
+ * ── BLOCKER 3B — OPTION A (frozen product decision) ─────────────────
+ * The grantability question this Service answers is scoped entirely to
+ * the Permission side (`assignmentPolicy.isAssignable(status)`) — it
+ * intentionally asks nothing about the principal. Per the frozen Option
+ * A contract, `principalId` may be any valid `public.users.id`
+ * (`user`/`contributor`/`admin`/`super_admin`/`MASTER_ADMIN` alike);
+ * this Service must never gain an Administrator-lifecycle eligibility
+ * check (an `admin_principals` lookup) as part of "formalizing" that
+ * decision — doing so would silently narrow Option A into Option B.
+ * Whether a principal can actually reach any given Administrator
+ * surface remains entirely the concern of that surface's own lifecycle
+ * guard (`requireAdmin`/`requireAdministrator`/`requireMasterAdmin`),
+ * composed in front of `requirePermission()` at the route/mount level —
+ * never decided here. See Blocker 3B's Decision Analysis Report for the
+ * full reasoning and the security boundary this separation preserves.
  */
 
 const { permissionRegistry: defaultRegistry } = require('../registry/permission.registry');
@@ -52,6 +68,7 @@ const { authorizationEvaluationEngine: defaultEvaluationEngine } = require('../e
 const { buildPermissionName } = require('../permission.model');
 const { createAssignment, buildAssignmentIdentity } = require('./permission.assignment.model');
 const { InMemoryAssignmentRepository } = require('./repository/permission.assignment.repository.inMemory');
+const { SupabaseAssignmentRepository } = require('./repository/permission.assignment.repository.supabase');
 const { defaultAssignmentPolicy } = require('./permission.assignment.policy');
 const { InvalidAssignmentError, PermissionNotAssignableError } = require('./permission.assignment.errors');
 const { validatePermissionRequestShape, validatePrincipalRequestShape } = require('./permission.assignment.validation');
@@ -84,8 +101,13 @@ class PermissionAssignmentService {
    * @param {import('../evaluation/permission.evaluation.engine').AuthorizationEvaluationEngine} [evaluationEngine]
    *   Defaults to the shared AuthorizationEvaluationEngine singleton.
    * @param {import('./repository/permission.assignment.repository.interface').AssignmentRepository} [assignmentRepository]
-   *   Defaults to a fresh `InMemoryAssignmentRepository` — this WP's
-   *   approved persistence, isolated from the Permission Repository.
+   *   Defaults to a fresh `InMemoryAssignmentRepository`, isolated from
+   *   the Permission Repository — used for isolated unit tests and any
+   *   caller that does not need durable state. BLOCKER 3C: the exported
+   *   `permissionAssignmentService` singleton below explicitly injects
+   *   `SupabaseAssignmentRepository` instead; this constructor default is
+   *   unchanged so existing and future domain-layer tests keep getting
+   *   isolated, zero-I/O behavior unless they ask for otherwise.
    * @param {import('./permission.assignment.policy').AssignmentPolicy} [assignmentPolicy]
    *   Defaults to the shared `defaultAssignmentPolicy` singleton.
    */
@@ -235,8 +257,17 @@ class PermissionAssignmentService {
 module.exports = {
   PermissionAssignmentService,
   // Convenience singleton, matching this domain's existing singleton
-  // convention. Uses its own private InMemoryAssignmentRepository
-  // instance — Assignment state is not shared with any other consumer
-  // by default.
-  permissionAssignmentService: new PermissionAssignmentService(),
+  // convention. BLOCKER 3C: now wired to SupabaseAssignmentRepository so
+  // production Assignment state is durable across restarts and
+  // consistent across backend instances (supabase/migrations/
+  // 20260825090000_wp_admin_04f_20_permission_assignment_persistence.sql).
+  // InMemoryAssignmentRepository remains available above and is still
+  // what every existing unit test explicitly injects via the
+  // constructor's second/third/fourth arguments — this line changes only
+  // the production default, not the class's own testability.
+  permissionAssignmentService: new PermissionAssignmentService(
+    defaultRegistry,
+    defaultEvaluationEngine,
+    new SupabaseAssignmentRepository(),
+  ),
 };

@@ -24,6 +24,9 @@
  *   getPrincipal(uid)                 → raw row | null
  *   listActive()                      → returns all active principals
  *   listByStatus(status)              → returns principals in a given lifecycle state
+ *   hasActiveMasterAdmin()            → true iff an active MASTER_ADMIN row exists
+ *                                        (WP-ADMIN-IMP-07 — see method doc for why this
+ *                                        is intentionally fail-closed, unlike listActive)
  *
  * BUGFIX (WP-ADMIN-04F-18B): getSupabase() previously returned the whole
  * config/supabase.js exports object ({ supabase, getClient, withRetry,
@@ -80,6 +83,7 @@ function getSupabase() {
 
 const TABLE = 'admin_principals';
 const SESSION_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
+const MASTER_ADMIN_ROLE = 'MASTER_ADMIN';
 
 class AdminPrincipalRepository {
 
@@ -207,6 +211,14 @@ class AdminPrincipalRepository {
    * Grant admin access to a user (MASTER_ADMIN only).
    * Creates or re-activates the principal. Valid from any status,
    * including no existing row (see adminLifecycle.states ACTIONS.grant).
+   *
+   * WP-ADMIN-IMP-07 follow-up: both the insert and update write paths
+   * below now propagate the original Supabase/Postgres error unchanged
+   * (`throw error`) instead of silently discarding it. This is what lets
+   * a concurrent bootstrap loser's 23505 unique_violation (from the
+   * admin_principals_single_active_master_admin_idx partial unique index)
+   * reach adminBootstrap.service.js, which maps it to
+   * BootstrapAlreadyCompletedError. No other behavior of grant() changed.
    */
   async grant(uid, role, grantedBy) {
     if (!uid || !role) throw new Error('uid and role are required');
@@ -225,7 +237,7 @@ class AdminPrincipalRepository {
     const isRoleChange = Boolean(existing) && existing.role !== role;
 
     if (existing) {
-      await supabase
+      const { error } = await supabase
         .from(TABLE)
         .update({
           role,
@@ -244,8 +256,12 @@ class AdminPrincipalRepository {
           expires_at:        null,
         })
         .eq('uid', uid);
+
+      if (error) {
+        throw error;
+      }
     } else {
-      await supabase.from(TABLE).insert({
+      const { error } = await supabase.from(TABLE).insert({
         uid,
         role,
         status:         STATES.ACTIVE,
@@ -254,6 +270,10 @@ class AdminPrincipalRepository {
         verified_at:    now,
         last_action_at: now,
       });
+
+      if (error) {
+        throw error;
+      }
     }
 
     emitLifecycleAudit(
@@ -427,6 +447,46 @@ class AdminPrincipalRepository {
 
     if (error) return [];
     return data || [];
+  }
+
+  /**
+   * Whether an active MASTER_ADMIN principal currently exists.
+   *
+   * WP-ADMIN-IMP-07 — Master Admin Bootstrap Recovery.
+   *
+   * This is the application-level eligibility fast-path for bootstrap
+   * ("has this deployment already established its first MASTER_ADMIN?").
+   * The database partial unique index
+   * (admin_principals_single_active_master_admin_idx) remains the
+   * authoritative concurrency guarantee — this method only short-circuits
+   * the common case before a write is attempted.
+   *
+   * It is deliberately its own method rather than a filter over
+   * listActive()/listByStatus(), for one reason: those two methods fail
+   * OPEN on a Supabase error (`return []`), which is the correct,
+   * already-certified behaviour for *listing* principals for display (an
+   * admin dashboard showing "no admins" on a transient read error is a UI
+   * inconvenience, not a security event). Bootstrap eligibility is a
+   * security decision — "may a new MASTER_ADMIN be created?" — so the same
+   * fail-open behaviour here would let a transient DB read error
+   * masquerade as "no MASTER_ADMIN exists yet" and let bootstrap through.
+   * This method therefore fails CLOSED: a query error is propagated, not
+   * swallowed, so bootstrap can never proceed without a confirmed answer.
+   */
+  async hasActiveMasterAdmin() {
+    const supabase = getSupabase();
+    const { data, error } = await supabase
+      .from(TABLE)
+      .select('uid')
+      .eq('role', MASTER_ADMIN_ROLE)
+      .eq('status', STATES.ACTIVE)
+      .limit(1);
+
+    if (error) {
+      throw error;
+    }
+
+    return Array.isArray(data) && data.length > 0;
   }
 }
 

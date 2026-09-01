@@ -12,7 +12,6 @@
 
 const crypto = require('crypto');
 const logger = require('../../utils/logger');
-const { AdaptiveWeightValidationError } = require('./adaptiveWeight.validator');
 
 class AdaptiveWeightController {
   constructor({ adaptiveWeightService }) {
@@ -115,6 +114,10 @@ class AdaptiveWeightController {
       const payload = {
         ...req.body,
         requestId,
+        // AW-03 §11: authenticated admin ID is sourced only from
+        // req.user.id (never body/query/headers) for audit threading.
+        adminId: req.user?.id,
+        ipAddress: req.ip,
       };
 
       const result = await this._service.applyManualOverride(payload);
@@ -140,6 +143,10 @@ class AdaptiveWeightController {
       const payload = {
         ...req.body,
         requestId,
+        // AW-03 §11: authenticated admin ID is sourced only from
+        // req.user.id (never body/query/headers) for audit threading.
+        adminId: req.user?.id,
+        ipAddress: req.ip,
       };
 
       const result = await this._service.releaseManualOverride(payload);
@@ -159,7 +166,13 @@ class AdaptiveWeightController {
   // ❌ Error Handler
   // ─────────────────────────────────────────────────────────────
   _handleError(err, res, next, requestId) {
-    if (err instanceof AdaptiveWeightValidationError || err.name === 'AdaptiveWeightValidationError') {
+    // Defect C fix (AW-03 §10): the validator does not export
+    // `AdaptiveWeightValidationError` as a class, so the previous
+    // `instanceof AdaptiveWeightValidationError` check destructured
+    // `undefined` and threw `TypeError: Right-hand side of 'instanceof'
+    // is not callable` on every validation failure. Classify by the
+    // existing `err.name` convention only — no validation rules change.
+    if (err.name === 'AdaptiveWeightValidationError') {
       return res.status(422).json({
         success: false,
         error: err.message,

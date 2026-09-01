@@ -14,19 +14,16 @@
  *     require('./modules/admin/administrators/administrators.routes')
  *   );
  *
- * WP-ADMIN-05A-R1 reconciliation: router-level requireMasterAdmin has been
- * removed. It made every operation MASTER_ADMIN-only, which was more
- * restrictive than the approved Enterprise Authorization Policy (see
- * WP-ADMIN-05A-R1). requireAdmin's own certified admin_principals
+ * POLICY UPDATE (supersedes WP-ADMIN-05A-R1 for Suspend/Reactivate only):
+ * the authoritative policy is now MASTER_ADMIN > ADMIN — ADMIN is delegated
+ * administrative authority and MUST NOT be able to suspend or reactivate
+ * administrator principals. requireAdmin's own certified admin_principals
  * verification (status='active' + session TTL, requireAdmin.middleware.js)
- * is the baseline gate for every route below.
+ * remains the baseline gate for every route below.
  *
- * requireMasterAdmin is now applied at the ROUTE level, only where the
- * certified repository itself documents a MASTER_ADMIN restriction
- * (adminPrincipal.repository.js#grant docstring: "MASTER_ADMIN only") or
- * where the approved policy table designates MASTER_ADMIN-exclusive:
- * Grant and Revoke. List, Details, Suspend, and Reactivate require only
- * requireAdmin, per the approved policy.
+ * requireMasterAdmin is applied at the ROUTE level, on every route the
+ * approved policy designates MASTER_ADMIN-exclusive: Grant, Suspend,
+ * Reactivate, and Revoke. List and Details require only requireAdmin.
  *
  * ┌────────────────────────────────────────────────────────────────────────┐
  * │ Method │ Path                              │ Authorization             │
@@ -34,8 +31,8 @@
  * │ GET    │ /admin/administrators             │ requireAdmin              │
  * │ GET    │ /admin/administrators/:uid         │ requireAdmin              │
  * │ POST   │ /admin/administrators/:uid/grant   │ requireAdmin + requireMasterAdmin │
- * │ POST   │ /admin/administrators/:uid/suspend │ requireAdmin              │
- * │ POST   │ /admin/administrators/:uid/reactivate │ requireAdmin           │
+ * │ POST   │ /admin/administrators/:uid/suspend │ requireAdmin + requireMasterAdmin │
+ * │ POST   │ /admin/administrators/:uid/reactivate │ requireAdmin + requireMasterAdmin │
  * │ POST   │ /admin/administrators/:uid/revoke  │ requireAdmin + requireMasterAdmin │
  * └────────────────────────────────────────────────────────────────────────┘
  *
@@ -108,8 +105,12 @@ router.post(
 );
 
 // ── POST /admin/administrators/:uid/suspend ──────────────────────────────
+// MASTER_ADMIN-only, per the Master Admin > Admin authoritative policy:
+// ADMIN is delegated administrative authority and MUST NOT be able to
+// suspend administrator principals. Mirrors grant/revoke's placement above.
 router.post(
   '/:uid/suspend',
+  requireMasterAdmin,
   validate([
     param('uid').isString().trim().notEmpty(),
     body('reason')
@@ -120,8 +121,12 @@ router.post(
 );
 
 // ── POST /admin/administrators/:uid/reactivate ───────────────────────────
+// MASTER_ADMIN-only, per the Master Admin > Admin authoritative policy:
+// ADMIN is delegated administrative authority and MUST NOT be able to
+// reactivate administrator principals. Mirrors grant/revoke's placement above.
 router.post(
   '/:uid/reactivate',
+  requireMasterAdmin,
   validate([
     param('uid').isString().trim().notEmpty(),
   ]),

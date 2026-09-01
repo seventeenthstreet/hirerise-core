@@ -109,13 +109,16 @@ describe('WP-ADMIN-COMP-08-R18 — Roles CSV normalized_name write-path fix', ()
 
       expect(result.imported).toBe(1);
       expect(result.writeErrors).toEqual([]);
-      expect(mockSupabase.upsertSpy).toHaveBeenCalledWith([
-        expect.objectContaining({
-          role_id: 'r1',
-          role_name: 'Senior Software Engineer',
-          normalized_name: 'senior software engineer',
-        }),
-      ]);
+      expect(mockSupabase.upsertSpy).toHaveBeenCalledWith(
+        [
+          expect.objectContaining({
+            role_id: 'r1',
+            role_name: 'Senior Software Engineer',
+            normalized_name: 'senior software engineer',
+          }),
+        ],
+        { onConflict: 'role_id' }
+      );
       // The exact failure this WP fixes must not recur.
       const payload = mockSupabase.upsertSpy.mock.calls[0][0][0];
       expect(payload.normalized_name).not.toBeNull();
@@ -209,9 +212,10 @@ describe('WP-ADMIN-COMP-08-R18 — Roles CSV normalized_name write-path fix', ()
 
       expect(result.imported).toBe(1);
       expect(result.mode).toBe('append');
-      expect(mockSupabase.upsertSpy).toHaveBeenCalledWith([
-        expect.objectContaining({ normalized_name: 'product manager' }),
-      ]);
+      expect(mockSupabase.upsertSpy).toHaveBeenCalledWith(
+        [expect.objectContaining({ normalized_name: 'product manager' })],
+        { onConflict: 'role_id' }
+      );
     });
   });
 

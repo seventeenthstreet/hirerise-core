@@ -87,6 +87,25 @@ const SCHEMAS = {
   },
 };
 
+// WP-ADMIN-COMP-08 Graph Phase 4: conflict target for the ordinary
+// Append upsert path, one per dataset. Each target is verified against
+// an actual live unique index in 000_initial_schema.sql (plus, for
+// role_skills, the two-column index substituted by
+// 20260727000002_role_skills_unique_index_reconciliation.sql) — not
+// invented. `roles` has no PRIMARY KEY, but idx_roles_role_id_unique is a
+// full (non-partial) unique index on role_id, which PostgREST/Supabase
+// upsert can resolve against just as it would a constraint.
+const APPEND_ON_CONFLICT = {
+  roles: 'role_id', // idx_roles_role_id_unique
+  skills: 'skill_id', // idx_skills_skill_id_unique
+  role_skills: 'role_id,skill_id', // idx_role_skills_unique_role_skill
+  role_transitions: 'from_role_id,to_role_id', // idx_role_trans_unique
+  skill_relationships: 'skill_id,related_skill_id', // idx_skill_rels_unique
+  role_education: 'role_id,education_level', // idx_role_edu_unique
+  role_salary_market: 'role_id,country', // idx_salary_unique
+  role_market_demand: 'role_id,country', // idx_demand_unique / idx_role_market_demand_role_country
+};
+
 function castRow(row) {
   const out = {};
   for (const [k, v] of Object.entries(row)) {
@@ -472,7 +491,7 @@ async function importGraphDataset({
 
     const { error } = await supabase
       .from(schema.collection)
-      .upsert(clean);
+      .upsert(clean, { onConflict: APPEND_ON_CONFLICT[datasetType] });
 
     if (error) {
       writeErrors.push({

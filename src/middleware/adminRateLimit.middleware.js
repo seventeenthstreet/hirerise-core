@@ -184,8 +184,60 @@ const masterRateLimit = createRateLimiter({
   prefix: 'master',
 });
 
+// WP-ADMIN-INTEL-02: Secrets Manager mutation rate limit.
+//
+// server.js's Secrets Manager mount comment has documented "Mutation
+// endpoints rate-limited to 10 requests/hour/admin UID" since the module
+// was introduced, but no rate limiter was ever actually mounted on
+// secrets.routes.js — the documentation was aspirational, not stale (it
+// was never implemented in the first place). This closes that gap using
+// the existing, already-hardened createRateLimiter() factory (fail-closed
+// Redis fallback, same RPC-backed limiter every other admin/master rate
+// limit in this file uses) — no new rate-limiting framework, just a new
+// instance matching the limit/window server.js already documents.
+//
+// Applied only to the mutating secrets routes (create/update, delete) —
+// GET/list/status reads are unaffected, matching the "Mutation endpoints"
+// wording in the docs this corrects.
+const secretsMutationRateLimit = createRateLimiter({
+  limit: 10,
+  windowSeconds: 60 * 60,
+  prefix: 'secrets-mutation',
+});
+
+// WP-ADMIN-INTEL-04: Intelligence non-secret configuration mutation rate
+// limit. Same createRateLimiter() factory and fail-closed Redis fallback as
+// every limiter above — not a new rate-limiting mechanism. A separate
+// instance (rather than reusing secretsMutationRateLimit) because these
+// writes are not secret mutations and a naming/metrics collision with the
+// Secrets Manager's own limiter would be confusing; the limit itself is set
+// to the same conservative 10/hour/admin-UID precedent secretsMutationRateLimit
+// established for admin-driven Intelligence writes.
+const intelligenceConfigMutationRateLimit = createRateLimiter({
+  limit: 10,
+  windowSeconds: 60 * 60,
+  prefix: 'intelligence-config-mutation',
+});
+
+// WP-ADMIN-INTEL-06: Intelligence provider registry mutation rate limit
+// (add/update/remove a provider, and set/replace a custom provider's
+// credential). Same createRateLimiter() factory and fail-closed Redis
+// fallback as every limiter above — not a new rate-limiting mechanism. A
+// separate instance from secretsMutationRateLimit / intelligenceConfig
+// MutationRateLimit for the same metrics-collision reason those two are
+// kept separate from each other; same conservative 10/hour/admin-UID
+// precedent.
+const intelligenceProviderMutationRateLimit = createRateLimiter({
+  limit: 10,
+  windowSeconds: 60 * 60,
+  prefix: 'intelligence-provider-mutation',
+});
+
 module.exports = {
   adminRateLimit,
   masterRateLimit,
+  secretsMutationRateLimit,
+  intelligenceConfigMutationRateLimit,
+  intelligenceProviderMutationRateLimit,
   createRateLimiter,
 };

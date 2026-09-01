@@ -163,6 +163,27 @@ describe('WP-ADMIN-04F-12A — Authorization middleware end-to-end (real resolve
     expect(res.status).toHaveBeenCalledWith(403);
     expect(next).not.toHaveBeenCalled();
   });
+
+  // WP-ADMIN-04F-10-R1 — root-cause regression: a Master Admin's
+  // req.user.role is 'MASTER_ADMIN' (projected from admin_principals.role
+  // by adminAuthSync.js), a value ../roles.constants.js's ROLES
+  // deliberately does not define. requirePermission() must translate it to
+  // ROLES.SUPER_ADMIN before consulting the real, populated
+  // ROLE_PERMISSION_MAP, rather than handing it through unmapped.
+  it.each([CORE_ACTIONS.VIEW, CORE_ACTIONS.CREATE, CORE_ACTIONS.DELETE])(
+    'calls next() for an authenticated Master Admin (role: MASTER_ADMIN) requesting administration:%s',
+    async (action) => {
+      const middleware = makeMiddleware(action);
+      const req = makeReq({ user: { id: 'master-admin-1', role: 'MASTER_ADMIN' } });
+      const res = makeRes();
+      const next = jest.fn();
+
+      await middleware(req, res, next);
+
+      expect(next).toHaveBeenCalledWith();
+      expect(res.status).not.toHaveBeenCalled();
+    },
+  );
 });
 
 describe('WP-ADMIN-04F-12A — identity derivation consistency', () => {

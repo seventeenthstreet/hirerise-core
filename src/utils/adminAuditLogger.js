@@ -12,6 +12,7 @@
 
 const { supabase } = require('../config/supabase');
 const logger = require('./logger');
+const crypto = require('crypto');
 
 const TABLES = Object.freeze({
   ADMIN_LOGS: 'admin_logs',
@@ -40,6 +41,14 @@ function normalizeMetadata(metadata) {
 /**
  * Build final insert payload.
  *
+ * WP-ADMIN-IMP-07 follow-up: `admin_logs.id` is a TEXT PRIMARY KEY with no
+ * database default/identity generation, so a value must be supplied on
+ * every insert or Postgres rejects it with a not-null violation. Uses the
+ * same crypto.randomUUID() convention already used throughout this
+ * codebase (e.g. requireMasterAdmin.middleware.js, BaseRepository.js) for
+ * generating TEXT/string primary key values — a UUID string is valid for
+ * a TEXT column. No other field's semantics changed.
+ *
  * @param {object} params
  * @returns {object}
  */
@@ -52,6 +61,7 @@ function buildAuditPayload({
   ipAddress = null,
 }) {
   return {
+    id: crypto.randomUUID(),
     admin_id: adminId || 'unknown',
     action: action || 'UNKNOWN_ACTION',
     entity_type: entityType || 'unknown',

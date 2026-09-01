@@ -64,6 +64,21 @@ async function main() {
       `[bootstrapMasterAdmin] SUCCESS — uid=${result.uid} role=${result.role}. ` +
         'This Administrator can now sign in and manage further Administrators through the standard lifecycle.'
     );
+
+    if (result.authSynchronized) {
+      console.info(
+        '[bootstrapMasterAdmin] Auth app_metadata synchronized — the MASTER_ADMIN claim will be present ' +
+          'after this user\'s next token refresh (re-login, or session refresh via POST /admin/auth/session).'
+      );
+    } else {
+      console.warn(
+        '[bootstrapMasterAdmin] WARNING — admin_principals authority was established, but Auth app_metadata ' +
+          `synchronization FAILED (${result.authSyncError}). The MASTER_ADMIN row is correct and authoritative, ` +
+          'but this user\'s JWT will NOT yet carry the MASTER_ADMIN claim. Re-run this script (it is safe to ' +
+          're-run — bootstrap is idempotent and will simply refuse since the MASTER_ADMIN row now exists) or ' +
+          'synchronize app_metadata manually before this user attempts to use Intelligence Administration.'
+      );
+    }
     process.exitCode = 0;
   } catch (err) {
     if (err instanceof BootstrapAlreadyCompletedError) {

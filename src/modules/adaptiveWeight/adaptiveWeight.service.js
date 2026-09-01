@@ -3,19 +3,24 @@
 /**
  * adaptiveWeight.service.js
  *
- * Production-grade Adaptive Learning Engine
- * - Supabase-ready
- * - Uses normalized weight utilities
- * - Confidence-gated learning
- * - Safe + stable updates
+ * WP-ADMIN-COMP-AW-03 — Backend Contract Reconciliation Implementation
+ *
+ * Reconciled to the canonical RPC-based repository contract:
+ *   getWeights() / recordOutcome() / applyOverride() / releaseOverride()
+ *
+ * The certified database functions (get_adaptive_weights(),
+ * record_adaptive_outcome()) and the new AW-03 functions
+ * (apply_adaptive_override(), release_adaptive_override()) are
+ * authoritative for all adaptive-learning business logic — fetch/create,
+ * clamping, normalization, performance smoothing, confidence adjustment,
+ * override/freeze state, and persistence. This service performs
+ * validation, delegates to the repository, and maps the canonical RPC
+ * response onto the existing external (controller-facing) contract. It
+ * does not reproduce RPC business logic in JavaScript.
  */
 
 const {
   DEFAULT_WEIGHTS,
-  DEFAULT_LEARNING_RATE,
-  WEIGHT_BOUNDS,
-  CONFIDENCE,
-  PERFORMANCE,
 } = require('./adaptiveWeight.constants');
 
 const {
@@ -24,12 +29,8 @@ const {
   validateManualOverride,
 } = require('./adaptiveWeight.validator');
 
-const {
-  normalizeWeights,
-  ensureValidWeights,
-} = require('./adaptiveWeight.utils');
-
 const logger = require('../../utils/logger');
+const { logAdminAction } = require('../../utils/adminAuditLogger');
 
 class AdaptiveWeightService {
   constructor({ adaptiveWeightRepo }) {
@@ -47,54 +48,23 @@ class AdaptiveWeightService {
     requestId,
   }) {
     try {
-      validateWeightKey({ roleFamily, experienceBucket, industryTag });
+      const validated = validateWeightKey({ roleFamily, experienceBucket, industryTag });
 
-      const record = await this._repo.findByKey({
-        roleFamily,
-        experienceBucket,
-        industryTag,
+      const data = await this._repo.getWeights({
+        roleFamily: validated.roleFamily,
+        experienceBucket: validated.experienceBucket,
+        industryTag: validated.industryTag,
+        requestId,
       });
 
-      if (!record) {
-        return this._defaultResponse('no_record');
-      }
-
-      // Ensure DB safety
-      const safeWeights = ensureValidWeights(record.weights);
-
-      // Manual override priority
-      if (record.manualOverride === true) {
-        return {
-          weights: safeWeights,
-          source: 'adaptive',
-          meta: {
-            manualOverride: true,
-            freezeLearning: true,
-            confidenceScore: record.confidenceScore,
-            performanceScore: record.performanceScore,
-            updatedAt: record.updatedAt,
-          },
-        };
-      }
-
-      // Confidence gate
-      if (
-        typeof record.confidenceScore !== 'number' ||
-        record.confidenceScore < CONFIDENCE.minimumToUse
-      ) {
-        return this._defaultResponse('low_confidence');
-      }
-
+      // get_adaptive_weights() is authoritative for weights, source,
+      // metadata, manual-override state, and default/no-record behavior.
+      // The service maps the RPC's response directly onto the existing
+      // external contract rather than recomputing any of it here.
       return {
-        weights: safeWeights,
-        source: 'adaptive',
-        meta: {
-          confidenceScore: record.confidenceScore,
-          performanceScore: record.performanceScore,
-          updatedAt: record.updatedAt,
-          freezeLearning: record.freezeLearning ?? false,
-          manualOverride: false,
-        },
+        weights: data.weights,
+        source: data.source,
+        meta: data.meta,
       };
 
     } catch (err) {
@@ -114,91 +84,39 @@ class AdaptiveWeightService {
   // ═══════════════════════════════════════════════════════════
 
   async recordOutcome(payload) {
-    const {
-      roleFamily,
-      experienceBucket,
-      industryTag,
-      predictedScore,
-      actualOutcome,
+    const { requestId } = payload;
+
+    const validated = validateOutcomePayload(payload);
+
+    const data = await this._repo.recordOutcome({
+      roleFamily: validated.roleFamily,
+      experienceBucket: validated.experienceBucket,
+      industryTag: validated.industryTag,
+      predictedScore: validated.predictedScore,
+      actualOutcome: validated.actualOutcome,
       requestId,
-    } = payload;
-
-    validateOutcomePayload(payload);
-
-    let record = await this._repo.findByKey({
-      roleFamily,
-      experienceBucket,
-      industryTag,
     });
 
-    // Initialize
-    if (!record) {
-      record = this._buildInitialRecord(payload);
-      await this._repo.upsert(record); // 🔥 Supabase style
-    }
-
-    // Freeze protection
-    if (record.freezeLearning === true) {
-      return {
-        updated: false,
-        newWeights: record.weights,
-        performanceScore: record.performanceScore,
-        confidenceScore: record.confidenceScore,
-      };
-    }
-
-    // ── Prediction Error
-    const normalizedPrediction = predictedScore / 100;
-    const predictionError = actualOutcome - normalizedPrediction;
-
-    const learningRate =
-      record.learningRate ?? DEFAULT_LEARNING_RATE;
-
-    const currentWeights = ensureValidWeights(record.weights);
-
-    // ── Apply delta
-    const delta = learningRate * predictionError;
-    const updatedWeights = this._applyDelta(currentWeights, delta);
-
-    // 🔒 Normalize (CRITICAL FIX)
-    const normalizedWeights = normalizeWeights(updatedWeights);
-
-    // ── Performance (EMA)
-    const currentPerformance =
-      record.performanceScore ?? PERFORMANCE.initial;
-
-    const accuracy = 1 - Math.abs(predictionError);
-
-    const newPerformanceScore = parseFloat(
-      (
-        PERFORMANCE.smoothingFactor * accuracy +
-        (1 - PERFORMANCE.smoothingFactor) * currentPerformance
-      ).toFixed(4)
-    );
-
-    // ── Confidence
-    const currentConfidence =
-      record.confidenceScore ?? CONFIDENCE.initial;
-
-    const newConfidenceScore = this._adjustConfidence(
-      currentConfidence,
-      newPerformanceScore
-    );
-
-    const updatedRecord = {
-      ...record,
-      weights: normalizedWeights,
-      performanceScore: newPerformanceScore,
-      confidenceScore: newConfidenceScore,
-    };
-
-    await this._repo.upsert(updatedRecord);
-
+    // record_adaptive_outcome() is authoritative for fetch/create,
+    // learning delta, clamping, normalization, performance smoothing,
+    // confidence adjustment, persistence, and freeze-learning behavior.
+    //
+    // NOTE (frozen-segment field gap — see AW-03 implementation report,
+    // "Remaining Follow-Up"): when the segment is frozen, the certified
+    // RPC intentionally returns only `{ updated: false }`
+    // (record_adaptive_outcome(), 000_initial_schema.sql) — no weights,
+    // performanceScore, or confidenceScore. AW-03 requires a single
+    // recordOutcome() call and forbids altering the certified RPC, so
+    // those three fields are not recoverable in the frozen branch without
+    // either a second RPC call (which would violate the "single call"
+    // requirement in §6) or changing the certified function (out of
+    // scope, §18). They are mapped through as `null` rather than
+    // fabricated from stale local state.
     return {
-      updated: true,
-      newWeights: normalizedWeights,
-      performanceScore: newPerformanceScore,
-      confidenceScore: newConfidenceScore,
+      updated: data.updated === true,
+      newWeights: data.weights ?? null,
+      performanceScore: data.performanceScore ?? null,
+      confidenceScore: data.confidenceScore ?? null,
     };
   }
 
@@ -207,31 +125,71 @@ class AdaptiveWeightService {
   // ═══════════════════════════════════════════════════════════
 
   async applyManualOverride(payload) {
-    validateManualOverride(payload);
+    const { requestId, adminId, ipAddress } = payload;
 
-    const normalized = normalizeWeights(payload.weights);
+    const validated = validateManualOverride(payload);
 
-    const record = {
-      ...payload,
-      weights: normalized,
+    const data = await this._repo.applyOverride({
+      roleFamily: validated.roleFamily,
+      experienceBucket: validated.experienceBucket,
+      industryTag: validated.industryTag,
+      weights: validated.weights,
+      requestId,
+    });
+
+    // Audit only after successful persistence. Fire-and-forget:
+    // logAdminAction() never throws (adminAuditLogger.js), so a logging
+    // failure can never turn this already-successful mutation into an
+    // HTTP failure. Follows the adminUsers.service.js pattern; the
+    // trailing .catch() is defense in depth only (mirrors
+    // permissionAssignment.controller.js's emitPermissionAudit()).
+    logAdminAction({
+      adminId,
+      action: 'ADAPTIVE_WEIGHT_OVERRIDE_APPLY',
+      entityType: 'adaptive_weight',
+      entityId: `${validated.roleFamily}::${validated.experienceBucket}::${validated.industryTag}`,
+      metadata: { weights: data.weights },
+      ipAddress,
+    }).catch(() => {});
+
+    return {
+      weights: data.weights,
       manualOverride: true,
-      freezeLearning: true,
     };
-
-    await this._repo.upsert(record);
-
-    return { weights: normalized, manualOverride: true };
   }
 
   async releaseManualOverride(payload) {
-    validateWeightKey(payload);
+    const { requestId, adminId, ipAddress } = payload;
 
-    await this._repo.update(payload, {
-      manualOverride: false,
-      freezeLearning: false,
+    const validated = validateWeightKey(payload);
+
+    const data = await this._repo.releaseOverride({
+      roleFamily: validated.roleFamily,
+      experienceBucket: validated.experienceBucket,
+      industryTag: validated.industryTag,
+      requestId,
     });
 
-    return { released: true };
+    // Audit only after a persistence change actually occurred. release_adaptive_override()
+    // returns { released: false } as a safe no-op when no segment exists to release
+    // (AW-03 migration comment, consistent with get_adaptive_weights()'s no-record
+    // handling) — that branch updates no row, so logging
+    // ADAPTIVE_WEIGHT_OVERRIDE_RELEASE for it would record an admin action that never
+    // happened in the audit trail. Gating on data.released === true keeps the
+    // fire-and-forget pattern (trailing .catch() is defense in depth only) for the
+    // one case that actually mutated state, matching applyManualOverride()'s
+    // audit-only-after-successful-persistence rule (§ AW-03).
+    if (data?.released === true) {
+      logAdminAction({
+        adminId,
+        action: 'ADAPTIVE_WEIGHT_OVERRIDE_RELEASE',
+        entityType: 'adaptive_weight',
+        entityId: `${validated.roleFamily}::${validated.experienceBucket}::${validated.industryTag}`,
+        ipAddress,
+      }).catch(() => {});
+    }
+
+    return { released: data?.released === true };
   }
 
   // ═══════════════════════════════════════════════════════════
@@ -244,50 +202,6 @@ class AdaptiveWeightService {
       source: 'default',
       meta: { reason },
     };
-  }
-
-  _buildInitialRecord({ roleFamily, experienceBucket, industryTag }) {
-    return {
-      roleFamily,
-      experienceBucket,
-      industryTag,
-      weights: { ...DEFAULT_WEIGHTS },
-      performanceScore: PERFORMANCE.initial,
-      confidenceScore: CONFIDENCE.initial,
-      learningRate: DEFAULT_LEARNING_RATE,
-      freezeLearning: false,
-      manualOverride: false,
-      softDeleted: false,
-    };
-  }
-
-  _applyDelta(weights, delta) {
-    const result = {};
-
-    for (const key of Object.keys(weights)) {
-      const nudged = weights[key] + delta;
-
-      result[key] = Math.min(
-        WEIGHT_BOUNDS.max,
-        Math.max(WEIGHT_BOUNDS.min, nudged)
-      );
-    }
-
-    return result;
-  }
-
-  _adjustConfidence(currentConfidence, performance) {
-    let updated;
-
-    if (performance > PERFORMANCE.degradationThreshold) {
-      updated = currentConfidence + CONFIDENCE.incrementPerGood;
-    } else {
-      updated = currentConfidence - CONFIDENCE.decayPerBad;
-    }
-
-    return parseFloat(
-      Math.min(CONFIDENCE.cap, Math.max(0.01, updated)).toFixed(4)
-    );
   }
 }
 

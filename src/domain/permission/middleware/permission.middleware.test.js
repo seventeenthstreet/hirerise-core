@@ -27,6 +27,10 @@ const {
   AuthorizationConfigurationError,
   AuthorizationMiddlewareError,
 } = require('./permission.middleware.errors');
+const { PermissionGrantResolver } = require('../resolver/permissionGrant.resolver');
+const { RolePermissionResolver } = require('../resolver/rolePermission.resolver');
+const { ROLE_PERMISSION_MAP } = require('../resolver/rolePermission.mapping');
+const { ROLES } = require('../resolver/roles.constants');
 
 const RESOURCE = RESOURCES.JOB_LISTING;
 const ACTION = ACTIONS.VIEW;
@@ -260,6 +264,115 @@ describe('requirePermission() — missing grant', () => {
       expect.objectContaining({ error: expect.objectContaining({ code: 'FORBIDDEN' }) }),
     );
     expect(next).not.toHaveBeenCalled();
+  });
+});
+
+describe('requirePermission() — Master Admin role resolution (WP-ADMIN-04F-10-R1)', () => {
+  // Root-cause regression coverage: req.user.role === 'MASTER_ADMIN' (the
+  // Administrator-lifecycle role Auth app_metadata carries for a Master
+  // Admin — see adminAuthSync.js) must be translated to ROLES.SUPER_ADMIN
+  // before being handed to the Grant Resolver, never passed through as-is.
+
+  it('passes ROLES.SUPER_ADMIN to the Grant Resolver when req.user.role is MASTER_ADMIN', async () => {
+    const hasGrant = jest.fn().mockResolvedValue(true);
+    const middleware = requirePermission(RESOURCE, ACTION, {
+      evaluationEngine: makeFakeEvaluationEngine(),
+      grantResolver: { hasGrant },
+    });
+    const req = makeReq({ user: { id: 'master-admin-1', role: 'MASTER_ADMIN' } });
+    const res = makeRes();
+    const next = jest.fn();
+
+    await middleware(req, res, next);
+
+    expect(hasGrant).toHaveBeenCalledWith({
+      principalId: 'master-admin-1',
+      role: ROLES.SUPER_ADMIN,
+      resource: RESOURCE,
+      action: ACTION,
+    });
+    expect(next).toHaveBeenCalledWith();
+  });
+
+  it('does not mutate req.user.role — the literal MASTER_ADMIN string is preserved for lifecycle checks', async () => {
+    const middleware = requirePermission(RESOURCE, ACTION, {
+      evaluationEngine: makeFakeEvaluationEngine(),
+      grantResolver: makeFakeGrantResolver({ hasGrant: true }),
+    });
+    const req = makeReq({ user: { id: 'master-admin-1', role: 'MASTER_ADMIN' } });
+    const res = makeRes();
+    const next = jest.fn();
+
+    await middleware(req, res, next);
+
+    expect(req.user.role).toBe('MASTER_ADMIN');
+  });
+
+  it('leaves every other Role value (admin, super_admin, user, contributor) untranslated', async () => {
+    for (const role of [ROLES.ADMIN, ROLES.SUPER_ADMIN, ROLES.USER, ROLES.CONTRIBUTOR]) {
+      const hasGrant = jest.fn().mockResolvedValue(true);
+      const middleware = requirePermission(RESOURCE, ACTION, {
+        evaluationEngine: makeFakeEvaluationEngine(),
+        grantResolver: { hasGrant },
+      });
+      const req = makeReq({ user: { id: 'user-1', role } });
+      const res = makeRes();
+      const next = jest.fn();
+
+      await middleware(req, res, next);
+
+      expect(hasGrant).toHaveBeenCalledWith({ principalId: 'user-1', role, resource: RESOURCE, action: ACTION });
+    }
+  });
+
+  it('end-to-end with the real Role→Permission Resolver: a Master Admin with no explicit Assignment is granted administration:view', async () => {
+    // Uses the certified, unmocked RolePermissionResolver/ROLE_PERMISSION_MAP —
+    // only the Assignment Service is faked (no explicit Assignment exists for
+    // this Principal), matching the Database Facts in the reported defect:
+    // no admin_principals-derived explicit Permission Assignment, Role-derived
+    // access only.
+    const fakeAssignmentService = { hasAssignment: jest.fn().mockResolvedValue(false) };
+    const rolePermissionResolver = new RolePermissionResolver(ROLE_PERMISSION_MAP);
+    const grantResolver = new PermissionGrantResolver(fakeAssignmentService, rolePermissionResolver);
+
+    const middleware = requirePermission(RESOURCES.ADMINISTRATION, ACTIONS.VIEW, {
+      evaluationEngine: makeFakeEvaluationEngine({ decision: makeDecision(AUTHORIZATION_DECISIONS.ALLOW) }),
+      grantResolver,
+    });
+    const req = makeReq({ user: { id: 'master-admin-1', role: 'MASTER_ADMIN' } });
+    const res = makeRes();
+    const next = jest.fn();
+
+    await middleware(req, res, next);
+
+    expect(fakeAssignmentService.hasAssignment).toHaveBeenCalledWith({
+      principalId: 'master-admin-1',
+      resource: RESOURCES.ADMINISTRATION,
+      action: ACTIONS.VIEW,
+    });
+    expect(next).toHaveBeenCalledWith();
+    expect(res.status).not.toHaveBeenCalled();
+  });
+
+  it('end-to-end: an ordinary user/contributor with no explicit Assignment is still denied administration:view', async () => {
+    const fakeAssignmentService = { hasAssignment: jest.fn().mockResolvedValue(false) };
+    const rolePermissionResolver = new RolePermissionResolver(ROLE_PERMISSION_MAP);
+    const grantResolver = new PermissionGrantResolver(fakeAssignmentService, rolePermissionResolver);
+
+    for (const role of [ROLES.USER, ROLES.CONTRIBUTOR]) {
+      const middleware = requirePermission(RESOURCES.ADMINISTRATION, ACTIONS.VIEW, {
+        evaluationEngine: makeFakeEvaluationEngine({ decision: makeDecision(AUTHORIZATION_DECISIONS.ALLOW) }),
+        grantResolver,
+      });
+      const req = makeReq({ user: { id: 'user-1', role } });
+      const res = makeRes();
+      const next = jest.fn();
+
+      await middleware(req, res, next);
+
+      expect(res.status).toHaveBeenCalledWith(403);
+      expect(next).not.toHaveBeenCalled();
+    }
   });
 });
 

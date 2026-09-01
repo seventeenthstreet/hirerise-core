@@ -67,20 +67,21 @@
  *     require('./modules/admin/weights/adminWeights.routes')
  *   );
  *
- * All routes — including the new POST — inherit authenticate +
- * requireAdmin + requireElevatedSession from the mount point, the
- * identical chain used by /admin/users, /admin/cms/*, and /admin/jobs
- * (NOT the older, route-level `verifyAdmin` middleware pattern used by
- * modules/adaptiveWeight/, which is deliberately not reused here — see
- * the R23 implementation report, §2, for why the mount-level chain was
- * chosen over that older pattern). R24's pre-implementation assessment
- * confirmed this same mount-level chain — without an additional
- * `requirePermission()` gate — is the established, repo-wide pattern for
- * this class of admin configuration mutation (adminCmsRoles, adminCmsSkills,
- * career-domains, job-families, education-levels, salary-benchmarks all
- * follow it identically; `requirePermission()` itself has exactly one
- * caller in the whole repository, and it governs the permission-admin
- * module itself, not a comparable config-mutation module). No admin
+ * All routes inherit authenticate + requireAdmin + requireElevatedSession
+ * from the mount point, the identical chain used by /admin/users,
+ * /admin/cms/*, and /admin/jobs (NOT the older, route-level `verifyAdmin`
+ * middleware pattern used by modules/adaptiveWeight/, which is
+ * deliberately not reused here — see the R23 implementation report, §2,
+ * for why the mount-level chain was chosen over that older pattern).
+ *
+ * WP-ADMIN-COMP-08-R27 (authorization correction): the three mutation
+ * routes (create/approve/deprecate) additionally require
+ * `requireMasterAdmin` at the route level, applied on top of the
+ * mount-level `requireAdmin` chain above — the identical pattern
+ * `administrators.routes.js` uses for its `/grant` and `/revoke` routes.
+ * A live negative-path test confirmed an ordinary `admin` (not
+ * MASTER_ADMIN) could create/approve/deprecate model versions; the two
+ * GET routes remain `requireAdmin`-only and are unaffected. No admin
  * identity is accepted from the request body or query string — it is
  * always taken from `req.user` (set by `authenticate`).
  *
@@ -119,6 +120,7 @@
 const express = require('express');
 const { query, body, param } = require('express-validator');
 const { validate } = require('../../../middleware/requestValidator');
+const { requireMasterAdmin } = require('../../../middleware/requireMasterAdmin.middleware');
 const ctrl = require('./adminWeights.controller');
 
 const router = express.Router();
@@ -244,12 +246,29 @@ router.get('/', validate(filterValidators), ctrl.listVersions);
 router.get('/active', validate(filterValidators), ctrl.getActiveVersion);
 
 // ── POST /admin/weights ──────────────────────────────────────────────────
-router.post('/', validate(createValidators), ctrl.createVersion);
+// MASTER_ADMIN-only, per project requirement that administrative
+// mutations for Intelligence Model/Version Governance remain
+// MASTER_ADMIN-only (see administrators.routes.js's identical
+// route-level requireMasterAdmin-on-top-of-mount-level-requireAdmin
+// pattern for /grant and /revoke).
+router.post('/', requireMasterAdmin, validate(createValidators), ctrl.createVersion);
 
 // ── POST /admin/weights/:id/approve — WP-ADMIN-COMP-08-R25 ──────────────
-router.post('/:id/approve', validate(approveValidators), ctrl.approveVersion);
+// MASTER_ADMIN-only.
+router.post(
+  '/:id/approve',
+  requireMasterAdmin,
+  validate(approveValidators),
+  ctrl.approveVersion
+);
 
 // ── POST /admin/weights/:id/deprecate — WP-ADMIN-COMP-08-R26 ────────────
-router.post('/:id/deprecate', validate(deprecateValidators), ctrl.deprecateVersion);
+// MASTER_ADMIN-only.
+router.post(
+  '/:id/deprecate',
+  requireMasterAdmin,
+  validate(deprecateValidators),
+  ctrl.deprecateVersion
+);
 
 module.exports = router;

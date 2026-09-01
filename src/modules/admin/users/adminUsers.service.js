@@ -23,11 +23,26 @@
  * beyond this comment.
  *
  * WP-ADMIN-04E — updateUserRole(): the requested role is already validated
- * against usersRepo.ROLES by adminUsers.routes.js's `isIn(ROLES)` (single
- * source of truth — see the repository's ROLES export), so this function
- * does not re-validate; that would duplicate the same rule in a second
- * place. `public.users.users_role_check` remains the final DB-level guard.
- * On success, fires a fire-and-forget audit log entry via the existing
+ * against usersRepo.ASSIGNABLE_ROLES by adminUsers.routes.js's
+ * `isIn(ASSIGNABLE_ROLES)` (single source of truth — see the repository's
+ * ASSIGNABLE_ROLES export), so this function does not re-validate; that
+ * would duplicate the same rule in a second place.
+ * `public.users.users_role_check` remains the final DB-level guard.
+ *
+ * WP-ADMIN-04G — Ordinary Role Synchronization: after `public.users.role`
+ * is persisted, this function now also projects the same role onto Auth
+ * `app_metadata` via ordinaryRoleSync.js#syncOrdinaryRoleToAuth() — see
+ * that module's doc comment for why. Both outcomes are reflected in the
+ * response and in the audit entry:
+ *   - DB write succeeds, Auth sync succeeds  -> USER_ROLE_UPDATED,
+ *     authSynchronized: true
+ *   - DB write succeeds, Auth sync fails     -> USER_ROLE_AUTH_SYNC_FAILED
+ *     (in addition to USER_ROLE_UPDATED), authSynchronized: false,
+ *     authSyncError set. The role change is NOT reported as fully
+ *     effective in this case — callers must check `authSynchronized`
+ *     rather than assume 200 OK means the target user's next JWT will
+ *     carry the new role.
+ * Both audit writes are fire-and-forget via the existing
  * utils/adminAuditLogger.js (admin_logs table) — the same audit trail
  * modules/admin/mfa/mfa.service.js already writes to; no new audit
  * mechanism introduced.
@@ -56,6 +71,7 @@ const usersRepo = require('./adminUsers.repository');
 const { AppError, ErrorCodes } = require('../../../middleware/errorHandler');
 const { logAdminAction } = require('../../../utils/adminAuditLogger');
 const logger = require('../../../utils/logger');
+const { syncOrdinaryRoleToAuth } = require('./ordinaryRoleSync');
 
 // WP-ADMIN-COMP-04 — merges the best-effort Supabase Auth read onto a
 // user record. mfaStatus has no backing capability anywhere in this
@@ -138,7 +154,34 @@ async function updateUserRole(userId, role, adminId) {
     metadata: { toRole: role },
   });
 
-  return withAuthState(updated);
+  // WP-ADMIN-04G — project the persisted role onto Auth app_metadata so
+  // req.user.role (built by auth.middleware.js#buildClaimSet() from
+  // app_metadata only) actually reflects this change on the target user's
+  // next token verification. `role` here is already restricted to
+  // usersRepo.ASSIGNABLE_ROLES by the route-level validator, so this call
+  // can never reach admin/super_admin/MASTER_ADMIN.
+  const { synchronized: authSynchronized, error: authSyncError } =
+    await syncOrdinaryRoleToAuth(userId, role);
+
+  if (!authSynchronized) {
+    // Distinct audit action from USER_ROLE_UPDATED so a partially-effective
+    // role change (DB updated, Auth projection failed) is never
+    // indistinguishable in admin_logs from a fully-effective one.
+    void logAdminAction({
+      adminId,
+      action: 'USER_ROLE_AUTH_SYNC_FAILED',
+      entityType: 'user',
+      entityId: userId,
+      metadata: { toRole: role, error: authSyncError },
+    });
+  }
+
+  const withState = await withAuthState(updated);
+
+  // Never falsely report the role change as fully effective — callers
+  // (and the frontend) must check authSynchronized rather than assume
+  // 200 OK means the target user's next JWT will carry the new role.
+  return { ...withState, authSynchronized, authSyncError };
 }
 
 // ── Edit Profile (WP-ADMIN-COMP-04) ──────────────────────────────────────

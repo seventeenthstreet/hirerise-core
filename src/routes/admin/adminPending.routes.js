@@ -17,6 +17,7 @@ const { body, param, query } = require('express-validator');
 const { validate } = require('../../middleware/requestValidator');
 const { requireAdmin } = require('../../middleware/auth.middleware');
 const { requireContributor } = require('../../middleware/requireContributor.middleware');
+const { requireEditor } = require('../../middleware/requireEditor.middleware');
 const { asyncHandler } = require('../../utils/helpers');
 const { getClient, withRetry } = require('../../config/supabase');
 const logger = require('../../utils/logger');
@@ -87,6 +88,52 @@ function isMasterOrAdmin(req) {
       ['admin', 'super_admin', 'MASTER_ADMIN'].includes(r)
     )
   );
+}
+
+// Editor role check (WP-ADMIN-COMP-EDITOR-01). Editor never submits or
+// withdraws entries (POST / and DELETE /:id stay requireContributor-only,
+// unchanged), but — like an Admin — is not scoped to "own" submissions:
+// Editor's whole purpose is reviewing/editing entries submitted by
+// Contributors, so ownership scoping (see GET / and GET /:id below) must
+// exclude Editor the same way it already excludes Admin/MASTER_ADMIN.
+function isEditorRole(req) {
+  const role = req.user?.role ?? '';
+  const roles = Array.isArray(req.user?.roles) ? req.user.roles : [];
+  return role === 'editor' || roles.includes('editor');
+}
+
+// GET / and GET /:id are the one part of this router genuinely shared by
+// both ordinary roles (Contributor sees/looks up its own entries; Editor
+// needs to see all pending entries in order to review/edit them). Neither
+// requireContributor nor requireEditor alone admits the other role, so this
+// is a small local OR rather than weakening either existing gate.
+function requireContributorOrEditor(req, res, next) {
+  if (!req.user) {
+    return res.status(401).json({
+      success: false,
+      error: { code: 'UNAUTHORIZED', message: 'Authentication required.' },
+      meta: { timestamp: new Date().toISOString() },
+    });
+  }
+
+  const role = req.user.role ?? '';
+  const roles = Array.isArray(req.user.roles) ? req.user.roles : [];
+  const allowed = ['contributor', 'editor', 'admin', 'super_admin', 'MASTER_ADMIN'];
+
+  const hasAccess =
+    req.user.admin === true ||
+    allowed.includes(role) ||
+    roles.some(r => allowed.includes(r));
+
+  if (!hasAccess) {
+    return res.status(403).json({
+      success: false,
+      error: { code: 'FORBIDDEN', message: 'Contributor or Editor privileges required.' },
+      meta: { timestamp: new Date().toISOString() },
+    });
+  }
+
+  return next();
 }
 
 function toCamel(row) {
@@ -200,7 +247,7 @@ router.post(
 
 router.get(
   '/',
-  requireContributor,
+  requireContributorOrEditor,
   validate([
     query('status')
       .optional()
@@ -225,7 +272,10 @@ router.get(
       .order('submitted_at', { ascending: false })
       .limit(maxRows);
 
-    if (!isMasterOrAdmin(req)) {
+    // Contributor is scoped to its own submissions. Admin/MASTER_ADMIN and
+    // Editor are not — Editor reviews entries Contributors submitted, so
+    // scoping to "own" would show Editor nothing (Editor never submits).
+    if (!isMasterOrAdmin(req) && !isEditorRole(req)) {
       q = q.eq('submitted_by', actorId);
     }
 
@@ -259,7 +309,7 @@ router.get(
 
 router.get(
   '/:id',
-  requireContributor,
+  requireContributorOrEditor,
   validate([param('id').isUUID()]),
   asyncHandler(async (req, res) => {
     const db = getDb();
@@ -286,7 +336,7 @@ router.get(
       });
     }
 
-    if (!isMasterOrAdmin(req) && data.submitted_by !== actorId) {
+    if (!isMasterOrAdmin(req) && !isEditorRole(req) && data.submitted_by !== actorId) {
       return res.status(403).json({
         success: false,
         error: {
@@ -580,6 +630,97 @@ router.delete(
         id:      req.params.id,
         deleted: true,
       },
+    });
+  })
+);
+
+// ─────────────────────────────────────────────
+// PATCH /:id
+// Editor-only: edit the payload of a still-pending
+// (pre-publish) entry. Entity type, status, and the
+// original submitter can never be changed here —
+// editing is a payload-content action, not a
+// reassignment or a publish. Approval/rejection
+// remain exclusively requireAdmin (see above); this
+// route grants no publishing authority.
+// ─────────────────────────────────────────────
+
+router.patch(
+  '/:id',
+  requireEditor,
+  validate([
+    param('id').isUUID(),
+    body('payload')
+      .isObject()
+      .withMessage('payload must be an object'),
+    body('payload.name')
+      .isString()
+      .trim()
+      .notEmpty()
+      .withMessage('payload.name is required'),
+    body('entityType').not().exists(),
+    body('status').not().exists(),
+    body('submittedByUid').not().exists(),
+  ]),
+  asyncHandler(async (req, res) => {
+    const db = getDb();
+    const actorId = getActorId(req);
+
+    const { data: entry, error } = await withRetry(() =>
+      db
+        .from('pending_entries')
+        .select('status')
+        .eq('id', req.params.id)
+        .single()
+    );
+
+    if (error || !entry) {
+      return res.status(404).json({
+        success: false,
+        error: {
+          code: 'NOT_FOUND',
+          message: 'Entry not found.',
+        },
+        meta: {
+          timestamp: new Date().toISOString(),
+        },
+      });
+    }
+
+    if (entry.status !== 'pending') {
+      return res.status(409).json({
+        success: false,
+        error: {
+          code: 'ALREADY_REVIEWED',
+          message: `Entry has already been ${entry.status} and can no longer be edited.`,
+        },
+        meta: {
+          timestamp: new Date().toISOString(),
+        },
+      });
+    }
+
+    const { data, error: updateError } = await withRetry(() =>
+      db
+        .from('pending_entries')
+        .update({ payload: req.body.payload })
+        .eq('id', req.params.id)
+        .select()
+        .single()
+    );
+
+    if (updateError) {
+      throw new Error(`Failed to update entry: ${updateError.message}`);
+    }
+
+    logger.info('[Pending] Entry edited by Editor', {
+      id: req.params.id,
+      actorId,
+    });
+
+    return res.json({
+      success: true,
+      data: toCamel(data),
     });
   })
 );

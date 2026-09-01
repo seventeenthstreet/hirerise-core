@@ -26,7 +26,16 @@ const { InvalidAssignmentError } = require('./permission.assignment.errors');
 /**
  * @typedef {Object} Assignment
  * @property {string} assignmentIdentity - deterministic, immutable: `${principalId}::${permissionIdentity}`
- * @property {string} principalId
+ * @property {string} principalId - a `public.users.id`. BLOCKER 3B —
+ *   OPTION A (frozen product decision): any valid enterprise user may be
+ *   an Assignment principal (`user`, `contributor`, `admin`,
+ *   `super_admin`, `MASTER_ADMIN` alike). This field is never an
+ *   `admin_principals.uid`, and eligibility to be assigned a Permission
+ *   here is never restricted by Administrator lifecycle membership —
+ *   that is a separate, independent authorization system (see
+ *   `../../../middleware/requireAdmin.middleware.js`). Route-level
+ *   access to any given surface still depends on that surface's own
+ *   Administrator lifecycle guard, unaffected by this field.
  * @property {string} permissionIdentity - `${resource}:${action}`, matching the certified Permission Identity
  * @property {import('../permission.types').Resource} resource
  * @property {import('../permission.types').Action} action

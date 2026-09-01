@@ -7,8 +7,22 @@
 const { normalizeText, normalizeForComposite } = require('../../../../shared/utils/normalizeText');
 const { AppError, ErrorCodes } = require('../../../../middleware/errorHandler');
 const { supabase } = require('../../../../config/supabase'); // ✅ avoid re-require per call
+const { deleteCache } = require('../../../../utils/cache.util');
+const logger = require('../../../../utils/logger');
 
 const TABLE = 'cms_roles';
+
+// The Career Graph reads from the separate `roles` table (a distinct
+// analytics dataset with its own FK-constrained job_family_id), not from
+// `cms_roles`. Without this, a role created here never appears in the
+// Career Graph until a manual graph-dataset import is run.
+//
+// NOTE: cms_roles.job_family_id is free text (e.g. "account-fin") and is
+// NOT validated against the graph's job_families table, so we deliberately
+// write it into roles.role_family (unconstrained) rather than
+// roles.job_family_id (FK-constrained) to avoid insert failures.
+const GRAPH_ROLES_TABLE = 'roles';
+const CAREER_GRAPH_CACHE_KEY = 'graph:career';
 
 class AdminCmsRolesRepository {
 
@@ -143,7 +157,10 @@ class AdminCmsRolesRepository {
 
     if (error) throw this._handleError(error);
 
-    return this._toCamel(data);
+    const created = this._toCamel(data);
+    await this._syncToGraphRoles(created);
+
+    return created;
   }
 
   async updateRole(id, updates, adminId) {
@@ -185,7 +202,10 @@ class AdminCmsRolesRepository {
 
     if (error) throw this._handleError(error);
 
-    return this._toCamel(data);
+    const updated = this._toCamel(data);
+    await this._syncToGraphRoles(updated);
+
+    return updated;
   }
 
   async softDelete(id, adminId) {
@@ -205,6 +225,69 @@ class AdminCmsRolesRepository {
   // ─────────────────────────────────────────────────────────────
   // INTERNAL HELPERS
   // ─────────────────────────────────────────────────────────────
+
+  // Syncs a cms_roles record into the Career Graph's `roles` table so it
+  // shows up in graph search / career-graph views without waiting for a
+  // manual dataset import. Never throws — a graph-sync problem should not
+  // block CMS role creation/update; it's logged and swallowed.
+  //
+  // NOTE ON MATCHING: roles.normalized_name is only *partially* unique
+  // (unique WHERE soft_deleted = false), so it can't be used as a
+  // Postgres ON CONFLICT target via a plain upsert() call — Supabase would
+  // throw 42P10 (no matching constraint). Only roles.role_id has a full
+  // unique index, so we do a manual find-by-normalized_name then
+  // update-by-role_id-or-insert instead of relying on upsert inference.
+  async _syncToGraphRoles(cmsRole) {
+    try {
+      const graphFields = {
+        role_name: cmsRole.name,
+        normalized_name: cmsRole.normalizedName,
+        role_family: cmsRole.jobFamilyId,
+        seniority_level: cmsRole.level,
+        level: cmsRole.level,
+        track: cmsRole.track,
+        description: cmsRole.description,
+        alternative_titles: cmsRole.alternativeTitles || [],
+        agency: cmsRole.sourceAgency || '',
+        soft_deleted: !!cmsRole.softDeleted,
+        updated_by: cmsRole.updatedByAdminId,
+      };
+
+      const { data: existing, error: findError } = await supabase
+        .from(GRAPH_ROLES_TABLE)
+        .select('role_id')
+        .eq('normalized_name', cmsRole.normalizedName)
+        .eq('soft_deleted', false)
+        .maybeSingle();
+
+      if (findError) throw findError;
+
+      if (existing) {
+        const { error: updateError } = await supabase
+          .from(GRAPH_ROLES_TABLE)
+          .update(graphFields)
+          .eq('role_id', existing.role_id);
+
+        if (updateError) throw updateError;
+      } else {
+        const { error: insertError } = await supabase
+          .from(GRAPH_ROLES_TABLE)
+          .insert({
+            ...graphFields,
+            created_by: cmsRole.createdByAdminId,
+          });
+
+        if (insertError) throw insertError;
+      }
+
+      await deleteCache(CAREER_GRAPH_CACHE_KEY);
+    } catch (err) {
+      logger.warn('[AdminCmsRoles] Career Graph sync failed (non-fatal)', {
+        cmsRoleId: cmsRole.id,
+        error: err.message,
+      });
+    }
+  }
 
   _handleError(error) {
     return new AppError(

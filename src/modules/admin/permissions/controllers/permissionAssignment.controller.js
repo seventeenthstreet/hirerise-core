@@ -16,6 +16,7 @@ const { buildPermissionName } = require('../../../../domain/permission/permissio
 const { translateDomainError } = require('../errors/permissionAdmin.errorMap');
 const { logAdminAction } = require('../../../../utils/adminAuditLogger');
 const { ACTIONS: PERMISSION_AUDIT_ACTIONS, buildPermissionAuditEvent } = require('../audit/permissionAudit.constants');
+const { enrichAssignmentsWithIdentity: defaultEnrichAssignmentsWithIdentity } = require('../identity/assignmentIdentity');
 
 /**
  * Fire-and-forget audit emission — WP-ADMIN-05B.
@@ -37,8 +38,15 @@ function ok(res, data, statusCode = 200) {
 
 /**
  * @param {import('../../../../domain/permission/assignment/permission.assignment.service').PermissionAssignmentService} [assignmentService]
+ * @param {(assignments: object[]) => Promise<object[]>} [enrichAssignmentsWithIdentity]
+ *   Blocker 3A — batch-resolves each Assignment's `principal` (email/
+ *   displayName) for display. Presentation-only: never alters
+ *   `principalId` or any other Assignment field. Injectable for tests.
  */
-function createPermissionAssignmentController(assignmentService = defaultAssignmentService) {
+function createPermissionAssignmentController(
+  assignmentService = defaultAssignmentService,
+  enrichAssignmentsWithIdentity = defaultEnrichAssignmentsWithIdentity
+) {
   return {
     async assignPermission(req, res, next) {
       try {
@@ -109,7 +117,8 @@ function createPermissionAssignmentController(assignmentService = defaultAssignm
       try {
         const { resource, action } = req.query;
         const assignments = await assignmentService.listAssignments({ resource, action });
-        return ok(res, { assignments });
+        const enriched = await enrichAssignmentsWithIdentity(assignments);
+        return ok(res, { assignments: enriched });
       } catch (error) {
         if (translateDomainError(error, req, res)) return undefined;
         return next(error);
@@ -119,7 +128,8 @@ function createPermissionAssignmentController(assignmentService = defaultAssignm
     async getAssignmentsForPrincipal(req, res, next) {
       try {
         const assignments = await assignmentService.getAssignments({ principalId: req.params.principalId });
-        return ok(res, { assignments });
+        const enriched = await enrichAssignmentsWithIdentity(assignments);
+        return ok(res, { assignments: enriched });
       } catch (error) {
         if (translateDomainError(error, req, res)) return undefined;
         return next(error);

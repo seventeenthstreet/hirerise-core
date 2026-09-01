@@ -23,11 +23,18 @@
  *   - Values are the existing role strings observed in
  *     `req.user.role` / `req.user.customClaims.role` across the audited
  *     middleware and controllers. No role is invented here.
+ *
+ * WP-ADMIN-04G — adds EDITOR: 'editor', the third ordinary role introduced
+ * alongside the User Directory's Auth-synchronized role assignment path
+ * (see adminUsers.repository.js's ASSIGNABLE_ROLES and
+ * requireEditor.middleware.js). Additive only, per this module's own
+ * scope note above.
  */
 
 const ROLES = Object.freeze({
   USER: 'user',
   CONTRIBUTOR: 'contributor',
+  EDITOR: 'editor',
   ADMIN: 'admin',
   SUPER_ADMIN: 'super_admin',
 });

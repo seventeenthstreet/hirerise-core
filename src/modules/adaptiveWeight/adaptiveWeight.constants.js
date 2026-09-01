@@ -21,7 +21,7 @@ module.exports = Object.freeze({
   PRIMARY_KEY: 'id',
 
   // Composite uniqueness (recommended DB constraint)
-  UNIQUE_KEYS: ['role_id', 'experience_bucket'],
+  UNIQUE_KEYS: ['role_family', 'experience_bucket', 'industry_tag'],
 
   // ─────────────────────────────────────────────────────────────
   // ⚖️ DEFAULT WEIGHTS (must sum = 1.0)

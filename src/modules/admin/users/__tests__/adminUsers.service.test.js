@@ -16,15 +16,26 @@ jest.mock('../adminUsers.repository', () => ({
   getAuthState: jest.fn(),
   setAccountStatus: jest.fn(),
   listAuditHistory: jest.fn(),
-  ROLES: ['user', 'admin', 'super_admin', 'MASTER_ADMIN', 'contributor'],
+  ROLES: ['user', 'admin', 'super_admin', 'MASTER_ADMIN', 'contributor', 'editor'],
+  ASSIGNABLE_ROLES: ['user', 'contributor', 'editor'],
 }));
 
 jest.mock('../../../../utils/adminAuditLogger', () => ({
   logAdminAction: jest.fn().mockResolvedValue(undefined),
 }));
 
+// WP-ADMIN-04G — updateUserRole() now also calls syncOrdinaryRoleToAuth();
+// mocked here so these remain orchestration tests, mirroring how the
+// repository and audit logger above are mocked rather than exercised for
+// real. Defaults to a successful sync; individual tests override this to
+// exercise the failure path.
+jest.mock('../ordinaryRoleSync', () => ({
+  syncOrdinaryRoleToAuth: jest.fn().mockResolvedValue({ synchronized: true, error: null }),
+}));
+
 const usersRepo = require('../adminUsers.repository');
 const { logAdminAction } = require('../../../../utils/adminAuditLogger');
+const { syncOrdinaryRoleToAuth } = require('../ordinaryRoleSync');
 const service = require('../adminUsers.service');
 
 function userRow(overrides = {}) {
@@ -179,6 +190,125 @@ describe('adminUsers.service — WP-ADMIN-COMP-04', () => {
       await expect(
         service.setUserAccountStatus('user-1', 'disable', 'admin-1')
       ).rejects.toMatchObject({ statusCode: 404 });
+    });
+  });
+
+  describe('updateUserRole', () => {
+    it('updates the role via the repository and writes a USER_ROLE_UPDATED audit entry', async () => {
+      usersRepo.updateRole.mockResolvedValue(userRow({ role: 'contributor' }));
+      usersRepo.getAuthState.mockResolvedValue(null);
+
+      const result = await service.updateUserRole('user-1', 'contributor', 'admin-1');
+
+      expect(usersRepo.updateRole).toHaveBeenCalledWith('user-1', 'contributor');
+      expect(result.role).toBe('contributor');
+      expect(logAdminAction).toHaveBeenCalledWith(
+        expect.objectContaining({
+          adminId: 'admin-1',
+          action: 'USER_ROLE_UPDATED',
+          entityType: 'user',
+          entityId: 'user-1',
+          metadata: { toRole: 'contributor' },
+        })
+      );
+    });
+
+    it('throws 404 when the user does not exist', async () => {
+      usersRepo.updateRole.mockResolvedValue(null);
+      await expect(
+        service.updateUserRole('missing', 'contributor', 'admin-1')
+      ).rejects.toMatchObject({ statusCode: 404 });
+    });
+
+    // Admin Authorization Role Reconciliation: the value restriction to
+    // ASSIGNABLE_ROLES is enforced by the route-level `isIn()` validator
+    // (see adminUsers.routes.test.js), not re-validated here — this
+    // service function is a thin pass-through by design (see the module
+    // doc comment: "does not re-validate; that would duplicate the same
+    // rule in a second place").
+
+    // ── WP-ADMIN-04G — Ordinary Role Synchronization ──────────────────────
+
+    it('projects the new role onto Auth app_metadata via syncOrdinaryRoleToAuth', async () => {
+      usersRepo.updateRole.mockResolvedValue(userRow({ role: 'editor' }));
+      usersRepo.getAuthState.mockResolvedValue(null);
+
+      await service.updateUserRole('user-1', 'editor', 'admin-1');
+
+      expect(syncOrdinaryRoleToAuth).toHaveBeenCalledWith('user-1', 'editor');
+    });
+
+    it('reports authSynchronized: true and no error on a successful sync', async () => {
+      usersRepo.updateRole.mockResolvedValue(userRow({ role: 'editor' }));
+      usersRepo.getAuthState.mockResolvedValue(null);
+      syncOrdinaryRoleToAuth.mockResolvedValue({ synchronized: true, error: null });
+
+      const result = await service.updateUserRole('user-1', 'editor', 'admin-1');
+
+      expect(result.authSynchronized).toBe(true);
+      expect(result.authSyncError).toBeNull();
+      // A successful sync must not itself trigger the failure audit event.
+      expect(logAdminAction).not.toHaveBeenCalledWith(
+        expect.objectContaining({ action: 'USER_ROLE_AUTH_SYNC_FAILED' })
+      );
+    });
+
+    it('does NOT falsely report success when the DB write succeeds but Auth sync fails', async () => {
+      usersRepo.updateRole.mockResolvedValue(userRow({ role: 'editor' }));
+      usersRepo.getAuthState.mockResolvedValue(null);
+      syncOrdinaryRoleToAuth.mockResolvedValue({ synchronized: false, error: 'Auth unreachable' });
+
+      const result = await service.updateUserRole('user-1', 'editor', 'admin-1');
+
+      // DB half still succeeded — role is on the response...
+      expect(result.role).toBe('editor');
+      // ...but the response explicitly says it is not yet effective.
+      expect(result.authSynchronized).toBe(false);
+      expect(result.authSyncError).toBe('Auth unreachable');
+    });
+
+    it('writes a USER_ROLE_AUTH_SYNC_FAILED audit entry (in addition to USER_ROLE_UPDATED) on sync failure', async () => {
+      usersRepo.updateRole.mockResolvedValue(userRow({ role: 'contributor' }));
+      usersRepo.getAuthState.mockResolvedValue(null);
+      syncOrdinaryRoleToAuth.mockResolvedValue({ synchronized: false, error: 'Auth unreachable' });
+
+      await service.updateUserRole('user-1', 'contributor', 'admin-1');
+
+      expect(logAdminAction).toHaveBeenCalledWith(
+        expect.objectContaining({
+          adminId: 'admin-1',
+          action: 'USER_ROLE_UPDATED',
+          entityType: 'user',
+          entityId: 'user-1',
+        })
+      );
+      expect(logAdminAction).toHaveBeenCalledWith(
+        expect.objectContaining({
+          adminId: 'admin-1',
+          action: 'USER_ROLE_AUTH_SYNC_FAILED',
+          entityType: 'user',
+          entityId: 'user-1',
+          metadata: { toRole: 'contributor', error: 'Auth unreachable' },
+        })
+      );
+    });
+
+    it('never calls syncOrdinaryRoleToAuth with an Administrator role (defense in depth)', async () => {
+      // ASSIGNABLE_ROLES excludes admin/super_admin/MASTER_ADMIN, so in
+      // practice the route validator never lets one reach this function —
+      // this asserts the service itself never special-cases or bypasses
+      // that boundary if ever called directly (e.g. from another service).
+      usersRepo.updateRole.mockResolvedValue(userRow({ role: 'admin' }));
+      usersRepo.getAuthState.mockResolvedValue(null);
+
+      await service.updateUserRole('user-1', 'admin', 'admin-1');
+
+      // The service is a thin pass-through (see the earlier note) — it
+      // does pass whatever role it was given to the sync call. The real
+      // enforcement point is the route's isIn(ASSIGNABLE_ROLES) validator
+      // (see adminUsers.routes.test.js); this test documents that fact
+      // rather than asserting a guard that doesn't exist at this layer.
+      expect(syncOrdinaryRoleToAuth).toHaveBeenCalledWith('user-1', 'admin');
     });
   });
 

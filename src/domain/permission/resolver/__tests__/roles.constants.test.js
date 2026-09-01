@@ -11,6 +11,7 @@ describe('ROLES', () => {
     expect(ROLES).toEqual({
       USER: 'user',
       CONTRIBUTOR: 'contributor',
+      EDITOR: 'editor',
       ADMIN: 'admin',
       SUPER_ADMIN: 'super_admin',
     });
