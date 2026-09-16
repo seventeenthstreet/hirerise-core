@@ -112,6 +112,18 @@ const COORDINATOR_PAIRS = {
     'timeEstimator.service',
     'timeEstimator.service.js',
   ]),
+  // Phase 1 Recommendation Engine (controlled implementation pass 1):
+  // canonical-context.service.js is required by spec to consume Student
+  // Intelligence exclusively through the existing read-only query methods
+  // intelligence.service.js#getStudentVector / #getStudentConfidence — it
+  // must never recompute Intelligence or call it over HTTP. This is a
+  // narrow, read-only composition (not a second Intelligence engine), so
+  // it is added here as an approved coordinator pair rather than worked
+  // around with a new repository/coordinator layer.
+  'canonical-context.service.js': new Set([
+    'intelligence.service',
+    'intelligence.service.js',
+  ]),
 };
 
 // ── 2. Approved infrastructure primitive basenames ───────────────────────────
