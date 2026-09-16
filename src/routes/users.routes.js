@@ -90,6 +90,16 @@ function normalizeUser(row, reqUser, userId) {
     plan: reqUser.plan ?? row.tier ?? 'free',
     role: reqUser.role ?? row.role ?? null,
     admin: reqUser.admin ?? false,
+    // G2 read-path fix (Phase 1): the frontend's authenticated `User` type
+    // (front/src/hooks/useUser.ts) reads `user.name` — the Dashboard
+    // greeting, AppShell, ResumePage, and CareerOnboardingPage all consume
+    // `user.name` directly. This function previously only emitted
+    // `displayName`, so a successfully saved name was written to the
+    // database but never actually reached the UI: the read chain was
+    // broken between the API response and every frontend consumer.
+    // `displayName` is kept alongside `name` since nothing regresses by
+    // keeping both, but `name` is the field the frontend actually reads.
+    name: row.display_name ?? null,
     displayName: row.display_name ?? null,
     onboarding_completed: row.onboarding_completed ?? false,
     onboardingCompleted: row.onboarding_completed ?? false,
