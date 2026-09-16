@@ -16,15 +16,22 @@
  * dependency direction is one-way (readinessEngine -> capabilityRegistry),
  * per WP-SPCE-01D §9 ("Repository Standards / Dependency direction").
  *
- * Field paths are dot-path strings resolved against the canonical
- * Professional Profile shape defined in
- * ../professionalProfile/professionalProfile.schema.js
- * (see emptyProfessionalProfile()) — never against raw onboarding_progress
- * or user_profiles table columns, which use a different, non-canonical
- * shape. Consumers integrating this registry in a future work package are
- * responsible for mapping whatever raw row shape they read into this
- * canonical shape before calling the Readiness Engine; this module does not
- * do that mapping.
+ * Field paths are dot-path strings resolved against a canonical shape —
+ * never against raw onboarding_progress or user_profiles table columns,
+ * which use different, non-canonical shapes. Consumers integrating this
+ * registry are responsible for mapping whatever raw row shape they read
+ * into the matching canonical shape before calling the Readiness Engine;
+ * this module does not do that mapping.
+ *
+ * Two canonical shapes exist, selected per capability via its `domain`
+ * field (added in Phase 0.6 — Student SPCE Capability Registration; see
+ * "DOMAIN / CANONICAL SHAPE SELECTION" below):
+ *   - 'professional' (default, unchanged since WP-SPCE-02A) — the
+ *     Professional Profile shape in ../professionalProfile/
+ *     professionalProfile.schema.js (see emptyProfessionalProfile()).
+ *   - 'student' — the canonical Student context shape returned by
+ *     ../../modules/student-onboarding/services/canonical-context.service.js
+ *     #assembleCanonicalStudentContext() (see STUDENT_CONTEXT_SHAPE below).
  *
  * ── EXPRESSION MODEL (WP-SPCE-02B) ─────────────────────────────────────
  *
@@ -98,11 +105,52 @@
  *   consumer switches over; it is not resolved by this work package, which
  *   is registry-only per its own scope.
  *
+ * ── DOMAIN / CANONICAL SHAPE SELECTION (Phase 0.6) ─────────────────────
+ *
+ * `student_onboarding_completion` (Phase 0.6 — approved, see "Decision A —
+ * Student SPCE capability" / Decision H in the Product Decision Resolution
+ * report) is the first capability whose field paths are NOT Professional-
+ * Profile-shaped. Its `domain: 'student'` marker tells validateRegistry()
+ * to resolve its field paths against STUDENT_CONTEXT_SHAPE instead of
+ * emptyProfessionalProfile(). A definition with no `domain` field is
+ * treated as `'professional'` — the five pre-existing capabilities are
+ * therefore untouched by this change and need no edit.
+ *
+ * readinessEngine.js itself needed NO change for this: evaluate() already
+ * resolves field paths against whatever `profile` object the caller passes
+ * in (see its own file header) — it has no built-in notion of "the"
+ * canonical shape. Only this module's own build/test-time self-validation
+ * (validateRegistry(), invoked from capabilityRegistry.test.js, never at
+ * runtime) needed to become shape-aware.
+ *
  * This is a PURE data-shape module — no I/O, no DB, no HTTP, no logging,
  * matching the "no runtime overhead" requirement in WP-SPCE-01D §4/§10.
  */
 
 const { emptyProfessionalProfile } = require('../professionalProfile/professionalProfile.schema');
+
+/**
+ * Minimal canonical Student context shape, used ONLY by validateRegistry()
+ * to structurally resolve Student-domain field paths. Mirrors — does not
+ * re-derive or duplicate any logic from — the documented return shape of
+ * ../../modules/student-onboarding/services/canonical-context.service.js
+ * #assembleCanonicalStudentContext(): `{ userId, education, academics,
+ * activities, achievements, cognitive, aspiration, contextVersion }`. Never
+ * imported by readinessEngine.js or any runtime path — a real profile
+ * object (or null) is what evaluate() is actually called with.
+ *
+ * @type {Readonly<object>}
+ */
+const STUDENT_CONTEXT_SHAPE = Object.freeze({
+  userId: null,
+  education: null,
+  academics: null,
+  activities: null,
+  achievements: null,
+  cognitive: null,
+  aspiration: null,
+  contextVersion: null,
+});
 
 /**
  * Stable, business-meaningful capability identifiers.
@@ -118,6 +166,7 @@ const CAPABILITY_IDS = Object.freeze({
   RESUME_GENERATOR:                   'resume_generator',
   JOB_MATCHING:                       'job_matching',
   CHI_SCORE:                          'chi_score',
+  STUDENT_ONBOARDING_COMPLETION:      'student_onboarding_completion',
 });
 
 /**
@@ -133,6 +182,13 @@ const CAPABILITY_IDS = Object.freeze({
  * @property {Expression} [requires]        - expression-tree form (mutually
  *                                             exclusive with `requiredFields`)
  * @property {string} addedIn               - work package that introduced it
+ * @property {'professional'|'student'} [domain] - which canonical shape
+ *                                             validateRegistry() resolves
+ *                                             this definition's field paths
+ *                                             against. Defaults to
+ *                                             'professional' when omitted
+ *                                             (see "DOMAIN / CANONICAL
+ *                                             SHAPE SELECTION" above).
  */
 
 /** @type {Object<string, CapabilityDefinition>} */
@@ -210,6 +266,31 @@ const CAPABILITIES = Object.freeze({
       'experience',
     ]),
     addedIn: 'WP-SPCE-02A',
+  }),
+
+  [CAPABILITY_IDS.STUDENT_ONBOARDING_COMPLETION]: Object.freeze({
+    id: CAPABILITY_IDS.STUDENT_ONBOARDING_COMPLETION,
+    description:
+      'Student Onboarding completion/readiness participation. A fully ' +
+      'faithful AND expression of the real rule in ' +
+      'student-onboarding/helpers/completion.js#isOnboardingComplete ' +
+      '(every entry in COMPLETABLE_STEPS present) — the five step names ' +
+      '(education, academics, activities, cognitive, aspiration) are ' +
+      'exactly the five top-level keys returned by ' +
+      'canonical-context.service.js#assembleCanonicalStudentContext(), so ' +
+      'each step maps 1:1 onto a canonical-context field-presence check ' +
+      'with no approximation needed. Field paths resolve against the ' +
+      'Student canonical context shape (domain: \'student\'), not the ' +
+      'Professional Profile shape.',
+    domain: 'student',
+    requiredFields: Object.freeze([
+      'education',
+      'academics',
+      'activities',
+      'cognitive',
+      'aspiration',
+    ]),
+    addedIn: 'Phase 0.6 — Student SPCE Capability Registration',
   }),
 });
 
@@ -402,7 +483,7 @@ function _validateExpression(expr, canonicalShape, contextLabel) {
  */
 function validateRegistry(registry = CAPABILITIES) {
   const errors = [];
-  const canonicalShape = emptyProfessionalProfile(null);
+  const professionalShape = emptyProfessionalProfile(null);
   const seenIds = new Set();
 
   for (const [key, definition] of Object.entries(registry)) {
@@ -410,6 +491,14 @@ function validateRegistry(registry = CAPABILITIES) {
       errors.push(`Registry entry "${key}" is not a valid definition object.`);
       continue;
     }
+
+    // Domain-aware shape selection (Phase 0.6) — see file header "DOMAIN /
+    // CANONICAL SHAPE SELECTION". Absent/unrecognized `domain` defaults to
+    // 'professional', preserving validation behavior for every
+    // pre-Phase-0.6 definition (including the malformed-fixture registries
+    // this same function is exercised against by capabilityRegistry.test.js).
+    const canonicalShape =
+      definition.domain === 'student' ? STUDENT_CONTEXT_SHAPE : professionalShape;
 
     if (typeof definition.id !== 'string' || definition.id.length === 0) {
       errors.push(`Registry entry "${key}" is missing a valid "id" field.`);

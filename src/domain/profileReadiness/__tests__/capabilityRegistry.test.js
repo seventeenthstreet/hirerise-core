@@ -61,11 +61,23 @@ describe('capabilityRegistry — registry self-validation', () => {
     expect(result.valid).toBe(false);
   });
 
-  it('every declared field path for every capability resolves against the canonical schema', () => {
+  it('every declared field path for every capability resolves against its own domain\'s canonical schema', () => {
+    // Domain-aware as of Phase 0.6 (see capabilityRegistry.js file header
+    // "DOMAIN / CANONICAL SHAPE SELECTION"): a definition with no `domain`
+    // field resolves against the Professional shape, exactly as this test
+    // always checked pre-Phase-0.6; `domain: 'student'` resolves against
+    // the Student canonical context shape instead. The shapes below are
+    // deliberately re-derived independently from validateRegistry()'s own
+    // internal selection, so this test still catches a real regression in
+    // that selection logic rather than trivially agreeing with it.
     const { emptyProfessionalProfile } = require(
       '../../professionalProfile/professionalProfile.schema'
     );
-    const shape = emptyProfessionalProfile(null);
+    const professionalShape = emptyProfessionalProfile(null);
+    const studentShape = {
+      userId: null, education: null, academics: null, activities: null,
+      achievements: null, cognitive: null, aspiration: null, contextVersion: null,
+    };
 
     function collectLeaves(expr) {
       if (typeof expr === 'string') return [expr];
@@ -77,6 +89,7 @@ describe('capabilityRegistry — registry self-validation', () => {
     const { toExpression } = require('../capabilityRegistry');
 
     for (const [key, definition] of Object.entries(CAPABILITIES)) {
+      const shape = definition.domain === 'student' ? studentShape : professionalShape;
       const leaves = collectLeaves(toExpression(definition));
       expect(leaves.length).toBeGreaterThan(0);
       for (const fieldPath of leaves) {
@@ -466,14 +479,97 @@ describe('capabilityRegistry — listCapabilityIds()', () => {
         'resume_generator',
         'job_matching',
         'chi_score',
+        'student_onboarding_completion',
       ])
     );
-    expect(ids).toHaveLength(5);
+    expect(ids).toHaveLength(6);
   });
 
   it('returns only strings', () => {
     for (const id of listCapabilityIds()) {
       expect(typeof id).toBe('string');
     }
+  });
+});
+
+describe('capabilityRegistry — student_onboarding_completion (Phase 0.6)', () => {
+  const PROFESSIONAL_CAPABILITY_IDS = [
+    'professional_onboarding_completion',
+    'career_report',
+    'resume_generator',
+    'job_matching',
+    'chi_score',
+  ];
+
+  it('is registered exactly once, under the domain: "student" marker', () => {
+    const definition = getCapability(CAPABILITY_IDS.STUDENT_ONBOARDING_COMPLETION);
+    expect(definition.id).toBe('student_onboarding_completion');
+    expect(definition.domain).toBe('student');
+    expect(
+      Object.values(CAPABILITIES).filter((d) => d.id === 'student_onboarding_completion')
+    ).toHaveLength(1);
+  });
+
+  it('is a faithful AND of student-onboarding/constants#COMPLETABLE_STEPS — the exact ' +
+     'step list isOnboardingComplete() requires', () => {
+    const { COMPLETABLE_STEPS } = require('../../../modules/student-onboarding/constants');
+    const definition = getCapability(CAPABILITY_IDS.STUDENT_ONBOARDING_COMPLETION);
+    expect(definition.requiredFields).toEqual(COMPLETABLE_STEPS);
+  });
+
+  it('every required field path is a real top-level key of ' +
+     'assembleCanonicalStudentContext()\'s documented return shape', () => {
+    // Cross-checked against the actual canonical context module's return
+    // statement, not re-derived/guessed — see canonical-context.service.js.
+    const canonicalStudentContextKeys = [
+      'userId', 'education', 'academics', 'activities',
+      'achievements', 'cognitive', 'aspiration', 'contextVersion',
+    ];
+    const definition = getCapability(CAPABILITY_IDS.STUDENT_ONBOARDING_COMPLETION);
+    for (const fieldPath of definition.requiredFields) {
+      expect(canonicalStudentContextKeys).toContain(fieldPath);
+    }
+  });
+
+  it('does not alter any existing Professional capability', () => {
+    for (const id of PROFESSIONAL_CAPABILITY_IDS) {
+      expect(listCapabilityIds()).toContain(id);
+    }
+    // The full-registry self-validation already asserts zero errors
+    // (see "registry self-validation" describe block above); this asserts
+    // the Professional-domain entries specifically still default to the
+    // Professional shape (no `domain` field added to any of them).
+    for (const id of PROFESSIONAL_CAPABILITY_IDS) {
+      expect(CAPABILITIES[id].domain).toBeUndefined();
+    }
+  });
+
+  it('validateRegistry() resolves it against the Student shape, not the Professional shape', () => {
+    // A field path that is valid Student-shape but NOT a Professional-shape
+    // path must pass when domain: 'student', proving shape selection is
+    // actually domain-aware rather than silently falling back to Professional.
+    const result = validateRegistry({
+      student_onboarding_completion: {
+        id: 'student_onboarding_completion',
+        description: 'test',
+        addedIn: 'test',
+        domain: 'student',
+        requiredFields: ['aspiration'],
+      },
+    });
+    expect(result.valid).toBe(true);
+    expect(result.errors).toEqual([]);
+  });
+
+  it('rejects a Student-shaped field path when domain is omitted (defaults to Professional)', () => {
+    const result = validateRegistry({
+      some_capability: {
+        id: 'some_capability',
+        description: 'test',
+        addedIn: 'test',
+        requiredFields: ['aspiration'],
+      },
+    });
+    expect(result.valid).toBe(false);
   });
 });

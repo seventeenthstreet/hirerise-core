@@ -385,3 +385,58 @@ describe('readinessEngine.evaluate() — purity', () => {
     expect(first.capabilityId).toBe(second.capabilityId);
   });
 });
+
+describe('readinessEngine.evaluate() — student_onboarding_completion (Phase 0.6)', () => {
+  // Proves evaluate() needed NO code change to support a Student-shaped
+  // profile: it was already shape-agnostic (resolves field paths against
+  // whatever object is passed in). These fixtures mirror the shape returned
+  // by canonical-context.service.js#assembleCanonicalStudentContext(), not
+  // the Professional Profile shape used elsewhere in this file.
+
+  function completeStudentContext() {
+    return {
+      userId: 'student-1',
+      education: { education_level: 'class_12' },
+      academics: { records: [{ subject: 'Math' }], subjects: [] },
+      activities: { activities: [{ title: 'Robotics Club' }], achievements: [], reflection: null },
+      achievements: [],
+      cognitive: { responses: [{ q: 1 }], signals: {} },
+      aspiration: { careerAreaKey: 'technology' },
+      contextVersion: 'student-recommendation-context-v1',
+    };
+  }
+
+  it('is ready when every canonical Student context field is present', () => {
+    const result = evaluate('student_onboarding_completion', completeStudentContext());
+    expect(result.isReady).toBe(true);
+    expect(result.missingFields).toEqual([]);
+  });
+
+  it('reports missing steps by canonical-context field name, matching COMPLETABLE_STEPS ordering', () => {
+    const partial = completeStudentContext();
+    partial.cognitive = null; // e.g. the optional/best-effort cognitive fetch failed
+    partial.aspiration = null;
+
+    const result = evaluate('student_onboarding_completion', partial);
+    expect(result.isReady).toBe(false);
+    expect(result.missingFields).toEqual(
+      expect.arrayContaining(['cognitive', 'aspiration'])
+    );
+    expect(result.missingFields).not.toEqual(
+      expect.arrayContaining(['education', 'academics', 'activities'])
+    );
+  });
+
+  it('a brand-new student (null profile) is not ready, missing every step', () => {
+    const result = evaluate('student_onboarding_completion', null);
+    expect(result.isReady).toBe(false);
+    expect(new Set(result.missingFields)).toEqual(
+      new Set(['education', 'academics', 'activities', 'cognitive', 'aspiration'])
+    );
+  });
+
+  it('does not affect evaluation of Professional capabilities against a Professional profile', () => {
+    const result = evaluate('chi_score', completeProfile());
+    expect(result.isReady).toBe(true);
+  });
+});
