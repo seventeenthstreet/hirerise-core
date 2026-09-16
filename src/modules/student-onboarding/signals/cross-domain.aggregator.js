@@ -69,7 +69,7 @@ const CONTRADICTION_PAIRS = Object.freeze([
 // @typedef {Object} CrossDomainSignalBundle
 // @property {{ [signal_key: string]: number }} signal_weights
 //   Aggregated signal weights, normalized [0,1]. Noise-floored.
-// @property {{ academic: {...}, activity: {...}, cognitive: {...}, cross_domain: {...} }} domain_vectors
+// @property {{ academic: {...}, activity: {...}, cognitive: {...}, aspiration: {...}, cross_domain: {...} }} domain_vectors
 //   Per-domain view of signal contributions. Shape: { [signal_key]: number }
 // @property {{ [signal_key: string]: EvidenceSummary }} evidence_summary
 //   Per-signal evidence metadata summary.
@@ -114,14 +114,16 @@ const CONTRADICTION_PAIRS = Object.freeze([
  * @param {import('./domain-normalizers').SignalContribution[]} domainContributions.academic
  * @param {import('./domain-normalizers').SignalContribution[]} domainContributions.activity
  * @param {import('./domain-normalizers').SignalContribution[]} domainContributions.cognitive
+ * @param {import('./domain-normalizers').SignalContribution[]} [domainContributions.aspiration]
  * @param {string} [pipelineRunId]
  * @returns {import('./cross-domain.aggregator').CrossDomainSignalBundle}
  */
 function aggregateCrossDomainSignals(userId, domainContributions, pipelineRunId = null) {
   const allContributions = [
-    ...(domainContributions.academic  ?? []),
-    ...(domainContributions.activity  ?? []),
-    ...(domainContributions.cognitive ?? []),
+    ...(domainContributions.academic   ?? []),
+    ...(domainContributions.activity   ?? []),
+    ...(domainContributions.cognitive  ?? []),
+    ...(domainContributions.aspiration ?? []),
   ];
 
   // ── Step 1: Group contributions by signal_key ─────────────────────────────
@@ -258,15 +260,21 @@ function _applyNoiseFloor(rawWeights) {
  *
  * @param {Object} domainContributions
  * @param {Record<string, number>} finalWeights  — noise-floored final weights
- * @returns {{ academic: Object, activity: Object, cognitive: Object, cross_domain: Object }}
+ * @returns {{ academic: Object, activity: Object, cognitive: Object, aspiration: Object, cross_domain: Object }}
  */
 function _buildDomainVectors(domainContributions, finalWeights) {
-  const vectors = { academic: {}, activity: {}, cognitive: {}, cross_domain: {} };
+  const vectors = { academic: {}, activity: {}, cognitive: {}, aspiration: {}, cross_domain: {} };
 
   for (const [domainKey, contributions] of Object.entries(domainContributions)) {
-    const domainName = domainKey === 'cognitive' ? 'cognitive'
-                     : domainKey === 'academic'  ? 'academic'
-                     : domainKey === 'activity'  ? 'activity'
+    // Phase 3B.5B — mandatory regression safeguard: 'aspiration' MUST route
+    // to its own explicit bucket here. Without this branch it would
+    // silently fall through to 'cross_domain' below, which the Phase
+    // 3B.5B contract explicitly forbids (Aspiration contributions must
+    // never appear in domain_vectors.cross_domain).
+    const domainName = domainKey === 'cognitive'   ? 'cognitive'
+                     : domainKey === 'academic'    ? 'academic'
+                     : domainKey === 'activity'    ? 'activity'
+                     : domainKey === 'aspiration'  ? 'aspiration'
                      : 'cross_domain';
 
     const grouped  = _groupBySignalKey(contributions ?? []);

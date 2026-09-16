@@ -1,0 +1,196 @@
+// Jest Snapshot v1, https://goo.gl/fbAQLP
+
+exports[`COGNITIVE_TAG_SIGNAL_MAP — snapshot lock matches the Phase 3B.4D-corrected map exactly 1`] = `
+{
+  "adaptive_worker": [
+    [
+      "exploratory_decision_making",
+      0.65,
+    ],
+  ],
+  "analytical": [
+    [
+      "analytical_strength",
+      1,
+    ],
+    [
+      "structured_problem_solving",
+      0.6,
+    ],
+  ],
+  "certainty_seeker": [
+    [
+      "detail_orientation",
+      0.8,
+    ],
+    [
+      "structured_problem_solving",
+      0.55,
+    ],
+  ],
+  "collaborative_learner": [
+    [
+      "collaboration",
+      0.9,
+    ],
+  ],
+  "detail_focused": [
+    [
+      "detail_orientation",
+      0.9,
+    ],
+    [
+      "analytical_strength",
+      0.4,
+    ],
+  ],
+  "experimental": [
+    [
+      "exploratory_decision_making",
+      0.85,
+    ],
+    [
+      "hands_on_learning",
+      0.65,
+    ],
+  ],
+  "exploratory_decider": [
+    [
+      "exploratory_decision_making",
+      1,
+    ],
+  ],
+  "fast_decider": [
+    [
+      "rapid_execution",
+      0.9,
+    ],
+  ],
+  "guided_learner": [
+    [
+      "structured_problem_solving",
+      0.55,
+    ],
+  ],
+  "hands_on_learner": [
+    [
+      "hands_on_learning",
+      1,
+    ],
+    [
+      "technical_execution",
+      0.5,
+    ],
+  ],
+  "independent_explorer": [
+    [
+      "independent_working",
+      1,
+    ],
+    [
+      "exploratory_decision_making",
+      0.6,
+    ],
+  ],
+  "intuitive": [
+    [
+      "exploratory_decision_making",
+      0.75,
+    ],
+  ],
+  "iterative": [
+    [
+      "exploratory_decision_making",
+      0.7,
+    ],
+  ],
+  "logic_first": [
+    [
+      "analytical_strength",
+      0.85,
+    ],
+    [
+      "structured_problem_solving",
+      0.8,
+    ],
+  ],
+  "multitask_oriented": [
+    [
+      "rapid_execution",
+      0.7,
+    ],
+  ],
+  "perfection_oriented": [
+    [
+      "detail_orientation",
+      1,
+    ],
+  ],
+  "planner": [
+    [
+      "structured_problem_solving",
+      0.85,
+    ],
+    [
+      "detail_orientation",
+      0.65,
+    ],
+  ],
+  "rapid_executor": [
+    [
+      "rapid_execution",
+      1,
+    ],
+  ],
+  "reading_learner": [
+    [
+      "analytical_strength",
+      0.5,
+    ],
+  ],
+  "research_heavy": [
+    [
+      "detail_orientation",
+      0.85,
+    ],
+    [
+      "analytical_strength",
+      0.6,
+    ],
+  ],
+  "risk_balanced": [
+    [
+      "entrepreneurial_signal",
+      0.5,
+    ],
+  ],
+  "structured": [
+    [
+      "structured_problem_solving",
+      1,
+    ],
+  ],
+  "systems_thinker": [
+    [
+      "systems_thinking",
+      1,
+    ],
+  ],
+  "visual_first": [
+    [
+      "hands_on_learning",
+      0.6,
+    ],
+    [
+      "exploratory_decision_making",
+      0.55,
+    ],
+  ],
+  "visual_learner": [
+    [
+      "hands_on_learning",
+      0.55,
+    ],
+  ],
+}
+`;

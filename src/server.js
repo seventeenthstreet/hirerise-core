@@ -4678,6 +4678,34 @@ app.use(`${API_PREFIX}/student-onboarding`, authenticate, require('./routes/stud
     requireOnboardingSession,
     require('./modules/student-onboarding/routes/cognitive.routes'),
   );
+
+  // Phase 2 (Student MVP, Option C) — Aspiration
+  // Persists careerInterests / motivationDriver / timeHorizon, previously
+  // collected by the frontend and discarded. Does not advance the onboarding
+  // session — see services/aspiration.service.js for why.
+  app.use(
+    `${API_PREFIX}/student-onboarding/v2/step/aspiration`,
+    authenticate,
+    requireOnboardingSession,
+    require('./modules/student-onboarding/routes/aspiration.routes'),
+  );
+
+  // Phase 1 Pass 3 — Recommendation Retry / Regeneration
+  // Explicit, authenticated recovery from a failed initial generation
+  // (failed → pending → ready/failed) and explicit regeneration of an
+  // existing valid result (ready → pending → ready/failed). The initial,
+  // backend-owned generation trigger remains in
+  // recommendation-lifecycle.service.js / recommendation-engine.js#initiateGeneration
+  // — this route only ever transitions an existing 'failed' or 'ready' row
+  // (see recommendation-engine.js#initiateRetry). No credit/rate-limit/
+  // quota middleware is wired yet (see recommendation.routes.js header for
+  // the documented future placement).
+  app.use(
+    `${API_PREFIX}/student-onboarding/v2/recommendation`,
+    authenticate,
+    requireOnboardingSession,
+    require('./modules/student-onboarding/routes/recommendation.routes'),
+  );
 }
 
 // ── Phase 3D: Cross-Domain Intelligence Layer ─────────────────────────────────

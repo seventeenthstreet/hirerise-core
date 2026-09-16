@@ -43,10 +43,30 @@ const {
   normalizeActivitySignals,
   normalizeCognitiveSignals,
   normalizeReflectionSignals,
+  normalizeAspirationSignals,
 } = require('../signals/domain-normalizers');
 const { buildSignalBundle }            = require('../signals/activity.signals');
 const { buildCognitiveSignalBundle }   = require('../signals/cognitive.signals');
 const { AGGREGATION_VERSION }          = require('../constants/intelligence');
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PURE HELPERS
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Filters a raw student_activities row list down to committed
+ * (is_partial === false) rows only — the same "committed records only"
+ * convention already used by academic year evidence (Phase 3B.2) and by
+ * activity.repository.js#fetchActivitySignalQuality's committedCount.
+ * Extracted as a pure, independently-testable function (Phase 3B.3).
+ *
+ * @param {Object[]} activities  — raw student_activities rows
+ * @returns {Object[]}
+ */
+function filterCommittedActivities(activities) {
+  if (!Array.isArray(activities)) return [];
+  return activities.filter((a) => a?.is_partial !== true);
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // REPOSITORY INSTANCES
@@ -66,10 +86,18 @@ const confidenceRepo   = new SignalConfidenceRepository();
  *
  * @param {string} userId
  * @param {Object} rawDomainData
- * @param {Object}   rawDomainData.academics  — { academicYears: Object[] }
+ * @param {Object}   rawDomainData.academics  — { years: Record<string, Object> } — the
+ *   year-map shape returned by academic.repository.js#groupAcademicData(records, subjects)
  * @param {Object}   rawDomainData.activities — { activities: Object[], achievements: Object[], reflection: Object|null }
  * @param {Object}   rawDomainData.cognitive  — { responses: Object[], taxonomyRows: Object[] }
- * @param {Object}   [rawDomainData.aspiration] — { reflection: Object|null }
+ * @param {Object}   [rawDomainData.aspiration] — Phase 3B.5B: the canonical
+ *   student_aspirations row — { career_interests: string[],
+ *   motivation_driver: string|null, time_horizon: string|null }. This is
+ *   unrelated to, and must not be confused with, the legacy
+ *   rawDomainData.activities.reflection / rawDomainData.aspiration.reflection
+ *   activity-reflection concept still read further below — that is a
+ *   separate, pre-existing path keyed off student_activity_reflections,
+ *   not student_aspirations.
  * @param {Object}   [options]
  * @param {boolean}  [options.dryRun]  — if true, aggregate but do not persist
  * @param {string}   [options.pipelineRunId]
@@ -89,17 +117,28 @@ async function runIntelligencePipeline(userId, rawDomainData, options = {}) {
   // ── Step 1: Normalize each domain ─────────────────────────────────────────
 
   const domainContributions = {
-    academic:  [],
-    activity:  [],
-    cognitive: [],
+    academic:   [],
+    activity:   [],
+    cognitive:  [],
+    aspiration: [],
   };
 
   // Academic normalization
+  //
+  // Phase 3B.2: rawDomainData.academics.years is the real Student v2 shape —
+  // the year-map produced by academic.repository.js#groupAcademicData(). The
+  // previous `academicYears` array shape (with subject_snapshots/current_band)
+  // never matched the actual schema; see the Phase 3B.1/3B.2 checkpoint
+  // report for details. This is a data-shape correction only — it does not
+  // change how the caller (currently only intelligence.controller.js's
+  // admin-only triggerPipeline, which has its own separate, pre-existing,
+  // out-of-scope defect — see checkpoint report §"Deferred Findings") loads
+  // the underlying records.
   try {
-    if (rawDomainData.academics?.academicYears?.length > 0) {
+    if (rawDomainData.academics?.years && Object.keys(rawDomainData.academics.years).length > 0) {
       domainContributions.academic = normalizeAcademicSignals(
         userId,
-        rawDomainData.academics.academicYears,
+        rawDomainData.academics.years,
       );
       logger.info('intelligence_pipeline.academic_normalized', {
         userId,
@@ -115,10 +154,27 @@ async function runIntelligencePipeline(userId, rawDomainData, options = {}) {
   }
 
   // Activity normalization
+  //
+  // Phase 3B.3: only committed (is_partial === false) activities are signal
+  // sources — mirrors the existing "committed records only" convention
+  // already established for academic years (Phase 3B.2) and already used
+  // for onboarding-completeness purposes by
+  // activity.repository.js#fetchActivitySignalQuality (committedCount =
+  // activities.filter(a => !a.is_partial)). Previously this filter was
+  // missing entirely from the signal-derivation path — an in-progress
+  // "activity just added to the list, depth details not yet filled in" row
+  // could silently contribute signal evidence. reflection/category lookup
+  // still uses the full (unfiltered) activity list — a reflection is a
+  // statement about the student's own intent, not a claim about that
+  // activity's recorded performance data, so partial-row completeness
+  // doesn't bear on it the same way.
   try {
-    if (rawDomainData.activities?.activities?.length > 0) {
+    const allActivities = rawDomainData.activities?.activities ?? [];
+    const committedActivities = filterCommittedActivities(allActivities);
+
+    if (committedActivities.length > 0) {
       const activityBundle = buildSignalBundle(
-        rawDomainData.activities.activities,
+        committedActivities,
         rawDomainData.activities.achievements ?? [],
       );
       domainContributions.activity = normalizeActivitySignals(userId, activityBundle.envelopes);
@@ -127,7 +183,7 @@ async function runIntelligencePipeline(userId, rawDomainData, options = {}) {
       const reflection = rawDomainData.activities.reflection ?? rawDomainData.aspiration?.reflection;
       if (reflection) {
         const activityCategoryMap = Object.fromEntries(
-          rawDomainData.activities.activities.map((a) => [a.activity_key, a.activity_category]),
+          allActivities.map((a) => [a.activity_key, a.activity_category]),
         );
         const reflectionContributions = normalizeReflectionSignals(
           userId, reflection, activityCategoryMap,
@@ -170,6 +226,34 @@ async function runIntelligencePipeline(userId, rawDomainData, options = {}) {
     });
   }
 
+  // Aspiration normalization — Phase 3B.5B
+  //
+  // Canonical source: student_aspirations (career_interests,
+  // motivation_driver only). time_horizon is intentionally never passed
+  // into the normalizer — it remains contextual metadata only per the
+  // Phase 3B.5B.0 contract and must never become a signal. This is a
+  // dedicated, first-class Family #1 domain — separate from, and never
+  // fed by, the legacy activities-reflection path above.
+  try {
+    const aspirationRow = rawDomainData.aspiration;
+    if (
+      (Array.isArray(aspirationRow?.career_interests) && aspirationRow.career_interests.length > 0) ||
+      aspirationRow?.motivation_driver
+    ) {
+      domainContributions.aspiration = normalizeAspirationSignals(userId, aspirationRow);
+      logger.info('intelligence_pipeline.aspiration_normalized', {
+        userId,
+        count: domainContributions.aspiration.length,
+      });
+    }
+  } catch (err) {
+    logger.warn('intelligence_pipeline.aspiration_normalization_failed', {
+      userId,
+      message: err.message,
+    });
+    // Continue with empty aspiration contributions — partial bundle is valid
+  }
+
   // ── Step 2: Aggregate ──────────────────────────────────────────────────────
 
   const bundle = aggregateCrossDomainSignals(userId, domainContributions, pipelineRunId);
@@ -194,6 +278,7 @@ async function runIntelligencePipeline(userId, rawDomainData, options = {}) {
     ...domainContributions.academic,
     ...domainContributions.activity,
     ...domainContributions.cognitive,
+    ...domainContributions.aspiration,
   ];
 
   const existingKeys   = await evidenceRepo.getExistingReferenceKeys(userId, AGGREGATION_VERSION);
@@ -293,4 +378,7 @@ module.exports = {
   getStudentConfidence,
   getSignalEvidence,
   getSignalRegistry,
+
+  // Exposed for testing (Phase 3B.3)
+  filterCommittedActivities,
 };

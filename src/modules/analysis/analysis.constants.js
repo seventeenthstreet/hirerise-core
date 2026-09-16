@@ -20,6 +20,12 @@ const DEFAULT_CREDIT_COSTS = Object.freeze({
   jobSpecificCV:   3,
   chiCalculation:  1,
   jobMatchPremium: 2,
+  // Student MVP — approved product decision: this operation is free.
+  // Registered here (server-owned) so isValidOperation('studentRecommendation')
+  // returns true and creditGuard's zero-cost branch has a legitimate,
+  // non-client-controlled source for the value 0. See
+  // creditGuard.middleware.js's cost validation for the corresponding guard.
+  studentRecommendation: 0,
 });
 
 const DEFAULT_PLAN_CREDITS = Object.freeze({
@@ -57,6 +63,13 @@ function isValidOperation(operationType) {
  * Mirrors the logic inside createConfigResolver().getRemainingUses() but
  * operates directly against DEFAULT_CREDIT_COSTS so it can be imported
  * without instantiating a resolver.
+ *
+ * A registered zero-cost operation (e.g. `studentRecommendation`) is not
+ * limited by credit balance at all, so it is reported as `null` — the
+ * same "unmetered" convention already used elsewhere in this codebase
+ * (see TIER_MONTHLY_QUOTAS's `default: null` in tierquota.middleware.js)
+ * — rather than dividing by zero, which would otherwise yield `Infinity`
+ * (or `NaN` when the balance is also 0).
  */
 function getRemainingUses(userDocOrCredits) {
   const raw =
@@ -68,7 +81,7 @@ function getRemainingUses(userDocOrCredits) {
   const result = {};
 
   for (const [operation, cost] of Object.entries(DEFAULT_CREDIT_COSTS)) {
-    result[operation] = Math.floor(safeCredits / cost);
+    result[operation] = cost === 0 ? null : Math.floor(safeCredits / cost);
   }
 
   return result;
@@ -112,8 +125,11 @@ function createConfigResolver({ creditCostCache = {}, planCache = {} } = {}) {
     const safeCredits = Math.max(Number(creditsRemaining) || 0, 0);
     const result     = {};
 
+    // See the standalone getRemainingUses() above for why a registered
+    // zero-cost operation is reported as `null` (unmetered) rather than
+    // divided by zero.
     for (const [operation, cost] of Object.entries(costs)) {
-      result[operation] = Math.floor(safeCredits / cost);
+      result[operation] = cost === 0 ? null : Math.floor(safeCredits / cost);
     }
 
     return result;

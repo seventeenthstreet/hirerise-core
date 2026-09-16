@@ -37,9 +37,23 @@ const ACADEMIC_YEARS = Object.freeze([
 // Mirror of: academic_subject_enum in SQL
 // ─────────────────────────────────────────────────────────────────────────────
 
-/** @type {readonly string[]} */
+/**
+ * G5 (Phase 1): 'science' added as a single combined-Science subject for
+ * Classes 8–10 (NCERT pre-stream curriculum). 'physics' / 'chemistry' /
+ * 'biology' remain in this list because Classes 11–12 still expose them
+ * as separate stream subjects (unchanged) and because pre-existing
+ * Class 8–10 rows already saved under the old three-way model must
+ * remain readable/valid. Only the frontend's SUBJECTS_BY_YEAR picker for
+ * Classes 8–10 (academic.types.ts) has been changed to stop *offering*
+ * physics/chemistry/biology as separate choices at that level — this
+ * validator enum intentionally still accepts them so existing rows don't
+ * fail validation on read/re-save.
+ *
+ * @type {readonly string[]}
+ */
 const ACADEMIC_SUBJECTS = Object.freeze([
   'mathematics',
+  'science',
   'physics',
   'chemistry',
   'biology',
@@ -146,6 +160,28 @@ const GRADE_PERCENTAGE_BANDS = Object.freeze({
   F:      { min: 0,  max: 39,  midpoint: 20 },
 });
 
+// ─────────────────────────────────────────────────────────────────────────────
+// SIGNAL DERIVATION — EVIDENCE STRENGTH TUNABLES
+// Phase 3B.2 — Student-Native Academic Signal Derivation
+//
+// PREDICTED_EVIDENCE_DISCOUNT:
+//   No existing project convention was found for weighting predicted vs.
+//   completed academic results differently (searched academic-normalization.js,
+//   academic-signal-quality.js, and the intelligence signal layer). Predicted
+//   marks/grades are self-reported ahead of official declaration and carry
+//   more uncertainty than a completed, declared result.
+//
+//   This is the smallest defensible deterministic treatment: a flat multiplier
+//   applied to a signal contribution's weight when either the subject row
+//   (student_academic_subjects.is_predicted) or its parent year record
+//   (student_academic_records.is_predicted) is true. It does not attempt a
+//   statistical adjustment — it is a fixed, documented discount, applied
+//   identically regardless of subject or magnitude.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** Multiplier applied to signal contribution weight for predicted (undeclared) results. */
+const PREDICTED_EVIDENCE_DISCOUNT = 0.85;
+
 module.exports = {
   ACADEMIC_YEARS,
   ACADEMIC_SUBJECTS,
@@ -159,4 +195,5 @@ module.exports = {
   YEARS_FOR_PARTIAL_SUFFICIENCY,
   MIN_SUBJECTS_FOR_PARTIAL_YEAR,
   GRADE_PERCENTAGE_BANDS,
+  PREDICTED_EVIDENCE_DISCOUNT,
 };

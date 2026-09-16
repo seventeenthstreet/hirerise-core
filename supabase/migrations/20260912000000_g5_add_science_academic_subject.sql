@@ -1,0 +1,22 @@
+-- 20260912000000_g5_add_science_academic_subject.sql
+--
+-- G5 — Classes 8–10 Science Academic Correctness (Phase 1)
+--
+-- Adds 'science' as a value on academic_subject_enum so Classes 8–10 can be
+-- represented as ONE combined Science subject (NCERT pre-stream curriculum),
+-- matching the frontend SUBJECTS_BY_YEAR correction in academic.types.ts and
+-- the backend ACADEMIC_SUBJECTS list in
+-- core/src/modules/student-onboarding/constants/academics.js.
+--
+-- Non-destructive: 'physics' / 'chemistry' / 'biology' remain valid enum
+-- values because:
+--   1. Classes 11–12 still use them as separate stream subjects (unchanged).
+--   2. Any pre-existing Class 8–10 rows saved under the old three-way model
+--      must remain readable and re-saveable without a migration of student
+--      data. See the G5 section of the Phase 1 report for the legacy-data
+--      verification findings — no destructive migration is performed here.
+--
+-- ALTER TYPE ... ADD VALUE cannot run inside a multi-statement transaction
+-- block together with a statement that uses the new value, so this file
+-- contains only the enum addition.
+ALTER TYPE academic_subject_enum ADD VALUE IF NOT EXISTS 'science';

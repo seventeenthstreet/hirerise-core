@@ -24,7 +24,11 @@
  *
  * Phase 1 MVP additions:
  *   POST /generate-recommendations  — triggers Claude AI recommendation engine
- *   GET  /results                   — polls for completed RecommendationResult
+ *   GET  /results                   — authoritative status/result contract;
+ *                                      returns not_started | pending | ready
+ *                                      | failed (Phase 1 Pass 5 — see the
+ *                                      GET /results handler below for the
+ *                                      full contract).
  *
  * NOTE: recommendation-engine is loaded lazily (inside the handler, not at
  * module load time). This means the server boots safely even if the file has
@@ -232,12 +236,54 @@ router.get(
 // ─────────────────────────────────────────────────────────────────────────────
 
 // POST /generate-recommendations
-// Triggered by the frontend after Step 6 (financial) completes.
-// Calls Claude with the student's full 6-step profile and writes a structured
-// RecommendationResult to student_recommendation_results.
+// LEGACY / ORPHANED — Phase 1 Pass 4 audit confirmed no current frontend
+// code calls this route (only a stray comment in front/src/routes/index.tsx
+// references the path) and no other backend caller exists. It remains
+// mounted with `authenticate` (server.js) and is kept reachable rather than
+// deleted, per spec, in case an untraced external caller depends on it.
+//
+// AUDIT FINDING — uncontrolled alternate generation path:
+// This handler previously called engine.generateRecommendations(userId)
+// DIRECTLY. generateRecommendations() has no internal precondition check —
+// it calls the Claude provider unconditionally every time it is invoked.
+// Calling this route bypassed:
+//   - the atomic duplicate-guard in initiateGeneration() (the conditional
+//     upsert with ignoreDuplicates that makes the backend-owned
+//     aspiration -> processing trigger safe against duplicate/racing
+//     generation — see recommendation-lifecycle.service.js);
+//   - CreditGuard, AI rate limiting, and tier quota (none of which this
+//     route ever had wired);
+// meaning repeated requests to this authenticated-but-unwired route could
+// fire multiple concurrent/racing AI provider calls for the same user with
+// no dedup and no abuse protection, independent of the (already free)
+// studentRecommendation credit cost.
+//
+// CONTAINMENT (smallest safe fix — spec §12 "preferred if safe"):
+// The route now delegates to the SAME guarded lifecycle entry point,
+// initiateGeneration(userId), instead of calling generateRecommendations()
+// directly. initiateGeneration()'s conditional upsert ensures only the
+// first caller to observe a missing/'not_started' row ever launches
+// generation; every subsequent call (from this route, or from the
+// aspiration-triggered backend flow, in any order) is a safe no-op. This
+// makes duplicate/racing generation from repeated calls to this legacy
+// route structurally impossible, without adding a second, competing
+// generation implementation and without wiring CreditGuard/rate-limit/
+// quota here (those protect the repeatable retry/regeneration path — see
+// recommendation.routes.js — not this now-idempotent initial-trigger path,
+// which cannot be abused into repeated AI spend once dedup-guarded).
+//
+// `userId` is taken exclusively from the authenticated request (getUserId,
+// same as every other handler in this file) — never from req.body. There
+// is a separate, unused handleGenerateRecommendations() export in
+// recommendation-engine.js that reads `userId` from req.body; it is dead
+// code (not required/wired by any route in this repository) and is
+// intentionally NOT used here, since wiring it as-is would let one
+// authenticated Student trigger generation for another Student's account.
+// See the implementation report's "Remaining Risks" section.
 //
 // Returns 202 immediately — generation runs async. The frontend polls
-// GET /results every 3 s while on the ProcessingStep screen.
+// GET /results every 3 s while on the ProcessingStep screen. Response
+// contract is unchanged from before this pass.
 //
 // The engine module is required lazily inside the handler so that a missing
 // file never crashes the server at boot (returns 503 instead).
@@ -266,13 +312,20 @@ router.post(
 
     logger.info('[StudentOnboarding] generate-recommendations requested', { userId });
 
-    // Fire-and-forget — return 202 immediately so the frontend can start polling
-    engine.generateRecommendations(userId).catch((err) => {
-      logger.error('[StudentOnboarding] generate-recommendations failed', {
+    // Routed through the same guarded initiateGeneration() the
+    // backend-owned aspiration->processing trigger uses — see the audit
+    // finding above. Errors here are the atomic guard's own DB-level
+    // failures only (generateRecommendations()'s own success/failure is
+    // handled and persisted internally, fire-and-forget); swallow and log,
+    // never fail this request on a best-effort generation kickoff.
+    try {
+      await engine.initiateGeneration(userId);
+    } catch (err) {
+      logger.error('[StudentOnboarding] generate-recommendations failed to initiate', {
         userId,
         err: err.message,
       });
-    });
+    }
 
     return res.status(202).json({
       success: true,
@@ -282,9 +335,49 @@ router.post(
 );
 
 // GET /results
-// Returns the completed RecommendationResult, or { result: null } while
-// generation is still in progress.
-// The frontend ProcessingStep polls this every 3 s until result is non-null.
+//
+// RESULTS / STATUS CONTRACT — Phase 1 Pass 5 (Results/status contract +
+// frontend consumption).
+//
+// AUDIT FINDING (this pass): prior to this change, this endpoint only ever
+// returned `{ result: null }` (no row / still generating) or
+// `{ result, generatedAt, engineVersion }` (row present). It never exposed
+// the `status` column that recommendation-engine.js has been writing
+// ('pending' | 'ready' | 'failed') since Phase 1 Pass 2, and never exposed
+// `error_detail` in any form. This made it structurally impossible for a
+// client to distinguish "no row yet" (not_started) from "row exists but
+// still pending" — both looked identical (`{ result: null }`) — and gave
+// no way to render a failure state or offer retry.
+//
+// This endpoint now returns the full authoritative lifecycle contract:
+//
+//   not_started → { status: 'not_started' }
+//   pending     → { status: 'pending' }
+//   ready       → { status: 'ready', result, generatedAt, engineVersion }
+//   failed      → { status: 'failed', message: <safe, student-facing text> }
+//
+// SAFE FAILURE MESSAGING:
+//   `error_detail` is populated exclusively by
+//   recommendation-engine.js#safeErrorDetail(), which already guarantees no
+//   stack traces, provider payloads/headers, prompts, or credentials ever
+//   reach that column (see its own file-level contract). This endpoint
+//   still never returns the raw column name or any other DB-internal
+//   shape — it surfaces error_detail's value under the generic `message`
+//   field, and falls back to a generic student-facing message if it is
+//   ever unexpectedly empty. No SQL detail, error code, or stack trace is
+//   ever included.
+//
+// OWNERSHIP: unchanged — userId is always getUserId(req) (authenticated
+// JWT via `authenticate` at the server.js mount point), the query is
+// always scoped `.eq('user_id', userId)`, and nothing is ever read from
+// req.body/req.params/req.query for identity. A client cannot fetch
+// another Student's Recommendation.
+//
+// BACKWARD COMPATIBILITY: no current frontend code calls this endpoint
+// (confirmed by repository search — see implementation report); the
+// previous `{ result: ... }`-only shape had no live consumer, so this is
+// a clean contract redesign rather than a breaking change to an active
+// client.
 router.get(
   '/results',
   asyncHandler(async (req, res) => {
@@ -292,7 +385,7 @@ router.get(
 
     const { data, error } = await supabase
       .from('student_recommendation_results')
-      .select('result_json, generated_at, engine_version')
+      .select('status, error_detail, result_json, generated_at, engine_version')
       .eq('user_id', userId)
       .maybeSingle();
 
@@ -300,10 +393,27 @@ router.get(
       throw new AppError(error.message, 500, { code: error.code }, ErrorCodes.INTERNAL_ERROR);
     }
 
+    // No row at all — generation has never been initiated for this user.
     if (!data) {
-      return res.status(200).json({ success: true, data: { result: null } });
+      return res.status(200).json({ success: true, data: { status: 'not_started' } });
     }
 
+    if (data.status === 'pending') {
+      return res.status(200).json({ success: true, data: { status: 'pending' } });
+    }
+
+    if (data.status === 'failed') {
+      const safeMessage = typeof data.error_detail === 'string' && data.error_detail.trim()
+        ? data.error_detail
+        : "We couldn't generate your recommendation right now. Please try again.";
+
+      return res.status(200).json({
+        success: true,
+        data: { status: 'failed', message: safeMessage },
+      });
+    }
+
+    // status === 'ready' — the only remaining valid terminal state.
     let parsed;
     try {
       parsed = typeof data.result_json === 'string'
@@ -321,6 +431,7 @@ router.get(
     return res.status(200).json({
       success: true,
       data: {
+        status: 'ready',
         result: parsed,
         generatedAt: data.generated_at,
         engineVersion: data.engine_version,

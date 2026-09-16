@@ -24,6 +24,7 @@ const INTELLIGENCE_DOMAINS = Object.freeze([
   'activity',
   'cognitive',
   'cross_domain',
+  'aspiration',
 ]);
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -116,6 +117,7 @@ const ACADEMIC_SIGNAL_KEYS = Object.freeze([
   'language_affinity',
   'scientific_orientation',
   'social_science_interest',
+  'commercial_orientation',
 ]);
 
 // Activity domain signals
@@ -146,12 +148,42 @@ const CROSS_DOMAIN_SIGNAL_KEYS = Object.freeze([
   'entrepreneurial_signal',
 ]);
 
+// Aspiration domain signals — Phase 3B.5B
+//
+// Source: student_aspirations.career_interests (11 keys) and
+// student_aspirations.motivation_driver (5 keys). These represent stated
+// occupational-field preference / stated career-motivation orientation
+// ONLY — never aptitude, demonstrated ability, or psychological certainty.
+// See the Phase 3B.5B.0 contract and constants/aspiration.js for the
+// canonical CAREER_DOMAINS / MOTIVATION_DRIVERS enums these mirror.
+const ASPIRATION_SIGNAL_KEYS = Object.freeze([
+  // Career-interest signals (mirror of CAREER_DOMAINS)
+  'career_interest_medicine',
+  'career_interest_engineering',
+  'career_interest_law',
+  'career_interest_arts_design',
+  'career_interest_business',
+  'career_interest_science',
+  'career_interest_teaching',
+  'career_interest_social',
+  'career_interest_defence',
+  'career_interest_sports_fitness',
+  'career_interest_undecided',
+  // Career-value signals (mirror of MOTIVATION_DRIVERS)
+  'career_value_impact',
+  'career_value_financial',
+  'career_value_passion',
+  'career_value_prestige',
+  'career_value_autonomy',
+]);
+
 // All signal keys — used for registry validation
 const ALL_SIGNAL_KEYS = Object.freeze([
   ...ACADEMIC_SIGNAL_KEYS,
   ...ACTIVITY_SIGNAL_KEYS,
   ...COGNITIVE_SIGNAL_KEYS,
   ...CROSS_DOMAIN_SIGNAL_KEYS,
+  ...ASPIRATION_SIGNAL_KEYS,
 ]);
 
 // Deprecated signal keys — no new evidence should be written for these
@@ -207,6 +239,19 @@ const SIGNAL_REGISTRY_METADATA = Object.freeze({
     category:               'subject_affinity',
     primary_domain:         'academic',
     compatible_domains:     ['academic', 'cognitive'],
+    normalization_strategy: 'weighted_average',
+    aggregation_compatible: true,
+    longitudinal_trackable: true,
+  },
+  // Added Phase 3B.2 — no existing signal covered commerce/business/accountancy/
+  // economics subjects (Student v2's 15-subject taxonomy has no "science" or
+  // single "commerce" catch-all; these four subjects had no home in the
+  // pre-existing 5-key academic signal set). Registry search confirmed no
+  // near-duplicate key exists.
+  commercial_orientation: {
+    category:               'subject_affinity',
+    primary_domain:         'academic',
+    compatible_domains:     ['academic'],
     normalization_strategy: 'weighted_average',
     aggregation_compatible: true,
     longitudinal_trackable: true,
@@ -348,6 +393,158 @@ const SIGNAL_REGISTRY_METADATA = Object.freeze({
     aggregation_compatible: true,
     longitudinal_trackable: true,
   },
+
+  // ── Aspiration signals — Phase 3B.5B ────────────────────────────────────────
+  //
+  // All 16 keys share the same metadata shape, per the finalized Phase
+  // 3B.5B.0 contract:
+  //   primary_domain         = 'aspiration'
+  //   compatible_domains     = ['aspiration']   (never reinforced by other
+  //                             domains — these are self-reported statements,
+  //                             not demonstrated evidence)
+  //   normalization_strategy = 'max_pooling'    (presence-based: selected = 1.0,
+  //                             not selected = no contribution at all)
+  //   category               = 'meta'           (self-reported/declarative
+  //                             preference statement — distinct from every
+  //                             other existing category, all of which are
+  //                             derived from demonstrated performance,
+  //                             activity, or cognitive-response evidence;
+  //                             'meta' was the one unused category in the
+  //                             registry and was chosen as the closest fit
+  //                             after searching for a more specific existing
+  //                             category and finding none)
+  //
+  // Career-interest signals (from student_aspirations.career_interests):
+  career_interest_medicine: {
+    category:               'meta',
+    primary_domain:         'aspiration',
+    compatible_domains:     ['aspiration'],
+    normalization_strategy: 'max_pooling',
+    aggregation_compatible: true,
+    longitudinal_trackable: true,
+  },
+  career_interest_engineering: {
+    category:               'meta',
+    primary_domain:         'aspiration',
+    compatible_domains:     ['aspiration'],
+    normalization_strategy: 'max_pooling',
+    aggregation_compatible: true,
+    longitudinal_trackable: true,
+  },
+  career_interest_law: {
+    category:               'meta',
+    primary_domain:         'aspiration',
+    compatible_domains:     ['aspiration'],
+    normalization_strategy: 'max_pooling',
+    aggregation_compatible: true,
+    longitudinal_trackable: true,
+  },
+  career_interest_arts_design: {
+    category:               'meta',
+    primary_domain:         'aspiration',
+    compatible_domains:     ['aspiration'],
+    normalization_strategy: 'max_pooling',
+    aggregation_compatible: true,
+    longitudinal_trackable: true,
+  },
+  career_interest_business: {
+    category:               'meta',
+    primary_domain:         'aspiration',
+    compatible_domains:     ['aspiration'],
+    normalization_strategy: 'max_pooling',
+    aggregation_compatible: true,
+    longitudinal_trackable: true,
+  },
+  career_interest_science: {
+    category:               'meta',
+    primary_domain:         'aspiration',
+    compatible_domains:     ['aspiration'],
+    normalization_strategy: 'max_pooling',
+    aggregation_compatible: true,
+    longitudinal_trackable: true,
+  },
+  career_interest_teaching: {
+    category:               'meta',
+    primary_domain:         'aspiration',
+    compatible_domains:     ['aspiration'],
+    normalization_strategy: 'max_pooling',
+    aggregation_compatible: true,
+    longitudinal_trackable: true,
+  },
+  career_interest_social: {
+    category:               'meta',
+    primary_domain:         'aspiration',
+    compatible_domains:     ['aspiration'],
+    normalization_strategy: 'max_pooling',
+    aggregation_compatible: true,
+    longitudinal_trackable: true,
+  },
+  career_interest_defence: {
+    category:               'meta',
+    primary_domain:         'aspiration',
+    compatible_domains:     ['aspiration'],
+    normalization_strategy: 'max_pooling',
+    aggregation_compatible: true,
+    longitudinal_trackable: true,
+  },
+  career_interest_sports_fitness: {
+    category:               'meta',
+    primary_domain:         'aspiration',
+    compatible_domains:     ['aspiration'],
+    normalization_strategy: 'max_pooling',
+    aggregation_compatible: true,
+    longitudinal_trackable: true,
+  },
+  career_interest_undecided: {
+    category:               'meta',
+    primary_domain:         'aspiration',
+    compatible_domains:     ['aspiration'],
+    normalization_strategy: 'max_pooling',
+    aggregation_compatible: true,
+    longitudinal_trackable: true,
+  },
+
+  // Career-value signals (from student_aspirations.motivation_driver):
+  career_value_impact: {
+    category:               'meta',
+    primary_domain:         'aspiration',
+    compatible_domains:     ['aspiration'],
+    normalization_strategy: 'max_pooling',
+    aggregation_compatible: true,
+    longitudinal_trackable: true,
+  },
+  career_value_financial: {
+    category:               'meta',
+    primary_domain:         'aspiration',
+    compatible_domains:     ['aspiration'],
+    normalization_strategy: 'max_pooling',
+    aggregation_compatible: true,
+    longitudinal_trackable: true,
+  },
+  career_value_passion: {
+    category:               'meta',
+    primary_domain:         'aspiration',
+    compatible_domains:     ['aspiration'],
+    normalization_strategy: 'max_pooling',
+    aggregation_compatible: true,
+    longitudinal_trackable: true,
+  },
+  career_value_prestige: {
+    category:               'meta',
+    primary_domain:         'aspiration',
+    compatible_domains:     ['aspiration'],
+    normalization_strategy: 'max_pooling',
+    aggregation_compatible: true,
+    longitudinal_trackable: true,
+  },
+  career_value_autonomy: {
+    category:               'meta',
+    primary_domain:         'aspiration',
+    compatible_domains:     ['aspiration'],
+    normalization_strategy: 'max_pooling',
+    aggregation_compatible: true,
+    longitudinal_trackable: true,
+  },
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -417,6 +614,7 @@ module.exports = {
   ACTIVITY_SIGNAL_KEYS,
   COGNITIVE_SIGNAL_KEYS,
   CROSS_DOMAIN_SIGNAL_KEYS,
+  ASPIRATION_SIGNAL_KEYS,
   ALL_SIGNAL_KEYS,
   DEPRECATED_SIGNAL_KEYS,
 

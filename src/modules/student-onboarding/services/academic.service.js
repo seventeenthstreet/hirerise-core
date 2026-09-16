@@ -103,16 +103,43 @@ async function saveAcademicsStep(ctx, userId, sessionId, validatedBody) {
   const yearSummaries = repo.buildYearSummaries(records);
   const signalQuality = evaluateAcademicSignalQuality(yearSummaries);
 
-  // Advance session when the student completes a non-partial save with sufficient signal
+  // Advance session ONLY when the student completes a non-partial (commit)
+  // save AND the resulting signal is sufficient.
+  //
+  // ROOT CAUSE (live verification): this used to call addCompletedStep /
+  // resolveCurrentStep / updateProgression unconditionally, on EVERY save —
+  // including every partial autosave fired while the student was still
+  // mid-typing on Class 10. That silently marked 'academics' complete and
+  // advanced current_step to 'activities' the moment the very first subject
+  // was autosaved, long before Continue was ever clickable. From then on,
+  // the frontend's StepRouter (see components/student-onboarding/steps/
+  // StepRouter.tsx, "REVIEW BRANCH") saw current_step='activities' while the
+  // student was still on the /academics URL with 'academics' already in
+  // completed_steps, and rendered the Academics screen in read-only REVIEW
+  // mode instead — whose Continue button never calls onComplete/advances
+  // anything by design. That is exactly why Continue looked enabled but
+  // "did nothing": the session had already (silently, incorrectly) moved on
+  // before the student ever pressed it.
+  //
+  // Fix: only the intentional commit action (is_partial: false) with
+  // sufficient signal_quality is allowed to advance progression — matching
+  // evaluateAcademicSignalQuality's own "Committed = is_partial is false"
+  // contract and the SUBJECTS_FOR_COMPLETE_YEAR / YEARS_FOR_PARTIAL_SUFFICIENCY
+  // thresholds in constants/academics.js (both left completely untouched).
   const currentSession = await sessionService.getSession(userId);
-  const newCompleted   = addCompletedStep(currentSession.completed_steps, 'academics');
-  const nextStep       = resolveCurrentStep('academics', currentSession.current_step);
+  let updatedSession   = currentSession;
+  let nextStep         = currentSession.current_step;
 
-  const updatedSession = await sessionService.updateProgression(userId, {
-    completedStep:  'academics',
-    nextStep,
-    completedSteps: newCompleted,
-  });
+  if (!isPartial && signalQuality.is_sufficient) {
+    const newCompleted = addCompletedStep(currentSession.completed_steps, 'academics');
+    nextStep = resolveCurrentStep('academics', currentSession.current_step);
+
+    updatedSession = await sessionService.updateProgression(userId, {
+      completedStep:  'academics',
+      nextStep,
+      completedSteps: newCompleted,
+    });
+  }
 
   return {
     academics:      { years },

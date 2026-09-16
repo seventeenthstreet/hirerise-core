@@ -30,6 +30,7 @@ const intelligenceService = require('../services/intelligence.service');
 const academicRepo        = require('../repositories/academic.repository');
 const activityRepo        = require('../repositories/activity.repository');
 const cognitiveRepo       = require('../repositories/cognitive.repository');
+const aspirationRepo      = require('../repositories/aspiration.repository');
 const logger              = require('../../../../shared/logger');
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -121,7 +122,18 @@ async function triggerPipeline(req, res) {
   });
 
   // Load raw domain data from existing Phase tables
-  const [academicYears, activities, achievements, reflection, cognitiveResponses, taxonomyRows] =
+  //
+  // NOTE (pre-existing, out of scope for Phase 3B.5B): the academic/activity/
+  // cognitive calls below invoke repository functions that do not accept —
+  // and in several cases do not exist with — the signature used here (e.g.
+  // academicRepo.findYearsByUser is not an exported member of
+  // academic.repository.js). This is a pre-existing defect in this
+  // controller, unrelated to Aspiration, and is intentionally NOT fixed
+  // here per the Phase 3B.5B implementation boundary (see checkpoint
+  // report's "Deferred Findings" / this phase's frozen-area rules). The
+  // new aspirationRepo.fetchAspiration(...) call below uses that
+  // repository's actual, correct signature (supabase client + userId).
+  const [academicYears, activities, achievements, reflection, cognitiveResponses, taxonomyRows, aspirationRow] =
     await Promise.all([
       _safeLoad(() => academicRepo.findYearsByUser(userId),   'academic_years',      []),
       _safeLoad(() => activityRepo.findActivitiesByUser(userId), 'activities',        []),
@@ -129,12 +141,20 @@ async function triggerPipeline(req, res) {
       _safeLoad(() => activityRepo.findReflectionByUser(userId), 'reflection',        null),
       _safeLoad(() => cognitiveRepo.findResponsesByUser(userId), 'cognitive_responses', []),
       _safeLoad(() => cognitiveRepo.fetchCognitiveTaxonomy(),    'cognitive_taxonomy',  []),
+      _safeLoad(() => aspirationRepo.fetchAspiration(req.supabase, userId), 'aspiration', null),
     ]);
 
   const rawDomainData = {
     academics:  { academicYears },
     activities: { activities, achievements, reflection },
     cognitive:  { responses: cognitiveResponses, taxonomyRows },
+    // Phase 3B.5B — canonical student_aspirations row. Defaults to an
+    // empty/null shape (never signalized) when no row exists yet.
+    aspiration: {
+      career_interests:  aspirationRow?.career_interests  ?? [],
+      motivation_driver:  aspirationRow?.motivation_driver ?? null,
+      time_horizon:       aspirationRow?.time_horizon      ?? null,
+    },
   };
 
   const result = await intelligenceService.runIntelligencePipeline(

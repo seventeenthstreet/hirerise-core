@@ -1,0 +1,32 @@
+-- ─────────────────────────────────────────────────────────────────────────────
+-- Migration: 20260903010000_aspiration_domain_enum.sql
+-- Phase 3B.5B — Aspiration Signalization (Family #1 Student-Native
+-- Intelligence Layer)
+--
+-- Adds a new value to the existing intelligence_domain_enum (created in
+-- 20260525000001_cross_domain_intelligence_phase3d.sql):
+--
+--   academic | activity | cognitive | cross_domain  →  + aspiration
+--
+-- This is a purely additive enum change. It does not modify, reorder, or
+-- remove any existing enum value. 'academic', 'activity', 'cognitive', and
+-- 'cross_domain' continue to behave exactly as before.
+--
+-- WHY A SEPARATE MIGRATION FILE FROM THE REGISTRY INSERT:
+--   PostgreSQL does not allow a newly-added enum value to be referenced
+--   within the same transaction that added it (safe-use restriction on
+--   ALTER TYPE ... ADD VALUE). Each migration file in this repository runs
+--   as its own transaction (see the existing two-step precedent set by
+--   20260525000001_cross_domain_intelligence_phase3d.sql defining the enum
+--   and 20260902010000_signal_registry_commercial_orientation.sql adding a
+--   registry row against it in a later file). The follow-up migration
+--   20260903020000_aspiration_signal_registry.sql inserts the 16 new
+--   Aspiration signal_registry rows that reference this value, and must
+--   run after this file has committed.
+--
+-- IDEMPOTENCY:
+--   `ADD VALUE IF NOT EXISTS` (supported since PostgreSQL 12) makes this
+--   migration safe to re-run.
+-- ─────────────────────────────────────────────────────────────────────────────
+
+ALTER TYPE intelligence_domain_enum ADD VALUE IF NOT EXISTS 'aspiration';
