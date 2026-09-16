@@ -1,0 +1,31 @@
+-- =============================================================================
+-- HireRise Curriculum Architecture — Phase 1: Schema Foundation
+-- Migration: 20260913010000_p1_curriculum_taxonomy_sentinel_enum.sql
+--
+-- PURPOSE:
+--   Add exactly ONE new value to academic_subject_enum: 'taxonomy_backed'.
+--
+--   This is a temporary compatibility SENTINEL for student_academic_subjects
+--   rows whose real subject identity is now carried by the new nullable
+--   student_academic_subjects.subject_id -> academic_subjects(id) FK
+--   (added in 20260913020000_p1_curriculum_schema_foundation.sql), because
+--   academic_subject_enum is NOT NULL on that table and some taxonomy-backed
+--   subjects (e.g. Kerala DHSE pathway subjects) have no safe 1:1 legacy
+--   enum equivalent.
+--
+--   'taxonomy_backed' is NOT a real academic subject. It must never be
+--   surfaced as a subject choice in onboarding UX. It only exists so a row
+--   can satisfy the legacy NOT NULL enum column while the authoritative
+--   subject identity lives in subject_id.
+--
+-- SAFETY:
+--   • Does NOT touch the already-applied G5 migration
+--     (20260912000000_g5_add_science_academic_subject.sql).
+--   • Does NOT remove or rename any existing enum value.
+--   • Adds exactly one value, nothing else.
+--   • ALTER TYPE ... ADD VALUE cannot run in the same transaction block as a
+--     statement that uses the new value (see G5 migration for the same
+--     constraint) — this migration performs ONLY the enum addition.
+-- =============================================================================
+
+ALTER TYPE academic_subject_enum ADD VALUE IF NOT EXISTS 'taxonomy_backed';
