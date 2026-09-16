@@ -77,7 +77,7 @@ function getAnonClient() {
 
   anonClient = createClient(
     getRequiredEnv('SUPABASE_URL'),
-    getRequiredEnv('SUPABASE_ANON_KEY'),
+    getRequiredEnv('SUPABASE_PUBLISHABLE_KEY'),
     {
       realtime: {
         transport: WebSocket,
