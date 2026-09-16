@@ -19,6 +19,17 @@ const { sendSuccess } = require('../../../shared/response');
 
 function getSupabase() { return require('../../../config/supabase').supabase; }
 
+// Phase 3B.6E.3: regression protection only — TABLE_MAP.careerDomains below
+// is currently dormant (no careerDomainsModule instance is built/wired; the
+// live route uses the dedicated adminCmsCareerDomains.module.js). If a
+// future generic careerDomains instance is ever created via
+// createCmsDatasetModule(), this denylist guarantees its allowedFields
+// config cannot be used to bypass the governed, migration-only
+// canonical_key vocabulary on cms_career_domains — regardless of what the
+// config passes in. Not a scope expansion: this file is not otherwise
+// changed, and no bulk-import or careerDomains factory instance is added.
+const GOVERNANCE_RESTRICTED_FIELDS = new Set(['canonical_key', 'canonicalKey']);
+
 // Map datasetType → Supabase table name
 const TABLE_MAP = {
   jobFamilies:      'cms_job_families',
@@ -89,6 +100,7 @@ function createCmsDatasetModule(config) {
         domainId: 'domain_id', domain_id: 'domain_id',
       };
       for (const field of allowedFields) {
+        if (GOVERNANCE_RESTRICTED_FIELDS.has(field)) continue;
         if (field !== 'name' && data[field] !== undefined) {
           const col = fieldMap[field] || field;
           payload[col] = data[field];
@@ -109,6 +121,7 @@ function createCmsDatasetModule(config) {
         safe.normalized_name = normalizeText(updates.name);
       }
       for (const field of allowedFields) {
+        if (GOVERNANCE_RESTRICTED_FIELDS.has(field)) continue;
         if (field !== 'name' && updates[field] !== undefined) safe[field] = updates[field];
       }
       const { data: updated, error } = await supabase
@@ -145,6 +158,7 @@ function createCmsDatasetModule(config) {
         id:               row.id,
         name:             row.name,
         normalizedName:   row.normalized_name,
+        canonicalKey:     row.canonical_key,
         description:      row.description,
         status:           row.status,
         sortOrder:        row.sort_order,
