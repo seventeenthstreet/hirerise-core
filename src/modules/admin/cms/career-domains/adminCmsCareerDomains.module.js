@@ -33,6 +33,32 @@ function normalizeName(name) {
   return name.trim().toLowerCase();
 }
 
+// Phase 3B.6E.3: canonical_key is migration-owned (see
+// supabase/migrations/20260904010000_phase3b6e3_career_area_governed_vocabulary.sql).
+// Ordinary Admin CRUD on this module must never be able to set or change it —
+// the DB CHECK/UNIQUE constraints are a backstop, not the enforcement point.
+// This helper makes that governance boundary explicit at the application
+// layer. Returns true (and has already written the response) if the request
+// was rejected; false if canonical_key was absent and the caller should
+// continue.
+function rejectCanonicalKeyMutation(req, res) {
+  if (Object.prototype.hasOwnProperty.call(req.body || {}, 'canonical_key')) {
+    res.status(403).json({
+      success: false,
+      error: {
+        code: 'CANONICAL_KEY_GOVERNANCE_RESTRICTED',
+        message: 'canonical_key is governed and cannot be supplied through ordinary Admin CRUD',
+      },
+      meta: {
+        timestamp: new Date().toISOString(),
+      },
+    });
+    return true;
+  }
+
+  return false;
+}
+
 // ─────────────────────────────────────────────
 // 🔹 MODULE LOGIC
 // ─────────────────────────────────────────────
@@ -43,56 +69,22 @@ const careerDomainsModule = {
   // ───────────────────────────────────────────
   async create(req, res, next) {
     try {
-      const { name, description } = req.body;
-      const adminId = req.admin?.id;
+      if (rejectCanonicalKeyMutation(req, res)) return;
 
-      const normalized_name = normalizeName(name);
-
-      // 🔍 Dedup check
-      const { data: existing } = await supabase
-        .from('cms_career_domains')
-        .select('id')
-        .eq('normalized_name', normalized_name)
-        .eq('soft_deleted', false)
-        .maybeSingle();
-
-      if (existing) {
-        return res.status(409).json({
-          success: false,
-          error: {
-            code: 'DUPLICATE_DOMAIN',
-            message: 'Career domain already exists',
-          },
-          meta: {
-            timestamp: new Date().toISOString(),
-          },
-        });
-      }
-
-      // ✅ Insert
-      const { data, error } = await supabase
-        .from('cms_career_domains')
-        .insert([
-          {
-            name,
-            description,
-            normalized_name,
-            status: 'active',
-            created_by_admin_id: adminId,
-            updated_by_admin_id: adminId,
-            soft_deleted: false,
-          },
-        ])
-        .select()
-        .single();
-
-      if (error) throw error;
-
-      return res.status(201).json({
-        success: true,
-        data,
+      // Phase 3B.6E.3: the Career Area vocabulary is closed. The eight
+      // governed Career Areas are seeded and owned by the Phase 3B.6E.3
+      // migration; ordinary Admin CREATE can no longer add arbitrary
+      // Career Areas through this endpoint.
+      return res.status(403).json({
+        success: false,
+        error: {
+          code: 'CAREER_AREA_VOCABULARY_CLOSED',
+          message: 'Career Area vocabulary is closed; new Career Areas are migration-owned.',
+        },
+        meta: {
+          timestamp: new Date().toISOString(),
+        },
       });
-
     } catch (err) {
       logger.error('CareerDomain CREATE error', err);
       next(err);
@@ -128,6 +120,8 @@ const careerDomainsModule = {
   // ───────────────────────────────────────────
   async update(req, res, next) {
     try {
+      if (rejectCanonicalKeyMutation(req, res)) return;
+
       const { id } = req.params;
       const { name, description, status } = req.body;
       const adminId = req.admin?.id;
@@ -226,6 +220,12 @@ careerDomainsModule.validators = [
     .optional()
     .isIn(['active', 'inactive']),
 ];
+
+// Test-compatible export structure (Phase 3B.6E.3 regression contract):
+// these mirror the internal helpers above exactly and do not change
+// production routing behavior.
+careerDomainsModule._normalizeName = normalizeName;
+careerDomainsModule._rejectCanonicalKeyMutation = rejectCanonicalKeyMutation;
 
 module.exports = careerDomainsModule;
 
