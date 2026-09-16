@@ -106,7 +106,7 @@ function getRequestId(req) {
 // GET /health — liveness probe
 // ─────────────────────────────────────────────────────────────────────────────
 
-router.get('/health', (req, res) => {
+router.get('/', (req, res) => {
   return res.status(200).json({
     ok:         true,
     service:    SERVICE_NAME,
