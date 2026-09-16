@@ -194,7 +194,13 @@ function creditGuard(operationType) {
       const rawCost = CREDIT_COSTS[operationType];
       const cost = Math.trunc(Number(rawCost));
 
-      if (!Number.isFinite(cost) || cost <= 0) {
+      // `cost` here is never client-controlled — it is looked up strictly
+      // from the server-owned CREDIT_COSTS map by an operationType that has
+      // already passed isValidOperation() above. A registered `0` (e.g.
+      // studentRecommendation, an approved zero-credit MVP operation) is
+      // therefore a legitimate configured value, not a misconfiguration —
+      // only a missing/non-numeric or negative cost indicates the latter.
+      if (!Number.isFinite(cost) || cost < 0) {
         logger.error('[CreditGuard] Invalid configured cost', {
           operationType,
           rawCost,
@@ -208,6 +214,24 @@ function creditGuard(operationType) {
             ErrorCodes.INTERNAL_SERVER_ERROR
           )
         );
+      }
+
+      // Zero-cost operations must never reach checkAndDeductCredits()/the
+      // consume_ai_credits RPC — that path is untested against amount 0
+      // and, more importantly, a zero-credit operation simply has nothing
+      // to deduct. Skip straight to next() with cost metadata attached,
+      // exactly as a successful deduction would.
+      if (cost === 0) {
+        req.creditCost = 0;
+        req.creditsRemaining = null;
+        req.creditConsumption = {
+          userId,
+          operationType,
+          consumed: 0,
+          remaining: null,
+        };
+
+        return next();
       }
 
       const result = await checkAndDeductCredits(userId, cost, operationType);

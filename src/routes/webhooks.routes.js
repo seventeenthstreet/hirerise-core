@@ -24,6 +24,10 @@ const {
   activateSubscription,
 } = require('../services/billing/Billing.service');
 const {
+  handleStripePaygWebhook,
+  handleRazorpayPaygWebhook,
+} = require('../services/billing/paygWebhook.service');
+const {
   authenticate,
   requireAdmin,
   requireRole,
@@ -147,9 +151,20 @@ router.post(
     // Fast ACK first
     res.status(200).json({ received: true });
 
-    // Fire-and-forget processing
+    // Fire-and-forget processing.
+    // PAYG payment processing (paygWebhook.service.js) runs as a SEPARATE
+    // path from subscription billing (Billing.service.js) — see PAYG
+    // Phase 1 controlling prompt §8/§9/§13. Each independently decides
+    // whether a given event is relevant to it.
     handleRazorpayWebhook(payload, true).catch((err) => {
       logger.error('[Webhook/Razorpay] Processing failed', {
+        event: payload?.event,
+        error: err.message,
+      });
+    });
+
+    handleRazorpayPaygWebhook(payload).catch((err) => {
+      logger.error('[Webhook/Razorpay/PAYG] Processing failed', {
         event: payload?.event,
         error: err.message,
       });
@@ -202,9 +217,20 @@ router.post(
     // Fast ACK first
     res.status(200).json({ received: true });
 
-    // Fire-and-forget processing
+    // Fire-and-forget processing.
+    // PAYG payment processing (paygWebhook.service.js) runs as a SEPARATE
+    // path from subscription billing (Billing.service.js) — see PAYG
+    // Phase 1 controlling prompt §8/§9/§13. Each independently decides
+    // whether a given event is relevant to it.
     handleStripeWebhook(event, true).catch((err) => {
       logger.error('[Webhook/Stripe] Processing failed', {
+        eventType: event?.type,
+        error: err.message,
+      });
+    });
+
+    handleStripePaygWebhook(event).catch((err) => {
+      logger.error('[Webhook/Stripe/PAYG] Processing failed', {
         eventType: event?.type,
         error: err.message,
       });

@@ -373,6 +373,18 @@ async function handleStripeWebhook(event, _ack) {
   if (STRIPE_ACTIVATE_EVENTS.has(type)) {
     const obj = data?.object ?? {};
 
+    // PAYG ISOLATION GUARD (added for PAYG Phase 1 — Payment Record Layer):
+    // checkout.session.completed fires for BOTH subscription checkouts
+    // and one-time (PAYG) payment checkouts. Without this guard, a PAYG
+    // checkout session would fall through to the subscriptionId fallback
+    // below (obj.id, i.e. the checkout session id "cs_...") and be
+    // misrouted into activate_subscription_tx as if it were a
+    // subscription — see src/services/billing/paygWebhook.service.js for
+    // the actual PAYG handling of mode:'payment' sessions.
+    if (type === 'checkout.session.completed' && obj.mode === 'payment') {
+      return;
+    }
+
     // checkout.session.completed puts subscription under obj.subscription
     // invoice.payment_succeeded puts subscription under obj.subscription
     // customer.subscription.* — obj IS the subscription
@@ -518,6 +530,18 @@ async function handleRazorpayWebhook(payload, _ack) {
 
   // ── ACTIVATE ──────────────────────────────────────────────────────────────
   if (RAZORPAY_ACTIVATE_EVENTS.has(event)) {
+    // PAYG ISOLATION GUARD (added for PAYG Phase 1 — Payment Record Layer):
+    // `payment.captured` fires for BOTH subscription recurring charges
+    // and one-time (PAYG) order payments. Without this guard, a PAYG
+    // order's payment.captured event would fall through to the payment
+    // entity below and be misrouted into activate_subscription_tx with
+    // subscriptionId set to a payment id, not a subscription id — see
+    // src/services/billing/paygWebhook.service.js for the actual PAYG
+    // handling of payment.captured events with no subscription entity.
+    if (event === 'payment.captured' && !payload?.payload?.subscription?.entity) {
+      return;
+    }
+
     const subscriptionId =
       entity.id ??
       payload?.payload?.subscription?.entity?.id;
